@@ -903,6 +903,7 @@ const CollectionsUI = {
     saveBtn.innerHTML = '<div class="spinner spinner-sm spinner-light"></div> Saving...';
 
     try {
+      console.log('[PPBase] updateCollection payload:', JSON.stringify(payload));
       await PBClient.updateCollection(collection.id || collection.name, payload);
       App.closeModal();
       App.showToast('Collection "' + newName + '" updated.');
@@ -1086,12 +1087,31 @@ const CollectionsUI = {
       const tables = await this._loadDbTables();
       const items = [];
 
-      // Check if typing after "tablename." → show columns
+      // Parse table aliases from the full SQL text
+      // Matches: FROM table AS alias, FROM table alias, JOIN table AS alias, JOIN table alias
+      const aliases = {};
+      const aliasRegex = /(?:FROM|JOIN)\s+(\w+)(?:\s+AS\s+(\w+)|\s+(\w+)(?=\s*(?:ON|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|GROUP|ORDER|LIMIT|HAVING|UNION|,|\)|$)))/gi;
+      let m;
+      while ((m = aliasRegex.exec(text)) !== null) {
+        const tableName = m[1].toLowerCase();
+        const alias = (m[2] || m[3] || '').toLowerCase();
+        if (alias && alias !== tableName) {
+          // Don't treat SQL keywords as aliases
+          const kwSet = new Set(this.SQL_KEYWORDS.map(k => k.toLowerCase()));
+          if (!kwSet.has(alias)) {
+            aliases[alias] = tableName;
+          }
+        }
+      }
+
+      // Check if typing after "name." → show columns (supports both table names and aliases)
       if (word.includes('.')) {
         const parts = word.split('.');
-        const tableName = parts[0].toLowerCase();
+        const prefix = parts[0].toLowerCase();
         const colPrefix = (parts[1] || '').toLowerCase();
-        const table = tables.find(t => t.name.toLowerCase() === tableName);
+        // Resolve alias to real table name, or use directly
+        const realName = aliases[prefix] || prefix;
+        const table = tables.find(t => t.name.toLowerCase() === realName);
         if (table) {
           for (const col of table.columns) {
             if (col.name.toLowerCase().startsWith(colPrefix)) {

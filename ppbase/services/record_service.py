@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import NotSupportedError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.core.id_generator import generate_id
@@ -120,7 +121,17 @@ async def list_records(
         where_sql, params = parse_filter(filter_str, request_context)
 
     # Build ORDER BY clause
-    order_sql = '"created" DESC'
+    # View collections may lack "created" — fall back to no explicit order
+    col_type = getattr(collection, "type", "base") or "base"
+    if col_type == "view":
+        # Check if the view has a "created" column
+        view_field_names = {f.name for f in schema_fields}
+        if "created" in view_field_names:
+            order_sql = '"created" DESC'
+        else:
+            order_sql = "1"
+    else:
+        order_sql = '"created" DESC'
     if sort:
         sort_parts = parse_sort(sort)
         if sort_parts:
@@ -149,10 +160,16 @@ async def list_records(
     total_items = -1
     if not skip_total:
         count_sql = f'SELECT COUNT(*) AS cnt FROM "{table}" WHERE {where_sql}'
-        async with engine.connect() as conn:
-            result = await conn.execute(text(count_sql), params)
-            row = result.mappings().first()
-            total_items = row["cnt"] if row else 0
+        for _attempt in range(2):
+            try:
+                async with engine.connect() as conn:
+                    result = await conn.execute(text(count_sql), params)
+                    row = result.mappings().first()
+                    total_items = row["cnt"] if row else 0
+                break
+            except NotSupportedError:
+                if _attempt > 0:
+                    raise
 
     # Fetch page
     select_sql = (
@@ -162,9 +179,15 @@ async def list_records(
     params["_limit"] = per_page
     params["_offset"] = offset
 
-    async with engine.connect() as conn:
-        result = await conn.execute(text(select_sql), params)
-        rows = [dict(r) for r in result.mappings().all()]
+    for _attempt in range(2):
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(text(select_sql), params)
+                rows = [dict(r) for r in result.mappings().all()]
+            break
+        except NotSupportedError:
+            if _attempt > 0:
+                raise
 
     items = [
         build_record_response(

@@ -85,13 +85,29 @@ const RecordsUI = {
       return;
     }
 
-    const visibleFields = schema.slice(0, 5);
+    // For view collections with empty schema, infer columns from the first record
+    let visibleFields;
+    let viewInferred = false;
+    if (schema.length > 0) {
+      visibleFields = schema.slice(0, 5);
+    } else if (records.length > 0) {
+      // Only exclude PPBase metadata keys — keep created/updated since the user chose them
+      const metaKeys = new Set(['id', 'collectionId', 'collectionName']);
+      visibleFields = Object.keys(records[0])
+        .filter(k => !metaKeys.has(k))
+        .slice(0, 8)
+        .map(k => ({ name: k, type: k === 'created' || k === 'updated' ? 'date' : 'text' }));
+      viewInferred = true;
+    } else {
+      visibleFields = [];
+    }
 
     let headerCells = '<th>ID</th>';
     visibleFields.forEach((f) => {
-      headerCells += '<th>' + App.escapeHtml(f.name) + '</th>';
+      headerCells += '<th>' + App.escapeHtml(f.name).toUpperCase() + '</th>';
     });
-    headerCells += '<th>Created</th>';
+    // Only add the hardcoded Created column for base/auth collections
+    if (!viewInferred) headerCells += '<th>Created</th>';
     if (!isView) headerCells += '<th></th>';
 
     let rows = '';
@@ -100,10 +116,14 @@ const RecordsUI = {
 
       visibleFields.forEach((f) => {
         const val = record[f.name];
-        cells += '<td>' + App.escapeHtml(this.formatCellValue(val, f)) + '</td>';
+        if (f.type === 'date') {
+          cells += '<td class="text-muted text-sm">' + App.formatDate(val) + '</td>';
+        } else {
+          cells += '<td>' + App.escapeHtml(this.formatCellValue(val, f)) + '</td>';
+        }
       });
 
-      cells += '<td class="text-muted text-sm">' + App.formatDate(record.created) + '</td>';
+      if (!viewInferred) cells += '<td class="text-muted text-sm">' + App.formatDate(record.created) + '</td>';
 
       if (!isView) {
         cells += `

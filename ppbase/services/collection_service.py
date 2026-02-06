@@ -215,6 +215,7 @@ async def update_collection(
             self.name = rec.name
             self.type = rec.type
             self.schema = list(rec.schema) if isinstance(rec.schema, list) else []
+            self.options = dict(rec.options) if isinstance(rec.options, dict) else {}
 
     old_snapshot = _Snapshot(record)
 
@@ -262,13 +263,37 @@ async def update_collection(
 
     await session.flush()
 
-    # Alter the physical table
-    schema_changed = (
-        old_snapshot.name != record.name
-        or old_snapshot.schema != (record.schema if isinstance(record.schema, list) else [])
-    )
-    if schema_changed:
-        await update_collection_table(engine, old_snapshot, record)
+    # View collections: recreate the VIEW if query or name changed
+    col_type = record.type or "base"
+    if col_type == "view":
+        old_options = old_snapshot.options if hasattr(old_snapshot, "options") else {}
+        new_options = record.options if isinstance(record.options, dict) else {}
+        old_query = old_options.get("query", "")
+        new_query = new_options.get("query", "")
+        if old_snapshot.name != record.name or old_query != new_query:
+            if new_query:
+                from ppbase.db.schema_manager import (
+                    delete_collection_table,
+                    validate_view_query,
+                )
+
+                await validate_view_query(engine, new_query)
+                # Drop old view/table, then create new view
+                await delete_collection_table(
+                    engine, old_snapshot.name, "view"
+                )
+                await create_collection_table(engine, record)
+            elif old_snapshot.name != record.name:
+                # Just rename
+                await update_collection_table(engine, old_snapshot, record)
+    else:
+        # Alter the physical table
+        schema_changed = (
+            old_snapshot.name != record.name
+            or old_snapshot.schema != (record.schema if isinstance(record.schema, list) else [])
+        )
+        if schema_changed:
+            await update_collection_table(engine, old_snapshot, record)
 
     await session.commit()
 

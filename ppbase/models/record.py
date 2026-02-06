@@ -57,24 +57,36 @@ def build_record_response(
     }
 
     # Add schema-defined fields
-    for field_def in schema:
-        fname = field_def.get("name", "")
-        if not fname:
-            continue
-        # Skip hidden fields unless specifically requested
-        if fname in hidden and (fields_filter is None or fname not in fields_filter):
-            continue
-        # Skip password-type fields always
-        if field_def.get("type") == "password":
-            continue
+    if schema:
+        for field_def in schema:
+            fname = field_def.get("name", "")
+            if not fname:
+                continue
+            # Skip hidden fields unless specifically requested
+            if fname in hidden and (fields_filter is None or fname not in fields_filter):
+                continue
+            # Skip password-type fields always
+            if field_def.get("type") == "password":
+                continue
 
-        val = row.get(fname)
-        if isinstance(val, datetime):
-            val = format_datetime(val)
-        # Return integers for whole-number floats (PocketBase compat)
-        if isinstance(val, float) and val == int(val):
-            val = int(val)
-        result[fname] = val
+            val = row.get(fname)
+            if isinstance(val, datetime):
+                val = format_datetime(val)
+            # Return integers for whole-number floats (PocketBase compat)
+            if isinstance(val, float) and val == int(val):
+                val = int(val)
+            result[fname] = val
+    else:
+        # View collections have no schema — include all row columns
+        system_keys = {"id", "created", "updated"}
+        for key, val in row.items():
+            if key in system_keys:
+                continue
+            if isinstance(val, datetime):
+                val = format_datetime(val)
+            if isinstance(val, float) and val == int(val):
+                val = int(val)
+            result[key] = val
 
     # Apply fields filter if specified
     if fields_filter:
