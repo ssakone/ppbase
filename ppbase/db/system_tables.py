@@ -200,6 +200,24 @@ class ExternalAuthRecord(Base):
 
 
 # ---------------------------------------------------------------------------
+# _migrations
+# ---------------------------------------------------------------------------
+
+
+class MigrationRecord(Base):
+    """Tracks which migrations have been applied to the database."""
+
+    __tablename__ = "_migrations"
+
+    file: Mapped[str] = mapped_column(String(255), primary_key=True)
+    applied: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Table creation helper
 # ---------------------------------------------------------------------------
 

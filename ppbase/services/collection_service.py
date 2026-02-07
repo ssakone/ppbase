@@ -7,7 +7,9 @@ PostgreSQL tables.
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -29,6 +31,8 @@ from ppbase.models.collection import (
     CollectionResponse,
     CollectionUpdate,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Name validation
@@ -101,6 +105,78 @@ def _apply_sort(stmt: Any, sort_str: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Migration helpers
+# ---------------------------------------------------------------------------
+
+
+async def _record_migration(
+    session: AsyncSession,
+    migration_filename: str,
+) -> None:
+    """Record a migration file as applied in the _migrations table."""
+    from ppbase.db.system_tables import MigrationRecord
+
+    record = MigrationRecord(
+        file=migration_filename,
+        applied=datetime.now(timezone.utc),
+    )
+    session.add(record)
+    await session.flush()
+
+
+async def _maybe_generate_migration(
+    session: AsyncSession,
+    *,
+    auto_migrate: bool,
+    migrations_dir: str | None,
+    kind: str,
+    record: CollectionRecord | None = None,
+    old_snapshot: Any | None = None,
+) -> None:
+    """Generate a migration file and record it as applied if auto_migrate is on.
+
+    Args:
+        session: The active database session (for recording the migration).
+        auto_migrate: Whether auto-migration is enabled.
+        migrations_dir: Directory to write migration files to.
+        kind: One of "create", "update", "delete".
+        record: The CollectionRecord (current state).
+        old_snapshot: For updates, the snapshot of the old state.
+    """
+    if not auto_migrate or not migrations_dir:
+        return
+
+    try:
+        from ppbase.services.migration_generator import (
+            generate_create_migration,
+            generate_delete_migration,
+            generate_update_migration,
+        )
+    except ImportError:
+        logger.warning("migration_generator module not available; skipping migration generation")
+        return
+
+    os.makedirs(migrations_dir, exist_ok=True)
+
+    try:
+        if kind == "create" and record is not None:
+            filename = generate_create_migration(record, migrations_dir)
+        elif kind == "update" and old_snapshot is not None and record is not None:
+            filename = generate_update_migration(old_snapshot, record, migrations_dir)
+        elif kind == "delete" and record is not None:
+            filename = generate_delete_migration(record, migrations_dir)
+        else:
+            return
+
+        if filename:
+            # Store just the basename, not the full path
+            basename = os.path.basename(filename)
+            await _record_migration(session, basename)
+    except Exception:
+        logger.exception("Failed to generate migration file (kind=%s)", kind)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -156,6 +232,9 @@ async def create_collection(
     session: AsyncSession,
     engine: AsyncEngine,
     data: CollectionCreate,
+    *,
+    auto_migrate: bool = False,
+    migrations_dir: str | None = None,
 ) -> CollectionResponse:
     """Create a new collection record and the corresponding table."""
     _validate_collection_name(data.name)
@@ -192,6 +271,15 @@ async def create_collection(
     # Create the physical table
     await create_collection_table(engine, record)
 
+    # Generate migration file if auto_migrate is enabled
+    await _maybe_generate_migration(
+        session,
+        auto_migrate=auto_migrate,
+        migrations_dir=migrations_dir,
+        kind="create",
+        record=record,
+    )
+
     await session.commit()
 
     return CollectionResponse.from_record(record)
@@ -202,6 +290,9 @@ async def update_collection(
     engine: AsyncEngine,
     id_or_name: str,
     data: CollectionUpdate,
+    *,
+    auto_migrate: bool = False,
+    migrations_dir: str | None = None,
 ) -> CollectionResponse:
     """Update a collection record and alter the underlying table if needed."""
     record = await _find_collection(session, id_or_name)
@@ -209,12 +300,20 @@ async def update_collection(
     if record.system:
         raise ValueError("Cannot modify a system collection.")
 
-    # Snapshot old state for schema diff
+    # Snapshot old state for schema diff and migration generation
     class _Snapshot:
         def __init__(self, rec: CollectionRecord) -> None:
+            self.id = rec.id
             self.name = rec.name
             self.type = rec.type
+            self.system = rec.system
             self.schema = list(rec.schema) if isinstance(rec.schema, list) else []
+            self.indexes = list(rec.indexes) if isinstance(rec.indexes, list) else []
+            self.list_rule = rec.list_rule
+            self.view_rule = rec.view_rule
+            self.create_rule = rec.create_rule
+            self.update_rule = rec.update_rule
+            self.delete_rule = rec.delete_rule
             self.options = dict(rec.options) if isinstance(rec.options, dict) else {}
 
     old_snapshot = _Snapshot(record)
@@ -295,6 +394,16 @@ async def update_collection(
         if schema_changed:
             await update_collection_table(engine, old_snapshot, record)
 
+    # Generate migration file if auto_migrate is enabled
+    await _maybe_generate_migration(
+        session,
+        auto_migrate=auto_migrate,
+        migrations_dir=migrations_dir,
+        kind="update",
+        record=record,
+        old_snapshot=old_snapshot,
+    )
+
     await session.commit()
 
     return CollectionResponse.from_record(record)
@@ -304,6 +413,9 @@ async def delete_collection(
     session: AsyncSession,
     engine: AsyncEngine,
     id_or_name: str,
+    *,
+    auto_migrate: bool = False,
+    migrations_dir: str | None = None,
 ) -> None:
     """Delete a collection record and drop the underlying table."""
     record = await _find_collection(session, id_or_name)
@@ -311,12 +423,40 @@ async def delete_collection(
     if record.system:
         raise ValueError("Cannot delete a system collection.")
 
+    # Capture state before deletion for migration rollback
+    class _DeleteSnapshot:
+        def __init__(self, r: CollectionRecord) -> None:
+            self.id = r.id
+            self.name = r.name
+            self.type = r.type or "base"
+            self.system = r.system
+            self.schema = list(r.schema) if isinstance(r.schema, list) else []
+            self.indexes = list(r.indexes) if isinstance(r.indexes, list) else []
+            self.list_rule = r.list_rule
+            self.view_rule = r.view_rule
+            self.create_rule = r.create_rule
+            self.update_rule = r.update_rule
+            self.delete_rule = r.delete_rule
+            self.options = dict(r.options) if isinstance(r.options, dict) else {}
+
+    saved_record = _DeleteSnapshot(record)
+
     table_name = record.name
     col_type = record.type or "base"
     await session.delete(record)
     await session.flush()
 
     await delete_collection_table(engine, table_name, col_type)
+
+    # Generate migration file if auto_migrate is enabled
+    await _maybe_generate_migration(
+        session,
+        auto_migrate=auto_migrate,
+        migrations_dir=migrations_dir,
+        kind="delete",
+        record=saved_record,
+    )
+
     await session.commit()
 
 
@@ -336,6 +476,8 @@ async def import_collections(
     collections_data: list[dict[str, Any]],
     *,
     delete_missing: bool = False,
+    auto_migrate: bool = False,
+    migrations_dir: str | None = None,
 ) -> None:
     """Bulk import collections.
 
@@ -361,9 +503,18 @@ async def import_collections(
 
             class _OldSnap:
                 def __init__(self, r: CollectionRecord) -> None:
+                    self.id = r.id
                     self.name = r.name
                     self.type = r.type
+                    self.system = r.system
                     self.schema = list(r.schema) if isinstance(r.schema, list) else []
+                    self.indexes = list(r.indexes) if isinstance(r.indexes, list) else []
+                    self.list_rule = r.list_rule
+                    self.view_rule = r.view_rule
+                    self.create_rule = r.create_rule
+                    self.update_rule = r.update_rule
+                    self.delete_rule = r.delete_rule
+                    self.options = dict(r.options) if isinstance(r.options, dict) else {}
 
             old = _OldSnap(record)
 
@@ -386,6 +537,16 @@ async def import_collections(
             )
             if schema_changed:
                 await update_collection_table(engine, old, record)
+
+            # Generate update migration for imported change
+            await _maybe_generate_migration(
+                session,
+                auto_migrate=auto_migrate,
+                migrations_dir=migrations_dir,
+                kind="update",
+                record=record,
+                old_snapshot=old,
+            )
         else:
             # Create new
             create_data = CollectionCreate(
@@ -423,14 +584,49 @@ async def import_collections(
             await session.flush()
             await create_collection_table(engine, record)
 
+            # Generate create migration for imported collection
+            await _maybe_generate_migration(
+                session,
+                auto_migrate=auto_migrate,
+                migrations_dir=migrations_dir,
+                kind="create",
+                record=record,
+            )
+
     # Delete missing collections if requested
     if delete_missing:
         for lower_name, record in existing_records.items():
             if lower_name not in imported_names and not record.system:
+                # Capture state before deletion for migration rollback
+                class _ImportDeleteSnap:
+                    def __init__(self, r: CollectionRecord) -> None:
+                        self.id = r.id
+                        self.name = r.name
+                        self.type = r.type or "base"
+                        self.system = r.system
+                        self.schema = list(r.schema) if isinstance(r.schema, list) else []
+                        self.indexes = list(r.indexes) if isinstance(r.indexes, list) else []
+                        self.list_rule = r.list_rule
+                        self.view_rule = r.view_rule
+                        self.create_rule = r.create_rule
+                        self.update_rule = r.update_rule
+                        self.delete_rule = r.delete_rule
+                        self.options = dict(r.options) if isinstance(r.options, dict) else {}
+
+                saved = _ImportDeleteSnap(record)
                 table_name = record.name
                 col_type = record.type or "base"
                 await session.delete(record)
                 await session.flush()
                 await delete_collection_table(engine, table_name, col_type)
+
+                # Generate delete migration for removed collection
+                await _maybe_generate_migration(
+                    session,
+                    auto_migrate=auto_migrate,
+                    migrations_dir=migrations_dir,
+                    kind="delete",
+                    record=saved,
+                )
 
     await session.commit()

@@ -17,9 +17,24 @@ const CollectionsUI = {
   // ── Field type definitions ─────────────────────────────────
 
   fieldTypes: [
-    'text', 'number', 'bool', 'email', 'url', 'date',
-    'select', 'json', 'file', 'relation', 'editor',
+    'text', 'editor', 'number', 'bool',
+    'email', 'url', 'date', 'select',
+    'json', 'file', 'relation',
   ],
+
+  fieldTypeConfig: {
+    text:     { label: 'Plain text',  icon: 'T',  bg: '#eff6ff', color: '#1d4ed8' },
+    editor:   { label: 'Rich editor', icon: 'R',  bg: '#f8fafc', color: '#475569' },
+    number:   { label: 'Number',      icon: '#',  bg: '#f5f3ff', color: '#7c3aed' },
+    bool:     { label: 'Bool',        icon: 'B',  bg: '#ecfdf5', color: '#059669' },
+    email:    { label: 'Email',       icon: '@',  bg: '#eef2ff', color: '#4f46e5' },
+    url:      { label: 'URL',         icon: 'U',  bg: '#eef2ff', color: '#4f46e5' },
+    date:     { label: 'Datetime',    icon: 'D',  bg: '#fffbeb', color: '#d97706' },
+    select:   { label: 'Select',      icon: 'S',  bg: '#fdf4ff', color: '#a855f7' },
+    json:     { label: 'JSON',        icon: 'J',  bg: '#f0fdf4', color: '#16a34a' },
+    file:     { label: 'File',        icon: 'F',  bg: '#fff7ed', color: '#ea580c' },
+    relation: { label: 'Relation',    icon: 'L',  bg: '#fef2f2', color: '#dc2626' },
+  },
 
   fieldTypeBadgeClass(type) {
     const map = {
@@ -96,19 +111,21 @@ const CollectionsUI = {
     });
 
     body.innerHTML = `
-      <div class="table-wrapper">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Type</th>
-              <th>Fields</th>
-              <th>Created</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
-        </table>
+      <div class="content-padded">
+        <div class="table-wrapper" style="border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Type</th>
+                <th>Fields</th>
+                <th>Created</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
       </div>
     `;
 
@@ -134,146 +151,429 @@ const CollectionsUI = {
     });
   },
 
-  // ── Create Collection Modal ────────────────────────────────
+  // ── Create Collection Drawer ────────────────────────────────
 
   showCreateModal() {
     const bodyHtml = `
       <div class="form-group">
-        <label class="form-label">Collection name</label>
-        <input class="form-input" type="text" id="col-name" placeholder="e.g. posts, users, comments" required>
-        <span class="form-help">Unique name, lowercase, no spaces (use underscores).</span>
+        <label class="form-label">Name <span class="text-light">*</span></label>
+        <div style="display: flex; align-items: center; gap: 0.75rem;">
+          <input class="form-input" type="text" id="col-name" placeholder='eg. "posts"' required style="flex: 1;">
+          <select class="form-select" id="col-type" style="flex: 0 0 auto; min-width: 140px;">
+            <option value="base">Type: Base</option>
+            <option value="auth">Type: Auth</option>
+            <option value="view">Type: View</option>
+          </select>
+        </div>
       </div>
-      <div class="form-group">
-        <label class="form-label">Type</label>
-        <select class="form-select" id="col-type">
-          <option value="base">Base</option>
-          <option value="auth">Auth</option>
-          <option value="view">View</option>
-        </select>
-        <span class="form-help" id="col-type-help">Standard data collection with custom fields.</span>
-      </div>
-      <div id="view-query-group" class="form-group hidden">
-        <label class="form-label">View query</label>
-        <div id="col-view-query-editor"></div>
-        <span class="form-help">SQL SELECT query that defines this view. Must include id, created, and updated columns. Press <kbd>Ctrl+Space</kbd> for autocomplete.</span>
-      </div>
-      <div id="schema-section">
-        <div class="form-group">
-          <label class="form-label">Schema fields</label>
-          <div id="schema-fields-container"></div>
-          <button type="button" class="btn btn-secondary btn-sm mt-2" id="btn-add-field">
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 1v10M1 6h10"/></svg>
-            Add field
-          </button>
+      <div id="col-tabs" class="mt-4">
+        <div style="display: flex; border-bottom: 2px solid #e2e8f0; margin-bottom: 1rem;">
+          <button class="btn btn-ghost col-tab-btn active" data-tab="fields" id="tab-fields" style="border-radius: 0; border-bottom: 2px solid #4f46e5; margin-bottom: -2px;">Fields</button>
+          <button class="btn btn-ghost col-tab-btn" data-tab="api-rules" id="tab-api-rules" style="border-radius: 0; margin-bottom: -2px;">API Rules</button>
+          <button class="btn btn-ghost col-tab-btn hidden" data-tab="options" id="tab-options" style="border-radius: 0; margin-bottom: -2px;">Options</button>
+          <button class="btn btn-ghost col-tab-btn hidden" data-tab="query" id="tab-query" style="border-radius: 0; margin-bottom: -2px;">Query</button>
+        </div>
+        <div class="col-tab-content" data-tab-content="fields" id="tab-content-fields">
+          <div id="schema-section">
+            <div id="schema-fields-container"></div>
+            <button type="button" class="btn btn-secondary w-full mt-3" id="btn-add-field" style="border-style: dashed;">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 1v10M1 6h10"/></svg>
+              New field
+            </button>
+          </div>
+        </div>
+        <div class="col-tab-content hidden" data-tab-content="api-rules" id="tab-content-api-rules">
+          <div class="form-group">
+            <label class="form-label">List/Search rule</label>
+            <input class="form-input" type="text" id="col-rule-list" placeholder='Leave empty for public access, or enter a filter expression'>
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">View rule</label>
+            <input class="form-input" type="text" id="col-rule-view" placeholder='Leave empty for public access'>
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">Create rule</label>
+            <input class="form-input" type="text" id="col-rule-create" placeholder='Leave empty for public access'>
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">Update rule</label>
+            <input class="form-input" type="text" id="col-rule-update" placeholder='Leave empty for public access'>
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">Delete rule</label>
+            <input class="form-input" type="text" id="col-rule-delete" placeholder='Leave empty for public access'>
+          </div>
+          <span class="form-help mt-2">Set to <code class="cell-id">null</code> (leave blank) for admin-only, or an empty string for public. Use filter expressions to control access.</span>
+        </div>
+        <div class="col-tab-content hidden" data-tab-content="options" id="tab-content-options">
+          <p class="text-muted text-sm">Auth collection options will appear here.</p>
+        </div>
+        <div class="col-tab-content hidden" data-tab-content="query" id="tab-content-query">
+          <div class="form-group">
+            <label class="form-label">Select query <span class="text-light">*</span></label>
+            <div id="col-view-query-editor"></div>
+            <span class="form-help">SQL SELECT query that defines this view. Must include id, created, and updated columns. Press <kbd>Ctrl+Space</kbd> for autocomplete.</span>
+          </div>
+          <ul class="text-sm text-muted mt-3" style="padding-left: 1.25rem; line-height: 1.8;">
+            <li>Wildcard columns (<code class="cell-id">*</code>) are not supported.</li>
+            <li>The query must have a unique <code class="cell-id">id</code> column.<br>If your query doesn't have a suitable one, you can use the universal <code class="cell-id">(ROW_NUMBER() OVER()) as id</code>.</li>
+            <li>Expressions must be aliased with a valid formatted field name, e.g. <code class="cell-id">MAX(balance) as maxBalance</code>.</li>
+            <li>Combined/multi-spaced expressions must be wrapped in parenthesis, e.g.<br><code class="cell-id">(MAX(balance) + 1) as maxBalance</code>.</li>
+          </ul>
         </div>
       </div>
     `;
 
     const footerHtml = `
-      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-      <button class="btn btn-primary" id="modal-save">Create collection</button>
+      <button class="btn btn-secondary" id="drawer-cancel">Cancel</button>
+      <button class="btn btn-primary" id="drawer-save">Create</button>
     `;
 
-    App.showModal('New Collection', bodyHtml, footerHtml, { wide: true });
+    App.showDrawer('New collection', bodyHtml, footerHtml);
 
     // Initialize SQL editor
     const sqlEditor = this.createSqlEditor();
     document.getElementById('col-view-query-editor').appendChild(sqlEditor.container);
     this._currentSqlEditor = sqlEditor;
 
+    // Tab switching
+    this._initTabs();
+
     // Type change handler
     const typeSelect = document.getElementById('col-type');
-    const typeHelp = document.getElementById('col-type-help');
-    const viewQueryGroup = document.getElementById('view-query-group');
-    const schemaSection = document.getElementById('schema-section');
-
     typeSelect.addEventListener('change', () => {
       const t = typeSelect.value;
+      const tabFields = document.getElementById('tab-fields');
+      const tabQuery = document.getElementById('tab-query');
+      const tabOptions = document.getElementById('tab-options');
+
       if (t === 'view') {
-        viewQueryGroup.classList.remove('hidden');
-        schemaSection.classList.add('hidden');
-        typeHelp.textContent = 'Read-only collection backed by a SQL SELECT query.';
+        tabFields.classList.add('hidden');
+        tabQuery.classList.remove('hidden');
+        tabOptions.classList.add('hidden');
+        // Auto-switch to query tab
+        tabQuery.click();
       } else {
-        viewQueryGroup.classList.add('hidden');
-        schemaSection.classList.remove('hidden');
+        tabFields.classList.remove('hidden');
+        tabQuery.classList.add('hidden');
         if (t === 'auth') {
-          typeHelp.textContent = 'Auth collections include built-in email/password fields.';
+          tabOptions.classList.remove('hidden');
         } else {
-          typeHelp.textContent = 'Standard data collection with custom fields.';
+          tabOptions.classList.add('hidden');
         }
+        tabFields.click();
+
+        // Update system fields display
+        const schemaContainer = document.getElementById('schema-fields-container');
+        const oldSystemFields = schemaContainer.querySelector('[data-role="system-fields"]');
+        if (oldSystemFields) oldSystemFields.remove();
+        // Re-add at the beginning
+        const firstChild = schemaContainer.firstChild;
+        const tempDiv = document.createElement('div');
+        schemaContainer.insertBefore(tempDiv, firstChild);
+        this._addSystemFieldsDisplay(schemaContainer, t);
+        // Move the system fields before any user fields
+        const newSystemFields = schemaContainer.querySelector('[data-role="system-fields"]');
+        if (newSystemFields && firstChild) {
+          schemaContainer.insertBefore(newSystemFields, schemaContainer.querySelector('[data-role="user-fields"]') || firstChild);
+        }
+        tempDiv.remove();
       }
     });
 
-    // Bind add-field
+    // Bind add-field to show type picker
     document.getElementById('btn-add-field').addEventListener('click', () => {
-      this.addFieldRow(document.getElementById('schema-fields-container'));
+      const schemaContainer = document.getElementById('schema-fields-container');
+      this.showTypePicker(schemaContainer, (type) => {
+        this.addFieldRow(schemaContainer, null, type);
+      });
     });
 
-    // Add one field row by default
-    this.addFieldRow(document.getElementById('schema-fields-container'));
+    // Add default system fields display
+    const container = document.getElementById('schema-fields-container');
+    this._addSystemFieldsDisplay(container, 'base');
 
     // Bind cancel/save
-    document.getElementById('modal-cancel').addEventListener('click', () => App.closeModal());
-    document.getElementById('modal-save').addEventListener('click', () => this.handleCreate());
+    document.getElementById('drawer-cancel').addEventListener('click', () => App.closeDrawer());
+    document.getElementById('drawer-save').addEventListener('click', () => this.handleCreate());
   },
 
-  // ── Field Row with Options ─────────────────────────────────
-
-  addFieldRow(container, existingField) {
-    const row = document.createElement('div');
-    row.className = 'field-editor-row';
-
-    const fieldType = existingField ? (existingField.type || 'text') : 'text';
-
-    let typeOptions = '';
-    this.fieldTypes.forEach((t) => {
-      const selected = (t === fieldType) ? 'selected' : '';
-      typeOptions += `<option value="${t}" ${selected}>${t}</option>`;
+  _initTabs() {
+    document.querySelectorAll('.col-tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.col-tab-btn').forEach(b => {
+          b.classList.remove('active');
+          b.style.borderBottom = '2px solid transparent';
+        });
+        btn.classList.add('active');
+        btn.style.borderBottom = '2px solid #4f46e5';
+        document.querySelectorAll('.col-tab-content').forEach(c => c.classList.add('hidden'));
+        const target = document.querySelector('[data-tab-content="' + btn.dataset.tab + '"]');
+        if (target) target.classList.remove('hidden');
+      });
     });
+  },
 
-    row.innerHTML = `
-      <div class="field-editor-header">
-        <div class="field-editor-inputs">
-          <div class="form-group" style="flex: 1;">
-            <input class="form-input" type="text" placeholder="Field name" data-role="field-name"
-              value="${existingField ? App.escapeHtml(existingField.name || '') : ''}">
-          </div>
-          <div class="form-group" style="flex: 0 0 160px;">
-            <select class="form-select" data-role="field-type">${typeOptions}</select>
-          </div>
-          <label class="form-checkbox field-required-toggle" title="Required">
-            <input type="checkbox" data-role="field-required" ${existingField && existingField.required ? 'checked' : ''}>
-            <span class="text-sm">Required</span>
-          </label>
-          <button type="button" class="btn btn-ghost btn-icon btn-remove-field" title="Remove field">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 3l8 8M11 3l-8 8"/></svg>
-          </button>
+  _addSystemFieldsDisplay(container, type) {
+    const cfg = this.fieldTypeConfig;
+
+    const makeRow = (icon, bg, color, name, badges = '') => {
+      return `
+        <div class="field-editor-row" style="color: #94a3b8;">
+          <span class="field-row-icon" style="background: ${bg}; color: ${color};">${icon}</span>
+          <span class="field-row-name" style="color: #94a3b8;">${name}</span>
+          ${badges ? `<span class="field-row-badges">${badges}</span>` : ''}
         </div>
-        <div class="field-options-panel" data-role="field-options"></div>
+      `;
+    };
+
+    let rows = makeRow('T', cfg.text.bg, cfg.text.color, 'id',
+      '<span class="badge badge-green">Nonempty</span>');
+
+    if (type === 'auth') {
+      rows += makeRow('P', '#f8fafc', '#475569', 'password',
+        '<span class="badge badge-green">Nonempty</span><span class="badge badge-red">Hidden</span>');
+      rows += makeRow('T', cfg.text.bg, cfg.text.color, 'tokenKey',
+        '<span class="badge badge-green">Nonempty</span><span class="badge badge-red">Hidden</span>');
+      rows += makeRow('@', cfg.email.bg, cfg.email.color, 'email',
+        '<span class="badge badge-green">Nonempty</span>');
+      rows += makeRow('B', cfg.bool.bg, cfg.bool.color, 'emailVisibility', '');
+      rows += makeRow('B', cfg.bool.bg, cfg.bool.color, 'verified', '');
+    }
+
+    rows += `
+      <div class="field-editor-row">
+        <span class="field-row-icon" style="background: ${cfg.date.bg}; color: ${cfg.date.color};">D</span>
+        <span class="field-row-name">created</span>
+        <span class="field-row-info">
+          <select class="form-select" style="font-size: 0.75rem; padding: 0.125rem 1.5rem 0.125rem 0.375rem; min-height: 22px; border-radius: 4px;" disabled>
+            <option>Create</option>
+          </select>
+        </span>
+      </div>
+      <div class="field-editor-row">
+        <span class="field-row-icon" style="background: ${cfg.date.bg}; color: ${cfg.date.color};">D</span>
+        <span class="field-row-name">updated</span>
+        <span class="field-row-info">
+          <select class="form-select" style="font-size: 0.75rem; padding: 0.125rem 1.5rem 0.125rem 0.375rem; min-height: 22px; border-radius: 4px;" disabled>
+            <option>Create/Update</option>
+          </select>
+        </span>
       </div>
     `;
 
-    // Type change → show relevant options
-    const typeSelect = row.querySelector('[data-role="field-type"]');
-    const optionsPanel = row.querySelector('[data-role="field-options"]');
+    const systemFields = document.createElement('div');
+    systemFields.className = 'fields-container';
+    systemFields.setAttribute('data-role', 'system-fields');
+    systemFields.innerHTML = rows;
+    container.appendChild(systemFields);
+  },
 
-    typeSelect.addEventListener('change', () => {
-      this.renderFieldOptions(typeSelect.value, optionsPanel);
+  // ── Type Picker Grid ──────────────────────────────────────
+
+  showTypePicker(container, onSelect) {
+    // Remove existing picker if any
+    const existing = container.parentElement.querySelector('.field-type-picker');
+    if (existing) { existing.remove(); return; }
+
+    const picker = document.createElement('div');
+    picker.className = 'field-type-picker';
+
+    let items = '';
+    this.fieldTypes.forEach(type => {
+      const cfg = this.fieldTypeConfig[type];
+      items += `
+        <div class="field-type-picker-item" data-type="${type}">
+          <span class="type-icon" style="background: ${cfg.bg}; color: ${cfg.color};">${cfg.icon}</span>
+          ${cfg.label}
+        </div>
+      `;
     });
 
-    // Render options for current type
-    this.renderFieldOptions(fieldType, optionsPanel);
+    picker.innerHTML = `<div class="field-type-picker-grid">${items}</div>`;
 
-    // Pre-fill existing field options
-    if (existingField) {
-      this._populateFieldOptions(optionsPanel, existingField);
+    picker.querySelectorAll('.field-type-picker-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const type = item.dataset.type;
+        picker.remove();
+        onSelect(type);
+      });
+    });
+
+    // Insert picker before the "New field" button
+    const addBtn = container.parentElement.querySelector('#btn-add-field, #edit-btn-add-field');
+    if (addBtn) {
+      addBtn.parentElement.insertBefore(picker, addBtn);
+    } else {
+      container.parentElement.appendChild(picker);
     }
+  },
 
-    row.querySelector('.btn-remove-field').addEventListener('click', () => row.remove());
-    container.appendChild(row);
+  // ── Field Row with Compact Layout ───────────────────────────
+
+  _getFieldInfoText(type, field) {
+    if (!field) return '';
+    const opts = field.options || {};
+    switch (type) {
+      case 'relation': {
+        const cid = opts.collectionId || field.collectionId || '';
+        if (cid && App.collections) {
+          const rel = App.collections.find(c => c.id === cid);
+          if (rel) return rel.name;
+        }
+        return cid ? cid : '';
+      }
+      case 'select': {
+        const vals = opts.values || field.values || [];
+        return vals.length ? vals.slice(0, 3).join(', ') + (vals.length > 3 ? '...' : '') : '';
+      }
+      default:
+        return '';
+    }
+  },
+
+  addFieldRow(container, existingField, fieldType) {
+    const type = fieldType || (existingField ? (existingField.type || 'text') : 'text');
+    const cfg = this.fieldTypeConfig[type] || this.fieldTypeConfig.text;
+    const name = existingField ? (existingField.name || '') : '';
+    const required = existingField && existingField.required;
+    const infoText = this._getFieldInfoText(type, existingField);
+
+    // Build the wrapper that holds the row + optional expanded options
+    const wrapper = document.createElement('div');
+    wrapper.className = 'field-row-wrapper';
+    wrapper.dataset.fieldType = type;
+
+    // Compact row
+    const row = document.createElement('div');
+    row.className = 'field-editor-row';
+    row.innerHTML = `
+      <span class="field-row-icon" style="background: ${cfg.bg}; color: ${cfg.color};">${cfg.icon}</span>
+      <span class="field-row-name">
+        <input type="text" placeholder="Field name" data-role="field-name" value="${App.escapeHtml(name)}">
+      </span>
+      ${infoText ? `<span class="field-row-info">${App.escapeHtml(infoText)}</span>` : ''}
+      ${required ? '<span class="field-row-badges"><span class="badge badge-green">Required</span></span>' : ''}
+      <button type="button" class="field-row-gear" title="Field settings" data-role="toggle-options">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="8" cy="8" r="2"/>
+          <path d="M13.5 8a5.5 5.5 0 01-.2 1.1l1 .8a.3.3 0 01.1.4l-1 1.7a.3.3 0 01-.4.1l-1.2-.5a5 5 0 01-1 .6l-.2 1.3a.3.3 0 01-.3.2H7.7a.3.3 0 01-.3-.2l-.2-1.3a5 5 0 01-1-.6l-1.2.5a.3.3 0 01-.4-.1l-1-1.7a.3.3 0 01.1-.4l1-.8A5.5 5.5 0 014.5 8c0-.4 0-.7.1-1.1l-1-.8a.3.3 0 01-.1-.4l1-1.7a.3.3 0 01.4-.1l1.2.5a5 5 0 011-.6l.2-1.3A.3.3 0 017.7 2h1.6a.3.3 0 01.3.2l.2 1.3a5 5 0 011 .6l1.2-.5a.3.3 0 01.4.1l1 1.7a.3.3 0 01-.1.4l-1 .8c.1.4.2.7.2 1.1z"/>
+        </svg>
+      </button>
+      <button type="button" class="field-row-remove" title="Remove field" data-role="remove-field">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 3l8 8M11 3l-8 8"/></svg>
+      </button>
+    `;
+
+    wrapper.appendChild(row);
+
+    // Hidden data elements for type and required
+    const hiddenType = document.createElement('input');
+    hiddenType.type = 'hidden';
+    hiddenType.dataset.role = 'field-type';
+    hiddenType.value = type;
+    wrapper.appendChild(hiddenType);
+
+    const hiddenRequired = document.createElement('input');
+    hiddenRequired.type = 'hidden';
+    hiddenRequired.dataset.role = 'field-required';
+    hiddenRequired.value = required ? '1' : '0';
+    wrapper.appendChild(hiddenRequired);
+
+    // Options panel element (hidden until gear is clicked)
+    const optionsWrapper = document.createElement('div');
+    optionsWrapper.className = 'field-options-wrapper hidden';
+    optionsWrapper.dataset.role = 'field-options-wrapper';
+    wrapper.appendChild(optionsWrapper);
+
+    // Gear toggle
+    const gearBtn = row.querySelector('[data-role="toggle-options"]');
+    gearBtn.addEventListener('click', () => {
+      const isHidden = optionsWrapper.classList.contains('hidden');
+      if (isHidden) {
+        this._renderExpandedOptions(optionsWrapper, type, existingField, hiddenRequired, row);
+        optionsWrapper.classList.remove('hidden');
+        gearBtn.classList.add('active');
+      } else {
+        optionsWrapper.classList.add('hidden');
+        gearBtn.classList.remove('active');
+      }
+    });
+
+    // Remove button
+    row.querySelector('[data-role="remove-field"]').addEventListener('click', () => wrapper.remove());
+
+    // Append to the user-fields container
+    let fieldsBox = container.querySelector('[data-role="user-fields"]');
+    if (!fieldsBox) {
+      fieldsBox = document.createElement('div');
+      fieldsBox.className = 'fields-container mt-2';
+      fieldsBox.setAttribute('data-role', 'user-fields');
+      container.appendChild(fieldsBox);
+    }
+    fieldsBox.appendChild(wrapper);
 
     if (!existingField) {
       row.querySelector('[data-role="field-name"]').focus();
+      // Auto-expand options for newly created fields
+      this._renderExpandedOptions(optionsWrapper, type, existingField, hiddenRequired, row);
+      optionsWrapper.classList.remove('hidden');
+      gearBtn.classList.add('active');
+    }
+
+    // If editing existing, pre-populate the options in background
+    if (existingField) {
+      this._renderExpandedOptions(optionsWrapper, type, existingField, hiddenRequired, row);
+      // Keep collapsed - options are rendered but wrapper stays hidden
+      // This ensures gatherSchemaFields can read data-opt values
+    }
+  },
+
+  _renderExpandedOptions(wrapper, type, existingField, hiddenRequired, row) {
+    if (wrapper.dataset.rendered === '1') return;
+    wrapper.dataset.rendered = '1';
+
+    const required = hiddenRequired.value === '1';
+
+    let html = `
+      <div style="margin-bottom: 0.75rem;">
+        <label class="form-checkbox" style="min-height: auto;">
+          <input type="checkbox" data-role="field-required-check" ${required ? 'checked' : ''}>
+          <span class="text-sm">Required</span>
+        </label>
+      </div>
+      <div data-role="field-options"></div>
+    `;
+
+    wrapper.innerHTML = html;
+
+    // Bind required checkbox to hidden + badge
+    const reqCheck = wrapper.querySelector('[data-role="field-required-check"]');
+    reqCheck.addEventListener('change', () => {
+      hiddenRequired.value = reqCheck.checked ? '1' : '0';
+      // Update badge
+      let badges = row.querySelector('.field-row-badges');
+      if (reqCheck.checked) {
+        if (!badges) {
+          badges = document.createElement('span');
+          badges.className = 'field-row-badges';
+          const gear = row.querySelector('[data-role="toggle-options"]');
+          row.insertBefore(badges, gear);
+        }
+        if (!badges.querySelector('.badge')) {
+          badges.innerHTML = '<span class="badge badge-green">Required</span>';
+        }
+      } else {
+        if (badges) badges.remove();
+      }
+    });
+
+    // Render type-specific options
+    const optionsPanel = wrapper.querySelector('[data-role="field-options"]');
+    this.renderFieldOptions(type, optionsPanel);
+
+    if (existingField) {
+      this._populateFieldOptions(optionsPanel, existingField);
     }
   },
 
@@ -612,21 +912,26 @@ const CollectionsUI = {
   // ── Gather Schema Fields with Options ──────────────────────
 
   gatherSchemaFields() {
-    const rows = document.querySelectorAll('.field-editor-row');
+    const wrappers = document.querySelectorAll('.field-row-wrapper');
     const schema = [];
 
-    rows.forEach((row) => {
-      const name = row.querySelector('[data-role="field-name"]').value.trim();
-      const type = row.querySelector('[data-role="field-type"]').value;
-      const required = row.querySelector('[data-role="field-required"]').checked;
+    wrappers.forEach((wrapper) => {
+      const name = wrapper.querySelector('[data-role="field-name"]').value.trim();
+      const type = wrapper.querySelector('[data-role="field-type"]').value;
+      const required = wrapper.querySelector('[data-role="field-required"]').value === '1';
 
       if (!name) return;
 
       // Build field object (flat PocketBase v0.23+ format)
       const field = { name, type, required };
 
-      // Gather type-specific options
-      const optionsPanel = row.querySelector('[data-role="field-options"]');
+      // Gather type-specific options from the options panel
+      const optionsWrapper = wrapper.querySelector('[data-role="field-options-wrapper"]');
+      const optionsPanel = optionsWrapper ? optionsWrapper.querySelector('[data-role="field-options"]') : null;
+      if (!optionsPanel) {
+        schema.push(field);
+        return;
+      }
 
       switch (type) {
         case 'text': {
@@ -755,13 +1060,13 @@ const CollectionsUI = {
       payload.schema = schema;
     }
 
-    const saveBtn = document.getElementById('modal-save');
+    const saveBtn = document.getElementById('drawer-save');
     saveBtn.disabled = true;
     saveBtn.innerHTML = '<div class="spinner spinner-sm spinner-light"></div> Creating...';
 
     try {
       await PBClient.createCollection(payload);
-      App.closeModal();
+      App.closeDrawer();
       App.showToast('Collection "' + name + '" created.');
       await App.loadSidebarCollections();
       App.navigate('collections');
@@ -769,11 +1074,11 @@ const CollectionsUI = {
       const msg = (err && err.message) || 'Failed to create collection.';
       App.showToast(msg, 'error');
       saveBtn.disabled = false;
-      saveBtn.textContent = 'Create collection';
+      saveBtn.textContent = 'Create';
     }
   },
 
-  // ── Edit Collection Modal ──────────────────────────────────
+  // ── Edit Collection Drawer ──────────────────────────────────
 
   async showDetailModal(collection) {
     let col;
@@ -785,50 +1090,103 @@ const CollectionsUI = {
 
     const fields = col.fields || col.schema || [];
     const isView = col.type === 'view';
-
-    let viewQueryHtml = '';
-    if (isView) {
-      viewQueryHtml = `
-        <div class="form-group" id="edit-view-query-group">
-          <label class="form-label">View query</label>
-          <div id="edit-view-query-editor"></div>
-          <span class="form-help">SQL SELECT query. Must include id, created, and updated columns. Press <kbd>Ctrl+Space</kbd> for autocomplete.</span>
-        </div>
-      `;
-    }
+    const typeBadge = isView ? 'View' : col.type === 'auth' ? 'Auth' : 'Base';
 
     const bodyHtml = `
       <div class="form-group">
-        <label class="form-label">Collection name</label>
-        <input class="form-input" type="text" id="edit-col-name" value="${App.escapeHtml(col.name)}">
-      </div>
-      <dl class="info-grid mb-4" style="margin-top: 0.5rem;">
-        <dt>Type</dt>
-        <dd><span class="badge ${isView ? 'badge-yellow' : col.type === 'auth' ? 'badge-green' : 'badge-blue'}">${App.escapeHtml(col.type)}</span></dd>
-        <dt>ID</dt>
-        <dd class="text-sm text-muted" style="font-family: monospace;">${App.escapeHtml(col.id || '-')}</dd>
-      </dl>
-      ${viewQueryHtml}
-      ${!isView ? `
-        <div>
-          <label class="form-label">Schema fields</label>
-          <div id="edit-schema-fields-container"></div>
-          <button type="button" class="btn btn-secondary btn-sm mt-2" id="edit-btn-add-field">
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 1v10M1 6h10"/></svg>
-            Add field
-          </button>
+        <label class="form-label">Name <span class="text-light">*</span></label>
+        <div style="display: flex; align-items: center; gap: 0.75rem;">
+          <input class="form-input" type="text" id="edit-col-name" value="${App.escapeHtml(col.name)}" style="flex: 1;">
+          <span class="text-sm text-muted">Type: ${typeBadge}</span>
         </div>
-      ` : ''}
+      </div>
+      <div id="edit-col-tabs" class="mt-4">
+        <div style="display: flex; border-bottom: 2px solid #e2e8f0; margin-bottom: 1rem;">
+          ${isView ? `
+            <button class="btn btn-ghost col-tab-btn active" data-tab="query" style="border-radius: 0; border-bottom: 2px solid #4f46e5; margin-bottom: -2px;">Query</button>
+          ` : `
+            <button class="btn btn-ghost col-tab-btn active" data-tab="fields" style="border-radius: 0; border-bottom: 2px solid #4f46e5; margin-bottom: -2px;">Fields</button>
+          `}
+          <button class="btn btn-ghost col-tab-btn" data-tab="api-rules" style="border-radius: 0; margin-bottom: -2px;">API Rules</button>
+          ${col.type === 'auth' ? '<button class="btn btn-ghost col-tab-btn" data-tab="options" style="border-radius: 0; margin-bottom: -2px;">Options</button>' : ''}
+        </div>
+        ${isView ? `
+          <div class="col-tab-content" data-tab-content="query" id="edit-tab-content-query">
+            <div class="form-group">
+              <label class="form-label">Select query <span class="text-light">*</span></label>
+              <div id="edit-view-query-editor"></div>
+              <span class="form-help">SQL SELECT query. Must include id, created, and updated columns. Press <kbd>Ctrl+Space</kbd> for autocomplete.</span>
+            </div>
+          </div>
+        ` : `
+          <div class="col-tab-content" data-tab-content="fields" id="edit-tab-content-fields">
+            <div id="edit-schema-fields-container"></div>
+            <button type="button" class="btn btn-secondary w-full mt-3" id="edit-btn-add-field" style="border-style: dashed;">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 1v10M1 6h10"/></svg>
+              New field
+            </button>
+          </div>
+        `}
+        <div class="col-tab-content hidden" data-tab-content="api-rules" id="edit-tab-content-api-rules">
+          <div class="form-group">
+            <label class="form-label">List/Search rule</label>
+            <input class="form-input" type="text" id="edit-col-rule-list" placeholder='Leave empty for public access' value="${App.escapeHtml((col.listRule != null ? col.listRule : '') || '')}">
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">View rule</label>
+            <input class="form-input" type="text" id="edit-col-rule-view" placeholder='Leave empty for public access' value="${App.escapeHtml((col.viewRule != null ? col.viewRule : '') || '')}">
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">Create rule</label>
+            <input class="form-input" type="text" id="edit-col-rule-create" placeholder='Leave empty for public access' value="${App.escapeHtml((col.createRule != null ? col.createRule : '') || '')}">
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">Update rule</label>
+            <input class="form-input" type="text" id="edit-col-rule-update" placeholder='Leave empty for public access' value="${App.escapeHtml((col.updateRule != null ? col.updateRule : '') || '')}">
+          </div>
+          <div class="form-group mt-3">
+            <label class="form-label">Delete rule</label>
+            <input class="form-input" type="text" id="edit-col-rule-delete" placeholder='Leave empty for public access' value="${App.escapeHtml((col.deleteRule != null ? col.deleteRule : '') || '')}">
+          </div>
+        </div>
+        ${col.type === 'auth' ? `
+          <div class="col-tab-content hidden" data-tab-content="options" id="edit-tab-content-options">
+            <p class="text-muted text-sm">Auth collection options.</p>
+          </div>
+        ` : ''}
+      </div>
     `;
 
     const footerHtml = `
-      <button class="btn btn-danger btn-sm" id="modal-delete-collection">Delete</button>
-      <div class="flex-1"></div>
-      <button class="btn btn-secondary" id="modal-cancel-edit">Cancel</button>
-      <button class="btn btn-primary" id="modal-save-edit">Save changes</button>
+      <button class="btn btn-secondary" id="drawer-cancel-edit">Cancel</button>
+      <button class="btn btn-primary" id="drawer-save-edit">Save changes</button>
     `;
 
-    App.showModal('Edit: ' + col.name, bodyHtml, footerHtml, { wide: true });
+    const headerActions = `
+      <div class="drawer-menu-wrapper">
+        <button class="drawer-menu-btn" id="drawer-col-menu-toggle" title="More options">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+            <circle cx="8" cy="3" r="1.5"/>
+            <circle cx="8" cy="8" r="1.5"/>
+            <circle cx="8" cy="13" r="1.5"/>
+          </svg>
+        </button>
+        <div class="drawer-dropdown hidden" id="drawer-col-dropdown">
+          <button class="drawer-dropdown-item dropdown-danger" id="drawer-col-delete">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 4h12M5 4V3a1 1 0 011-1h4a1 1 0 011 1v1M6.5 7v5M9.5 7v5"/>
+              <path d="M3 4l1 10a1 1 0 001 1h6a1 1 0 001-1l1-10"/>
+            </svg>
+            Delete collection
+          </button>
+        </div>
+      </div>
+    `;
+
+    App.showDrawer('Edit collection', bodyHtml, footerHtml, { headerActions });
+
+    // Tab switching
+    this._initTabs();
 
     // Initialize SQL editor for view collections
     if (isView) {
@@ -841,22 +1199,47 @@ const CollectionsUI = {
     // Populate existing fields
     if (!isView) {
       const container = document.getElementById('edit-schema-fields-container');
+
+      // Add system fields first
+      this._addSystemFieldsDisplay(container, col.type || 'base');
+
       fields.forEach((f) => {
         this.addFieldRow(container, f);
       });
 
       document.getElementById('edit-btn-add-field').addEventListener('click', () => {
-        this.addFieldRow(container);
+        this.showTypePicker(container, (type) => {
+          this.addFieldRow(container, null, type);
+        });
       });
     }
 
     // Bind buttons
-    document.getElementById('modal-cancel-edit').addEventListener('click', () => App.closeModal());
-    document.getElementById('modal-delete-collection').addEventListener('click', () => {
-      this.confirmDeleteCollection(col);
-    });
-    document.getElementById('modal-save-edit').addEventListener('click', () => {
+    document.getElementById('drawer-cancel-edit').addEventListener('click', () => App.closeDrawer());
+    document.getElementById('drawer-save-edit').addEventListener('click', () => {
       this.handleUpdate(col);
+    });
+
+    // Dropdown menu
+    const menuToggle = document.getElementById('drawer-col-menu-toggle');
+    const dropdown = document.getElementById('drawer-col-dropdown');
+    menuToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = dropdown.classList.contains('hidden');
+      dropdown.classList.toggle('hidden');
+      if (isHidden) {
+        const closeHandler = () => {
+          dropdown.classList.add('hidden');
+          document.removeEventListener('click', closeHandler);
+        };
+        setTimeout(() => document.addEventListener('click', closeHandler), 0);
+      }
+    });
+
+    document.getElementById('drawer-col-delete').addEventListener('click', () => {
+      dropdown.classList.add('hidden');
+      App.closeDrawer();
+      this.confirmDeleteCollection(col);
     });
   },
 
@@ -898,14 +1281,14 @@ const CollectionsUI = {
       payload.schema = schema;
     }
 
-    const saveBtn = document.getElementById('modal-save-edit');
+    const saveBtn = document.getElementById('drawer-save-edit');
     saveBtn.disabled = true;
     saveBtn.innerHTML = '<div class="spinner spinner-sm spinner-light"></div> Saving...';
 
     try {
       console.log('[PPBase] updateCollection payload:', JSON.stringify(payload));
       await PBClient.updateCollection(collection.id || collection.name, payload);
-      App.closeModal();
+      App.closeDrawer();
       App.showToast('Collection "' + newName + '" updated.');
       await App.loadSidebarCollections();
       // Refresh current view

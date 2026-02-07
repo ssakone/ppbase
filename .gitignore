@@ -25,6 +25,8 @@ env/
 # PPBase runtime
 .ppbase.pid
 .ppbase.log
+pb_migrations/
+pb_data/
 
 # Testing
 .pytest_cache/

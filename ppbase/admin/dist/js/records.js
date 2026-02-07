@@ -2,7 +2,7 @@
  * PPBase Admin - Records UI
  *
  * Handles rendering the records table for a collection,
- * plus create/edit/delete record modals.
+ * plus create/edit/delete record drawers.
  * Supports all field types with proper input controls.
  *
  * Depends on:
@@ -15,6 +15,7 @@ const RecordsUI = {
   totalPages: 1,
   perPage: 30,
   currentRecords: [],
+  selectedIds: new Set(),
 
   // ── Load & Render Records ────────────────────────────────────
 
@@ -24,6 +25,8 @@ const RecordsUI = {
     body.innerHTML = '<div class="content-loading"><div class="spinner"></div></div>';
 
     this.currentPage = page;
+    this.selectedIds.clear();
+    App.hideSelectionBar();
 
     try {
       const params = 'page=' + page + '&perPage=' + this.perPage;
@@ -58,8 +61,19 @@ const RecordsUI = {
     const schema = collection.fields || collection.schema || [];
     const isView = collection.type === 'view';
 
+    // Search bar
+    const searchBarHtml = `
+      <div class="records-search-bar">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7" cy="7" r="5"/>
+          <path d="M15 15l-3.5-3.5"/>
+        </svg>
+        <input type="text" class="records-search-input" id="records-search-input" placeholder='Search term or filter like created > "2022-01-01"...'>
+      </div>
+    `;
+
     if (!records || records.length === 0) {
-      body.innerHTML = `
+      body.innerHTML = searchBarHtml + `
         <div class="empty-state">
           <div class="empty-state-icon">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -80,7 +94,7 @@ const RecordsUI = {
         </div>
       `;
       if (!isView) {
-        App.bindActionEvent('btn-empty-new-record', () => this.showCreateModal(collection));
+        App.bindActionEvent('btn-empty-new-record', () => this.showCreateDrawer(collection));
       }
       return;
     }
@@ -91,7 +105,6 @@ const RecordsUI = {
     if (schema.length > 0) {
       visibleFields = schema.slice(0, 5);
     } else if (records.length > 0) {
-      // Only exclude PPBase metadata keys — keep created/updated since the user chose them
       const metaKeys = new Set(['id', 'collectionId', 'collectionName']);
       visibleFields = Object.keys(records[0])
         .filter(k => !metaKeys.has(k))
@@ -102,17 +115,25 @@ const RecordsUI = {
       visibleFields = [];
     }
 
-    let headerCells = '<th>ID</th>';
+    // Build header
+    let headerCells = '';
+    if (!isView) {
+      headerCells += '<th class="th-checkbox"><input type="checkbox" class="record-checkbox" id="select-all-records"></th>';
+    }
+    headerCells += '<th>ID</th>';
     visibleFields.forEach((f) => {
       headerCells += '<th>' + App.escapeHtml(f.name).toUpperCase() + '</th>';
     });
-    // Only add the hardcoded Created column for base/auth collections
     if (!viewInferred) headerCells += '<th>Created</th>';
-    if (!isView) headerCells += '<th></th>';
 
+    // Build rows
     let rows = '';
     records.forEach((record) => {
-      let cells = '<td class="cell-id">' + App.escapeHtml(this.truncateId(record.id)) + '</td>';
+      let cells = '';
+      if (!isView) {
+        cells += `<td class="td-checkbox"><input type="checkbox" class="record-checkbox" data-record-id="${App.escapeHtml(record.id)}"></td>`;
+      }
+      cells += '<td class="cell-id">' + App.escapeHtml(this.truncateId(record.id)) + '</td>';
 
       visibleFields.forEach((f) => {
         const val = record[f.name];
@@ -125,32 +146,15 @@ const RecordsUI = {
 
       if (!viewInferred) cells += '<td class="text-muted text-sm">' + App.formatDate(record.created) + '</td>';
 
-      if (!isView) {
-        cells += `
-          <td class="row-actions">
-            <button class="btn btn-ghost btn-sm btn-edit-record" data-id="${App.escapeHtml(record.id)}" title="Edit">
-              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M10 1.5l2.5 2.5L4.5 12H2v-2.5L10 1.5z"/>
-              </svg>
-            </button>
-            <button class="btn btn-ghost btn-sm btn-delete-record" data-id="${App.escapeHtml(record.id)}" title="Delete">
-              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-                <path d="M2.5 4h9M5 4V2.5a.5.5 0 01.5-.5h3a.5.5 0 01.5.5V4M11 4v7.5a1 1 0 01-1 1H4a1 1 0 01-1-1V4"/>
-              </svg>
-            </button>
-          </td>
-        `;
-      }
-
-      rows += '<tr>' + cells + '</tr>';
+      rows += '<tr data-record-id="' + App.escapeHtml(record.id) + '">' + cells + '</tr>';
     });
 
     const totalItems = result.totalItems || records.length;
-    const startItem = (this.currentPage - 1) * this.perPage + 1;
-    const endItem = Math.min(this.currentPage * this.perPage, totalItems);
 
     let paginationHtml = '';
     if (this.totalPages > 1) {
+      const startItem = (this.currentPage - 1) * this.perPage + 1;
+      const endItem = Math.min(this.currentPage * this.perPage, totalItems);
       paginationHtml = `
         <div class="table-footer">
           <span class="text-sm text-muted">${startItem}\u2013${endItem} of ${totalItems} records</span>
@@ -163,13 +167,13 @@ const RecordsUI = {
     } else {
       paginationHtml = `
         <div class="table-footer">
-          <span class="text-sm text-muted">${totalItems} record${totalItems !== 1 ? 's' : ''}</span>
+          <span class="text-sm text-muted">Total Found: ${totalItems}</span>
           <span></span>
         </div>
       `;
     }
 
-    body.innerHTML = `
+    body.innerHTML = searchBarHtml + `
       <div class="table-wrapper">
         <table class="data-table">
           <thead><tr>${headerCells}</tr></thead>
@@ -186,19 +190,121 @@ const RecordsUI = {
       if (nextBtn) nextBtn.addEventListener('click', () => this.loadAndRender(collection, this.currentPage + 1));
     }
 
-    if (!isView) {
-      body.querySelectorAll('.btn-edit-record').forEach((btn) => {
-        btn.addEventListener('click', () => this.showEditModal(collection, btn.dataset.id));
+    // Row click → open edit drawer
+    body.querySelectorAll('tr[data-record-id]').forEach((row) => {
+      row.addEventListener('click', (e) => {
+        // Don't open drawer if clicking checkbox
+        if (e.target.classList.contains('record-checkbox') || e.target.closest('.td-checkbox')) return;
+        const recordId = row.dataset.recordId;
+        if (isView) return;
+        this.showEditDrawer(collection, recordId);
       });
-      body.querySelectorAll('.btn-delete-record').forEach((btn) => {
-        btn.addEventListener('click', () => this.confirmDeleteRecord(collection, btn.dataset.id));
+    });
+
+    // Checkbox selection logic
+    if (!isView) {
+      const selectAll = document.getElementById('select-all-records');
+      const checkboxes = body.querySelectorAll('.record-checkbox[data-record-id]');
+
+      if (selectAll) {
+        selectAll.addEventListener('change', () => {
+          checkboxes.forEach(cb => {
+            cb.checked = selectAll.checked;
+            if (selectAll.checked) {
+              this.selectedIds.add(cb.dataset.recordId);
+            } else {
+              this.selectedIds.delete(cb.dataset.recordId);
+            }
+          });
+          this.updateSelectionBar(collection);
+        });
+      }
+
+      checkboxes.forEach(cb => {
+        cb.addEventListener('change', () => {
+          if (cb.checked) {
+            this.selectedIds.add(cb.dataset.recordId);
+          } else {
+            this.selectedIds.delete(cb.dataset.recordId);
+            if (selectAll) selectAll.checked = false;
+          }
+          this.updateSelectionBar(collection);
+        });
       });
     }
   },
 
-  // ── Create Record Modal ──────────────────────────────────────
+  // ── Selection Bar ──────────────────────────────────────────
 
-  showCreateModal(collection) {
+  updateSelectionBar(collection) {
+    if (this.selectedIds.size === 0) {
+      App.hideSelectionBar();
+      return;
+    }
+
+    App.showSelectionBar(
+      this.selectedIds.size,
+      () => {
+        // Reset selection
+        this.selectedIds.clear();
+        App.hideSelectionBar();
+        const selectAll = document.getElementById('select-all-records');
+        if (selectAll) selectAll.checked = false;
+        document.querySelectorAll('.record-checkbox[data-record-id]').forEach(cb => {
+          cb.checked = false;
+        });
+      },
+      () => {
+        // Delete selected
+        this.confirmDeleteSelected(collection);
+      }
+    );
+  },
+
+  confirmDeleteSelected(collection) {
+    const count = this.selectedIds.size;
+    const bodyHtml = `
+      <div class="confirm-message">
+        Are you sure you want to delete <strong>${count} record${count !== 1 ? 's' : ''}</strong>?
+        This action cannot be undone.
+      </div>
+    `;
+
+    const footerHtml = `
+      <button class="btn btn-secondary" id="modal-cancel-delete">Cancel</button>
+      <button class="btn btn-danger" id="modal-confirm-delete">Delete ${count} record${count !== 1 ? 's' : ''}</button>
+    `;
+
+    App.showModal('Delete Records', bodyHtml, footerHtml);
+
+    document.getElementById('modal-cancel-delete').addEventListener('click', () => App.closeModal());
+    document.getElementById('modal-confirm-delete').addEventListener('click', async () => {
+      const btn = document.getElementById('modal-confirm-delete');
+      btn.disabled = true;
+      btn.innerHTML = '<div class="spinner spinner-sm spinner-light"></div> Deleting...';
+
+      try {
+        const ids = Array.from(this.selectedIds);
+        await Promise.all(ids.map(id =>
+          PBClient.deleteRecord(collection.name || collection.id, id)
+        ));
+        App.closeModal();
+        App.showToast('Deleted ' + count + ' record' + (count !== 1 ? 's' : '') + '.');
+        this.selectedIds.clear();
+        App.hideSelectionBar();
+        this.loadAndRender(collection);
+      } catch (err) {
+        const msg = (err && err.message) || 'Failed to delete records.';
+        App.showToast(msg, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Delete ' + count + ' record' + (count !== 1 ? 's' : '');
+      }
+    });
+  },
+
+  // ── Create Record Drawer ────────────────────────────────────
+
+  showCreateDrawer(collection) {
     const schema = collection.fields || collection.schema || [];
 
     if (schema.length === 0) {
@@ -214,40 +320,40 @@ const RecordsUI = {
     const bodyHtml = '<form id="record-form" class="flex-col gap-4">' + fieldsHtml + '</form>';
 
     const footerHtml = `
-      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-      <button class="btn btn-primary" id="modal-save">Create record</button>
+      <button class="btn btn-secondary" id="drawer-cancel">Cancel</button>
+      <button class="btn btn-primary" id="drawer-save">Create</button>
     `;
 
-    App.showModal('New Record', bodyHtml, footerHtml);
+    App.showDrawer('New <strong>' + App.escapeHtml(collection.name) + '</strong> record', bodyHtml, footerHtml);
 
-    document.getElementById('modal-cancel').addEventListener('click', () => App.closeModal());
-    document.getElementById('modal-save').addEventListener('click', () => {
+    document.getElementById('drawer-cancel').addEventListener('click', () => App.closeDrawer());
+    document.getElementById('drawer-save').addEventListener('click', () => {
       this.handleCreateRecord(collection, schema);
     });
   },
 
   async handleCreateRecord(collection, schema) {
     const data = this.gatherFormData(schema);
-    const btn = document.getElementById('modal-save');
+    const btn = document.getElementById('drawer-save');
     btn.disabled = true;
     btn.innerHTML = '<div class="spinner spinner-sm spinner-light"></div> Creating...';
 
     try {
       await PBClient.createRecord(collection.name || collection.id, data);
-      App.closeModal();
+      App.closeDrawer();
       App.showToast('Record created successfully.');
       this.loadAndRender(collection);
     } catch (err) {
       const msg = (err && err.message) || 'Failed to create record.';
       App.showToast(msg, 'error');
       btn.disabled = false;
-      btn.textContent = 'Create record';
+      btn.textContent = 'Create';
     }
   },
 
-  // ── Edit Record Modal ──────────────────────────────────────
+  // ── Edit Record Drawer ──────────────────────────────────────
 
-  async showEditModal(collection, recordId) {
+  async showEditDrawer(collection, recordId) {
     let record;
     try {
       record = await PBClient.getRecord(collection.name || collection.id, recordId);
@@ -268,27 +374,134 @@ const RecordsUI = {
     `;
 
     const footerHtml = `
-      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
-      <button class="btn btn-primary" id="modal-save">Save changes</button>
+      <button class="btn btn-secondary" id="drawer-cancel">Cancel</button>
+      <button class="btn btn-primary" id="drawer-save">Save changes</button>
     `;
 
-    App.showModal('Edit Record', bodyHtml, footerHtml);
+    const headerActions = `
+      <div class="drawer-menu-wrapper">
+        <button class="drawer-menu-btn" id="drawer-menu-toggle" title="More options">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+            <circle cx="8" cy="3" r="1.5"/>
+            <circle cx="8" cy="8" r="1.5"/>
+            <circle cx="8" cy="13" r="1.5"/>
+          </svg>
+        </button>
+        <div class="drawer-dropdown hidden" id="drawer-dropdown-menu">
+          <button class="drawer-dropdown-item" id="drawer-action-copy-json">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 2h4l4 4v6a2 2 0 01-2 2H4a2 2 0 01-2-2V4a2 2 0 012-2z"/>
+              <path d="M8 2v4h4"/>
+            </svg>
+            Copy raw JSON
+          </button>
+          <button class="drawer-dropdown-item" id="drawer-action-duplicate">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="5" width="9" height="9" rx="1.5"/>
+              <path d="M3 11H2.5A1.5 1.5 0 011 9.5v-7A1.5 1.5 0 012.5 1h7A1.5 1.5 0 0111 2.5V3"/>
+            </svg>
+            Duplicate
+          </button>
+          <div class="drawer-dropdown-divider"></div>
+          <button class="drawer-dropdown-item dropdown-danger" id="drawer-action-delete">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 4h12M5 4V3a1 1 0 011-1h4a1 1 0 011 1v1M6.5 7v5M9.5 7v5"/>
+              <path d="M3 4l1 10a1 1 0 001 1h6a1 1 0 001-1l1-10"/>
+            </svg>
+            Delete
+          </button>
+        </div>
+      </div>
+    `;
 
-    document.getElementById('modal-cancel').addEventListener('click', () => App.closeModal());
-    document.getElementById('modal-save').addEventListener('click', () => {
+    App.showDrawer('Edit <strong>' + App.escapeHtml(collection.name) + '</strong> record', bodyHtml, footerHtml, { headerActions });
+
+    document.getElementById('drawer-cancel').addEventListener('click', () => App.closeDrawer());
+    document.getElementById('drawer-save').addEventListener('click', () => {
       this.handleUpdateRecord(collection, record.id, schema);
+    });
+
+    // Dropdown menu toggle
+    const menuToggle = document.getElementById('drawer-menu-toggle');
+    const dropdown = document.getElementById('drawer-dropdown-menu');
+    menuToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = dropdown.classList.contains('hidden');
+      dropdown.classList.toggle('hidden');
+      if (isHidden) {
+        // Close dropdown when clicking anywhere else
+        const closeHandler = () => {
+          dropdown.classList.add('hidden');
+          document.removeEventListener('click', closeHandler);
+        };
+        setTimeout(() => document.addEventListener('click', closeHandler), 0);
+      }
+    });
+
+    // Copy raw JSON
+    document.getElementById('drawer-action-copy-json').addEventListener('click', () => {
+      dropdown.classList.add('hidden');
+      const json = JSON.stringify(record, null, 2);
+      navigator.clipboard.writeText(json).then(() => {
+        App.showToast('Raw JSON copied to clipboard.');
+      }).catch(() => {
+        App.showToast('Failed to copy to clipboard.', 'error');
+      });
+    });
+
+    // Duplicate
+    document.getElementById('drawer-action-duplicate').addEventListener('click', () => {
+      dropdown.classList.add('hidden');
+      App.closeDrawer();
+      this.duplicateRecord(collection, record);
+    });
+
+    // Delete
+    document.getElementById('drawer-action-delete').addEventListener('click', () => {
+      dropdown.classList.add('hidden');
+      App.closeDrawer();
+      this.confirmDeleteRecord(collection, record.id);
+    });
+  },
+
+  duplicateRecord(collection, sourceRecord) {
+    const schema = collection.fields || collection.schema || [];
+    const data = {};
+    schema.forEach(field => {
+      if (sourceRecord[field.name] !== undefined) {
+        data[field.name] = sourceRecord[field.name];
+      }
+    });
+
+    let fieldsHtml = '';
+    schema.forEach((field) => {
+      fieldsHtml += this.renderFieldInput(field, data[field.name]);
+    });
+
+    const bodyHtml = '<form id="record-form" class="flex-col gap-4">' + fieldsHtml + '</form>';
+
+    const footerHtml = `
+      <button class="btn btn-secondary" id="drawer-cancel">Cancel</button>
+      <button class="btn btn-primary" id="drawer-save">Create</button>
+    `;
+
+    App.showDrawer('New <strong>' + App.escapeHtml(collection.name) + '</strong> record', bodyHtml, footerHtml);
+
+    document.getElementById('drawer-cancel').addEventListener('click', () => App.closeDrawer());
+    document.getElementById('drawer-save').addEventListener('click', () => {
+      this.handleCreateRecord(collection, schema);
     });
   },
 
   async handleUpdateRecord(collection, recordId, schema) {
     const data = this.gatherFormData(schema);
-    const btn = document.getElementById('modal-save');
+    const btn = document.getElementById('drawer-save');
     btn.disabled = true;
     btn.innerHTML = '<div class="spinner spinner-sm spinner-light"></div> Saving...';
 
     try {
       await PBClient.updateRecord(collection.name || collection.id, recordId, data);
-      App.closeModal();
+      App.closeDrawer();
       App.showToast('Record updated successfully.');
       this.loadAndRender(collection);
     } catch (err) {
@@ -340,11 +553,6 @@ const RecordsUI = {
 
   // ── Form Field Rendering ───────────────────────────────────
 
-  /**
-   * Render an HTML form input for a single schema field.
-   * Uses proper controls: select dropdown for select fields,
-   * collection-aware input for relations, etc.
-   */
   renderFieldInput(field, value) {
     const name = App.escapeHtml(field.name);
     const type = field.type;
@@ -424,8 +632,7 @@ const RecordsUI = {
 
         if (values.length > 0) {
           if (maxSelect <= 1) {
-            // Single select → dropdown
-            let selectOptions = '<option value="">-- Select --</option>';
+            let selectOptions = '<option value="">- Select -</option>';
             values.forEach((v) => {
               const selected = (String(value) === v) ? 'selected' : '';
               selectOptions += `<option value="${App.escapeHtml(v)}" ${selected}>${App.escapeHtml(v)}</option>`;
@@ -439,7 +646,6 @@ const RecordsUI = {
               </div>
             `;
           } else {
-            // Multi-select → checkboxes
             const currentValues = Array.isArray(value) ? value : (value ? [value] : []);
             let checkboxes = '';
             values.forEach((v) => {
@@ -462,7 +668,6 @@ const RecordsUI = {
           }
         }
 
-        // Fallback: no values defined
         return `
           <div class="form-group">
             <label class="form-label">${name}${requiredLabel} <span class="badge badge-purple" style="vertical-align: middle;">select</span></label>
@@ -479,7 +684,6 @@ const RecordsUI = {
         const maxSelect = field.maxSelect || opts.maxSelect || 1;
 
         if (maxSelect > 1) {
-          // Multi-relation: show as textarea for IDs
           const currentValues = Array.isArray(value) ? value.join(', ') : (value || '');
           return `
             <div class="form-group">

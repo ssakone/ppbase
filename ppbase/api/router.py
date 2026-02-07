@@ -32,6 +32,15 @@ except (ImportError, AttributeError):
 
     api_router.include_router(_collections_stub, tags=["collections"])
 
+# Migrations router -- import gracefully.
+# NOTE: The migrations router already defines prefix="/migrations" internally.
+try:
+    from ppbase.api.migrations import router as migrations_router
+
+    api_router.include_router(migrations_router, tags=["migrations"])
+except (ImportError, AttributeError):
+    pass
+
 # Records router -- built by another agent; import gracefully.
 # NOTE: The records router defines paths like /api/collections/{...}/records/...
 # which already include the /api prefix. We store a reference here; the app

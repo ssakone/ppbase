@@ -62,38 +62,60 @@
 
       <!-- Sidebar -->
       <aside class="sidebar">
-        <div class="sidebar-header">
-          <div class="sidebar-logo">
-            <svg width="32" height="32" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <!-- Icon strip on the left -->
+        <div class="sidebar-icon-strip">
+          <div class="sidebar-logo-icon">
+            <svg width="28" height="28" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
               <rect width="36" height="36" rx="8" fill="#4f46e5"/>
               <path d="M10 12h8a4 4 0 010 8h-8v-8zm2 2v4h6a2 2 0 000-4h-6z" fill="#fff"/>
               <path d="M10 22h8a4 4 0 010 8h-8v-8zm2 2v4h6a2 2 0 000-4h-6z" fill="#fff" opacity="0.6"/>
             </svg>
-            <span class="sidebar-logo-text">PPBase</span>
           </div>
+          <a href="#" class="sidebar-icon-btn active" id="nav-icon-collections" title="Collections">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="6" height="6" rx="1"/>
+              <rect x="11" y="3" width="6" height="6" rx="1"/>
+              <rect x="3" y="11" width="6" height="6" rx="1"/>
+              <rect x="11" y="11" width="6" height="6" rx="1"/>
+            </svg>
+          </a>
+          <a href="#" class="sidebar-icon-btn" id="nav-icon-migrations" title="Migrations">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 5h14M3 10h14M3 15h14"/>
+              <path d="M6 3v4M14 8v4M10 13v4"/>
+            </svg>
+          </a>
+          <a href="#" class="sidebar-icon-btn" id="nav-icon-settings" title="Settings">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="10" cy="10" r="2.5"/>
+              <path d="M16.5 10a6.5 6.5 0 01-.3 1.4l1.3 1a.4.4 0 01.1.5l-1.3 2.2a.4.4 0 01-.5.1l-1.5-.6a6 6 0 01-1.2.7l-.2 1.6a.4.4 0 01-.4.2H8.5a.4.4 0 01-.4-.2l-.2-1.6a6 6 0 01-1.2-.7l-1.5.6a.4.4 0 01-.5-.1L3.4 12.9a.4.4 0 01.1-.5l1.3-1A6.5 6.5 0 014.5 10c0-.5 0-.9.1-1.4l-1.3-1a.4.4 0 01-.1-.5l1.3-2.2a.4.4 0 01.5-.1l1.5.6a6 6 0 011.2-.7l.2-1.6A.4.4 0 018.5 3h2.6a.4.4 0 01.4.2l.2 1.6a6 6 0 011.2.7l1.5-.6a.4.4 0 01.5.1l1.3 2.2a.4.4 0 01-.1.5l-1.3 1c.1.5.2.9.2 1.4z"/>
+            </svg>
+          </a>
+          <div style="flex:1"></div>
+          <a href="#" class="sidebar-icon-btn sidebar-icon-logout" id="nav-logout" title="Log out">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M7.5 17.5H4.17a1.67 1.67 0 01-1.67-1.67V4.17A1.67 1.67 0 014.17 2.5H7.5M13.33 14.17L17.5 10l-4.17-4.17M17.5 10H7.5"/>
+            </svg>
+          </a>
         </div>
-
-        <div class="sidebar-section">
-          <div class="sidebar-section-label">Collections</div>
+        <!-- Collection list panel -->
+        <div class="sidebar-collections-panel">
+          <div class="sidebar-search">
+            <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7" cy="7" r="5"/>
+              <path d="M15 15l-3.5-3.5"/>
+            </svg>
+            <input type="text" class="sidebar-search-input" id="collections-search" placeholder="Search collections...">
+          </div>
           <nav class="sidebar-nav" id="collections-nav">
             <!-- Dynamically populated -->
           </nav>
-        </div>
-
-        <div class="sidebar-footer">
-          <a href="#" class="nav-item nav-item-settings" id="nav-settings">
-            <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="8" cy="8" r="2.5"/>
-              <path d="M13.5 8a5.5 5.5 0 01-.3 1.2l1.1.9a.3.3 0 01.1.4l-1.1 1.9a.3.3 0 01-.4.1l-1.3-.5a5 5 0 01-1 .6l-.2 1.4a.3.3 0 01-.3.2H8a.3.3 0 01-.3-.2l-.2-1.4a5 5 0 01-1-.6l-1.3.5a.3.3 0 01-.4-.1L3.7 10.5a.3.3 0 01.1-.4l1.1-.9A5.5 5.5 0 014.5 8c0-.4 0-.8.1-1.2l-1.1-.9a.3.3 0 01-.1-.4l1.1-1.9a.3.3 0 01.4-.1l1.3.5a5 5 0 011-.6l.2-1.4a.3.3 0 01.3-.2H10a.3.3 0 01.3.2l.2 1.4a5 5 0 011 .6l1.3-.5a.3.3 0 01.4.1l1.1 1.9a.3.3 0 01-.1.4l-1.1.9c.1.4.2.8.2 1.2z"/>
-            </svg>
-            Settings
-          </a>
-          <a href="#" class="nav-item nav-item-logout" id="nav-logout">
-            <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M6 14H3.33a1.33 1.33 0 01-1.33-1.33V3.33A1.33 1.33 0 013.33 2H6M10.67 11.33L14 8l-3.33-3.33M14 8H6"/>
-            </svg>
-            Log out
-          </a>
+          <div class="sidebar-new-collection">
+            <button class="btn btn-secondary btn-full btn-new-collection" id="btn-sidebar-new-collection">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 1v12M1 7h12"/></svg>
+              New collection
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -127,6 +149,27 @@
       </div>
     </div>
 
+    <!-- Drawer Sidebar -->
+    <div id="drawer-overlay" class="drawer-overlay hidden"></div>
+    <div id="drawer" class="drawer hidden">
+      <div class="drawer-header">
+        <div class="drawer-header-left">
+          <button class="drawer-close" id="drawer-close" aria-label="Close drawer">
+            <svg width="22" height="22" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <path d="M5 5l10 10M15 5L5 15"/>
+            </svg>
+          </button>
+          <h2 class="drawer-title" id="drawer-title"></h2>
+        </div>
+        <div id="drawer-header-actions"></div>
+      </div>
+      <div class="drawer-body" id="drawer-body"></div>
+      <div class="drawer-footer" id="drawer-footer"></div>
+    </div>
+
+    <!-- Selection Bar (floating at bottom for record selection) -->
+    <div id="selection-bar" class="selection-bar hidden"></div>
+
     <!-- Toast Container -->
     <div id="toast-container" class="toast-container"></div>
 
@@ -135,6 +178,7 @@
   <script src="/_/assets/js/api.js"></script>
   <script src="/_/assets/js/collections.js"></script>
   <script src="/_/assets/js/records.js"></script>
+  <script src="/_/assets/js/migrations.js"></script>
   <script src="/_/assets/js/app.js"></script>
 </body>
 </html>
