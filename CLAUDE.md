@@ -89,16 +89,50 @@ Collection models use a field named `schema` which shadows `BaseModel.schema()`.
 
 ## Admin UI
 
-The admin UI is a vanilla JS SPA served at `/_/` (4 files, no build step):
+The admin UI is a React + TypeScript SPA built with Vite, served at `/_/`. Source lives in `admin-ui/`, build output goes to `ppbase/admin/dist/`.
 
-- `ppbase/admin/dist/index.html` — shell with login, dashboard, modal, toast
-- `ppbase/admin/dist/js/api.js` — PBClient HTTP wrapper
-- `ppbase/admin/dist/js/app.js` — main controller (login, nav, sidebar, modal)
-- `ppbase/admin/dist/js/collections.js` — collection CRUD, schema editor with full field options
-- `ppbase/admin/dist/js/records.js` — record CRUD with type-aware form inputs
-- `ppbase/admin/dist/css/style.css` — all styles (~1500 lines)
+### Build & Dev
 
-Supports all 14 field types with options (select values, relation picker, file limits, etc.), view collections, and proper validation feedback.
+```bash
+# Install dependencies
+cd admin-ui && npm install
+
+# Development (with HMR, proxies API to localhost:8090)
+npm run dev
+
+# Production build (outputs to ppbase/admin/dist/)
+npm run build
+```
+
+### Tech stack
+
+- **React 18** + **TypeScript** + **Vite**
+- **shadcn/ui** (Radix primitives + Tailwind CSS)
+- **TanStack Query** (server state, cache, mutations)
+- **React Router v7** (basename `/_/`)
+- **Sonner** (toast notifications)
+- **Inter font** (self-hosted, no CDN)
+
+### Structure
+
+```
+admin-ui/src/
+├── api/              # Fetch client + typed endpoints (auth, collections, records, migrations, settings)
+├── hooks/            # TanStack Query hooks (use-collections, use-records, etc.)
+├── context/          # Auth + Sidebar React contexts
+├── routes/           # Pages (login, collections, records, migrations, settings)
+├── components/
+│   ├── ui/           # shadcn/ui primitives (button, input, dialog, sheet, table, etc.)
+│   ├── fields/       # Per-type record field inputs (text, number, bool, select, relation, etc.)
+│   ├── sql-editor/   # SQL editor with syntax highlighting and autocomplete
+│   └── *.tsx         # Feature components (collection-editor, record-editor, etc.)
+├── lib/              # Utilities (cn, formatDate, field-types config, format-cell)
+└── styles/globals.css
+```
+
+### Serving
+
+`ppbase/app.py` mounts `/_/assets` → `ppbase/admin/dist/` (StaticFiles) and returns `index.html` for all `/_/*` routes (SPA catch-all). No changes needed to app.py for the React build.
 
 ## Reference docs
 

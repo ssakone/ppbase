@@ -41,3 +41,7 @@ htmlcov/
 
 # Claude Code
 .claude/
+
+# Admin UI (React build)
+admin-ui/node_modules/
+admin-ui/dist/

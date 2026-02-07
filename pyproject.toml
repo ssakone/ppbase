@@ -30,6 +30,9 @@ ppbase = "ppbase.__main__:main"
 [tool.setuptools.packages.find]
 include = ["ppbase*"]
 
+[tool.setuptools.package-data]
+"ppbase" = ["admin/dist/**/*"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
