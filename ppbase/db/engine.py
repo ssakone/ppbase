@@ -26,7 +26,7 @@ async def init_engine(
 
     Args:
         database_url: SQLAlchemy-style async database URL
-            (e.g. ``postgresql+asyncpg://localhost:5432/ppbase``).
+            (e.g. ``postgresql+asyncpg://localhost:5433/ppbase``).
         pool_size: Core connection pool size.
         max_overflow: Maximum number of connections above *pool_size*.
         echo: If ``True``, log all SQL statements.

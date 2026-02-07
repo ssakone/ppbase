@@ -254,7 +254,7 @@ def _cmd_db(args: argparse.Namespace) -> None:
                 "-e", f"POSTGRES_DB={_PG_DB}",
                 "-e", f"POSTGRES_USER={_PG_USER}",
                 "-e", f"POSTGRES_PASSWORD={_PG_PASSWORD}",
-                "-p", f"{_PG_PORT}:5432",
+                "-p", f"{_PG_PORT}:5433",
                 _PG_IMAGE,
             ], capture_output=True, text=True)
             if r.returncode != 0:

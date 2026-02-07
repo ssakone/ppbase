@@ -506,7 +506,7 @@ class PPBase:
 
     def __init__(
         self,
-        database_url: str = "postgresql+asyncpg://localhost:5432/ppbase",
+        database_url: str = "postgresql+asyncpg://localhost:5433/ppbase",
         data_dir: str = "./pb_data",
         dev: bool = False,
         origins: list[str] | None = None,
@@ -1639,7 +1639,7 @@ class Settings(BaseSettings):
     """PPBase configuration. All values can be set via environment variables."""
 
     # Database
-    database_url: str = "postgresql+asyncpg://localhost:5432/ppbase"
+    database_url: str = "postgresql+asyncpg://localhost:5433/ppbase"
     pool_size: int = 10
     max_overflow: int = 20
 
