@@ -85,7 +85,16 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
 
 
 def _table_name(collection: CollectionRecord) -> str:
+    # _superusers is a virtual collection backed by the _admins system table
+    if collection.name == "_superusers":
+        return "_admins"
     return collection.name
+
+
+# Columns from the _admins table that must never be exposed through the API
+_SUPERUSERS_HIDDEN_COLUMNS = frozenset({
+    "password_hash", "token_key", "last_reset_sent_at",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +198,10 @@ async def list_records(
             if _attempt > 0:
                 raise
 
+    # Strip sensitive columns for _superusers (backed by _admins table)
+    if collection.name == "_superusers":
+        rows = [{k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS} for row in rows]
+
     items = [
         build_record_response(
             row, collection.id, collection.name, collection.schema or [],
@@ -227,8 +240,14 @@ async def get_record(
     if row is None:
         return None
 
+    row_dict = dict(row)
+
+    # Strip sensitive columns for _superusers (backed by _admins table)
+    if collection.name == "_superusers":
+        row_dict = {k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
+
     return build_record_response(
-        dict(row), collection.id, collection.name, collection.schema or [],
+        row_dict, collection.id, collection.name, collection.schema or [],
         fields_filter=ff, hidden_fields=hidden,
     )
 

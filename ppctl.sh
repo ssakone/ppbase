@@ -149,7 +149,7 @@ do_db_start() {
       -e "POSTGRES_DB=$PG_DB" \
       -e "POSTGRES_USER=$PG_USER" \
       -e "POSTGRES_PASSWORD=$PG_PASSWORD" \
-      -p "$PG_PORT:5433" \
+      -p "$PG_PORT:5432" \
       "$PG_IMAGE" > /dev/null
   fi
 

@@ -3,7 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { useCollections } from '@/hooks/use-collections'
 import { useSidebar } from '@/context/sidebar-context'
 import { cn } from '@/lib/utils'
-import { Plus, Search } from 'lucide-react'
+import { Plus, Search, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import type { Collection } from '@/api/types'
 
@@ -13,12 +13,23 @@ export function SidebarCollectionsPanel() {
   const { data: collections = [], isLoading } = useCollections()
   const { setSelectedCollectionId, setActiveSection } = useSidebar()
   const [search, setSearch] = useState('')
+  const [systemCollapsed, setSystemCollapsed] = useState(false)
 
   const filtered = useMemo(() => {
     if (!search) return collections
     const q = search.toLowerCase()
     return collections.filter((c: Collection) => c.name.toLowerCase().includes(q))
   }, [collections, search])
+
+  const userCollections = useMemo(
+    () => filtered.filter((c: Collection) => !c.system),
+    [filtered],
+  )
+
+  const systemCollections = useMemo(
+    () => filtered.filter((c: Collection) => c.system),
+    [filtered],
+  )
 
   const handleClick = (col: typeof collections[0]) => {
     setActiveSection('collections')
@@ -33,6 +44,25 @@ export function SidebarCollectionsPanel() {
   // Hide panel when not on collections routes
   const showPanel = location.pathname.startsWith('/collections')
   if (!showPanel) return null
+
+  const renderCollectionItem = (col: Collection) => {
+    const isActive = location.pathname === `/collections/${col.id}`
+    return (
+      <button
+        key={col.id}
+        className={cn(
+          'flex items-center gap-2.5 w-full px-3 mb-1 py-2 text-[16px] rounded-md text-left transition-colors',
+          isActive
+            ? 'bg-indigo-50 text-indigo-700 font-medium'
+            : 'text-slate-600 hover:bg-slate-100',
+        )}
+        onClick={() => handleClick(col)}
+      >
+        <CollectionIcon type={col.type} />
+        <span className="truncate">{col.name}</span>
+      </button>
+    )
+  }
 
   return (
     <div className="flex flex-col w-[300px] border-r bg-white">
@@ -63,24 +93,29 @@ export function SidebarCollectionsPanel() {
             {search ? 'No matching collections' : 'No collections yet'}
           </div>
         ) : (
-          filtered.map((col: Collection) => {
-            const isActive = location.pathname === `/collections/${col.id}`
-            return (
-              <button
-                key={col.id}
-                className={cn(
-                  'flex items-center gap-2.5 w-full px-3 mb-1 py-2 text-[16px] rounded-md text-left transition-colors',
-                  isActive
-                    ? 'bg-indigo-50 text-indigo-700 font-medium'
-                    : 'text-slate-600 hover:bg-slate-100',
-                )}
-                onClick={() => handleClick(col)}
-              >
-                <CollectionIcon type={col.type} />
-                <span className="truncate">{col.name}</span>
-              </button>
-            )
-          })
+          <>
+            {/* User collections */}
+            {userCollections.map(renderCollectionItem)}
+
+            {/* System collections section */}
+            {systemCollections.length > 0 && (
+              <div className="mt-3">
+                <button
+                  className="flex items-center gap-1.5 w-full px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition-colors"
+                  onClick={() => setSystemCollapsed(!systemCollapsed)}
+                >
+                  <ChevronRight
+                    className={cn(
+                      'h-3.5 w-3.5 transition-transform',
+                      !systemCollapsed && 'rotate-90',
+                    )}
+                  />
+                  System
+                </button>
+                {!systemCollapsed && systemCollections.map(renderCollectionItem)}
+              </div>
+            )}
+          </>
         )}
       </nav>
 
@@ -120,9 +155,8 @@ function CollectionIcon({ type }: { type: string }) {
   }
   return (
     <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-slate-400">
-      <path d="M2 5l6-3 6 3v6l-6 3-6-3V5z"/>
-      <path d="M2 5l6 3 6-3"/>
-      <path d="M8 8v6"/>
+      <path d="M9 2H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V6L9 2z"/>
+      <path d="M9 2v4h4"/>
     </svg>
   )
 }

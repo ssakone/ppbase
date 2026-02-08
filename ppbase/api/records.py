@@ -120,6 +120,14 @@ async def api_create_record(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
+    # _superusers records are managed via the admin auth API, not here
+    if collection.name == "_superusers":
+        return _error_response(
+            400,
+            "You cannot create _superusers records via the records API. "
+            "Use the admin auth endpoints instead.",
+        )
+
     try:
         data = await request.json()
     except Exception:
@@ -202,6 +210,14 @@ async def api_update_record(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
+    # _superusers records are managed via the admin auth API, not here
+    if collection.name == "_superusers":
+        return _error_response(
+            400,
+            "You cannot update _superusers records via the records API. "
+            "Use the admin auth endpoints instead.",
+        )
+
     try:
         data = await request.json()
     except Exception:
@@ -249,6 +265,14 @@ async def api_delete_record(
     collection = await resolve_collection(engine, collectionIdOrName)
     if collection is None:
         return _error_response(404, "Missing collection context.")
+
+    # _superusers records are managed via the admin auth API, not here
+    if collection.name == "_superusers":
+        return _error_response(
+            400,
+            "You cannot delete _superusers records via the records API. "
+            "Use the admin auth endpoints instead.",
+        )
 
     all_colls = await get_all_collections(engine)
     deleted = await delete_record(

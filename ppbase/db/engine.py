@@ -42,6 +42,7 @@ async def init_engine(
         max_overflow=max_overflow,
         pool_pre_ping=True,
         echo=echo,
+        connect_args={"ssl": "disable"},
     )
     _session_factory = async_sessionmaker(
         bind=_engine,

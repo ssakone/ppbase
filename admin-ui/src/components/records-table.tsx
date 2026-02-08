@@ -29,13 +29,13 @@ interface RecordsTableProps {
 
 function getSchemaFields(collection: Collection, records: RecordModel[]): Field[] {
   const fields = collection.fields ?? collection.schema ?? []
-  if (fields.length > 0) return fields.slice(0, 5)
+  if (fields.length > 0) return fields
 
   // For view collections with empty schema, infer from first record
   if (records.length > 0) {
     const systemKeys = new Set(['id', 'collectionId', 'collectionName', 'created', 'updated'])
     const keys = Object.keys(records[0]).filter((k) => !systemKeys.has(k))
-    return keys.slice(0, 5).map((k) => ({ name: k, type: 'text' }))
+    return keys.map((k) => ({ name: k, type: 'text' }))
   }
 
   return []
@@ -93,8 +93,8 @@ export function RecordsTable({
       </div>
 
       {/* Table */}
-      <div className="rounded-md border">
-        <Table>
+      <div className="rounded-md border overflow-x-auto">
+        <Table className="min-w-max">
           <TableHeader>
             <TableRow>
               {!isView && (

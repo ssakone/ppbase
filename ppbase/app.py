@@ -32,6 +32,15 @@ async def _lifespan(app: FastAPI):
     )
     await create_system_tables(engine)
 
+    # Ensure the _superusers system collection is registered
+    from ppbase.db.bootstrap import ensure_superusers_collection
+    from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker as _asm
+
+    _boot_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
+    async with _boot_factory() as _boot_session:
+        async with _boot_session.begin():
+            await ensure_superusers_collection(_boot_session)
+
     # Apply pending migrations if auto_migrate is enabled
     if settings.auto_migrate:
         from ppbase.services.migration_runner import apply_all_pending

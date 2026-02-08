@@ -137,7 +137,7 @@ export function RecordEditor({
   return (
     <>
       <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
-        <SheetContent className="sm:max-w-lg flex flex-col overflow-hidden">
+        <SheetContent className="sm:max-w-[700px] flex flex-col overflow-hidden">
           <SheetHeader className="shrink-0 px-6 pt-6 pb-4">
             <div className="flex items-center justify-between pr-8">
               <SheetTitle>{title}</SheetTitle>

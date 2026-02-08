@@ -39,11 +39,12 @@ import { toast } from 'sonner'
 interface CollectionEditorProps {
   open: boolean
   onClose: () => void
+  onDelete?: () => void
   mode: 'create' | 'edit'
   collectionId?: string
 }
 
-export function CollectionEditor({ open, onClose, mode, collectionId }: CollectionEditorProps) {
+export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }: CollectionEditorProps) {
   const { data: existingCollection, isLoading: isLoadingCollection } = useCollection(
     mode === 'edit' ? collectionId : undefined,
   )
@@ -174,6 +175,7 @@ export function CollectionEditor({ open, onClose, mode, collectionId }: Collecti
       await deleteMutation.mutateAsync(collectionId)
       toast.success(`Collection "${name}" deleted.`)
       setDeleteDialogOpen(false)
+      onDelete?.()
       onClose()
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to delete collection.'
@@ -182,14 +184,15 @@ export function CollectionEditor({ open, onClose, mode, collectionId }: Collecti
   }
 
   const isSaving = createMutation.isPending || updateMutation.isPending
+  const isSystem = existingCollection?.system === true
 
   return (
     <>
       <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
-        <SheetContent side="right" className="w-full sm:max-w-lg flex flex-col overflow-hidden">
+        <SheetContent side="right" className="w-full sm:max-w-[700px] flex flex-col overflow-hidden">
           <SheetHeader className="shrink-0 px-6 pt-6 pb-4 flex flex-row items-center justify-between pr-8">
             <SheetTitle>{mode === 'create' ? 'New collection' : 'Edit collection'}</SheetTitle>
-            {mode === 'edit' && (
+            {mode === 'edit' && !isSystem && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
@@ -226,6 +229,7 @@ export function CollectionEditor({ open, onClose, mode, collectionId }: Collecti
                       placeholder='e.g. "posts"'
                       value={name}
                       onChange={(e) => setName(e.target.value)}
+                      disabled={isSystem}
                     />
                     {mode === 'create' ? (
                       <Select
@@ -264,10 +268,12 @@ export function CollectionEditor({ open, onClose, mode, collectionId }: Collecti
                 <Button variant="outline" onClick={onClose} disabled={isSaving}>
                   Cancel
                 </Button>
-                <Button onClick={handleSave} disabled={isSaving}>
-                  {isSaving && <LoadingSpinner size="sm" className="mr-2" />}
-                  {mode === 'create' ? 'Create' : 'Save changes'}
-                </Button>
+                {!isSystem && (
+                  <Button onClick={handleSave} disabled={isSaving}>
+                    {isSaving && <LoadingSpinner size="sm" className="mr-2" />}
+                    {mode === 'create' ? 'Create' : 'Save changes'}
+                  </Button>
+                )}
               </SheetFooter>
             </>
           )}
