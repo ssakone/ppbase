@@ -88,18 +88,18 @@ class CollectionRecord(Base):
 
 
 # ---------------------------------------------------------------------------
-# _admins
+# _superusers
 # ---------------------------------------------------------------------------
 
 
-class AdminRecord(Base):
+class SuperuserRecord(Base):
     """Superuser / admin accounts.
 
-    In PocketBase v0.23+ admins are a special ``_superusers`` auth collection.
-    For simplicity PPBase uses a dedicated table.
+    In PocketBase v0.23+ admins are stored in a special ``_superusers`` auth
+    collection. PPBase now follows this convention with a real _superusers table.
     """
 
-    __tablename__ = "_admins"
+    __tablename__ = "_superusers"
 
     id: Mapped[str] = mapped_column(String(15), primary_key=True)
     avatar: Mapped[int] = mapped_column(
@@ -126,8 +126,8 @@ class AdminRecord(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("email", name="uq_admins_email"),
-        UniqueConstraint("token_key", name="uq_admins_token_key"),
+        UniqueConstraint("email", name="uq_superusers_email"),
+        UniqueConstraint("token_key", name="uq_superusers_token_key"),
     )
 
 

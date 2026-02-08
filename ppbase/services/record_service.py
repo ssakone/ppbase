@@ -85,13 +85,11 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
 
 
 def _table_name(collection: CollectionRecord) -> str:
-    # _superusers is a virtual collection backed by the _admins system table
-    if collection.name == "_superusers":
-        return "_admins"
+    # _superusers is now a real table (no longer mapped to _admins)
     return collection.name
 
 
-# Columns from the _admins table that must never be exposed through the API
+# Columns from the _superusers table that must never be exposed through the API
 _SUPERUSERS_HIDDEN_COLUMNS = frozenset({
     "password_hash", "token_key", "last_reset_sent_at",
 })
@@ -261,14 +259,18 @@ async def create_record(
     engine: AsyncEngine,
     collection: CollectionRecord,
     data: dict[str, Any],
+    files: dict[str, list[tuple[str, bytes]]] | None = None,
 ) -> dict[str, Any]:
     """Create a new record in the collection.
 
     Validates all fields, generates an ID, and sets timestamps.
+    Handles file uploads if files dict is provided.
 
     Raises:
         FieldValidationError: If any field fails validation.
     """
+    from ppbase.services.file_storage import save_files
+
     table = _table_name(collection)
     schema_fields = _get_schema_fields(collection)
     hidden = _get_hidden_fields(schema_fields)
@@ -286,6 +288,25 @@ async def create_record(
     }
 
     errors: dict[str, dict[str, str]] = {}
+
+    # Build field map for file handling
+    field_map = {f.name: f for f in schema_fields}
+
+    # Process uploaded files
+    if files:
+        for field_name, file_list in files.items():
+            field_def = field_map.get(field_name)
+            if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            max_select = field_def.options.get("maxSelect", 1) or 1
+            saved_names = save_files(
+                collection.id, record_id, field_name, file_list, max_select
+            )
+            if max_select == 1:
+                data[field_name] = saved_names[0] if saved_names else ""
+            else:
+                data[field_name] = saved_names
+
     for field_def in schema_fields:
         # Skip autodate fields -- we handle created/updated ourselves
         if field_def.type == FieldType.AUTODATE:
@@ -330,14 +351,18 @@ async def update_record(
     collection: CollectionRecord,
     record_id: str,
     data: dict[str, Any],
+    files: dict[str, list[tuple[str, bytes]]] | None = None,
 ) -> dict[str, Any] | None:
     """Update an existing record.
 
     Supports ``field+`` (append) and ``field-`` (remove) modifiers for
     multi-value fields (select, relation, file).
+    Handles file uploads if files dict is provided.
 
     Returns the updated record dict, or None if not found.
     """
+    from ppbase.services.file_storage import save_files
+
     table = _table_name(collection)
     schema_fields = _get_schema_fields(collection)
 
@@ -359,6 +384,26 @@ async def update_record(
     errors: dict[str, dict[str, str]] = {}
 
     field_map = {f.name: f for f in schema_fields}
+
+    # Process uploaded files
+    if files:
+        for field_name, file_list in files.items():
+            field_def = field_map.get(field_name)
+            if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            max_select = field_def.options.get("maxSelect", 1) or 1
+            saved_names = save_files(
+                collection.id, record_id, field_name, file_list, max_select
+            )
+            if max_select == 1:
+                data[field_name] = saved_names[0] if saved_names else ""
+            else:
+                # Append to existing files for multi-file
+                current = raw_row.get(field_name)
+                if isinstance(current, list):
+                    data[field_name] = current + saved_names
+                else:
+                    data[field_name] = saved_names
 
     # Process +/- modifiers and plain field updates
     processed_fields: set[str] = set()

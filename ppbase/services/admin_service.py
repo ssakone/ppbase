@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ppbase.core.id_generator import generate_id
-from ppbase.db.system_tables import AdminRecord
+from ppbase.db.system_tables import SuperuserRecord
 from ppbase.services.auth_service import (
     create_admin_token,
     generate_token_key,
@@ -26,8 +26,8 @@ def _fmt_dt(dt: datetime | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
-def _admin_to_dict(admin: AdminRecord) -> dict[str, Any]:
-    """Serialise an AdminRecord to the API response format."""
+def _admin_to_dict(admin: SuperuserRecord) -> dict[str, Any]:
+    """Serialise an SuperuserRecord to the API response format."""
     return {
         "id": admin.id,
         "created": _fmt_dt(admin.created),
@@ -43,13 +43,13 @@ async def list_admins(
     per_page: int = 30,
 ) -> dict[str, Any]:
     """Return a paginated list of admin records."""
-    count_q = select(func.count()).select_from(AdminRecord)
+    count_q = select(func.count()).select_from(SuperuserRecord)
     total_items = (await session.execute(count_q)).scalar() or 0
     total_pages = max(1, math.ceil(total_items / per_page))
 
     q = (
-        select(AdminRecord)
-        .order_by(AdminRecord.created.desc())
+        select(SuperuserRecord)
+        .order_by(SuperuserRecord.created.desc())
         .offset((page - 1) * per_page)
         .limit(per_page)
     )
@@ -63,14 +63,14 @@ async def list_admins(
     }
 
 
-async def get_admin(session: AsyncSession, admin_id: str) -> AdminRecord | None:
+async def get_admin(session: AsyncSession, admin_id: str) -> SuperuserRecord | None:
     """Fetch a single admin by ID."""
-    return await session.get(AdminRecord, admin_id)
+    return await session.get(SuperuserRecord, admin_id)
 
 
-async def get_admin_by_email(session: AsyncSession, email: str) -> AdminRecord | None:
+async def get_admin_by_email(session: AsyncSession, email: str) -> SuperuserRecord | None:
     """Fetch a single admin by email."""
-    q = select(AdminRecord).where(AdminRecord.email == email)
+    q = select(SuperuserRecord).where(SuperuserRecord.email == email)
     return (await session.execute(q)).scalars().first()
 
 
@@ -79,9 +79,9 @@ async def create_admin(
     email: str,
     password: str,
     avatar: int = 0,
-) -> AdminRecord:
+) -> SuperuserRecord:
     """Create a new admin record."""
-    admin = AdminRecord(
+    admin = SuperuserRecord(
         id=generate_id(),
         email=email,
         password_hash=hash_password(password),
@@ -99,9 +99,9 @@ async def update_admin(
     session: AsyncSession,
     admin_id: str,
     data: dict[str, Any],
-) -> AdminRecord | None:
+) -> SuperuserRecord | None:
     """Update an existing admin record."""
-    admin = await session.get(AdminRecord, admin_id)
+    admin = await session.get(SuperuserRecord, admin_id)
     if admin is None:
         return None
 
@@ -120,12 +120,12 @@ async def update_admin(
 
 async def delete_admin(session: AsyncSession, admin_id: str) -> bool:
     """Delete an admin. Returns False if it's the last admin."""
-    count_q = select(func.count()).select_from(AdminRecord)
+    count_q = select(func.count()).select_from(SuperuserRecord)
     total = (await session.execute(count_q)).scalar() or 0
     if total <= 1:
         return False
 
-    admin = await session.get(AdminRecord, admin_id)
+    admin = await session.get(SuperuserRecord, admin_id)
     if admin is None:
         return False
 
@@ -166,7 +166,7 @@ async def auth_refresh(
         ``{"token": str, "admin": dict}`` on success, or ``None`` if the admin is
         not found.
     """
-    admin = await session.get(AdminRecord, admin_id)
+    admin = await session.get(SuperuserRecord, admin_id)
     if admin is None:
         return None
 

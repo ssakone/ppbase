@@ -45,6 +45,30 @@ class ApiClient {
 
     return data as T
   }
+
+  async requestFormData<T>(method: string, path: string, formData: FormData): Promise<T> {
+    const headers: Record<string, string> = {}
+    const token = this.getToken()
+    if (token) {
+      headers['Authorization'] = token
+    }
+
+    const opts: RequestInit = { method, headers, body: formData }
+
+    const res = await fetch(this.baseUrl + path, opts)
+
+    if (res.status === 204) {
+      return null as T
+    }
+
+    const data = await res.json()
+
+    if (!res.ok) {
+      throw { status: res.status, ...data }
+    }
+
+    return data as T
+  }
 }
 
 export const apiClient = new ApiClient()

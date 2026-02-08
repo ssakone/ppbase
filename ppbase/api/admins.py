@@ -46,6 +46,11 @@ class AdminUpdateBody(BaseModel):
     avatar: int | None = None
 
 
+class ChangePasswordBody(BaseModel):
+    password: str
+    passwordConfirm: str
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -208,3 +213,62 @@ async def delete_admin(
             },
         )
     await session.commit()
+
+
+@router.post("/{admin_id}/change-password")
+async def change_password(
+    admin_id: str,
+    body: ChangePasswordBody,
+    admin_auth: dict = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    """Change an admin's password.
+
+    The caller must provide matching password and passwordConfirm values.
+    After the password is changed, the admin's token_key is rotated, which
+    invalidates all existing sessions.
+    """
+    if body.password != body.passwordConfirm:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "Password and confirmation do not match.",
+                "data": {
+                    "passwordConfirm": {
+                        "code": "validation_values_mismatch",
+                        "message": "Values don't match.",
+                    }
+                },
+            },
+        )
+
+    if len(body.password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "Password must be at least 8 characters.",
+                "data": {
+                    "password": {
+                        "code": "validation_length_out_of_range",
+                        "message": "The length must be at least 8 characters.",
+                    }
+                },
+            },
+        )
+
+    admin = await admin_service.update_admin(
+        session, admin_id, {"password": body.password}
+    )
+    if admin is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": 404,
+                "message": "The requested resource wasn't found.",
+                "data": {},
+            },
+        )
+    await session.commit()
+    return {"message": "Password changed successfully."}
