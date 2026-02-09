@@ -65,11 +65,15 @@ export async function updateRecord(
 ): Promise<RecordModel> {
   const path = '/api/collections/' + encodeURIComponent(collection) + '/records/' + encodeURIComponent(id)
 
+  console.log('[records.ts] updateRecord:', { collection, id, hasFiles: hasFiles(data), data })
+
   if (hasFiles(data)) {
     const formData = buildFormData(data)
+    console.log('[records.ts] Sending FormData, entries:', [...formData.entries()])
     return apiClient.requestFormData<RecordModel>('PATCH', path, formData)
   }
 
+  console.log('[records.ts] Sending JSON:', data)
   return apiClient.request<RecordModel>('PATCH', path, data)
 }
 

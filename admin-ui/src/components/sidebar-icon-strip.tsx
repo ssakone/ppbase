@@ -35,13 +35,16 @@ export function SidebarIconStrip() {
     <TooltipProvider>
       <div className="flex flex-col items-center w-[75px] bg-slate-50 border-r py-4 gap-2">
         {/* Logo */}
-        <div className="mb-4">
+        <button
+          className="mb-4 cursor-pointer"
+          onClick={() => handleNav('collections', '/collections')}
+        >
           <svg width="46" height="46" viewBox="0 0 36 36" fill="none">
             <rect width="36" height="36" rx="8" fill="#4f46e5" />
             <path d="M10 12h8a4 4 0 010 8h-8v-8zm2 2v4h6a2 2 0 000-4h-6z" fill="#fff" />
             <path d="M10 22h8a4 4 0 010 8h-8v-8zm2 2v4h6a2 2 0 000-4h-6z" fill="#fff" opacity="0.6" />
           </svg>
-        </div>
+        </button>
 
         {/* Collections */}
         <Tooltip>

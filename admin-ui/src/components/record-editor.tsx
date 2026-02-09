@@ -89,10 +89,12 @@ export function RecordEditor({
   }, [existingRecord, duplicateData, isEditing, fields])
 
   const handleFieldChange = (fieldName: string, value: unknown) => {
+    console.log('[RecordEditor] handleFieldChange:', fieldName, value)
     setFormData((prev) => ({ ...prev, [fieldName]: value }))
   }
 
   const handleSave = async () => {
+    console.log('[RecordEditor] handleSave formData:', JSON.stringify(formData, (k, v) => v instanceof File ? `[File: ${v.name}]` : v, 2))
     try {
       if (isEditing) {
         await updateMutation.mutateAsync({ id: recordId!, data: formData })
@@ -224,6 +226,8 @@ export function RecordEditor({
                     value={formData[field.name]}
                     onChange={(value) => handleFieldChange(field.name, value)}
                     collections={collections}
+                    recordId={existingRecord?.id}
+                    collectionId={collection.id}
                   />
                 ))}
                 {fields.length === 0 && (

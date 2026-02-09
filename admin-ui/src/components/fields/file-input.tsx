@@ -1,8 +1,9 @@
-import { useRef, useState } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Upload, X, FileIcon, ImageIcon } from 'lucide-react'
 import type { FieldInputProps } from '@/components/record-field-input'
+import { ImagePreview } from '@/components/ui/image-preview'
 
 interface FileData {
   name: string
@@ -10,7 +11,7 @@ interface FileData {
   file?: File
 }
 
-export function FileInput({ field, value, onChange }: FieldInputProps) {
+export function FileInput({ field, value, onChange, collectionId, recordId }: FieldInputProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const maxSelect = field.options?.maxSelect ?? field.maxSelect ?? 1
   const isMultiple = maxSelect > 1
@@ -33,6 +34,10 @@ export function FileInput({ field, value, onChange }: FieldInputProps) {
 
   const [files, setFiles] = useState<FileData[]>(parseValue)
   const [pendingFiles, setPendingFiles] = useState<File[]>([])
+
+  useEffect(() => {
+    setFiles(parseValue())
+  }, [value])
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(e.target.files || [])
@@ -65,11 +70,21 @@ export function FileInput({ field, value, onChange }: FieldInputProps) {
     }
 
     if (isMultiple) {
-      // Add to existing files
-      const newFiles = [...pendingFiles, ...selected]
+      // Limit to maxSelect
+      const remaining = maxSelect - files.length
+      if (remaining <= 0) {
+        alert(`Maximum of ${maxSelect} files allowed.`)
+        return
+      }
+      const toAdd = selected.slice(0, remaining)
+      if (toAdd.length < selected.length) {
+        alert(`Only ${remaining} more file(s) allowed. ${selected.length - toAdd.length} file(s) were ignored.`)
+      }
+
+      const newFiles = [...pendingFiles, ...toAdd]
       const allFileData = [
         ...files,
-        ...selected.map((f) => ({ name: f.name, isNew: true, file: f })),
+        ...toAdd.map((f) => ({ name: f.name, isNew: true, file: f })),
       ]
       setPendingFiles(newFiles)
       setFiles(allFileData)
@@ -89,6 +104,7 @@ export function FileInput({ field, value, onChange }: FieldInputProps) {
 
   const handleRemove = (index: number) => {
     const removed = files[index]
+    console.log('[FileInput] handleRemove:', { removed, isNew: removed.isNew })
     const newFiles = files.filter((_, i) => i !== index)
     setFiles(newFiles)
 
@@ -98,9 +114,11 @@ export function FileInput({ field, value, onChange }: FieldInputProps) {
       setPendingFiles(newPending)
     }
 
-    // Update value - include deletion marker for existing files
+    // Update value - send empty string when all files removed so backend can delete them
     const newValue = newFiles.map((f) => f.file || f.name)
-    onChange(newValue.length > 0 ? newValue : null)
+    const finalValue = newValue.length > 0 ? newValue : ''
+    console.log('[FileInput] onChange called with:', finalValue)
+    onChange(finalValue)
   }
 
   const isImage = (filename: string) => {
@@ -116,31 +134,54 @@ export function FileInput({ field, value, onChange }: FieldInputProps) {
 
       {/* File list */}
       {files.length > 0 && (
-        <div className="space-y-1">
+        <div className="space-y-2">
           {files.map((file, index) => (
             <div
               key={`${file.name}-${index}`}
-              className="flex items-center gap-2 p-2 bg-muted rounded-md group"
+              className="flex items-center gap-3 p-2 bg-muted rounded-md group relative"
             >
-              {isImage(file.name) ? (
-                <ImageIcon className="h-4 w-4 text-muted-foreground shrink-0" />
-              ) : (
-                <FileIcon className="h-4 w-4 text-muted-foreground shrink-0" />
-              )}
+              {/* Preview Thumbnail */}
+              <div className="h-10 w-10 shrink-0 overflow-hidden rounded bg-background border flex items-center justify-center relative">
+                {file.isNew && file.file && isImage(file.name) ? (
+                  <img
+                    src={URL.createObjectURL(file.file)}
+                    alt={file.name}
+                    className="h-full w-full object-cover"
+                    onLoad={(e) => URL.revokeObjectURL(e.currentTarget.src)}
+                  />
+                ) : !file.isNew && collectionId && recordId && isImage(file.name) ? (
+                  <div className="absolute inset-0 p-0.5">
+                    <ImagePreview
+                      collectionId={collectionId}
+                      recordId={recordId}
+                      files={file.name}
+                      className="h-full w-full"
+                      size="fill"
+                    />
+                  </div>
+                ) : isImage(file.name) ? (
+                  <ImageIcon className="h-5 w-5 text-muted-foreground" />
+                ) : (
+                  <FileIcon className="h-5 w-5 text-muted-foreground" />
+                )}
+              </div>
+
               <span className="text-sm truncate flex-1">{file.name}</span>
+
               {file.isNew && (
                 <span className="text-xs text-blue-600 bg-blue-100 px-1.5 py-0.5 rounded">
                   New
                 </span>
               )}
+
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
                 onClick={() => handleRemove(index)}
               >
-                <X className="h-3 w-3" />
+                <X className="h-4 w-4" />
               </Button>
             </div>
           ))}
@@ -148,27 +189,29 @@ export function FileInput({ field, value, onChange }: FieldInputProps) {
       )}
 
       {/* Upload button */}
-      {(isMultiple || files.length === 0) && (
-        <div>
-          <input
-            ref={inputRef}
-            type="file"
-            multiple={isMultiple}
-            accept={mimeTypes.length > 0 ? mimeTypes.join(',') : undefined}
-            className="hidden"
-            onChange={handleFileSelect}
-          />
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => inputRef.current?.click()}
-          >
-            <Upload className="h-4 w-4 mr-2" />
-            {isMultiple ? 'Add files' : 'Choose file'}
-          </Button>
-        </div>
-      )}
+      <div>
+        <input
+          ref={inputRef}
+          type="file"
+          multiple={isMultiple}
+          accept={mimeTypes.length > 0 ? mimeTypes.join(',') : undefined}
+          className="hidden"
+          onChange={handleFileSelect}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => inputRef.current?.click()}
+        >
+          <Upload className="h-4 w-4 mr-2" />
+          {isMultiple
+            ? 'Add files'
+            : files.length > 0
+              ? 'Change file'
+              : 'Choose file'}
+        </Button>
+      </div>
 
       {/* Hints */}
       <div className="text-xs text-muted-foreground space-y-0.5">

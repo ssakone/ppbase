@@ -14,6 +14,7 @@ import {
 import type { Collection, Field, RecordModel, PaginatedResult } from '@/api/types'
 import { formatCellValue } from '@/lib/format-cell'
 import { formatDate, truncateId } from '@/lib/utils'
+import { ImagePreview } from '@/components/ui/image-preview'
 
 interface RecordsTableProps {
   collection: Collection
@@ -144,7 +145,15 @@ export function RecordsTable({
                   </TableCell>
                   {fields.map((f) => (
                     <TableCell key={f.name} className="max-w-[200px] truncate">
-                      {formatCellValue(record[f.name], f)}
+                      {f.type === 'file' ? (
+                        <ImagePreview
+                          collectionId={collection.id}
+                          recordId={record.id}
+                          files={record[f.name] as string | string[]}
+                        />
+                      ) : (
+                        formatCellValue(record[f.name], f)
+                      )}
                     </TableCell>
                   ))}
                   <TableCell className="text-xs text-muted-foreground">
