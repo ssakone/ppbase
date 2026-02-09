@@ -8,6 +8,7 @@ Supports the following commands:
     ppbase status         -- Check if PPBase is running
     ppbase db {start|stop|restart|status}  -- Manage PostgreSQL Docker container
     ppbase create-admin   -- Interactively create an admin account
+    ppbase migrate {up|down|status|create|snapshot}  -- Manage migrations
 """
 
 from __future__ import annotations
@@ -131,6 +132,8 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     overrides: dict = {}
     if args.db:
         overrides["database_url"] = args.db
+    if args.automigrate is not None:
+        overrides["auto_migrate"] = args.automigrate
 
     pb = PPBase(**overrides)
     host = args.host or pb.settings.host
@@ -251,7 +254,7 @@ def _cmd_db(args: argparse.Namespace) -> None:
                 "-e", f"POSTGRES_DB={_PG_DB}",
                 "-e", f"POSTGRES_USER={_PG_USER}",
                 "-e", f"POSTGRES_PASSWORD={_PG_PASSWORD}",
-                "-p", f"{_PG_PORT}:5432",
+                "-p", f"{_PG_PORT}:5433",
                 _PG_IMAGE,
             ], capture_output=True, text=True)
             if r.returncode != 0:
@@ -324,6 +327,232 @@ def _cmd_create_admin(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Migrate commands
+# ---------------------------------------------------------------------------
+
+
+def _cmd_migrate(args: argparse.Namespace) -> None:
+    """Dispatch migrate sub-subcommands."""
+    action = args.action
+
+    if action is None:
+        print("Usage: ppbase migrate {up|down|status|create|snapshot}")
+        print("Run 'ppbase migrate -h' for more information.")
+        sys.exit(1)
+
+    if action == "create":
+        _cmd_migrate_create(args)
+        return
+
+    dispatch = {
+        "up": _cmd_migrate_up_async,
+        "down": _cmd_migrate_down_async,
+        "status": _cmd_migrate_status_async,
+        "snapshot": _cmd_migrate_snapshot_async,
+    }
+    handler = dispatch.get(action)
+    if handler is None:
+        print(f"Unknown migrate action: {action}", file=sys.stderr)
+        sys.exit(1)
+    asyncio.run(handler(args))
+
+
+def _cmd_migrate_create(args: argparse.Namespace) -> None:
+    """Create a blank migration skeleton (no DB connection needed)."""
+    migrations_dir = args.dir
+    name = args.name
+
+    ts = int(time.time())
+    filename = f"{ts}_{name}.py"
+    dirpath = Path(migrations_dir)
+    dirpath.mkdir(parents=True, exist_ok=True)
+    filepath = dirpath / filename
+
+    filepath.write_text(
+        '"""Auto-generated migration."""\n'
+        "\n"
+        "\n"
+        "async def up(app):\n"
+        '    """Apply migration."""\n'
+        "    pass\n"
+        "\n"
+        "\n"
+        "async def down(app):\n"
+        '    """Revert migration."""\n'
+        "    pass\n"
+    )
+    print(f"Created migration: {filepath}")
+
+
+async def _cmd_migrate_up_async(args: argparse.Namespace) -> None:
+    """Apply all pending migrations."""
+    from ppbase.config import Settings
+    from ppbase.db.engine import init_engine, close_engine
+    from ppbase.db.system_tables import create_system_tables
+    from ppbase.services.migration_runner import apply_all_pending
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    settings = Settings()
+    db_url = args.db or settings.database_url
+    migrations_dir = args.dir
+
+    engine = await init_engine(db_url)
+    try:
+        await create_system_tables(engine)
+        session_factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with session_factory() as session:
+            async with session.begin():
+                applied = await apply_all_pending(session, engine, migrations_dir)
+            if not applied:
+                print("No pending migrations.")
+            else:
+                for name in applied:
+                    print(f"  Applied: {name}")
+                print(f"\n{len(applied)} migration(s) applied.")
+    finally:
+        await close_engine()
+
+
+async def _cmd_migrate_down_async(args: argparse.Namespace) -> None:
+    """Revert the last N migrations."""
+    from ppbase.config import Settings
+    from ppbase.db.engine import init_engine, close_engine
+    from ppbase.db.system_tables import create_system_tables
+    from ppbase.services.migration_runner import (
+        get_applied_migrations,
+        revert_migration,
+    )
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    settings = Settings()
+    db_url = args.db or settings.database_url
+    migrations_dir = args.dir
+    count = args.count
+
+    engine = await init_engine(db_url)
+    try:
+        await create_system_tables(engine)
+        session_factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with session_factory() as session:
+            async with session.begin():
+                applied = await get_applied_migrations(session)
+                if not applied:
+                    print("No applied migrations to revert.")
+                    return
+
+                to_revert = list(reversed(applied[-count:]))
+                for record in to_revert:
+                    await revert_migration(
+                        session, engine, record.file, migrations_dir,
+                    )
+                    print(f"  Reverted: {record.file}")
+
+        print(f"\n{len(to_revert)} migration(s) reverted.")
+    finally:
+        await close_engine()
+
+
+async def _cmd_migrate_status_async(args: argparse.Namespace) -> None:
+    """Show migration status."""
+    from ppbase.config import Settings
+    from ppbase.db.engine import init_engine, close_engine
+    from ppbase.db.system_tables import create_system_tables
+    from ppbase.services.migration_runner import get_migration_status
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    settings = Settings()
+    db_url = args.db or settings.database_url
+    migrations_dir = args.dir
+
+    engine = await init_engine(db_url)
+    try:
+        await create_system_tables(engine)
+        session_factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with session_factory() as session:
+            status = await get_migration_status(session, migrations_dir)
+
+        total = status.get("total", 0)
+        applied_count = len(status.get("applied", []))
+        pending_count = len(status.get("pending", []))
+
+        print(f"Migration status ({migrations_dir}):")
+        print(f"  Total:   {total}")
+        print(f"  Applied: {applied_count}")
+        print(f"  Pending: {pending_count}")
+
+        if status.get("applied"):
+            print("\nApplied migrations:")
+            for m in status["applied"]:
+                print(f"  [x] {m}")
+
+        if status.get("pending"):
+            print("\nPending migrations:")
+            for m in status["pending"]:
+                print(f"  [ ] {m}")
+
+        if total == 0:
+            print(f"\nNo migration files found in {migrations_dir}")
+    finally:
+        await close_engine()
+
+
+async def _cmd_migrate_snapshot_async(args: argparse.Namespace) -> None:
+    """Generate migrations from the current database state."""
+    from ppbase.config import Settings
+    from ppbase.db.engine import init_engine, close_engine
+    from ppbase.db.system_tables import (
+        CollectionRecord,
+        MigrationRecord,
+        create_system_tables,
+    )
+    from ppbase.services.migration_generator import generate_create_migration
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    settings = Settings()
+    db_url = args.db or settings.database_url
+    migrations_dir = args.dir
+
+    engine = await init_engine(db_url)
+    try:
+        await create_system_tables(engine)
+        session_factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with session_factory() as session:
+            result = await session.execute(select(CollectionRecord))
+            collections = result.scalars().all()
+
+            if not collections:
+                print("No collections found in the database.")
+                return
+
+            generated = []
+            for coll in collections:
+                filepath = generate_create_migration(coll, migrations_dir)
+                filename = Path(filepath).name
+                # Record the migration as applied so it doesn't re-run
+                record = MigrationRecord(file=filename)
+                session.add(record)
+                generated.append(filepath)
+                print(f"  Generated: {filepath}")
+                # Small delay so timestamps differ between files
+                time.sleep(1)
+
+            await session.commit()
+
+        print(f"\n{len(generated)} migration(s) generated and recorded as applied.")
+    finally:
+        await close_engine()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -342,6 +571,12 @@ def main() -> None:
     serve_parser.add_argument("--port", type=int, default=None)
     serve_parser.add_argument("--db", type=str, default=None, help="Database URL")
     serve_parser.add_argument("-d", "--daemon", action="store_true", help="Run in background")
+    serve_parser.add_argument(
+        "--automigrate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable auto-migration (default: from settings)",
+    )
 
     # stop
     subparsers.add_parser("stop", help="Stop a running PPBase daemon")
@@ -365,6 +600,51 @@ def main() -> None:
     admin_parser.add_argument("--password", type=str, default=None)
     admin_parser.add_argument("--db", type=str, default=None, help="Database URL")
 
+    # migrate
+    migrate_parser = subparsers.add_parser("migrate", help="Manage database migrations")
+    migrate_subs = migrate_parser.add_subparsers(dest="action")
+
+    # migrate up
+    migrate_up = migrate_subs.add_parser("up", help="Apply all pending migrations")
+    migrate_up.add_argument("--db", type=str, default=None, help="Database URL")
+    migrate_up.add_argument(
+        "--dir", type=str, default="./pb_migrations", help="Migrations directory",
+    )
+
+    # migrate down
+    migrate_down = migrate_subs.add_parser("down", help="Revert the last N migrations")
+    migrate_down.add_argument(
+        "count", nargs="?", type=int, default=1,
+        help="Number of migrations to revert (default: 1)",
+    )
+    migrate_down.add_argument("--db", type=str, default=None, help="Database URL")
+    migrate_down.add_argument(
+        "--dir", type=str, default="./pb_migrations", help="Migrations directory",
+    )
+
+    # migrate status
+    migrate_st = migrate_subs.add_parser("status", help="Show migration status")
+    migrate_st.add_argument("--db", type=str, default=None, help="Database URL")
+    migrate_st.add_argument(
+        "--dir", type=str, default="./pb_migrations", help="Migrations directory",
+    )
+
+    # migrate create
+    migrate_cr = migrate_subs.add_parser("create", help="Create a blank migration file")
+    migrate_cr.add_argument("name", type=str, help="Migration name (e.g. add_users_table)")
+    migrate_cr.add_argument(
+        "--dir", type=str, default="./pb_migrations", help="Migrations directory",
+    )
+
+    # migrate snapshot
+    migrate_snap = migrate_subs.add_parser(
+        "snapshot", help="Generate migrations from current DB state",
+    )
+    migrate_snap.add_argument("--db", type=str, default=None, help="Database URL")
+    migrate_snap.add_argument(
+        "--dir", type=str, default="./pb_migrations", help="Migrations directory",
+    )
+
     args = parser.parse_args()
 
     commands = {
@@ -374,6 +654,7 @@ def main() -> None:
         "status": _cmd_status,
         "db": _cmd_db,
         "create-admin": _cmd_create_admin,
+        "migrate": _cmd_migrate,
     }
 
     handler = commands.get(args.command)

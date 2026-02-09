@@ -14,7 +14,7 @@ PPBase est une reimplementation de [PocketBase](https://pocketbase.io/) en Pytho
 ```python
 from ppbase import PPBase
 
-app = PPBase(database_url="postgresql+asyncpg://localhost:5432/ppbase")
+app = PPBase(database_url="postgresql+asyncpg://localhost:5433/ppbase")
 app.start(host="0.0.0.0", port=8090)
 ```
 
@@ -347,10 +347,10 @@ docker run -d --name ppbase-pg \
   -e POSTGRES_DB=ppbase \
   -e POSTGRES_USER=ppbase \
   -e POSTGRES_PASSWORD=ppbase \
-  -p 5432:5432 postgres:17
+  -p 5433:5433 postgres:17
 
 # 4. Lancer PPBase
-ppbase serve --db postgresql+asyncpg://ppbase:ppbase@localhost:5432/ppbase
+ppbase serve --db postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase
 
 # 5. Lancer les tests
 pytest tests/ -v

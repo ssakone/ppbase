@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from ppbase.db.engine import get_async_session, get_engine
@@ -66,6 +66,17 @@ def _get_engine() -> AsyncEngine:
     return get_engine()
 
 
+def _get_migration_kwargs(request: Request) -> dict[str, Any]:
+    """Extract auto_migrate and migrations_dir from app settings."""
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None:
+        return {"auto_migrate": False, "migrations_dir": None}
+    return {
+        "auto_migrate": getattr(settings, "auto_migrate", False),
+        "migrations_dir": getattr(settings, "migrations_dir", None),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -93,6 +104,7 @@ async def list_collections(
 
 @router.post("", status_code=200)
 async def create_collection(
+    request: Request,
     data: CollectionCreate,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
@@ -100,7 +112,9 @@ async def create_collection(
 ) -> dict[str, Any]:
     """Create a new collection."""
     try:
-        result = await collection_service.create_collection(session, engine, data)
+        result = await collection_service.create_collection(
+            session, engine, data, **_get_migration_kwargs(request)
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -154,6 +168,7 @@ async def view_collection(
 
 @router.patch("/{idOrName}")
 async def update_collection(
+    request: Request,
     idOrName: str,
     data: CollectionUpdate,
     session: AsyncSession = Depends(_get_session),
@@ -163,7 +178,7 @@ async def update_collection(
     """Update an existing collection."""
     try:
         result = await collection_service.update_collection(
-            session, engine, idOrName, data
+            session, engine, idOrName, data, **_get_migration_kwargs(request)
         )
     except LookupError:
         raise HTTPException(
@@ -188,6 +203,7 @@ async def update_collection(
 
 @router.delete("/{idOrName}", status_code=204)
 async def delete_collection(
+    request: Request,
     idOrName: str,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
@@ -195,7 +211,9 @@ async def delete_collection(
 ) -> None:
     """Delete a collection."""
     try:
-        await collection_service.delete_collection(session, engine, idOrName)
+        await collection_service.delete_collection(
+            session, engine, idOrName, **_get_migration_kwargs(request)
+        )
     except LookupError:
         raise HTTPException(
             status_code=404,
@@ -218,6 +236,7 @@ async def delete_collection(
 
 @router.put("/import", status_code=204)
 async def import_collections(
+    request: Request,
     payload: CollectionImportPayload,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
@@ -230,6 +249,7 @@ async def import_collections(
             engine,
             payload.collections,
             delete_missing=payload.deleteMissing,
+            **_get_migration_kwargs(request),
         )
     except ValueError as exc:
         raise HTTPException(

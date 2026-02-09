@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     """
 
     # ---- Database ----
-    database_url: str = "postgresql+asyncpg://localhost:5432/ppbase"
+    database_url: str = "postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase"
     pool_size: int = 10
     max_overflow: int = 20
 
@@ -48,6 +48,10 @@ class Settings(BaseSettings):
 
     # ---- CORS ----
     origins: list[str] = ["*"]
+
+    # ---- Migrations ----
+    auto_migrate: bool = True
+    migrations_dir: str = "./pb_migrations"
 
     # ---- Misc ----
     log_level: str = "INFO"

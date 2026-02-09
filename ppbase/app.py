@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -9,6 +11,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from ppbase.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -27,6 +31,35 @@ async def _lifespan(app: FastAPI):
         echo=settings.dev,
     )
     await create_system_tables(engine)
+
+    # Apply pending migrations if auto_migrate is enabled
+    if settings.auto_migrate:
+        from ppbase.services.migration_runner import apply_all_pending
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        migrations_dir = settings.migrations_dir
+        os.makedirs(migrations_dir, exist_ok=True)
+
+        session_factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with session_factory() as session:
+            try:
+                async with session.begin():
+                    applied = await apply_all_pending(session, engine, migrations_dir)
+                if applied:
+                    logger.info(
+                        "Applied %d pending migration(s) on startup", len(applied)
+                    )
+                else:
+                    logger.debug("No pending migrations to apply")
+            except Exception as exc:
+                logger.error(
+                    "Migration failed during startup: %s", exc
+                )
+                raise
+    else:
+        logger.info("Auto-migrate disabled, skipping migration check")
 
     yield
 
