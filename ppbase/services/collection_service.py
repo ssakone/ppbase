@@ -47,7 +47,6 @@ _RESERVED_NAMES = frozenset({
     "collectionId",
     "collectionName",
     "_collections",
-    "_admins",
     "_params",
     "_external_auths",
     "_superusers",

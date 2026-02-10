@@ -1,7 +1,11 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { MoreVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Sheet,
   SheetContent,
@@ -16,6 +20,7 @@ import { RecordActionsMenu } from '@/components/record-actions-menu'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { useRecord, useCreateRecord, useUpdateRecord, useDeleteRecord } from '@/hooks/use-records'
 import { useCollections } from '@/hooks/use-collections'
+import { changeAdminPassword } from '@/api/endpoints/admins'
 import type { Collection, Field, RecordModel } from '@/api/types'
 
 interface RecordEditorProps {
@@ -37,6 +42,7 @@ export function RecordEditor({
   recordId,
   duplicateData,
 }: RecordEditorProps) {
+  const navigate = useNavigate()
   const isEditing = !!recordId
   const fields = getFields(collection)
   const { data: collections } = useCollections()
@@ -51,6 +57,13 @@ export function RecordEditor({
 
   const [formData, setFormData] = useState<Record<string, unknown>>({})
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+
+  // Password change state for _superusers collection
+  const isSuperusersCollection = collection.name === '_superusers'
+  const [changePassword, setChangePassword] = useState(false)
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [isChangingPassword, setIsChangingPassword] = useState(false)
 
   // Initialize form data
   useEffect(() => {
@@ -76,10 +89,12 @@ export function RecordEditor({
   }, [existingRecord, duplicateData, isEditing, fields])
 
   const handleFieldChange = (fieldName: string, value: unknown) => {
+    console.log('[RecordEditor] handleFieldChange:', fieldName, value)
     setFormData((prev) => ({ ...prev, [fieldName]: value }))
   }
 
   const handleSave = async () => {
+    console.log('[RecordEditor] handleSave formData:', JSON.stringify(formData, (k, v) => v instanceof File ? `[File: ${v.name}]` : v, 2))
     try {
       if (isEditing) {
         await updateMutation.mutateAsync({ id: recordId!, data: formData })
@@ -95,6 +110,40 @@ export function RecordEditor({
           ? String((err as { message: string }).message)
           : 'Failed to save record'
       toast.error(message)
+    }
+  }
+
+  const handlePasswordChange = async () => {
+    if (!recordId) return
+    if (newPassword !== confirmPassword) {
+      toast.error('Passwords do not match')
+      return
+    }
+    if (newPassword.length < 8) {
+      toast.error('Password must be at least 8 characters')
+      return
+    }
+
+    setIsChangingPassword(true)
+    try {
+      await changeAdminPassword(recordId, {
+        password: newPassword,
+        passwordConfirm: confirmPassword,
+      })
+      toast.success('Password changed successfully. Please log in again.')
+      // Clear auth and redirect to login
+      localStorage.removeItem('ppbase_token')
+      localStorage.removeItem('ppbase_admin')
+      onClose()
+      navigate('/login')
+    } catch (err: unknown) {
+      const message =
+        err && typeof err === 'object' && 'message' in err
+          ? String((err as { message: string }).message)
+          : 'Failed to change password'
+      toast.error(message)
+    } finally {
+      setIsChangingPassword(false)
     }
   }
 
@@ -137,7 +186,7 @@ export function RecordEditor({
   return (
     <>
       <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
-        <SheetContent className="sm:max-w-lg flex flex-col overflow-hidden">
+        <SheetContent className="sm:max-w-[700px] flex flex-col overflow-hidden">
           <SheetHeader className="shrink-0 px-6 pt-6 pb-4">
             <div className="flex items-center justify-between pr-8">
               <SheetTitle>{title}</SheetTitle>
@@ -177,12 +226,72 @@ export function RecordEditor({
                     value={formData[field.name]}
                     onChange={(value) => handleFieldChange(field.name, value)}
                     collections={collections}
+                    recordId={existingRecord?.id}
+                    collectionId={collection.id}
                   />
                 ))}
                 {fields.length === 0 && (
                   <p className="text-sm text-muted-foreground py-4">
                     This collection has no editable fields.
                   </p>
+                )}
+
+                {/* Password change section for _superusers */}
+                {isSuperusersCollection && isEditing && (
+                  <div className="border-t pt-4 mt-4 space-y-4">
+                    <div className="flex items-center gap-3">
+                      <Checkbox
+                        id="change-password-toggle"
+                        checked={changePassword}
+                        onCheckedChange={(checked) => {
+                          setChangePassword(!!checked)
+                          if (!checked) {
+                            setNewPassword('')
+                            setConfirmPassword('')
+                          }
+                        }}
+                      />
+                      <Label htmlFor="change-password-toggle" className="cursor-pointer font-medium">
+                        Change password
+                      </Label>
+                    </div>
+
+                    {changePassword && (
+                      <div className="flex gap-4">
+                        <div className="flex-1 space-y-1.5">
+                          <Label htmlFor="new-password">New Password *</Label>
+                          <Input
+                            id="new-password"
+                            type="password"
+                            placeholder="Min. 8 characters"
+                            value={newPassword}
+                            onChange={(e) => setNewPassword(e.target.value)}
+                          />
+                        </div>
+                        <div className="flex-1 space-y-1.5">
+                          <Label htmlFor="confirm-password">Confirm Password *</Label>
+                          <Input
+                            id="confirm-password"
+                            type="password"
+                            placeholder="Confirm password"
+                            value={confirmPassword}
+                            onChange={(e) => setConfirmPassword(e.target.value)}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {changePassword && (
+                      <Button
+                        onClick={handlePasswordChange}
+                        disabled={isChangingPassword || !newPassword || !confirmPassword}
+                        variant="destructive"
+                      >
+                        {isChangingPassword && <LoadingSpinner size="sm" className="mr-2" />}
+                        Change Password
+                      </Button>
+                    )}
+                  </div>
                 )}
               </div>
             )}

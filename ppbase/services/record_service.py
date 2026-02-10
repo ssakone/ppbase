@@ -85,7 +85,14 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
 
 
 def _table_name(collection: CollectionRecord) -> str:
+    # _superusers is now a real table (no longer mapped to _admins)
     return collection.name
+
+
+# Columns from the _superusers table that must never be exposed through the API
+_SUPERUSERS_HIDDEN_COLUMNS = frozenset({
+    "password_hash", "token_key", "last_reset_sent_at",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +196,10 @@ async def list_records(
             if _attempt > 0:
                 raise
 
+    # Strip sensitive columns for _superusers (backed by _admins table)
+    if collection.name == "_superusers":
+        rows = [{k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS} for row in rows]
+
     items = [
         build_record_response(
             row, collection.id, collection.name, collection.schema or [],
@@ -227,8 +238,14 @@ async def get_record(
     if row is None:
         return None
 
+    row_dict = dict(row)
+
+    # Strip sensitive columns for _superusers (backed by _admins table)
+    if collection.name == "_superusers":
+        row_dict = {k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
+
     return build_record_response(
-        dict(row), collection.id, collection.name, collection.schema or [],
+        row_dict, collection.id, collection.name, collection.schema or [],
         fields_filter=ff, hidden_fields=hidden,
     )
 
@@ -242,14 +259,18 @@ async def create_record(
     engine: AsyncEngine,
     collection: CollectionRecord,
     data: dict[str, Any],
+    files: dict[str, list[tuple[str, bytes]]] | None = None,
 ) -> dict[str, Any]:
     """Create a new record in the collection.
 
     Validates all fields, generates an ID, and sets timestamps.
+    Handles file uploads if files dict is provided.
 
     Raises:
         FieldValidationError: If any field fails validation.
     """
+    from ppbase.services.file_storage import save_files
+
     table = _table_name(collection)
     schema_fields = _get_schema_fields(collection)
     hidden = _get_hidden_fields(schema_fields)
@@ -267,6 +288,25 @@ async def create_record(
     }
 
     errors: dict[str, dict[str, str]] = {}
+
+    # Build field map for file handling
+    field_map = {f.name: f for f in schema_fields}
+
+    # Process uploaded files
+    if files:
+        for field_name, file_list in files.items():
+            field_def = field_map.get(field_name)
+            if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            max_select = field_def.options.get("maxSelect", 1) or 1
+            saved_names = save_files(
+                collection.id, record_id, field_name, file_list, max_select
+            )
+            if max_select == 1:
+                data[field_name] = saved_names[0] if saved_names else ""
+            else:
+                data[field_name] = saved_names
+
     for field_def in schema_fields:
         # Skip autodate fields -- we handle created/updated ourselves
         if field_def.type == FieldType.AUTODATE:
@@ -311,14 +351,18 @@ async def update_record(
     collection: CollectionRecord,
     record_id: str,
     data: dict[str, Any],
+    files: dict[str, list[tuple[str, bytes]]] | None = None,
 ) -> dict[str, Any] | None:
     """Update an existing record.
 
     Supports ``field+`` (append) and ``field-`` (remove) modifiers for
     multi-value fields (select, relation, file).
+    Handles file uploads if files dict is provided.
 
     Returns the updated record dict, or None if not found.
     """
+    from ppbase.services.file_storage import delete_files, save_files
+
     table = _table_name(collection)
     schema_fields = _get_schema_fields(collection)
 
@@ -340,6 +384,33 @@ async def update_record(
     errors: dict[str, dict[str, str]] = {}
 
     field_map = {f.name: f for f in schema_fields}
+
+    print(f"[DEBUG] update_record called: record_id={record_id}")
+    print(f"[DEBUG] data keys: {list(data.keys())}, data values: {data}")
+    print(f"[DEBUG] files keys: {list(files.keys()) if files else []}")
+
+    # Process uploaded files
+    if files:
+        for field_name, file_list in files.items():
+            field_def = field_map.get(field_name)
+            if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            max_select = field_def.options.get("maxSelect", 1) or 1
+            saved_names = save_files(
+                collection.id, record_id, field_name, file_list, max_select
+            )
+            if max_select == 1:
+                data[field_name] = saved_names[0] if saved_names else ""
+            else:
+                # Append to existing files for multi-file
+                current = raw_row.get(field_name)
+                if isinstance(current, list):
+                    data[field_name] = current + saved_names
+                else:
+                    data[field_name] = saved_names
+
+    # Track file fields that need cleanup after update
+    files_to_delete: list[str] = []
 
     # Process +/- modifiers and plain field updates
     processed_fields: set[str] = set()
@@ -376,6 +447,11 @@ async def update_record(
         elif modifier == "-":
             current = raw_row.get(field_name)
             reduced = _apply_remove(current, value, field_def)
+            # For file fields, track the removed filenames for disk cleanup
+            if field_def.type == FieldType.FILE:
+                cur_set = set(str(v) for v in (current if isinstance(current, list) else [current]) if v)
+                new_set = set(str(v) for v in (reduced if isinstance(reduced, list) else [reduced]) if v)
+                files_to_delete.extend(cur_set - new_set)
             try:
                 validated = validate_field_value(field_def, reduced)
                 updates[field_name] = _serialize_for_pg(validated, field_def)
@@ -383,6 +459,25 @@ async def update_record(
                 errors[exc.field_name] = {"code": exc.code, "message": exc.message}
 
         else:
+            # For file fields, detect removed files
+            if field_def.type == FieldType.FILE:
+                old_val = raw_row.get(field_name)
+                old_files: set[str] = set()
+                if isinstance(old_val, list):
+                    old_files = {str(v) for v in old_val if v}
+                elif old_val:
+                    old_files = {str(old_val)}
+
+                new_files: set[str] = set()
+                if isinstance(value, list):
+                    new_files = {str(v) for v in value if v}
+                elif value:
+                    new_files = {str(value)}
+
+                removed = old_files - new_files
+                print(f"[DEBUG] File field '{field_name}': old_val={old_val}, old_files={old_files}, new_files={new_files}, removed={removed}")
+                files_to_delete.extend(removed)
+
             try:
                 validated = validate_field_value(field_def, value)
                 updates[field_name] = _serialize_for_pg(validated, field_def)
@@ -403,6 +498,12 @@ async def update_record(
 
     async with engine.begin() as conn:
         await conn.execute(text(update_sql), params)
+
+    # Delete removed files from disk
+    print(f"[DEBUG] files_to_delete: {files_to_delete}")
+    if files_to_delete:
+        print(f"[DEBUG] Calling delete_files for record {record_id}: {files_to_delete}")
+        delete_files(collection.id, record_id, files_to_delete)
 
     return await get_record(engine, collection, record_id)
 
@@ -463,9 +564,12 @@ async def delete_record(
     """Delete a record by ID.
 
     Handles cascade deletes for relation fields when configured.
+    Deletes associated files from disk.
 
     Returns True if a record was deleted, False if not found.
     """
+    from ppbase.services.file_storage import delete_all_files
+
     table = _table_name(collection)
 
     # Check existence
@@ -485,6 +589,9 @@ async def delete_record(
     delete_sql = f'DELETE FROM "{table}" WHERE "id" = :id'
     async with engine.begin() as conn:
         await conn.execute(text(delete_sql), {"id": record_id})
+
+    # Delete all associated files from disk
+    delete_all_files(collection.id, record_id)
 
     return True
 

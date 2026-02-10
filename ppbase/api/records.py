@@ -120,16 +120,48 @@ async def api_create_record(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
-    try:
-        data = await request.json()
-    except Exception:
-        return _error_response(400, "Invalid JSON body.")
+    # _superusers records are managed via the admin auth API, not here
+    if collection.name == "_superusers":
+        return _error_response(
+            400,
+            "You cannot create _superusers records via the records API. "
+            "Use the admin auth endpoints instead.",
+        )
+
+    # Parse body - support both JSON and multipart/form-data
+    content_type = request.headers.get("content-type", "")
+    data: dict[str, Any] = {}
+    files: dict[str, list[tuple[str, bytes]]] = {}
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        for key in form.keys():
+            values = form.getlist(key)
+            file_values: list[tuple[str, bytes]] = []
+            str_values: list[str] = []
+            for v in values:
+                if hasattr(v, "read"):  # UploadFile
+                    content = await v.read()
+                    file_values.append((v.filename or "file", content))
+                else:
+                    str_values.append(str(v))
+            if file_values:
+                files[key] = file_values
+            elif len(str_values) == 1:
+                data[key] = str_values[0]
+            elif str_values:
+                data[key] = str_values
+    else:
+        try:
+            data = await request.json()
+        except Exception:
+            return _error_response(400, "Invalid JSON body.")
 
     if not isinstance(data, dict):
         return _error_response(400, "Request body must be a JSON object.")
 
     try:
-        record = await create_record(engine, collection, data)
+        record = await create_record(engine, collection, data, files=files)
     except _ValidationErrors as exc:
         return _error_response(400, "Failed to create record.", exc.errors)
     except Exception as exc:
@@ -202,16 +234,48 @@ async def api_update_record(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
-    try:
-        data = await request.json()
-    except Exception:
-        return _error_response(400, "Invalid JSON body.")
+    # _superusers records are managed via the admin auth API, not here
+    if collection.name == "_superusers":
+        return _error_response(
+            400,
+            "You cannot update _superusers records via the records API. "
+            "Use the admin auth endpoints instead.",
+        )
+
+    # Parse body - support both JSON and multipart/form-data
+    content_type = request.headers.get("content-type", "")
+    data: dict[str, Any] = {}
+    files: dict[str, list[tuple[str, bytes]]] = {}
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        for key in form.keys():
+            values = form.getlist(key)
+            file_values: list[tuple[str, bytes]] = []
+            str_values: list[str] = []
+            for v in values:
+                if hasattr(v, "read"):  # UploadFile
+                    content = await v.read()
+                    file_values.append((v.filename or "file", content))
+                else:
+                    str_values.append(str(v))
+            if file_values:
+                files[key] = file_values
+            elif len(str_values) == 1:
+                data[key] = str_values[0]
+            elif str_values:
+                data[key] = str_values
+    else:
+        try:
+            data = await request.json()
+        except Exception:
+            return _error_response(400, "Invalid JSON body.")
 
     if not isinstance(data, dict):
         return _error_response(400, "Request body must be a JSON object.")
 
     try:
-        record = await update_record(engine, collection, recordId, data)
+        record = await update_record(engine, collection, recordId, data, files=files)
     except _ValidationErrors as exc:
         return _error_response(400, "Failed to update record.", exc.errors)
     except Exception as exc:
@@ -249,6 +313,14 @@ async def api_delete_record(
     collection = await resolve_collection(engine, collectionIdOrName)
     if collection is None:
         return _error_response(404, "Missing collection context.")
+
+    # _superusers records are managed via the admin auth API, not here
+    if collection.name == "_superusers":
+        return _error_response(
+            400,
+            "You cannot delete _superusers records via the records API. "
+            "Use the admin auth endpoints instead.",
+        )
 
     all_colls = await get_all_collections(engine)
     deleted = await delete_record(

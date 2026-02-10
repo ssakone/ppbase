@@ -16,6 +16,8 @@ export interface FieldInputProps {
   value: unknown
   onChange: (value: unknown) => void
   collections?: Collection[]
+  recordId?: string
+  collectionId?: string
 }
 
 const FIELD_COMPONENTS: Record<string, React.FC<FieldInputProps>> = {
@@ -32,7 +34,7 @@ const FIELD_COMPONENTS: Record<string, React.FC<FieldInputProps>> = {
   relation: RelationInput,
 }
 
-interface RecordFieldInputProps extends FieldInputProps {}
+interface RecordFieldInputProps extends FieldInputProps { }
 
 export function RecordFieldInput(props: RecordFieldInputProps) {
   const Component = FIELD_COMPONENTS[props.field.type]

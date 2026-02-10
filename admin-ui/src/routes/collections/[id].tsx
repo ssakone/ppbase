@@ -272,6 +272,7 @@ export function RecordsPage() {
       <CollectionEditor
         open={isCollectionEditorOpen}
         onClose={() => setIsCollectionEditorOpen(false)}
+        onDelete={() => navigate('/collections')}
         mode="edit"
         collectionId={collection.id}
       />

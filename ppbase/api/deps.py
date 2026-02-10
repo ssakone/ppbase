@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ppbase.db.engine import get_engine, get_async_session
-from ppbase.db.system_tables import AdminRecord, CollectionRecord
+from ppbase.db.system_tables import SuperuserRecord, CollectionRecord
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ async def get_optional_auth(
 
     # For admin tokens, look up the admin to build the full secret
     if token_type == "admin":
-        admin = await session.get(AdminRecord, token_id)
+        admin = await session.get(SuperuserRecord, token_id)
         if admin is None:
             return None
         full_secret = admin.token_key + secret

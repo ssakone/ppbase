@@ -8,7 +8,7 @@ interface FieldTypePickerProps {
 export function FieldTypePicker({ onSelect, onClose }: FieldTypePickerProps) {
   return (
     <div className="rounded-lg border bg-background p-3 mb-3 shadow-sm">
-      <div className="grid grid-cols-4 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         {FIELD_TYPES.map((type) => {
           const config = FIELD_TYPE_CONFIG[type]
           if (!config) return null
@@ -34,7 +34,7 @@ export function FieldTypePicker({ onSelect, onClose }: FieldTypePickerProps) {
               >
                 {config.icon}
               </span>
-              <span className="truncate">{config.label}</span>
+              <span className="whitespace-nowrap">{config.label}</span>
             </button>
           )
         })}

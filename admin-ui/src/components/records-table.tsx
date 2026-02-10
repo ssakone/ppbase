@@ -14,6 +14,7 @@ import {
 import type { Collection, Field, RecordModel, PaginatedResult } from '@/api/types'
 import { formatCellValue } from '@/lib/format-cell'
 import { formatDate, truncateId } from '@/lib/utils'
+import { ImagePreview } from '@/components/ui/image-preview'
 
 interface RecordsTableProps {
   collection: Collection
@@ -29,13 +30,13 @@ interface RecordsTableProps {
 
 function getSchemaFields(collection: Collection, records: RecordModel[]): Field[] {
   const fields = collection.fields ?? collection.schema ?? []
-  if (fields.length > 0) return fields.slice(0, 5)
+  if (fields.length > 0) return fields
 
   // For view collections with empty schema, infer from first record
   if (records.length > 0) {
     const systemKeys = new Set(['id', 'collectionId', 'collectionName', 'created', 'updated'])
     const keys = Object.keys(records[0]).filter((k) => !systemKeys.has(k))
-    return keys.slice(0, 5).map((k) => ({ name: k, type: 'text' }))
+    return keys.map((k) => ({ name: k, type: 'text' }))
   }
 
   return []
@@ -93,8 +94,8 @@ export function RecordsTable({
       </div>
 
       {/* Table */}
-      <div className="rounded-md border">
-        <Table>
+      <div className="rounded-md border overflow-x-auto">
+        <Table className="min-w-max">
           <TableHeader>
             <TableRow>
               {!isView && (
@@ -144,7 +145,15 @@ export function RecordsTable({
                   </TableCell>
                   {fields.map((f) => (
                     <TableCell key={f.name} className="max-w-[200px] truncate">
-                      {formatCellValue(record[f.name], f)}
+                      {f.type === 'file' ? (
+                        <ImagePreview
+                          collectionId={collection.id}
+                          recordId={record.id}
+                          files={record[f.name] as string | string[]}
+                        />
+                      ) : (
+                        formatCellValue(record[f.name], f)
+                      )}
                     </TableCell>
                   ))}
                   <TableCell className="text-xs text-muted-foreground">

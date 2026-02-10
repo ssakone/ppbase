@@ -2,6 +2,7 @@ export interface Collection {
   id: string
   name: string
   type: 'base' | 'auth' | 'view'
+  system?: boolean
   schema?: Field[]
   fields?: Field[]
   listRule: string | null
