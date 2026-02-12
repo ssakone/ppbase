@@ -28,8 +28,16 @@ export function RecordsPage() {
   const {
     data: records,
     isLoading: isRecordsLoading,
+    isError: isRecordsError,
+    error: recordsError,
     refetch,
   } = useRecords(id, { page, perPage, filter: filter || undefined })
+
+  // Reset filter and page when switching collections
+  useEffect(() => {
+    setFilter('')
+    setPage(1)
+  }, [id])
 
   const deleteMutation = useDeleteRecord(id ?? '')
 
@@ -178,7 +186,15 @@ export function RecordsPage() {
       />
 
       <div className="flex-1 overflow-auto p-4 md:p-6">
+        {isRecordsError && recordsError && (
+          <div className="mb-4 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            {typeof recordsError === 'object' && 'message' in recordsError
+              ? String((recordsError as { message: string }).message)
+              : 'Failed to load records. Check your connection and try again.'}
+          </div>
+        )}
         <RecordsTable
+          key={collection.id}
           collection={collection}
           records={
             records ?? {

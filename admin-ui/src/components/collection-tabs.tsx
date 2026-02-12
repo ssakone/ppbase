@@ -126,7 +126,7 @@ export function CollectionTabs({
           />
         </div>
         <p className="text-xs text-muted-foreground">
-          Set to <code className="bg-muted px-1 rounded text-[11px]">null</code> (leave blank) for admin-only, or an empty string for public. Use filter expressions to control access.
+          Leave empty for public access. Use filter expressions (e.g. <code className="bg-muted px-1 rounded text-[11px]">user = @request.auth.id</code>) to restrict access.
         </p>
       </TabsContent>
 

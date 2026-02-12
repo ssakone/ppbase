@@ -136,12 +136,13 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
       payload.schema = schema
     }
 
-    // Rules: empty string means the rule is set (public), undefined means null (admin-only)
-    payload.listRule = rules.listRule || null
-    payload.viewRule = rules.viewRule || null
-    payload.createRule = rules.createRule || null
-    payload.updateRule = rules.updateRule || null
-    payload.deleteRule = rules.deleteRule || null
+    // Rules: empty input = "" (public); non-empty = filter expression
+    const rule = (s: string) => (s.trim() === '' ? '' : s.trim())
+    payload.listRule = rule(rules.listRule)
+    payload.viewRule = rule(rules.viewRule)
+    payload.createRule = rule(rules.createRule)
+    payload.updateRule = rule(rules.updateRule)
+    payload.deleteRule = rule(rules.deleteRule)
 
     return payload
   }
