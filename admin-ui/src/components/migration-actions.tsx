@@ -54,7 +54,7 @@ export function MigrationActions({ status }: MigrationActionsProps) {
 
   return (
     <>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Button onClick={() => setApplyOpen(true)} disabled={!status?.pending}>
           <Check className="mr-1.5 h-4 w-4" />
           Apply All Pending

@@ -95,6 +95,47 @@ _SUPERUSERS_HIDDEN_COLUMNS = frozenset({
 })
 
 
+async def _build_relation_resolver(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+) -> dict[str, tuple[str, int]]:
+    """Map relation field names to ``(target_table_name, max_select)``.
+
+    This allows the filter parser to translate dotted paths like
+    ``author.name`` into proper ``EXISTS`` subqueries against the related
+    collection's table.
+    """
+    schema: list[dict[str, Any]] = collection.schema or []
+    # Collect (field_name, target_collection_id, max_select)
+    targets: list[tuple[str, str, int]] = []
+    for raw in schema:
+        f = _normalize_field(raw)
+        if f.get("type") != "relation":
+            continue
+        opts = f.get("options") or {}
+        coll_id = opts.get("collectionId")
+        max_select = opts.get("maxSelect", 1) or 1
+        if coll_id:
+            targets.append((f["name"], coll_id, max_select))
+
+    if not targets:
+        return {}
+
+    # Resolve unique collection IDs to table names in one pass
+    unique_ids = {cid for _, cid, _ in targets}
+    id_to_name: dict[str, str] = {}
+    for cid in unique_ids:
+        target = await resolve_collection(engine, cid)
+        if target is not None:
+            id_to_name[cid] = _table_name(target)
+
+    resolver: dict[str, tuple[str, int]] = {}
+    for field_name, coll_id, max_select in targets:
+        if coll_id in id_to_name:
+            resolver[field_name] = (id_to_name[coll_id], max_select)
+    return resolver
+
+
 # ---------------------------------------------------------------------------
 # List records
 # ---------------------------------------------------------------------------
@@ -125,7 +166,11 @@ async def list_records(
     where_sql = "1=1"
     params: dict[str, Any] = {}
     if filter_str:
-        where_sql, params = parse_filter(filter_str, request_context)
+        # Only resolve relations when the filter contains a dotted path
+        relation_resolver = None
+        if "." in filter_str:
+            relation_resolver = await _build_relation_resolver(engine, collection)
+        where_sql, params = parse_filter(filter_str, request_context, relation_resolver)
 
     # Build ORDER BY clause
     # View collections may lack "created" — fall back to no explicit order
@@ -644,6 +689,42 @@ async def _cascade_delete(
                     engine, other_coll, related_id,
                     all_collections=all_collections,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Rule filter check
+# ---------------------------------------------------------------------------
+
+
+async def check_record_rule(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    record_id: str,
+    rule_filter: str,
+    request_context: dict[str, Any] | None = None,
+) -> bool:
+    """Check if a record matches a rule filter expression.
+
+    Used for view/update/delete rule enforcement.  Parses the rule as a
+    PocketBase filter expression and runs it as a WHERE clause against the
+    record's row.
+
+    Returns True if the record matches the rule, False otherwise.
+    """
+    table = _table_name(collection)
+    # Resolve relation fields for dotted paths in the rule
+    relation_resolver = None
+    if "." in rule_filter:
+        relation_resolver = await _build_relation_resolver(engine, collection)
+    where_sql, params = parse_filter(rule_filter, request_context, relation_resolver)
+    sql = (
+        f'SELECT 1 FROM "{table}" '
+        f'WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'
+    )
+    params["_rule_rec_id"] = record_id
+    async with engine.connect() as conn:
+        result = await conn.execute(text(sql), params)
+        return result.first() is not None
 
 
 # ---------------------------------------------------------------------------

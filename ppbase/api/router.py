@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ppbase.api.health import router as health_router
 from ppbase.api.admins import router as admins_router
 from ppbase.api.settings import router as settings_router
 from ppbase.api.files import router as files_router
+from ppbase.api.deps import get_session
 
 api_router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Public init status endpoint
+# ---------------------------------------------------------------------------
+
+
+@api_router.get("/init", tags=["init"])
+async def init_status(session: AsyncSession = Depends(get_session)):
+    """Check if the application needs initial setup (no admins exist)."""
+    from ppbase.services.admin_service import count_admins
+
+    count = await count_admins(session)
+    return {"needsSetup": count == 0}
+
 
 # Always-available routes
 api_router.include_router(health_router, prefix="/health", tags=["health"])

@@ -1,43 +1,57 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/context/auth-context'
+import { createFirstAdmin } from '@/api/endpoints/init'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { LoadingSpinner } from '@/components/loading-spinner'
 
-export function LoginPage() {
-  const { login, isAuthenticated, needsSetup } = useAuth()
+export function SetupPage() {
+  const { isAuthenticated, needsSetup, loginWithToken } = useAuth()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [passwordConfirm, setPasswordConfirm] = useState('')
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
 
+  // If already authenticated, go to collections
   if (isAuthenticated) {
     navigate('/collections', { replace: true })
     return null
   }
 
-  if (needsSetup) {
-    navigate('/setup', { replace: true })
+  // If setup is not needed, go to login
+  if (!needsSetup) {
+    navigate('/login', { replace: true })
     return null
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!email.trim() || !password) return
+    if (!email.trim() || !password || !passwordConfirm) return
+
+    if (password !== passwordConfirm) {
+      setError('Passwords do not match.')
+      return
+    }
+
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.')
+      return
+    }
 
     setIsLoading(true)
     setError('')
 
     try {
-      await login(email.trim(), password)
+      const result = await createFirstAdmin(email.trim(), password, passwordConfirm)
+      loginWithToken(result.token)
       navigate('/collections', { replace: true })
     } catch (err: unknown) {
-      const message = (err as { message?: string })?.message || 'Invalid email or password.'
+      const message = (err as { message?: string })?.message || 'Failed to create admin account.'
       setError(message)
-      setPassword('')
     } finally {
       setIsLoading(false)
     }
@@ -56,14 +70,14 @@ export function LoginPage() {
           <h1 className="text-2xl font-bold text-foreground">PPBase</h1>
         </div>
         <p className="text-sm text-muted-foreground text-center mb-6">
-          Sign in to your admin dashboard
+          Create your first admin account
         </p>
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="login-email">Email</Label>
+            <Label htmlFor="setup-email">Email</Label>
             <Input
-              id="login-email"
+              id="setup-email"
               type="email"
               placeholder="admin@example.com"
               required
@@ -73,15 +87,29 @@ export function LoginPage() {
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="login-password">Password</Label>
+            <Label htmlFor="setup-password">Password</Label>
             <Input
-              id="login-password"
+              id="setup-password"
               type="password"
-              placeholder="Enter your password"
+              placeholder="Min. 8 characters"
               required
-              autoComplete="current-password"
+              autoComplete="new-password"
+              minLength={8}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="setup-password-confirm">Confirm password</Label>
+            <Input
+              id="setup-password-confirm"
+              type="password"
+              placeholder="Repeat your password"
+              required
+              autoComplete="new-password"
+              minLength={8}
+              value={passwordConfirm}
+              onChange={(e) => setPasswordConfirm(e.target.value)}
             />
           </div>
 
@@ -93,7 +121,7 @@ export function LoginPage() {
 
           <Button type="submit" className="w-full" disabled={isLoading}>
             {isLoading && <LoadingSpinner size="sm" className="mr-2" />}
-            Sign in
+            Create admin
           </Button>
         </form>
       </div>

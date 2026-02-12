@@ -5,6 +5,7 @@ import { AuthProvider } from '@/context/auth-context'
 import { SidebarProvider } from '@/context/sidebar-context'
 import { Layout } from '@/routes/layout'
 import { LoginPage } from '@/routes/login'
+import { SetupPage } from '@/routes/setup'
 import { CollectionsPage } from '@/routes/collections/index'
 import { RecordsPage } from '@/routes/collections/[id]'
 import { MigrationsPage } from '@/routes/migrations'
@@ -28,6 +29,7 @@ export default function App() {
             <Toaster position="bottom-right" richColors closeButton />
             <Routes>
               <Route path="/login" element={<LoginPage />} />
+              <Route path="/setup" element={<SetupPage />} />
               <Route element={<Layout />}>
                 <Route index element={<Navigate to="/collections" replace />} />
                 <Route path="/collections" element={<CollectionsPage />} />

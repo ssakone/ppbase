@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -15,6 +16,27 @@ from ppbase.config import Settings
 logger = logging.getLogger(__name__)
 
 
+def _handle_db_connection_error(database_url: str, exc: BaseException) -> None:
+    """Print a clear message when PostgreSQL is unreachable and exit."""
+    import re
+    # Mask password in URL for display
+    safe_url = re.sub(r"://([^:]*):([^@]*)@", r"://\1:****@", database_url)
+
+    msg = (
+        "\n"
+        "PostgreSQL is not reachable. PPBase cannot start without a database.\n"
+        "\n"
+        "  Database URL: %s\n"
+        "\n"
+        "  Make sure PostgreSQL is running, then try:\n"
+        "    python -m ppbase db start   # start PostgreSQL via Docker\n"
+        "\n"
+        "  Or set PPBASE_DATABASE_URL if using a different database.\n"
+    ) % safe_url
+    print(msg, file=sys.stderr)
+    os._exit(1)  # Exit immediately without raising (avoids traceback)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Manage startup and shutdown of the database engine."""
@@ -24,13 +46,16 @@ async def _lifespan(app: FastAPI):
     settings: Settings = app.state.settings
 
     # Startup: create engine and ensure system tables exist
-    engine = await init_engine(
-        settings.database_url,
-        pool_size=settings.pool_size,
-        max_overflow=settings.max_overflow,
-        echo=settings.dev,
-    )
-    await create_system_tables(engine)
+    try:
+        engine = await init_engine(
+            settings.database_url,
+            pool_size=settings.pool_size,
+            max_overflow=settings.max_overflow,
+            echo=settings.dev,
+        )
+        await create_system_tables(engine)
+    except (ConnectionRefusedError, OSError) as exc:
+        _handle_db_connection_error(settings.database_url, exc)
 
     # Ensure the _superusers and _external_auths system collections are registered
     from ppbase.db.bootstrap import ensure_superusers_collection, ensure_external_auths_collection
@@ -70,6 +95,23 @@ async def _lifespan(app: FastAPI):
                 raise
     else:
         logger.info("Auto-migrate disabled, skipping migration check")
+
+    # Check if any admin exists — if not, print setup URL
+    from ppbase.services.admin_service import count_admins
+    from sqlalchemy.ext.asyncio import AsyncSession as _CheckAS, async_sessionmaker as _check_asm
+
+    _check_factory = _check_asm(bind=engine, class_=_CheckAS, expire_on_commit=False)
+    async with _check_factory() as _check_session:
+        admin_count = await count_admins(_check_session)
+
+    if admin_count == 0:
+        display_host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
+        setup_url = f"http://{display_host}:{settings.port}/_/"
+        print(
+            "\n"
+            "No admin account found.\n"
+            f"Open {setup_url} to set up your first admin.\n"
+        )
 
     yield
 

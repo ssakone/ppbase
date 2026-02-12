@@ -20,7 +20,7 @@ export function MigrationsPage() {
         left={<Breadcrumb items={[{ label: 'Migrations', active: true }]} />}
         right={<MigrationActions status={status} />}
       />
-      <div className="flex-1 overflow-auto p-6">
+      <div className="flex-1 overflow-auto p-4 md:p-6">
         {isLoading ? (
           <LoadingSpinner fullPage />
         ) : isError ? (

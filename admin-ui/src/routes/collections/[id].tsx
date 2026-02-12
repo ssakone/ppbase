@@ -147,29 +147,29 @@ export function RecordsPage() {
           >
             <button
               onClick={() => setIsCollectionEditorOpen(true)}
-              className="ml-1 rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted"
+              className="ml-0.5 rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted"
               title="Collection settings"
             >
-              <Settings className="h-6 w-6" />
+              <Settings className="h-4.5 w-4.5" />
             </button>
             <button
               onClick={() => refetch()}
               className="rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted"
               title="Refresh records"
             >
-              <RefreshCw className="h-6 w-6" />
+              <RefreshCw className="h-4.5 w-4.5" />
             </button>
           </Breadcrumb>
         }
         right={
           <>
-            <Button variant="outline" onClick={() => setIsApiPreviewOpen(true)}>
-              <Code className="mr-1.5 h-4 w-4" />
+            <Button variant="outline" size="sm" onClick={() => setIsApiPreviewOpen(true)}>
+              <Code className="mr-1 h-3.5 w-3.5" />
               API Preview
             </Button>
             {!isView && (
-              <Button onClick={handleNewRecord}>
-                <Plus className="mr-1.5 h-4 w-4" />
+              <Button size="sm" onClick={handleNewRecord}>
+                <Plus className="mr-1 h-3.5 w-3.5" />
                 New record
               </Button>
             )}
@@ -177,38 +177,33 @@ export function RecordsPage() {
         }
       />
 
-      <div className="flex-1 overflow-auto p-6">
-        {isRecordsLoading ? (
-          <LoadingSpinner fullPage />
-        ) : !records || records.items.length === 0 && !filter ? (
-          <EmptyState
-            icon={<Database className="h-6 w-6" />}
-            title="No records yet"
-            description={`Create your first record in the "${collection.name}" collection.`}
-            action={
-              isView
-                ? undefined
-                : { label: 'New record', onClick: handleNewRecord }
+      <div className="flex-1 overflow-auto p-4 md:p-6">
+        <RecordsTable
+          collection={collection}
+          records={
+            records ?? {
+              items: [],
+              page: 1,
+              perPage,
+              totalItems: 0,
+              totalPages: 0,
             }
-          />
-        ) : records ? (
-          <RecordsTable
-            collection={collection}
-            records={records}
-            selectedIds={selectedIds}
-            onSelectAll={handleSelectAll}
-            onSelectRow={handleSelectRow}
-            onRowClick={handleRowClick}
-            onPageChange={setPage}
-            onFilterChange={handleFilterChange}
-            hidePagination
-          />
-        ) : null}
+          }
+          selectedIds={selectedIds}
+          onSelectAll={handleSelectAll}
+          onSelectRow={handleSelectRow}
+          onRowClick={handleRowClick}
+          onPageChange={setPage}
+          onFilterChange={handleFilterChange}
+          onNewRecord={handleNewRecord}
+          hidePagination
+          isLoading={isRecordsLoading}
+        />
       </div>
 
       {/* Fixed pagination footer */}
       {records && records.totalItems > 0 && (
-        <div className="flex items-center justify-between border-t bg-white px-8 py-3">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-t bg-white px-4 py-3 md:px-8">
           <span className="text-sm text-muted-foreground">
             {(records.page - 1) * records.perPage + 1}-
             {Math.min(records.page * records.perPage, records.totalItems)} of{' '}

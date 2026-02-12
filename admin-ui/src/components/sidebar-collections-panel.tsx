@@ -11,7 +11,7 @@ export function SidebarCollectionsPanel() {
   const navigate = useNavigate()
   const location = useLocation()
   const { data: collections = [], isLoading } = useCollections()
-  const { setSelectedCollectionId, setActiveSection } = useSidebar()
+  const { setSelectedCollectionId, setActiveSection, setSidebarOpen, collectionsPanelWidth } = useSidebar()
   const [search, setSearch] = useState('')
   const [systemCollapsed, setSystemCollapsed] = useState(false)
 
@@ -34,10 +34,12 @@ export function SidebarCollectionsPanel() {
   const handleClick = (col: typeof collections[0]) => {
     setActiveSection('collections')
     setSelectedCollectionId(col.id)
+    setSidebarOpen(false)
     navigate(`/collections/${col.id}`)
   }
 
   const handleNewCollection = () => {
+    setSidebarOpen(false)
     navigate('/collections?new=1')
   }
 
@@ -51,7 +53,7 @@ export function SidebarCollectionsPanel() {
       <button
         key={col.id}
         className={cn(
-          'flex items-center gap-2.5 w-full px-3 mb-1 py-2 text-[16px] rounded-md text-left transition-colors',
+          'flex items-center gap-2.5 w-full px-3 mb-0.5 py-1.5 text-[13.5px] rounded-md text-left transition-colors',
           isActive
             ? 'bg-indigo-50 text-indigo-700 font-medium'
             : 'text-slate-600 hover:bg-slate-100',
@@ -65,7 +67,10 @@ export function SidebarCollectionsPanel() {
   }
 
   return (
-    <div className="flex flex-col w-[300px] border-r bg-white">
+    <div
+      className="flex flex-col border-r bg-white shrink-0"
+      style={{ width: collectionsPanelWidth }}
+    >
       {/* Search */}
       <div className="px-4 pt-3 pb-2">
         <div className="relative">
@@ -99,18 +104,18 @@ export function SidebarCollectionsPanel() {
 
             {/* System collections section */}
             {systemCollections.length > 0 && (
-              <div className="mt-3">
+              <div className="mt-2 pt-2 border-t border-slate-100">
                 <button
-                  className="flex items-center gap-1.5 w-full px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-600 transition-colors"
+                  className="flex items-center gap-1 w-full px-3 py-1 text-[11px] font-medium uppercase tracking-wider text-slate-400 hover:text-slate-500 transition-colors"
                   onClick={() => setSystemCollapsed(!systemCollapsed)}
                 >
+                  System
                   <ChevronRight
                     className={cn(
-                      'h-3.5 w-3.5 transition-transform',
+                      'h-3 w-3 transition-transform',
                       !systemCollapsed && 'rotate-90',
                     )}
                   />
-                  System
                 </button>
                 {!systemCollapsed && systemCollections.map(renderCollectionItem)}
               </div>
@@ -120,13 +125,13 @@ export function SidebarCollectionsPanel() {
       </nav>
 
       {/* New collection button */}
-      <div className="px-4 pb-3 pt-2">
+      <div className="px-3 pb-3 pt-2">
         <Button
           variant="outline"
-          className="w-full border-solid border-black h-10"
+          className="w-full border-dashed border-slate-300 text-slate-500 hover:text-slate-700 hover:border-slate-400 h-9 text-[13px]"
           onClick={handleNewCollection}
         >
-          <Plus className="h-4 w-4" />
+          <Plus className="h-3.5 w-3.5 mr-1" />
           New collection
         </Button>
       </div>

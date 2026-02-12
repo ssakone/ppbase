@@ -12,13 +12,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
+from ppbase.api.deps import get_optional_auth
 from ppbase.db.engine import get_engine
+from ppbase.models.record import build_list_response
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
     _ValidationErrors,
+    check_record_rule,
     create_record,
     delete_record,
     get_all_collections,
@@ -27,8 +30,67 @@ from ppbase.services.record_service import (
     resolve_collection,
     update_record,
 )
+from ppbase.services.rule_engine import check_rule
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Rule enforcement helpers
+# ---------------------------------------------------------------------------
+
+
+def _prepare_rule_context(
+    request: Request,
+    token_payload: dict[str, Any] | None,
+    data: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Build auth context (for rule engine) and request context (for filter macros).
+
+    Returns:
+        ``(auth_context, request_context)`` tuple.
+
+    - ``auth_context`` is passed to :func:`check_rule` to determine admin bypass.
+    - ``request_context`` is passed to :func:`parse_filter` so that
+      ``@request.auth.*`` and ``@request.data.*`` macros resolve correctly
+      when a rule expression is used as a SQL WHERE filter.
+    """
+    # Auth context for the rule engine ---
+    if token_payload is None:
+        auth_ctx: dict[str, Any] | None = None
+    elif token_payload.get("type") == "admin":
+        auth_ctx = {
+            "is_admin": True,
+            "@request.auth.id": token_payload.get("id", ""),
+            "@request.auth.email": token_payload.get("email", ""),
+        }
+    else:
+        auth_ctx = {
+            "is_admin": False,
+            "@request.auth.id": token_payload.get("id", ""),
+            "@request.auth.collectionId": token_payload.get("collectionId", ""),
+            "@request.auth.collectionName": token_payload.get("collectionName", ""),
+            "@request.auth.type": token_payload.get("type", ""),
+        }
+
+    # Request context for the filter parser (macro resolution) ---
+    auth_info: dict[str, Any] = {}
+    if token_payload:
+        auth_info = {
+            "id": token_payload.get("id", ""),
+            "email": token_payload.get("email", ""),
+            "type": token_payload.get("type", ""),
+            "collectionId": token_payload.get("collectionId", ""),
+            "collectionName": token_payload.get("collectionName", ""),
+        }
+
+    request_context: dict[str, Any] = {
+        "auth": auth_info,
+        "data": data or {},
+        "query": dict(request.query_params),
+    }
+
+    return auth_ctx, request_context
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +123,7 @@ async def api_list_records(
     expand: str | None = Query(None),
     fields: str | None = Query(None),
     skipTotal: bool = Query(False),
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> JSONResponse:
     """List / search records in a collection."""
     engine = get_engine()
@@ -69,12 +132,25 @@ async def api_list_records(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
-    # Build request context for filter macros
-    request_context: dict[str, Any] = {
-        "auth": {},
-        "data": {},
-        "query": dict(request.query_params),
-    }
+    # --- Rule enforcement ---
+    auth_ctx, request_context = _prepare_rule_context(request, auth)
+    rule_result = check_rule(collection.list_rule, auth_ctx)
+
+    if rule_result is False:
+        # PocketBase returns 200 with empty results (not 403) to prevent
+        # information disclosure about collection existence.
+        return JSONResponse(
+            content=build_list_response([], page, perPage, 0),
+            status_code=200,
+        )
+
+    # Merge rule expression with user-supplied filter
+    effective_filter = filter
+    if isinstance(rule_result, str):
+        if effective_filter:
+            effective_filter = f"({rule_result}) && ({effective_filter})"
+        else:
+            effective_filter = rule_result
 
     try:
         result = await list_records(
@@ -83,7 +159,7 @@ async def api_list_records(
             page=page,
             per_page=perPage,
             sort=sort,
-            filter_str=filter,
+            filter_str=effective_filter,
             fields=fields,
             skip_total=skipTotal,
             request_context=request_context,
@@ -112,6 +188,7 @@ async def api_create_record(
     request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> JSONResponse:
     """Create a new record in a collection."""
     engine = get_engine()
@@ -160,6 +237,18 @@ async def api_create_record(
     if not isinstance(data, dict):
         return _error_response(400, "Request body must be a JSON object.")
 
+    # --- Rule enforcement ---
+    auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
+    rule_result = check_rule(collection.create_rule, auth_ctx)
+
+    if rule_result is False:
+        # PocketBase returns 400 for denied create
+        return _error_response(
+            400,
+            "Failed to create record.",
+            {"rule": {"code": "validation_rule_failed", "message": "Action not allowed."}},
+        )
+
     try:
         record = await create_record(engine, collection, data, files=files)
     except _ValidationErrors as exc:
@@ -168,6 +257,21 @@ async def api_create_record(
         import logging
         logging.getLogger("ppbase").exception("Record creation failed")
         return _error_response(400, "Failed to create record.", {})
+
+    # If rule is an expression, verify the created record matches it.
+    # PocketBase evaluates the rule via a CTE before commit; we check
+    # after insert and rollback (delete) on mismatch.
+    if isinstance(rule_result, str):
+        matches = await check_record_rule(
+            engine, collection, record["id"], rule_result, request_context,
+        )
+        if not matches:
+            await delete_record(engine, collection, record["id"])
+            return _error_response(
+                400,
+                "Failed to create record.",
+                {"rule": {"code": "validation_rule_failed", "message": "Action not allowed."}},
+            )
 
     # Expand relations if requested
     if expand and record:
@@ -189,8 +293,10 @@ async def api_create_record(
 async def api_get_record(
     collectionIdOrName: str,
     recordId: str,
+    request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> JSONResponse:
     """View a single record."""
     engine = get_engine()
@@ -199,9 +305,25 @@ async def api_get_record(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
+    # --- Rule enforcement ---
+    auth_ctx, request_context = _prepare_rule_context(request, auth)
+    rule_result = check_rule(collection.view_rule, auth_ctx)
+
+    if rule_result is False:
+        # PocketBase returns 404, not 403, to hide record existence.
+        return _error_response(404, "The requested resource wasn't found.")
+
     record = await get_record(engine, collection, recordId, fields=fields)
     if record is None:
         return _error_response(404, "The requested resource wasn't found.")
+
+    # If rule is an expression, verify the record matches it
+    if isinstance(rule_result, str):
+        matches = await check_record_rule(
+            engine, collection, recordId, rule_result, request_context,
+        )
+        if not matches:
+            return _error_response(404, "The requested resource wasn't found.")
 
     # Expand relations if requested
     if expand and record:
@@ -226,6 +348,7 @@ async def api_update_record(
     request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> JSONResponse:
     """Update an existing record."""
     engine = get_engine()
@@ -274,6 +397,22 @@ async def api_update_record(
     if not isinstance(data, dict):
         return _error_response(400, "Request body must be a JSON object.")
 
+    # --- Rule enforcement ---
+    auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
+    rule_result = check_rule(collection.update_rule, auth_ctx)
+
+    if rule_result is False:
+        # PocketBase returns 404 to hide record existence
+        return _error_response(404, "The requested resource wasn't found.")
+
+    # If rule is an expression, verify the existing record matches it
+    if isinstance(rule_result, str):
+        matches = await check_record_rule(
+            engine, collection, recordId, rule_result, request_context,
+        )
+        if not matches:
+            return _error_response(404, "The requested resource wasn't found.")
+
     try:
         record = await update_record(engine, collection, recordId, data, files=files)
     except _ValidationErrors as exc:
@@ -306,6 +445,8 @@ async def api_update_record(
 async def api_delete_record(
     collectionIdOrName: str,
     recordId: str,
+    request: Request,
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> JSONResponse:
     """Delete a record."""
     engine = get_engine()
@@ -321,6 +462,22 @@ async def api_delete_record(
             "You cannot delete _superusers records via the records API. "
             "Use the admin auth endpoints instead.",
         )
+
+    # --- Rule enforcement ---
+    auth_ctx, request_context = _prepare_rule_context(request, auth)
+    rule_result = check_rule(collection.delete_rule, auth_ctx)
+
+    if rule_result is False:
+        # PocketBase returns 404 to hide record existence
+        return _error_response(404, "The requested resource wasn't found.")
+
+    # If rule is an expression, verify the existing record matches it
+    if isinstance(rule_result, str):
+        matches = await check_record_rule(
+            engine, collection, recordId, rule_result, request_context,
+        )
+        if not matches:
+            return _error_response(404, "The requested resource wasn't found.")
 
     all_colls = await get_all_collections(engine)
     deleted = await delete_record(

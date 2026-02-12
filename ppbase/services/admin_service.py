@@ -37,6 +37,12 @@ def _admin_to_dict(admin: SuperuserRecord) -> dict[str, Any]:
     }
 
 
+async def count_admins(session: AsyncSession) -> int:
+    """Return the total number of admin (superuser) records."""
+    count_q = select(func.count()).select_from(SuperuserRecord)
+    return (await session.execute(count_q)).scalar() or 0
+
+
 async def list_admins(
     session: AsyncSession,
     page: int = 1,
