@@ -23,6 +23,17 @@ def format_datetime(dt: datetime | str | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+# Auth collection columns that must NEVER appear in API responses
+_AUTH_HIDDEN_COLUMNS = frozenset({
+    "password_hash", "token_key",
+})
+
+# Auth collection columns that need snake_case → camelCase mapping
+_AUTH_COLUMN_MAP = {
+    "email_visibility": "emailVisibility",
+}
+
+
 def build_record_response(
     row: dict[str, Any],
     collection_id: str,
@@ -31,6 +42,7 @@ def build_record_response(
     *,
     fields_filter: list[str] | None = None,
     hidden_fields: set[str] | None = None,
+    is_auth_collection: bool = False,
 ) -> dict[str, Any]:
     """Build a record response dict from a raw database row.
 
@@ -42,6 +54,8 @@ def build_record_response(
         fields_filter: Optional list of field names to include in response.
             If None, all non-hidden fields are included.
         hidden_fields: Set of field names marked as hidden in the schema.
+        is_auth_collection: If True, add auth system columns (email,
+            emailVisibility, verified) and hide password_hash/token_key.
 
     Returns:
         A dict suitable for JSON serialization as a record response.
@@ -55,6 +69,12 @@ def build_record_response(
         "created": format_datetime(row.get("created")),
         "updated": format_datetime(row.get("updated")),
     }
+
+    # Auth collection: add system auth columns (camelCase)
+    if is_auth_collection:
+        result["email"] = row.get("email", "")
+        result["emailVisibility"] = row.get("email_visibility", False)
+        result["verified"] = row.get("verified", False)
 
     # Add schema-defined fields
     if schema:
@@ -82,11 +102,24 @@ def build_record_response(
         for key, val in row.items():
             if key in system_keys:
                 continue
+            # Always hide auth internal columns
+            if key in _AUTH_HIDDEN_COLUMNS:
+                continue
             if isinstance(val, datetime):
                 val = format_datetime(val)
             if isinstance(val, float) and val == int(val):
                 val = int(val)
-            result[key] = val
+            # Map snake_case auth columns to camelCase
+            output_key = _AUTH_COLUMN_MAP.get(key, key)
+            result[output_key] = val
+
+    # Strip auth-internal columns if they leaked through schema
+    for col in _AUTH_HIDDEN_COLUMNS:
+        result.pop(col, None)
+    # Remove snake_case duplicates of mapped auth columns
+    for snake in _AUTH_COLUMN_MAP:
+        if snake in result and _AUTH_COLUMN_MAP[snake] in result:
+            del result[snake]
 
     # Apply fields filter if specified
     if fields_filter:

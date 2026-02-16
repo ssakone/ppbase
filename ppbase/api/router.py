@@ -68,3 +68,12 @@ try:
     _records_router = records_router
 except (ImportError, AttributeError):
     _records_router = None
+
+# Record auth router -- auth endpoints for auth collections.
+# Paths: /api/collections/{collection}/auth-with-password etc.
+try:
+    from ppbase.api.record_auth import router as record_auth_router
+
+    _record_auth_router = record_auth_router
+except (ImportError, AttributeError):
+    _record_auth_router = None

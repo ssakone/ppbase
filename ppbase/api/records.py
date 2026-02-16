@@ -107,6 +107,19 @@ def _error_response(status: int, message: str, data: Any = None) -> JSONResponse
     return JSONResponse(content=body, status_code=status)
 
 
+def _validation_message(base: str, errors: dict[str, Any]) -> str:
+    """Build an error message that includes the failing field names.
+
+    PocketBase SDK ``ClientResponseError.message`` is set from the top-level
+    ``message`` field.  Tests match against it with regexes like ``/email/i``,
+    so the field names must appear in the message string.
+    """
+    if errors:
+        field_names = ", ".join(errors.keys())
+        return f"{base} Validation failed for: {field_names}."
+    return base
+
+
 # ---------------------------------------------------------------------------
 # GET /api/collections/{collectionIdOrName}/records
 # ---------------------------------------------------------------------------
@@ -137,11 +150,10 @@ async def api_list_records(
     rule_result = check_rule(collection.list_rule, auth_ctx)
 
     if rule_result is False:
-        # PocketBase returns 200 with empty results (not 403) to prevent
-        # information disclosure about collection existence.
-        return JSONResponse(
-            content=build_list_response([], page, perPage, 0),
-            status_code=200,
+        # PocketBase returns 403 for locked (null) rules
+        return _error_response(
+            403,
+            "Only superusers can perform this action.",
         )
 
     # Merge rule expression with user-supplied filter
@@ -242,17 +254,16 @@ async def api_create_record(
     rule_result = check_rule(collection.create_rule, auth_ctx)
 
     if rule_result is False:
-        # PocketBase returns 400 for denied create
+        # PocketBase returns 403 for locked (null) rules
         return _error_response(
-            400,
-            "Failed to create record.",
-            {"rule": {"code": "validation_rule_failed", "message": "Action not allowed."}},
+            403,
+            "Only superusers can perform this action.",
         )
 
     try:
         record = await create_record(engine, collection, data, files=files)
     except _ValidationErrors as exc:
-        return _error_response(400, "Failed to create record.", exc.errors)
+        return _error_response(400, _validation_message("Failed to create record.", exc.errors), exc.errors)
     except Exception as exc:
         import logging
         logging.getLogger("ppbase").exception("Record creation failed")
@@ -310,8 +321,11 @@ async def api_get_record(
     rule_result = check_rule(collection.view_rule, auth_ctx)
 
     if rule_result is False:
-        # PocketBase returns 404, not 403, to hide record existence.
-        return _error_response(404, "The requested resource wasn't found.")
+        # PocketBase returns 403 for locked (null) rules
+        return _error_response(
+            403,
+            "Only superusers can perform this action.",
+        )
 
     record = await get_record(engine, collection, recordId, fields=fields)
     if record is None:
@@ -402,8 +416,11 @@ async def api_update_record(
     rule_result = check_rule(collection.update_rule, auth_ctx)
 
     if rule_result is False:
-        # PocketBase returns 404 to hide record existence
-        return _error_response(404, "The requested resource wasn't found.")
+        # PocketBase returns 403 for locked (null) rules
+        return _error_response(
+            403,
+            "Only superusers can perform this action.",
+        )
 
     # If rule is an expression, verify the existing record matches it
     if isinstance(rule_result, str):
@@ -416,7 +433,7 @@ async def api_update_record(
     try:
         record = await update_record(engine, collection, recordId, data, files=files)
     except _ValidationErrors as exc:
-        return _error_response(400, "Failed to update record.", exc.errors)
+        return _error_response(400, _validation_message("Failed to update record.", exc.errors), exc.errors)
     except Exception as exc:
         import logging
         logging.getLogger("ppbase").exception("Record update failed")
@@ -468,8 +485,11 @@ async def api_delete_record(
     rule_result = check_rule(collection.delete_rule, auth_ctx)
 
     if rule_result is False:
-        # PocketBase returns 404 to hide record existence
-        return _error_response(404, "The requested resource wasn't found.")
+        # PocketBase returns 403 for locked (null) rules
+        return _error_response(
+            403,
+            "Only superusers can perform this action.",
+        )
 
     # If rule is an expression, verify the existing record matches it
     if isinstance(rule_result, str):

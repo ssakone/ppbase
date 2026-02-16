@@ -193,6 +193,7 @@ async def _expand_path(
         if f.get("hidden", False) or f.get("type") == "password"
     }
 
+    _is_auth = getattr(target_coll, "type", "base") == "auth"
     related_responses: dict[str, dict[str, Any]] = {}
     for rid, row in related_rows.items():
         related_responses[rid] = build_record_response(
@@ -201,6 +202,7 @@ async def _expand_path(
             target_coll.name,
             target_schema,
             hidden_fields=hidden_fields,
+            is_auth_collection=_is_auth,
         )
 
     # Attach expanded records to each parent record

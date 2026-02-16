@@ -44,12 +44,18 @@ _RESERVED_NAMES = frozenset({
     "created",
     "updated",
     "expand",
-    "collectionId",
-    "collectionName",
+    "collectionid",
+    "collectionname",
     "_collections",
     "_params",
     "_external_auths",
+    "_externalauths",
     "_superusers",
+    "_mfas",
+    "_otps",
+    "_authorigins",
+    "_migrations",
+    "users",
     "import",
 })
 
@@ -246,6 +252,15 @@ async def create_collection(
     if existing is not None:
         raise ValueError(f"Collection with name '{data.name}' already exists.")
 
+    # Auth collections need default auth options (per-collection token secrets)
+    # if the client didn't provide them.
+    options = data.options
+    if data.type == "auth":
+        from ppbase.services.auth_service import generate_default_auth_options
+
+        if not options or not options.get("authToken"):
+            options = generate_default_auth_options(is_superusers=False)
+
     now = datetime.now(timezone.utc)
     record = CollectionRecord(
         id=data.id or generate_id(),
@@ -259,7 +274,7 @@ async def create_collection(
         create_rule=data.create_rule,
         update_rule=data.update_rule,
         delete_rule=data.delete_rule,
-        options=data.options,
+        options=options,
         created=now,
         updated=now,
     )
@@ -548,10 +563,17 @@ async def import_collections(
             )
         else:
             # Create new
+            import_options = coll_data.get("options", {})
+            import_type = coll_data.get("type", "base")
+            # Auth collections need default auth options if not provided
+            if import_type == "auth" and (not import_options or not import_options.get("authToken")):
+                from ppbase.services.auth_service import generate_default_auth_options
+                import_options = generate_default_auth_options(is_superusers=False)
+
             create_data = CollectionCreate(
                 id=coll_data.get("id"),
                 name=name,
-                type=coll_data.get("type", "base"),
+                type=import_type,
                 system=coll_data.get("system", False),
                 schema=coll_data.get("schema", []),
                 indexes=coll_data.get("indexes", []),
@@ -560,7 +582,7 @@ async def import_collections(
                 createRule=coll_data.get("createRule"),
                 updateRule=coll_data.get("updateRule"),
                 deleteRule=coll_data.get("deleteRule"),
-                options=coll_data.get("options", {}),
+                options=import_options,
             )
             now = datetime.now(timezone.utc)
             record = CollectionRecord(

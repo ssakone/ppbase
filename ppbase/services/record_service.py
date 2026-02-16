@@ -20,6 +20,7 @@ from ppbase.models.field_types import (
     FieldDefinition,
     FieldType,
     FieldValidationError,
+    _EMAIL_RE,
     validate_field_value,
 )
 from ppbase.models.record import (
@@ -245,10 +246,12 @@ async def list_records(
     if collection.name == "_superusers":
         rows = [{k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS} for row in rows]
 
+    _is_auth = getattr(collection, "type", "base") == "auth"
     items = [
         build_record_response(
             row, collection.id, collection.name, collection.schema or [],
             fields_filter=ff, hidden_fields=hidden,
+            is_auth_collection=_is_auth,
         )
         for row in rows
     ]
@@ -289,9 +292,11 @@ async def get_record(
     if collection.name == "_superusers":
         row_dict = {k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
 
+    _is_auth = getattr(collection, "type", "base") == "auth"
     return build_record_response(
         row_dict, collection.id, collection.name, collection.schema or [],
         fields_filter=ff, hidden_fields=hidden,
+        is_auth_collection=_is_auth,
     )
 
 
@@ -310,6 +315,9 @@ async def create_record(
 
     Validates all fields, generates an ID, and sets timestamps.
     Handles file uploads if files dict is provided.
+
+    For auth collections, handles password hashing, token_key generation,
+    and auth system column defaults.
 
     Raises:
         FieldValidationError: If any field fails validation.
@@ -333,6 +341,59 @@ async def create_record(
     }
 
     errors: dict[str, dict[str, str]] = {}
+
+    # --- Auth collection: password & system columns ---
+    col_type = getattr(collection, "type", "base") or "base"
+    if col_type == "auth":
+        from ppbase.services.auth_service import hash_password, generate_token_key
+
+        # Reject client-supplied internal columns
+        data.pop("password_hash", None)
+        data.pop("token_key", None)
+
+        password = data.pop("password", None)
+        password_confirm = data.pop("passwordConfirm", None)
+
+        if not password:
+            errors["password"] = {
+                "code": "validation_required",
+                "message": "Cannot be blank.",
+            }
+        elif len(password) < 8:
+            errors["password"] = {
+                "code": "validation_length_out_of_range",
+                "message": "The length must be between 8 and 72.",
+            }
+        elif password_confirm != password:
+            errors["passwordConfirm"] = {
+                "code": "validation_values_mismatch",
+                "message": "Values don't match.",
+            }
+
+        if not errors:
+            columns["password_hash"] = hash_password(password)
+            columns["token_key"] = generate_token_key()
+
+        # Auth system column: email (required for auth, from data)
+        email_val = data.pop("email", None)
+        if email_val is None or (isinstance(email_val, str) and not email_val.strip()):
+            errors["email"] = {"code": "validation_required", "message": "Cannot be blank."}
+        else:
+            email_str = str(email_val).strip()
+            if not _EMAIL_RE.match(email_str):
+                errors["email"] = {"code": "validation_invalid_email", "message": "Must be a valid email address."}
+            else:
+                columns["email"] = email_str
+
+        # Auth system column defaults
+        if "email_visibility" not in data:
+            columns["email_visibility"] = False
+        else:
+            columns["email_visibility"] = bool(data.pop("email_visibility", False))
+        if "verified" not in data:
+            columns["verified"] = False
+        else:
+            columns["verified"] = bool(data.pop("verified", False))
 
     # Build field map for file handling
     field_map = {f.name: f for f in schema_fields}
@@ -367,6 +428,16 @@ async def create_record(
 
     if errors:
         raise _ValidationErrors(errors)
+
+    # Email uniqueness check for auth collections
+    if col_type == "auth" and "email" in columns:
+        dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email LIMIT 1'
+        async with engine.connect() as conn:
+            dup = (await conn.execute(text(dup_sql), {"email": columns["email"]})).first()
+        if dup:
+            raise _ValidationErrors({
+                "email": {"code": "validation_not_unique", "message": "The email is already in use."}
+            })
 
     # Build INSERT
     col_names = ", ".join(f'"{c}"' for c in columns)
@@ -428,11 +499,54 @@ async def update_record(
     updates: dict[str, Any] = {"updated": now}
     errors: dict[str, dict[str, str]] = {}
 
-    field_map = {f.name: f for f in schema_fields}
+    # --- Auth collection: password update handling ---
+    col_type = getattr(collection, "type", "base") or "base"
+    if col_type == "auth":
+        from ppbase.services.auth_service import hash_password, generate_token_key
 
-    print(f"[DEBUG] update_record called: record_id={record_id}")
-    print(f"[DEBUG] data keys: {list(data.keys())}, data values: {data}")
-    print(f"[DEBUG] files keys: {list(files.keys()) if files else []}")
+        # Strip internal columns from client data
+        data.pop("password_hash", None)
+        data.pop("token_key", None)
+
+        password = data.pop("password", None)
+        password_confirm = data.pop("passwordConfirm", None)
+
+        if password is not None:
+            if len(password) < 8:
+                errors["password"] = {
+                    "code": "validation_length_out_of_range",
+                    "message": "The length must be between 8 and 72.",
+                }
+            elif password_confirm != password:
+                errors["passwordConfirm"] = {
+                    "code": "validation_values_mismatch",
+                    "message": "Values don't match.",
+                }
+            else:
+                updates["password_hash"] = hash_password(password)
+                updates["token_key"] = generate_token_key()
+
+        # Handle email update with format validation
+        if "email" in data:
+            email_val = data.pop("email")
+            if email_val is None or (isinstance(email_val, str) and not email_val.strip()):
+                errors["email"] = {"code": "validation_required", "message": "Cannot be blank."}
+            else:
+                email_str = str(email_val).strip()
+                if not _EMAIL_RE.match(email_str):
+                    errors["email"] = {"code": "validation_invalid_email", "message": "Must be a valid email address."}
+                else:
+                    updates["email"] = email_str
+
+        # Handle camelCase-to-snake_case for auth system columns
+        if "email_visibility" in data:
+            updates["email_visibility"] = bool(data.pop("email_visibility"))
+        elif "emailVisibility" in data:
+            updates["email_visibility"] = bool(data.pop("emailVisibility"))
+        if "verified" in data:
+            updates["verified"] = bool(data.pop("verified"))
+
+    field_map = {f.name: f for f in schema_fields}
 
     # Process uploaded files
     if files:
@@ -531,6 +645,16 @@ async def update_record(
 
     if errors:
         raise _ValidationErrors(errors)
+
+    # Email uniqueness check for auth collections on update
+    if col_type == "auth" and "email" in updates and updates["email"]:
+        dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email AND "id" != :rid LIMIT 1'
+        async with engine.connect() as conn:
+            dup = (await conn.execute(text(dup_sql), {"email": updates["email"], "rid": record_id})).first()
+        if dup:
+            raise _ValidationErrors({
+                "email": {"code": "validation_not_unique", "message": "The email is already in use."}
+            })
 
     if len(updates) <= 1:
         # Only "updated" timestamp -- nothing else changed

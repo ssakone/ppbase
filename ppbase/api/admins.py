@@ -115,13 +115,14 @@ async def init_admin(
             },
         )
 
-    from ppbase.services.admin_service import _admin_to_dict
+    from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
     from ppbase.services.auth_service import create_admin_token
 
     admin = await admin_service.create_admin(session, body.email, body.password)
     await session.commit()
 
-    token = create_admin_token(admin, settings)
+    su_coll = await _get_superusers_collection(session)
+    token = create_admin_token(admin, settings, superusers_collection=su_coll)
     return {"token": token, "admin": _admin_to_dict(admin)}
 
 

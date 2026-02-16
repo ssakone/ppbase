@@ -262,7 +262,7 @@ async def import_collections(
         )
 
 
-@router.delete("/{idOrName}/truncate", status_code=204)
+@router.post("/{idOrName}/truncate", status_code=204)
 async def truncate_collection(
     idOrName: str,
     session: AsyncSession = Depends(_get_session),

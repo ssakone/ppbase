@@ -57,15 +57,28 @@ async def _lifespan(app: FastAPI):
     except (ConnectionRefusedError, OSError) as exc:
         _handle_db_connection_error(settings.database_url, exc)
 
-    # Ensure the _superusers and _external_auths system collections are registered
-    from ppbase.db.bootstrap import ensure_superusers_collection, ensure_external_auths_collection
+    # Bootstrap all system collections and backfill auth options
+    from ppbase.db.bootstrap import bootstrap_system_collections
+    from ppbase.services.auth_service import generate_default_auth_options
     from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker as _asm
 
     _boot_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
     async with _boot_factory() as _boot_session:
         async with _boot_session.begin():
-            await ensure_superusers_collection(_boot_session)
-            await ensure_external_auths_collection(_boot_session)
+            await bootstrap_system_collections(_boot_session, engine)
+
+            # Backfill auth options for existing auth collections
+            from ppbase.db.system_tables import CollectionRecord
+            from sqlalchemy import select
+
+            stmt = select(CollectionRecord).where(CollectionRecord.type == "auth")
+            auth_colls = (await _boot_session.execute(stmt)).scalars().all()
+            for coll in auth_colls:
+                opts = coll.options or {}
+                if not opts.get("authToken"):
+                    is_su = (coll.name == "_superusers")
+                    coll.options = generate_default_auth_options(is_superusers=is_su)
+                    await _boot_session.flush()
 
     # Apply pending migrations if auto_migrate is enabled
     if settings.auto_migrate:
@@ -149,7 +162,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     setup_cors(app, settings.origins)
 
     # API routes
-    from ppbase.api.router import api_router, _records_router
+    from ppbase.api.router import api_router, _records_router, _record_auth_router
 
     app.include_router(api_router, prefix="/api")
 
@@ -157,6 +170,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # so it must be included at the root level.
     if _records_router is not None:
         app.include_router(_records_router, tags=["records"])
+
+    # The record auth router uses full paths like /api/collections/{...}/auth-*
+    # so it must also be included at the root level.
+    if _record_auth_router is not None:
+        app.include_router(_record_auth_router, tags=["record-auth"])
 
     # Admin UI - serve static files from ppbase/admin/dist/
     import pathlib

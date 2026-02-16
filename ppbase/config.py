@@ -44,7 +44,16 @@ class Settings(BaseSettings):
     # ---- Auth ----
     jwt_secret: str = ""
     admin_token_duration: int = 1_209_600  # 14 days in seconds
-    record_token_duration: int = 1_209_600  # 14 days in seconds
+    record_token_duration: int = 604_800  # 7 days in seconds
+    verification_token_duration: int = 259_200  # 3 days in seconds
+    password_reset_token_duration: int = 1_800  # 30 minutes in seconds
+
+    # ---- SMTP (optional — if not configured, tokens are logged) ----
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "noreply@ppbase.local"
 
     # ---- CORS ----
     origins: list[str] = ["*"]
