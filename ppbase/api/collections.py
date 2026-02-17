@@ -77,6 +77,25 @@ def _get_migration_kwargs(request: Request) -> dict[str, Any]:
     }
 
 
+def _parse_fields(fields_param: str | None) -> set[str] | None:
+    """Parse ``fields`` query param into a normalized set."""
+    if not fields_param:
+        return None
+    fields = {name.strip() for name in fields_param.split(",") if name.strip()}
+    return fields or None
+
+
+def _filter_item_fields(
+    items: list[dict[str, Any]],
+    fields_param: str | None,
+) -> list[dict[str, Any]]:
+    """Filter list item keys based on PocketBase ``fields`` semantics."""
+    fields = _parse_fields(fields_param)
+    if not fields or "*" in fields:
+        return items
+    return [{k: v for k, v in item.items() if k in fields} for item in items]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -88,6 +107,8 @@ async def list_collections(
     perPage: int = Query(default=30, ge=1, le=500, alias="perPage"),
     sort: str = Query(default=""),
     filter: str = Query(default="", alias="filter"),
+    fields: str | None = Query(default=None),
+    skipTotal: bool = Query(default=False),
     session: AsyncSession = Depends(_get_session),
     _admin: str = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -98,8 +119,11 @@ async def list_collections(
         per_page=perPage,
         sort=sort,
         filter_str=filter,
+        skip_total=skipTotal,
     )
-    return result.model_dump()
+    payload = result.model_dump()
+    payload["items"] = _filter_item_fields(payload.get("items", []), fields)
+    return payload
 
 
 @router.post("", status_code=200)

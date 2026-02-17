@@ -150,3 +150,37 @@ class TestDefaultUsersCollection:
         names = {c["name"] for c in items}
         expected = {"_superusers", "_externalAuths", "_mfas", "_otps", "_authOrigins", "users"}
         assert expected.issubset(names), f"Missing: {expected - names}"
+
+    async def test_collections_list_supports_skip_total(
+        self,
+        app_client: AsyncClient,
+        admin_token: str,
+    ):
+        resp = await app_client.get(
+            "/api/collections",
+            headers={"Authorization": admin_token},
+            params={"perPage": 2, "skipTotal": "true"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["totalItems"] == -1
+        assert data["totalPages"] == -1
+        assert data["page"] == 1
+        assert data["perPage"] == 2
+        assert isinstance(data["items"], list)
+
+    async def test_collections_list_supports_fields_filter(
+        self,
+        app_client: AsyncClient,
+        admin_token: str,
+    ):
+        resp = await app_client.get(
+            "/api/collections",
+            headers={"Authorization": admin_token},
+            params={"perPage": 10, "fields": "id,name"},
+        )
+        assert resp.status_code == 200
+        items = resp.json().get("items", [])
+        assert items, "Expected at least one collection."
+        for item in items:
+            assert set(item.keys()) == {"id", "name"}

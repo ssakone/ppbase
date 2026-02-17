@@ -22,6 +22,7 @@ import {
   getAdminPb,
   getFreshPb,
   createTestCollection,
+  registerAndLogin,
   uniqueName,
   waitFor,
 } from './helpers';
@@ -372,5 +373,323 @@ describe('Realtime SSE', () => {
     // Cleanup
     clientPb.realtime.unsubscribe(`${collectionName}/*`);
     await clientPb.collection(collectionName).delete(record.id);
+  });
+
+  it('should not receive events for admin-only listRule when unauthenticated', async () => {
+    const unauthPb = getFreshPb();
+    const events: any[] = [];
+
+    const { collection, cleanup: privateCleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('realtime_private'),
+      schema: [
+        { name: 'title', type: 'text', required: true },
+      ],
+      listRule: null,   // admin-only
+      viewRule: '',     // public
+      createRule: '',   // public
+      updateRule: '',   // public
+      deleteRule: '',   // public
+    });
+
+    let recordId = '';
+    try {
+      unauthPb.realtime.subscribe(`${collection.name}/*`, (data) => {
+        events.push(data);
+      });
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      const created = await adminPb.collection(collection.name).create({ title: 'private' });
+      recordId = created.id;
+      await adminPb.collection(collection.name).update(recordId, { title: 'private-updated' });
+
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      expect(events.length).toBe(0);
+    } finally {
+      unauthPb.realtime.unsubscribe(`${collection.name}/*`);
+      if (recordId) {
+        try { await adminPb.collection(collection.name).delete(recordId); } catch {}
+      }
+      await privateCleanup();
+    }
+  });
+
+  it('should allow admin subscriptions for admin-only listRule', async () => {
+    const adminEvents: any[] = [];
+
+    const { collection, cleanup: privateCleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('realtime_admin_only'),
+      schema: [
+        { name: 'title', type: 'text', required: true },
+      ],
+      listRule: null,   // admin-only
+      viewRule: '',     // public
+      createRule: '',   // public
+      updateRule: '',   // public
+      deleteRule: '',   // public
+    });
+
+    let recordId = '';
+    try {
+      adminPb.realtime.subscribe(`${collection.name}/*`, (data) => {
+        adminEvents.push(data);
+      });
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      const created = await adminPb.collection(collection.name).create({ title: 'admin-visible' });
+      recordId = created.id;
+      await adminPb.collection(collection.name).update(recordId, { title: 'admin-updated' });
+
+      await waitFor(async () => adminEvents.some(e => e.action === 'update'), 5000);
+      expect(adminEvents.some(e => e.record?.id === recordId)).toBe(true);
+    } finally {
+      adminPb.realtime.unsubscribe(`${collection.name}/*`);
+      if (recordId) {
+        try { await adminPb.collection(collection.name).delete(recordId); } catch {}
+      }
+      await privateCleanup();
+    }
+  });
+
+  it('should filter expression listRule events by auth context', async () => {
+    const ownerPb = getFreshPb();
+    const otherPb = getFreshPb();
+    const ownerEvents: any[] = [];
+    const otherEvents: any[] = [];
+    const password = 'securepass123';
+
+    const ownerEmail = `${uniqueName('owner')}@example.com`;
+    const otherEmail = `${uniqueName('other')}@example.com`;
+
+    const ownerAuth = await registerAndLogin(ownerPb, 'users', ownerEmail, password);
+    const otherAuth = await registerAndLogin(otherPb, 'users', otherEmail, password);
+
+    const { collection, cleanup: filteredCleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('realtime_rule_expr'),
+      schema: [
+        { name: 'owner', type: 'text', required: true },
+        { name: 'title', type: 'text', required: true },
+      ],
+      listRule: 'owner = @request.auth.id',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    let recordId = '';
+    try {
+      ownerPb.realtime.subscribe(`${collection.name}/*`, (data) => {
+        ownerEvents.push(data);
+      });
+      otherPb.realtime.subscribe(`${collection.name}/*`, (data) => {
+        otherEvents.push(data);
+      });
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      const created = await adminPb.collection(collection.name).create({
+        owner: ownerAuth.user.id,
+        title: 'owner-only',
+      });
+      recordId = created.id;
+
+      await adminPb.collection(collection.name).update(recordId, {
+        title: 'owner-only-updated',
+      });
+
+      await waitFor(async () => ownerEvents.some(e => e.action === 'update'), 5000);
+      await new Promise(resolve => setTimeout(resolve, 1200));
+
+      expect(ownerEvents.some(e => e.record?.id === recordId)).toBe(true);
+      expect(otherEvents.length).toBe(0);
+    } finally {
+      ownerPb.realtime.unsubscribe(`${collection.name}/*`);
+      otherPb.realtime.unsubscribe(`${collection.name}/*`);
+      if (recordId) {
+        try { await adminPb.collection(collection.name).delete(recordId); } catch {}
+      }
+      try { await adminPb.collection('users').delete(ownerAuth.user.id); } catch {}
+      try { await adminPb.collection('users').delete(otherAuth.user.id); } catch {}
+      await filteredCleanup();
+    }
+  });
+
+  it('should return 403 when realtime auth changes for the same client connection', async () => {
+    const authedPb = getFreshPb();
+    const password = 'securepass123';
+    const email = `${uniqueName('rt_auth')}@example.com`;
+    const auth = await registerAndLogin(authedPb, 'users', email, password);
+
+    try {
+      await authedPb.collection(collectionName).subscribe('*', () => {});
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      const clientId = (authedPb.realtime as any).clientId;
+      expect(clientId).toBeTruthy();
+
+      await expect(
+        authedPb.send('/api/realtime', {
+          method: 'POST',
+          headers: { Authorization: '' },
+          body: {
+            clientId,
+            subscriptions: [`${collectionName}/*`],
+          },
+        })
+      ).rejects.toMatchObject({
+        status: 403,
+      });
+    } finally {
+      await authedPb.realtime.unsubscribe();
+      try { await adminPb.collection('users').delete(auth.user.id); } catch {}
+    }
+  });
+
+  it('should replace subscriptions on partial realtime unsubscribe', async () => {
+    const pb = getFreshPb();
+    const record1Events: any[] = [];
+    const record2Events: any[] = [];
+
+    const record1 = await adminPb.collection(collectionName).create({
+      title: 'replace-semantics-1',
+      count: 1,
+    });
+    const record2 = await adminPb.collection(collectionName).create({
+      title: 'replace-semantics-2',
+      count: 2,
+    });
+
+    try {
+      await pb.collection(collectionName).subscribe(record1.id, (data) => {
+        record1Events.push(data);
+      });
+      await pb.collection(collectionName).subscribe(record2.id, (data) => {
+        record2Events.push(data);
+      });
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // This triggers a POST /api/realtime with only the remaining subscription.
+      await pb.collection(collectionName).unsubscribe(record1.id);
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      await adminPb.collection(collectionName).update(record1.id, {
+        title: 'replace-semantics-1-updated',
+      });
+      await adminPb.collection(collectionName).update(record2.id, {
+        title: 'replace-semantics-2-updated',
+      });
+
+      await waitFor(async () => record2Events.some(e => e.action === 'update'), 5000);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      expect(record1Events.length).toBe(0);
+      expect(record2Events.some(e => e.record?.id === record2.id)).toBe(true);
+    } finally {
+      await pb.realtime.unsubscribe();
+      try { await adminPb.collection(collectionName).delete(record1.id); } catch {}
+      try { await adminPb.collection(collectionName).delete(record2.id); } catch {}
+    }
+  });
+
+  it('should support realtime options query with fields and expand', async () => {
+    const pb = getFreshPb();
+    const expandEvents: any[] = [];
+    const fieldsEvents: any[] = [];
+
+    const { collection: authorsColl, cleanup: authorsCleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('realtime_authors'),
+      schema: [{ name: 'name', type: 'text', required: true }],
+      listRule: '',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    const { collection: postsColl, cleanup: postsCleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('realtime_posts'),
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        { name: 'count', type: 'number', required: false },
+        {
+          name: 'author',
+          type: 'relation',
+          required: false,
+          options: {
+            collectionId: authorsColl.id,
+            maxSelect: 1,
+          },
+        },
+      ],
+      listRule: '',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    let authorId = '';
+    let postId = '';
+    try {
+      await pb.collection(postsColl.name).subscribe('*', (data) => {
+        expandEvents.push(data);
+      }, {
+        query: { expand: 'author' },
+      });
+
+      await pb.collection(postsColl.name).subscribe('*', (data) => {
+        fieldsEvents.push(data);
+      }, {
+        query: { fields: 'id,title' },
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      const author = await adminPb.collection(authorsColl.name).create({ name: 'Realtime Author' });
+      authorId = author.id;
+
+      const post = await adminPb.collection(postsColl.name).create({
+        title: 'Realtime Options',
+        count: 7,
+        author: author.id,
+      });
+      postId = post.id;
+
+      await waitFor(
+        async () => expandEvents.some(e => e.action === 'create' && e.record?.id === post.id),
+        5000
+      );
+      await waitFor(
+        async () => fieldsEvents.some(e => e.action === 'create' && e.record?.id === post.id),
+        5000
+      );
+
+      const expandEvent = expandEvents.find(
+        e => e.action === 'create' && e.record?.id === post.id
+      );
+      const fieldsEvent = fieldsEvents.find(
+        e => e.action === 'create' && e.record?.id === post.id
+      );
+
+      expect(expandEvent).toBeDefined();
+      expect(expandEvent.record.expand.author).toBeTruthy();
+      expect(expandEvent.record.expand.author.id).toBe(author.id);
+      expect(expandEvent.record.expand.author.name).toBe('Realtime Author');
+
+      expect(fieldsEvent).toBeDefined();
+      expect(fieldsEvent.record.id).toBe(post.id);
+      expect(fieldsEvent.record.title).toBe('Realtime Options');
+      expect(fieldsEvent.record.count).toBeUndefined();
+      expect(fieldsEvent.record.author).toBeUndefined();
+    } finally {
+      await pb.realtime.unsubscribe();
+      if (postId) {
+        try { await adminPb.collection(postsColl.name).delete(postId); } catch {}
+      }
+      if (authorId) {
+        try { await adminPb.collection(authorsColl.name).delete(authorId); } catch {}
+      }
+      await postsCleanup();
+      await authorsCleanup();
+    }
   });
 });

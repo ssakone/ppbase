@@ -193,14 +193,20 @@ async def list_collections(
     per_page: int = 30,
     sort: str = "",
     filter_str: str = "",
+    skip_total: bool = False,
 ) -> CollectionListResponse:
     """List collections with pagination and sorting."""
-    # Count total
-    count_stmt = select(func.count(CollectionRecord.id))
-    count_result = await session.execute(count_stmt)
-    total_items = count_result.scalar_one()
+    # Count total unless explicitly skipped
+    total_items = -1
+    if not skip_total:
+        count_stmt = select(func.count(CollectionRecord.id))
+        count_result = await session.execute(count_stmt)
+        total_items = count_result.scalar_one()
 
-    total_pages = max(1, math.ceil(total_items / per_page)) if per_page > 0 else 1
+    if total_items < 0:
+        total_pages = -1
+    else:
+        total_pages = max(1, math.ceil(total_items / per_page)) if per_page > 0 else 0
 
     # Query items
     stmt = select(CollectionRecord)

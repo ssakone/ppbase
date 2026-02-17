@@ -10,7 +10,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ppbase.api.deps import get_optional_auth
 from ppbase.db.engine import get_engine
-from ppbase.services.realtime_service import SubscriptionManager
+from ppbase.services.realtime_service import (
+    ParsedRealtimeTopic,
+    RealtimeSubscription,
+    SubscriptionManager,
+    parse_realtime_topic,
+)
 from ppbase.services.record_service import resolve_collection
 
 logger = logging.getLogger(__name__)
@@ -29,6 +34,16 @@ def _error_response(status: int, message: str, data: Any = None) -> JSONResponse
         "data": data or {},
     }
     return JSONResponse(content=body, status_code=status)
+
+
+def _build_realtime_auth_key(auth: dict[str, Any] | None) -> str | None:
+    """Build a stable auth identity key for realtime subscription consistency."""
+    if not auth:
+        return None
+    token_type = auth.get("type", "")
+    auth_id = auth.get("id", "")
+    collection_id = auth.get("collectionId", "")
+    return f"{token_type}:{collection_id}:{auth_id}"
 
 
 @router.get("/api/realtime")
@@ -110,14 +125,19 @@ async def realtime_subscribe(
     # Verify client exists
     session = subscription_manager.get_session(client_id)
     if not session:
-        return _error_response(404, f"Client not found: {client_id}")
+        return _error_response(404, "Missing or invalid client id.")
+
+    current_auth_key = _build_realtime_auth_key(auth)
+    if session.auth_key_set and session.auth_key != current_auth_key:
+        return _error_response(
+            403,
+            "The current and the previous request authorization don't match.",
+        )
+    if not session.auth_key_set:
+        session.auth_key = current_auth_key
+        session.auth_key_set = True
 
     engine = get_engine()
-
-    # If subscriptions is empty, clear all subscriptions
-    if not subscriptions:
-        await subscription_manager.clear_subscriptions(client_id)
-        return Response(status_code=204)
 
     # Parse auth token from Authorization header
     auth_token = None
@@ -126,41 +146,49 @@ async def realtime_subscribe(
         if auth_token.lower().startswith("bearer "):
             auth_token = auth_token[7:].strip()
 
-    # Process each subscription
+    parsed_subscriptions: list[RealtimeSubscription] = []
+
+    # Process each subscription (new set replaces old subscriptions)
     for sub in subscriptions:
         # Parse topic: "collectionName/*" or "collectionName/recordId"
-        topic = sub.strip()
-        if not topic:
+        raw_topic = sub.strip()
+        if not raw_topic:
             continue
 
-        parts = topic.split("/")
-        if len(parts) != 2:
-            logger.warning(f"Invalid topic format: {topic}")
+        try:
+            parsed_topic: ParsedRealtimeTopic = parse_realtime_topic(raw_topic)
+        except ValueError as e:
+            logger.warning("Invalid realtime topic '%s': %s", raw_topic, e)
             continue
-
-        collection_name = parts[0]
-        resource = parts[1]
 
         # Resolve collection
         try:
-            collection = await resolve_collection(engine, collection_name)
+            collection = await resolve_collection(engine, parsed_topic.collection_name)
             if collection is None:
-                logger.warning(f"Collection not found: {collection_name}")
+                logger.warning(f"Collection not found: {parsed_topic.collection_name}")
                 continue
         except Exception as e:
-            logger.warning(f"Failed to resolve collection {collection_name}: {e}")
+            logger.warning(
+                "Failed to resolve collection %s: %s",
+                parsed_topic.collection_name,
+                e,
+            )
             continue
 
-        # Check authorization
-        # For collection-wide subscriptions (*), check listRule
-        # For single-record subscriptions, check viewRule
-        # TODO: Actually evaluate rules with auth context
-        # For now, we'll allow all subscriptions and rely on
-        # the rules being enforced when records are fetched
-        # This matches PocketBase behavior where subscriptions
-        # are allowed but events are filtered by rules
+        parsed_subscriptions.append(
+            RealtimeSubscription(
+                topic=parsed_topic.raw_topic,
+                base_topic=parsed_topic.base_topic,
+                auth_token=auth_token,
+                auth_payload=auth,
+                options_query=parsed_topic.options_query,
+                options_headers=parsed_topic.options_headers,
+            )
+        )
 
-        # Add subscription
-        await subscription_manager.add_subscription(client_id, topic, auth_token)
+    await subscription_manager.replace_subscriptions(
+        client_id,
+        parsed_subscriptions,
+    )
 
     return Response(status_code=204)
