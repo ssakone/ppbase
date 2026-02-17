@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     verification_token_duration: int = 259_200  # 3 days in seconds
     password_reset_token_duration: int = 1_800  # 30 minutes in seconds
 
+    # ---- OAuth2 Provider Credentials ----
+    oauth2_google_client_id: str = ""
+    oauth2_google_client_secret: str = ""
+    oauth2_github_client_id: str = ""
+    oauth2_github_client_secret: str = ""
+    oauth2_gitlab_client_id: str = ""
+    oauth2_gitlab_client_secret: str = ""
+    oauth2_discord_client_id: str = ""
+    oauth2_discord_client_secret: str = ""
+    oauth2_facebook_client_id: str = ""
+    oauth2_facebook_client_secret: str = ""
+
     # ---- SMTP (optional — if not configured, tokens are logged) ----
     smtp_host: str = ""
     smtp_port: int = 587

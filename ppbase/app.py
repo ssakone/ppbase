@@ -40,8 +40,10 @@ def _handle_db_connection_error(database_url: str, exc: BaseException) -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Manage startup and shutdown of the database engine."""
+    import asyncio
     from ppbase.db.engine import init_engine, close_engine
     from ppbase.db.system_tables import create_system_tables
+    from ppbase.services.realtime_service import SubscriptionManager, listen_for_db_events
 
     settings: Settings = app.state.settings
 
@@ -56,6 +58,16 @@ async def _lifespan(app: FastAPI):
         await create_system_tables(engine)
     except (ConnectionRefusedError, OSError) as exc:
         _handle_db_connection_error(settings.database_url, exc)
+
+    # Initialize realtime subscription manager
+    subscription_manager = SubscriptionManager()
+    app.state.subscription_manager = subscription_manager
+
+    # Start PostgreSQL LISTEN task for realtime events
+    listen_task = asyncio.create_task(
+        listen_for_db_events(engine, subscription_manager)
+    )
+    logger.info("Started PostgreSQL LISTEN task for realtime events")
 
     # Bootstrap all system collections and backfill auth options
     from ppbase.db.bootstrap import bootstrap_system_collections
@@ -128,7 +140,14 @@ async def _lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: dispose of the connection pool
+    # Shutdown: cancel LISTEN task and dispose of the connection pool
+    logger.info("Shutting down PostgreSQL LISTEN task")
+    listen_task.cancel()
+    try:
+        await listen_task
+    except asyncio.CancelledError:
+        pass
+
     await close_engine()
 
 
@@ -162,7 +181,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     setup_cors(app, settings.origins)
 
     # API routes
-    from ppbase.api.router import api_router, _records_router, _record_auth_router
+    from ppbase.api.router import (
+        api_router,
+        _records_router,
+        _record_auth_router,
+        _realtime_router,
+    )
 
     app.include_router(api_router, prefix="/api")
 
@@ -175,6 +199,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # so it must also be included at the root level.
     if _record_auth_router is not None:
         app.include_router(_record_auth_router, tags=["record-auth"])
+
+    # The realtime router uses full paths like /api/realtime
+    # so it must also be included at the root level.
+    if _realtime_router is not None:
+        app.include_router(_realtime_router, tags=["realtime"])
 
     # Admin UI - serve static files from ppbase/admin/dist/
     import pathlib

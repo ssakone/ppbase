@@ -10,6 +10,8 @@ import math
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel
+
 
 def format_datetime(dt: datetime | str | None) -> str:
     """Format a datetime value to PocketBase's string format.
@@ -168,3 +170,32 @@ def build_list_response(
         "totalPages": total_pages,
         "items": items,
     }
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 Models
+# ---------------------------------------------------------------------------
+
+
+class OAuth2AuthRequest(BaseModel):
+    """Request model for OAuth2 authentication."""
+
+    provider: str
+    code: str
+    codeVerifier: str
+    redirectUrl: str
+    createData: dict[str, Any] = {}
+
+
+class OAuth2Meta(BaseModel):
+    """OAuth2 metadata returned in auth response."""
+
+    id: str
+    name: str | None = None
+    email: str | None = None
+    username: str | None = None
+    avatarURL: str | None = None
+    isNew: bool
+    accessToken: str
+    refreshToken: str | None = None
+    expiry: float | None = None

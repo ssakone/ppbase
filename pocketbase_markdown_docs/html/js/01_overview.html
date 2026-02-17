@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vue d'ensemble — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link active" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Extend with JavaScript <span>›</span> Vue d'ensemble</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="js-overview">JS - Overview</h1>
+<hr />
+<p>Overview</p>
+<h3 id="javascript-engine"><a href="#javascript-engine">JavaScript engine</a></h3>
+<p>The prebuilt PocketBase v0.17+ executable comes with embedded ES5 JavaScript engine (<a href="https://github.com/dop251/goja">goja</a>) which enables you to write custom server-side code using plain JavaScript.</p>
+<p>You can start by creating <code>*.pb.js</code> file(s) inside a <code>pb_hooks</code> directory next to your executable.</p>
+<p><code>// pb_hooks/main.pb.js routerAdd("GET", "/hello/{name}", (e) =&gt; { let name = e.request.pathValue("name") return e.json(200, { "message": "Hello " + name }) }) onRecordAfterUpdateSuccess((e) =&gt; { console.log("user updated...", e.record.get("email")) e.next() }, "users")</code></p>
+<p><em>For convenience, when making changes to the files inside <code>pb_hooks</code>, the process will automatically restart/reload itself (currently supported only on UNIX based platforms). The <code>*.pb.js</code> files are loaded per their filename sort order.</em></p>
+<p>For most parts, the JavaScript APIs are derived from <a href="/docs/go-overview">Go</a> with 2 main differences:</p>
+<ul>
+<li>Go exported method and field names are converted to camelCase, for example:<br />
+<code>app.FindRecordById("example", "RECORD_ID")</code> becomes <code>$app.findRecordById("example", "RECORD_ID")</code>.</li>
+<li>Errors are thrown as regular JavaScript exceptions and not returned as Go values.</li>
+</ul>
+<h5 id="global-objects"><a href="#global-objects">Global objects</a></h5>
+<p>Below is a list with some of the commonly used global objects that are accessible from everywhere:</p>
+<ul>
+<li><a href="/jsvm/variables/__hooks.html"><code>__hooks</code></a> - The absolute path to the app <code>pb_hooks</code> directory.</li>
+<li><a href="/jsvm/modules/_app.html"><code>$app</code></a> - The current running PocketBase application instance.</li>
+<li><a href="/jsvm/modules/_apis.html"><code>$apis.*</code></a> - API routing helpers and middlewares.</li>
+<li><a href="/jsvm/modules/_os.html"><code>$os.*</code></a> - OS level primitives (deleting directories, executing shell commands, etc.).</li>
+<li><a href="/jsvm/modules/_security.html"><code>$security.*</code></a> - Low level helpers for creating and parsing JWTs, random string generation, AES encryption, etc.</li>
+<li>And many more - for all exposed APIs, please refer to the <a href="/jsvm/index.html">JSVM reference docs</a>.</li>
+</ul>
+<h3 id="typescript-declarations-and-code-completion"><a href="#typescript-declarations-and-code-completion">TypeScript declarations and code completion</a></h3>
+<p>While you can't use directly TypeScript (<em>without transpiling it to JS on your own</em>), PocketBase comes with builtin <strong>ambient TypeScript declarations</strong> that can help providing information and documentation about the available global variables, methods and arguments, code completion, etc. as long as your editor has TypeScript LSP support <em>(most editors either have it builtin or available as plugin)</em>.</p>
+<p>The types declarations are stored in <code>pb_data/types.d.ts</code> file. You can point to those declarations using the <a href="https://www.typescriptlang.org/docs/handbook/triple-slash-directives.html#-reference-path-">reference triple-slash directive</a> at the top of your JS file:</p>
+<p><code>/// &lt;reference path="../pb_data/types.d.ts" /&gt; onBootstrap((e) =&gt; { e.next() console.log("App initialized!") })</code></p>
+<p>If after referencing the types your editor still doesn't perform linting, then you can try to rename your file to have <code>.pb.ts</code> extension.</p>
+<h3 id="caveats-and-limitations"><a href="#caveats-and-limitations">Caveats and limitations</a></h3>
+<h5 id="handlers-scope"><a href="#handlers-scope">Handlers scope</a></h5>
+<p>Each handler function (hook, route, middleware, etc.) is <strong>serialized and executed in its own isolated context as a separate "program"</strong>. This means that you don't have access to custom variables and functions declared outside of the handler scope. For example, the below code will fail:</p>
+<p><code>const name = "test" onBootstrap((e) =&gt; { e.next() console.log(name) // &lt;-- name will be undefined inside the handler })</code></p>
+<p>The above serialization and isolation context is also the reason why error stack trace line numbers may not be accurate.</p>
+<p>One possible workaround for sharing/reusing code across different handlers could be to move and export the reusable code portion as local module and load it with <code>require()</code> inside the handler but keep in mind that the loaded modules use a shared registry and mutations should be avoided when possible to prevent concurrency issues:</p>
+<p><code>onBootstrap((e) =&gt; { e.next() const config = require(`${__hooks}/config.js`) console.log(config.name) })</code></p>
+<h5 id="relative-paths"><a href="#relative-paths">Relative paths</a></h5>
+<p>Relative file paths are relative to the current working directory (CWD) and not to the <code>pb_hooks</code>.<br />
+To get an absolute path to the <code>pb_hooks</code> directory you can use the global <code>__hooks</code> variable.</p>
+<h5 id="loading-modules"><a href="#loading-modules">Loading modules</a></h5>
+<p>Please note that the embedded JavaScript engine is not a Node.js or browser environment, meaning that modules that rely on APIs like <em>window</em>, <em>fs</em>, <em>fetch</em>, <em>buffer</em> or any other runtime specific API not part of the ES5 spec may not work!</p>
+<p>You can load modules either by specifying their local filesystem path or by using their name, which will automatically search in:</p>
+<ul>
+<li>the current working directory (<em>affects also relative paths</em>)</li>
+<li>any <code>node_modules</code> directory</li>
+<li>any parent <code>node_modules</code> directory</li>
+</ul>
+<p>Currently only CommonJS (CJS) modules are supported and can be loaded with <code>const x = require(...)</code>.<br />
+ECMAScript modules (ESM) can be loaded by first precompiling and transforming your dependencies with a bundler like <a href="https://rollupjs.org/">rollup</a>, <a href="https://webpack.js.org/">webpack</a>, <a href="https://browserify.org/">browserify</a>, etc.</p>
+<p>A common usage of local modules is for loading shared helpers or configuration parameters, for example:</p>
+<p><code>// pb_hooks/utils.js module.exports = { hello: (name) =&gt; { console.log("Hello " + name) } }</code></p>
+<p><code>// pb_hooks/main.pb.js onBootstrap((e) =&gt; { e.next() const utils = require(`${__hooks}/utils.js`) utils.hello("world") })</code></p>
+<p>Loaded modules use a shared registry and mutations should be avoided when possible to prevent concurrency issues.</p>
+<h5 id="performance"><a href="#performance">Performance</a></h5>
+<p>The prebuilt executable comes with a <strong>prewarmed pool of 15 JS runtimes</strong>, which helps maintaining the handlers execution times on par with the Go equivalent code (see <a href="https://github.com/pocketbase/benchmarks/blob/master/results/hetzner_cax11.md#go-vs-js-route-execution">benchmarks</a>). You can adjust the pool size manually with the <code>--hooksPool=50</code> flag (<em>increasing the pool size may improve the performance in high concurrent scenarios but also will increase the memory usage</em>).</p>
+<p>Note that the handlers performance may degrade if you have heavy computational tasks in pure JavaScript (encryption, random generators, etc.). For such cases prefer using the exposed <a href="/jsvm/index.html">Go bindings</a> (e.g. <code>$security.randomString(10)</code>).</p>
+<h5 id="engine-limitations"><a href="#engine-limitations">Engine limitations</a></h5>
+<p>We inherit some of the limitations and caveats of the embedded JavaScript engine (<a href="https://github.com/dop251/goja">goja</a>):</p>
+<ul>
+<li>Has most of ES6 functionality already implemented but it is not fully spec compliant yet.</li>
+<li>No concurrent execution inside a single handler (aka. no <code>setTimeout</code>/<code>setInterval</code>).</li>
+<li>Wrapped Go structural types (such as maps, slices) comes with some peculiarities and do not behave the exact same way as native ECMAScript values (for more details see <a href="https://pkg.go.dev/github.com/dop251/goja#Runtime.ToValue">goja ToValue</a>).</li>
+<li>In relation to the above, DB <code>json</code> field values require the use of <code>get()</code> and <code>set()</code> helpers (<em>this may change in the future</em>).</li>
+</ul>
+    <div id="page-nav">
+      <a href="../go/17_record-proxy.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Record Proxy</span>
+        </a>
+      <a href="../js/02_event-hooks.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Event Hooks</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

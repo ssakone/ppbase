@@ -447,6 +447,16 @@ async def create_record(
     async with engine.begin() as conn:
         await conn.execute(text(insert_sql), columns)
 
+        # Send PostgreSQL NOTIFY for realtime updates
+        notify_payload = _json.dumps({
+            "collection": collection.name,
+            "record_id": record_id,
+            "action": "create",
+        })
+        # NOTIFY requires string literal, escape single quotes
+        escaped_payload = notify_payload.replace("'", "''")
+        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+
     # Fetch and return the created record
     return (await get_record(engine, collection, record_id)) or {
         "id": record_id,
@@ -634,7 +644,6 @@ async def update_record(
                     new_files = {str(value)}
 
                 removed = old_files - new_files
-                print(f"[DEBUG] File field '{field_name}': old_val={old_val}, old_files={old_files}, new_files={new_files}, removed={removed}")
                 files_to_delete.extend(removed)
 
             try:
@@ -668,10 +677,18 @@ async def update_record(
     async with engine.begin() as conn:
         await conn.execute(text(update_sql), params)
 
+        # Send PostgreSQL NOTIFY for realtime updates
+        notify_payload = _json.dumps({
+            "collection": collection.name,
+            "record_id": record_id,
+            "action": "update",
+        })
+        # NOTIFY requires string literal, escape single quotes
+        escaped_payload = notify_payload.replace("'", "''")
+        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+
     # Delete removed files from disk
-    print(f"[DEBUG] files_to_delete: {files_to_delete}")
     if files_to_delete:
-        print(f"[DEBUG] Calling delete_files for record {record_id}: {files_to_delete}")
         delete_files(collection.id, record_id, files_to_delete)
 
     return await get_record(engine, collection, record_id)
@@ -758,6 +775,16 @@ async def delete_record(
     delete_sql = f'DELETE FROM "{table}" WHERE "id" = :id'
     async with engine.begin() as conn:
         await conn.execute(text(delete_sql), {"id": record_id})
+
+        # Send PostgreSQL NOTIFY for realtime updates
+        notify_payload = _json.dumps({
+            "collection": collection.name,
+            "record_id": record_id,
+            "action": "delete",
+        })
+        # NOTIFY requires string literal, escape single quotes
+        escaped_payload = notify_payload.replace("'", "''")
+        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
 
     # Delete all associated files from disk
     delete_all_files(collection.id, record_id)

@@ -6,8 +6,10 @@ be used to authenticate against a different auth collection.
 
 from __future__ import annotations
 
+import time
 import uuid
 
+import jwt as pyjwt
 import pytest
 from httpx import AsyncClient
 
@@ -114,3 +116,35 @@ class TestTokenIsolation:
             headers={"Authorization": token},
         )
         assert resp.status_code == 401
+
+    async def test_forged_authrecord_with_unknown_collection_is_rejected(
+        self, app_client: AsyncClient, auth_collection: dict
+    ):
+        """Forged authRecord token with unknown collectionId must not grant access."""
+        email = f"forged_{uuid.uuid4().hex[:8]}@example.com"
+        reg = await app_client.post(
+            "/api/collections/users/records",
+            json={
+                "email": email,
+                "password": "securepass123",
+                "passwordConfirm": "securepass123",
+            },
+        )
+        assert reg.status_code == 200, reg.text
+        user = reg.json()
+
+        now = int(time.time())
+        forged_payload = {
+            "id": user["id"],
+            "type": "authRecord",
+            "collectionId": "missing_collection_id",
+            "iat": now,
+            "exp": now + 3600,
+        }
+        forged = pyjwt.encode(forged_payload, "attacker-secret", algorithm="HS256")
+
+        resp = await app_client.get(
+            f"/api/collections/users/records/{user['id']}",
+            headers={"Authorization": forged},
+        )
+        assert resp.status_code == 404, resp.text

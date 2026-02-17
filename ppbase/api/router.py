@@ -77,3 +77,12 @@ try:
     _record_auth_router = record_auth_router
 except (ImportError, AttributeError):
     _record_auth_router = None
+
+# Realtime router -- SSE endpoints for real-time updates.
+# Paths: /api/realtime (GET for connection, POST for subscriptions)
+try:
+    from ppbase.api.realtime import router as realtime_router
+
+    _realtime_router = realtime_router
+except (ImportError, AttributeError):
+    _realtime_router = None

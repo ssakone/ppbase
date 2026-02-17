@@ -3,6 +3,7 @@
 Provides authentication endpoints for collections of type ``auth``:
 - GET    /api/collections/{collection}/auth-methods
 - POST   /api/collections/{collection}/auth-with-password
+- POST   /api/collections/{collection}/auth-with-oauth2
 - POST   /api/collections/{collection}/auth-refresh
 - POST   /api/collections/{collection}/request-verification
 - POST   /api/collections/{collection}/confirm-verification
@@ -66,7 +67,7 @@ def _apply_fields_filter(record: dict[str, Any], fields_param: str) -> dict[str,
 
 
 @router.get("/api/collections/{collectionIdOrName}/auth-methods")
-async def api_auth_methods(collectionIdOrName: str) -> JSONResponse:
+async def api_auth_methods(collectionIdOrName: str, request: Request) -> JSONResponse:
     """Return available auth methods for the collection."""
     engine = get_engine()
     collection = await resolve_collection(engine, collectionIdOrName)
@@ -87,20 +88,79 @@ async def api_auth_methods(collectionIdOrName: str) -> JSONResponse:
     email_password = enabled and "email" in identity_fields
     username_password = enabled and "username" in identity_fields
 
+    # Build OAuth2 providers list
+    oauth2_config = opts.get("oauth2", {})
+    oauth2_enabled = oauth2_config.get("enabled", False)
+    oauth2_providers = []
+
+    if oauth2_enabled:
+        from ppbase.services.oauth2_service import (
+            generate_pkce_pair,
+            generate_state,
+            get_provider_class,
+            get_provider_credentials,
+        )
+
+        settings = request.app.state.settings
+
+        # Get configured providers from collection options or environment
+        provider_names = []
+        if oauth2_config.get("providers"):
+            provider_names = [p.get("name") for p in oauth2_config["providers"] if p.get("name")]
+        else:
+            # Check environment for any configured providers
+            for provider_name in ["google", "github", "gitlab", "discord", "facebook"]:
+                try:
+                    get_provider_credentials(provider_name, settings, opts)
+                    provider_names.append(provider_name)
+                except Exception:
+                    pass
+
+        # Build provider configs with auth URLs
+        for provider_name in provider_names:
+            try:
+                client_id, client_secret = get_provider_credentials(provider_name, settings, opts)
+                provider_class = get_provider_class(provider_name)
+                provider = provider_class(client_id, client_secret)
+
+                # Generate PKCE pair and state
+                code_verifier, code_challenge = generate_pkce_pair()
+                state = generate_state()
+
+                # Build redirect URL (base URL + collection-specific callback)
+                base_url = str(request.base_url).rstrip("/")
+                redirect_url = f"{base_url}/api/oauth2-redirect"
+
+                # Get auth URL
+                auth_url = provider.get_auth_url(state, code_challenge, redirect_url)
+
+                oauth2_providers.append({
+                    "name": provider_name,
+                    "displayName": provider_name.capitalize(),
+                    "state": state,
+                    "codeVerifier": code_verifier,
+                    "codeChallenge": code_challenge,
+                    "codeChallengeMethod": "S256",
+                    "authURL": auth_url,
+                })
+            except Exception:
+                # Skip providers that aren't configured
+                pass
+
     return JSONResponse(
         content={
             # PocketBase SDK v0.x compatibility fields
             "usernamePassword": username_password,
             "emailPassword": email_password,
-            "authProviders": [],
+            "authProviders": oauth2_providers,  # Legacy field
             # Newer structured format
             "password": {
                 "enabled": enabled,
                 "identityFields": identity_fields,
             },
             "oauth2": {
-                "enabled": False,
-                "providers": [],
+                "enabled": oauth2_enabled and len(oauth2_providers) > 0,
+                "providers": oauth2_providers,
             },
         }
     )
@@ -196,6 +256,149 @@ async def api_auth_with_password(
         result["record"] = _apply_fields_filter(result["record"], fields_param)
 
     return JSONResponse(content=result)
+
+
+# ---------------------------------------------------------------------------
+# POST auth-with-oauth2
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/collections/{collectionIdOrName}/auth-with-oauth2")
+async def api_auth_with_oauth2(
+    collectionIdOrName: str,
+    request: Request,
+) -> JSONResponse:
+    """Authenticate a user with OAuth2 authorization code."""
+    engine = get_engine()
+    collection = await resolve_collection(engine, collectionIdOrName)
+    if collection is None:
+        return _error_response(404, "Missing collection context.")
+
+    # Block _superusers
+    if collection.name == "_superusers":
+        return _error_response(
+            404,
+            "Use the admin auth endpoints for _superusers.",
+        )
+
+    err = _require_auth_collection(collection)
+    if err:
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response(400, "Invalid JSON body.")
+
+    provider = body.get("provider", "").strip()
+    code = body.get("code", "").strip()
+    code_verifier = body.get("codeVerifier", "").strip()
+    redirect_url = body.get("redirectUrl", "").strip()
+    create_data = body.get("createData", {})
+
+    if not provider:
+        return _error_response(
+            400,
+            "Failed to authenticate.",
+            {"provider": {"code": "validation_required", "message": "Cannot be blank."}},
+        )
+
+    if not code:
+        return _error_response(
+            400,
+            "Failed to authenticate.",
+            {"code": {"code": "validation_required", "message": "Cannot be blank."}},
+        )
+
+    if not code_verifier:
+        return _error_response(
+            400,
+            "Failed to authenticate.",
+            {"codeVerifier": {"code": "validation_required", "message": "Cannot be blank."}},
+        )
+
+    if not redirect_url:
+        return _error_response(
+            400,
+            "Failed to authenticate.",
+            {"redirectUrl": {"code": "validation_required", "message": "Cannot be blank."}},
+        )
+
+    # Check OAuth2 is enabled for this collection
+    opts = collection.options or {}
+    oauth2_config = opts.get("oauth2", {})
+    if not oauth2_config.get("enabled", False):
+        return _error_response(
+            400,
+            f"OAuth2 authentication is not enabled for collection \"{collection.name}\".",
+        )
+
+    settings = request.app.state.settings
+
+    from ppbase.services.oauth2_service import (
+        get_provider_class,
+        get_provider_credentials,
+        link_or_create_oauth_user,
+    )
+
+    try:
+        # Get provider credentials and instantiate provider
+        client_id, client_secret = get_provider_credentials(provider, settings, opts)
+        provider_class = get_provider_class(provider)
+        provider_instance = provider_class(client_id, client_secret)
+
+        # Exchange code for access token
+        token_data = await provider_instance.exchange_code(code, redirect_url, code_verifier)
+
+        # Get user info from provider
+        user_info = await provider_instance.get_user_info(token_data.get("access_token"))
+
+        # Link or create user
+        result = await link_or_create_oauth_user(
+            engine,
+            collection,
+            provider,
+            user_info,
+            token_data,
+            create_data,
+        )
+
+        # Generate JWT token for the user
+        from ppbase.services.record_auth_service import generate_record_auth_token
+
+        token = await generate_record_auth_token(
+            engine, collection, result["record"]["id"], settings
+        )
+
+        # Build response
+        response_data = {
+            "token": token,
+            "record": result["record"],
+            "meta": result["meta"],
+        }
+
+        # Apply expand if requested
+        expand_str = request.query_params.get("expand", "")
+        if expand_str and response_data.get("record"):
+            all_colls = await get_all_collections(engine)
+            records = await expand_records(
+                engine, collection, [response_data["record"]], expand_str, all_colls,
+            )
+            response_data["record"] = records[0] if records else response_data["record"]
+
+        # Apply fields filter if requested
+        fields_param = request.query_params.get("fields", "")
+        if fields_param and response_data.get("record"):
+            response_data["record"] = _apply_fields_filter(response_data["record"], fields_param)
+
+        return JSONResponse(content=response_data)
+
+    except Exception as e:
+        return _error_response(
+            400,
+            f"Failed to authenticate with OAuth2: {str(e)}",
+            {"provider": {"code": "validation_oauth2_failed", "message": str(e)}},
+        )
 
 
 # ---------------------------------------------------------------------------

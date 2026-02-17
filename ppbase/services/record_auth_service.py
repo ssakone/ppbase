@@ -96,6 +96,30 @@ async def _update_record_columns(
 # ---------------------------------------------------------------------------
 
 
+async def generate_record_auth_token(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    record_id: str,
+    settings: Any,
+) -> str:
+    """Generate an auth token for a record by ID.
+
+    Args:
+        engine: Database engine
+        collection: Auth collection
+        record_id: Record ID
+        settings: App settings
+
+    Returns:
+        JWT token string
+    """
+    row = await _get_raw_record_by_id(engine, collection, record_id)
+    if row is None:
+        raise ValueError(f"Record not found: {record_id}")
+
+    return create_record_auth_token(row, collection, settings)
+
+
 async def auth_with_password(
     engine: AsyncEngine,
     collection: CollectionRecord,

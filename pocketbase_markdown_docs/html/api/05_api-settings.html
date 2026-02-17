@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API — Paramètres — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link active" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Référence Web API <span>›</span> API — Paramètres</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="web-api-settings">Web API - Settings</h1>
+<hr />
+<p>API Settings</p>
+<p><strong><a href="#list-settings">List settings</a></strong></p>
+<p>Returns a list with all available application settings.</p>
+<p>Secret/password fields are automatically redacted with <em>******</em> characters.</p>
+<p>Only superusers can perform this action.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); const settings = await pb.settings.getAll();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); final settings = await pb.settings.getAll();</code></p>
+<h6 id="api-details">API details</h6>
+<p><strong>GET</strong></p>
+<p>/api/settings</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 401 403</p>
+<p><code>{ "smtp": { "enabled": false, "port": 587, "host": "smtp.example.com", "username": "", "authMethod": "", "tls": true, "localName": "" }, "backups": { "cron": "0 0 * * *", "cronMaxKeep": 3, "s3": { "enabled": false, "bucket": "", "region": "", "endpoint": "", "accessKey": "", "forcePathStyle": false } }, "s3": { "enabled": false, "bucket": "", "region": "", "endpoint": "", "accessKey": "", "forcePathStyle": false }, "meta": { "appName": "Acme", "appURL": "https://example.com", "senderName": "Support", "senderAddress": "support@example.com", "hideControls": false }, "rateLimits": { "rules": [ { "label": "*:auth", "audience": "", "duration": 3, "maxRequests": 2 }, { "label": "*:create", "audience": "", "duration": 5, "maxRequests": 20 }, { "label": "/api/batch", "audience": "", "duration": 1, "maxRequests": 3 }, { "label": "/api/", "audience": "", "duration": 10, "maxRequests": 300 } ], "enabled": false }, "trustedProxy": { "headers": [], "useLeftmostIP": false }, "batch": { "enabled": true, "maxRequests": 50, "timeout": 3, "maxBodySize": 0 }, "logs": { "maxDays": 7, "minLevel": 0, "logIP": true, "logAuthId": false } }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "The authorized record is not allowed to perform this action.", "data": {} }</code></p>
+<p><strong><a href="#update-settings">Update settings</a></strong></p>
+<p>Bulk updates application settings and returns the updated settings list.</p>
+<p>Only superusers can perform this action.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '123456'); const settings = await pb.settings.update({ meta: { appName: 'YOUR_APP', appUrl: 'http://127.0.0.1:8090', }, });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '123456'); final settings = await pb.settings.update(body: { 'meta': { 'appName': 'YOUR_APP', 'appUrl': 'http://127.0.0.1:8090', }, });</code></p>
+<h6 id="api-details_1">API details</h6>
+<p><strong>PATCH</strong></p>
+<p>/api/settings</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p><strong>meta</strong><br />
+Application meta data (name, url, support email, etc.).</p>
+<p>├─ Required <em>appName</em></p>
+<p>String</p>
+<p>The app name.</p>
+<p>├─ Required <em>appUrl</em></p>
+<p>String</p>
+<p>The app public absolute url.</p>
+<p>├─ Optional <em>hideControls</em></p>
+<p>Boolean</p>
+<p>Hides the collection create and update controls from the Dashboard. Useful to prevent making accidental schema changes when in production environment.</p>
+<p>├─ Required <em>senderName</em></p>
+<p>String</p>
+<p>Transactional mails sender name.</p>
+<p>├─ Required <em>senderAddress</em></p>
+<p>String</p>
+<p>Transactional mails sender address.</p>
+<p><strong>logs</strong><br />
+App logger settings.</p>
+<p>└─ Optional <em>maxDays</em></p>
+<p>Number</p>
+<p>Max retention period. Set to <em>0</em> for no logs.</p>
+<p>└─ Optional <em>minLevel</em></p>
+<p>Number</p>
+<p>Specifies the minimum log persistent level.<br />
+The default log levels are:</p>
+<ul>
+<li>-4: DEBUG</li>
+<li>0: INFO</li>
+<li>4: WARN</li>
+<li>8: ERROR</li>
+</ul>
+<p>└─ Optional <em>logIP</em></p>
+<p>Boolean</p>
+<p>If enabled includes the client IP in the activity request logs.</p>
+<p>└─ Optional <em>logAuthId</em></p>
+<p>Boolean</p>
+<p>If enabled includes the authenticated record id in the activity request logs.</p>
+<p><strong>backups</strong><br />
+App data backups settings.</p>
+<p>├─ Optional <em>cron</em></p>
+<p>String</p>
+<p>Cron expression to schedule auto backups, e.g. <code>0 0 * * *</code>.</p>
+<p>├─ Optional <em>cronMaxKeep</em></p>
+<p>Number</p>
+<p>The max number of cron generated backups to keep before removing older entries.</p>
+<p>└─ Optional <em>s3</em></p>
+<p>Object</p>
+<p>S3 configuration (the same fields as for the S3 file storage settings).</p>
+<p><strong>smtp</strong><br />
+SMTP mail server settings.</p>
+<p>├─ Optional <em>enabled</em></p>
+<p>Boolean</p>
+<p>Enable the use of the SMTP mail server for sending emails.</p>
+<p>├─ Required <em>host</em></p>
+<p>String</p>
+<p>Mail server host (required if SMTP is enabled).</p>
+<p>├─ Required <em>port</em></p>
+<p>Number</p>
+<p>Mail server port (required if SMTP is enabled).</p>
+<p>├─ Optional <em>username</em></p>
+<p>String</p>
+<p>Mail server username.</p>
+<p>├─ Optional <em>password</em></p>
+<p>String</p>
+<p>Mail server password.</p>
+<p>├─ Optional <em>tls</em></p>
+<p>Boolean</p>
+<p>Whether to enforce TLS connection encryption.<br />
+When <em>false</em> <em>StartTLS</em> command is send, leaving the server to decide whether to upgrade the connection or not).</p>
+<p>├─ Optional <em>authMethod</em></p>
+<p>String</p>
+<p>The SMTP AUTH method to use - <em>PLAIN</em> or <em>LOGIN</em> (used mainly by Microsoft).<br />
+Default to <em>PLAIN</em> if empty.</p>
+<p>└─ Optional <em>localName</em></p>
+<p>String</p>
+<p>Optional domain name or (IP address) to use for the initial EHLO/HELO exchange.<br />
+If not explicitly set, <code>localhost</code> will be used.<br />
+Note that some SMTP providers, such as Gmail SMTP-relay, requires a proper domain name and and will reject attempts to use localhost.</p>
+<p><strong>s3</strong><br />
+S3 compatible file storage settings.</p>
+<p>├─ Optional <em>enabled</em></p>
+<p>Boolean</p>
+<p>Enable the use of a S3 compatible storage.</p>
+<p>├─ Required <em>bucket</em></p>
+<p>String</p>
+<p>S3 storage bucket (required if enabled).</p>
+<p>├─ Required <em>region</em></p>
+<p>String</p>
+<p>S3 storage region (required if enabled).</p>
+<p>├─ Required <em>endpoint</em></p>
+<p>String</p>
+<p>S3 storage public endpoint (required if enabled).</p>
+<p>├─ Required <em>accessKey</em></p>
+<p>String</p>
+<p>S3 storage access key (required if enabled).</p>
+<p>├─ Required <em>secret</em></p>
+<p>String</p>
+<p>S3 storage secret (required if enabled).</p>
+<p>└─ Optional <em>forcePathStyle</em></p>
+<p>Boolean</p>
+<p>Forces the S3 request to use path-style addressing, e.g. "https://s3.amazonaws.com/BUCKET/KEY" instead of the default "https://BUCKET.s3.amazonaws.com/KEY".</p>
+<p><strong>batch</strong><br />
+Batch logs settings.</p>
+<p>├─ Optional <em>enabled</em></p>
+<p>Boolean</p>
+<p>Enable the batch Web APIs.</p>
+<p>├─ Required <em>maxRequests</em></p>
+<p>Number</p>
+<p>The maximum allowed batch request to execute.</p>
+<p>├─ Required <em>timeout</em></p>
+<p>Number</p>
+<p>The max duration in seconds to wait before cancelling the batch transaction.</p>
+<p>└─ Optional <em>maxBodySize</em></p>
+<p>Number</p>
+<p>The maximum allowed batch request body size in bytes.<br />
+If not set, fallbacks to max ~128MB.</p>
+<p><strong>rateLimits</strong><br />
+Rate limiter settings.</p>
+<p>├─ Optional <em>enabled</em></p>
+<p>Boolean</p>
+<p>Enable the builtin rate limiter.</p>
+<p>└─ Optional <em>rules</em></p>
+<p>Array<RateLimitRule></p>
+<p>List of rate limit rules. Each rule have:</p>
+<ul>
+<li><code>label</code> - the identifier of the rule.<br />
+    It could be a tag, complete path or path prerefix (when ends with `/`).</li>
+<li><code>maxRequests</code> - the max allowed number of requests per duration.</li>
+<li><code>duration</code> - specifies the interval (in seconds) per which to reset the counted/accumulated rate limiter tokens..</li>
+</ul>
+<p><strong>trustedProxy</strong><br />
+Trusted proxy headers settings.</p>
+<p>├─ Optional <em>headers</em></p>
+<p>Array<String></p>
+<p>List of explicit trusted header(s) to check.</p>
+<p>└─ Optional <em>useLeftmostIP</em></p>
+<p>Boolean</p>
+<p>Specifies to use the left-mostish IP from the trusted headers.</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400 401 403</p>
+<p><code>{ "smtp": { "enabled": false, "port": 587, "host": "smtp.example.com", "username": "", "authMethod": "", "tls": true, "localName": "" }, "backups": { "cron": "0 0 * * *", "cronMaxKeep": 3, "s3": { "enabled": false, "bucket": "", "region": "", "endpoint": "", "accessKey": "", "forcePathStyle": false } }, "s3": { "enabled": false, "bucket": "", "region": "", "endpoint": "", "accessKey": "", "forcePathStyle": false }, "meta": { "appName": "Acme", "appURL": "https://example.com", "senderName": "Support", "senderAddress": "support@example.com", "hideControls": false }, "rateLimits": { "rules": [ { "label": "*:auth", "audience": "", "duration": 3, "maxRequests": 2 }, { "label": "*:create", "audience": "", "duration": 5, "maxRequests": 20 }, { "label": "/api/batch", "audience": "", "duration": 1, "maxRequests": 3 }, { "label": "/api/", "audience": "", "duration": 10, "maxRequests": 300 } ], "enabled": false }, "trustedProxy": { "headers": [], "useLeftmostIP": false }, "batch": { "enabled": true, "maxRequests": 50, "timeout": 3, "maxBodySize": 0 }, "logs": { "maxDays": 7, "minLevel": 0, "logIP": true, "logAuthId": false } }</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while submitting the form.", "data": { "meta": { "appName": { "code": "validation_required", "message": "Missing required value." } } } }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "The authorized record is not allowed to perform this action.", "data": {} }</code></p>
+<p><strong><a href="#test-s3-storage-connection">Test S3 storage connection</a></strong></p>
+<p>Performs S3 storage connection test.</p>
+<p>Only superusers can perform this action.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); await pb.settings.testS3("backups");</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); await pb.settings.testS3("backups");</code></p>
+<h6 id="api-details_2">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/settings/test/s3</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required filesystem</p>
+<p>String</p>
+<p>The storage filesystem to test (<code>storage</code> or <code>backups</code>).</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Responses</p>
+<p>204 400 401</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "Failed to initialize the S3 storage. Raw error:...", "data": {} }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token.", "data": {} }</code></p>
+<p><strong><a href="#send-test-email">Send test email</a></strong></p>
+<p>Sends a test user email.</p>
+<p>Only superusers can perform this action.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); await pb.settings.testEmail("test@example.com", "verification");</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); await pb.settings.testEmail("test@example.com", "verification");</code></p>
+<h6 id="api-details_3">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/settings/test/email</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Optional collection</p>
+<p>String</p>
+<p>The name or id of the auth collection. Fallbacks to <em>_superusers</em> if not set.</p>
+<p>Required email</p>
+<p>String</p>
+<p>The receiver of the test email.</p>
+<p>Required template</p>
+<p>String</p>
+<p>The test email template to send:<br />
+<code>verification</code>, <code>password-reset</code> or <code>email-change</code>.</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Responses</p>
+<p>204 400 401</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "Failed to send the test email.", "data": { "email": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token.", "data": {} }</code></p>
+<p><strong><a href="#generate-apple-client-secret">Generate Apple client secret</a></strong></p>
+<p>Generates a new Apple OAuth2 client secret key.</p>
+<p>Only superusers can perform this action.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); await pb.settings.generateAppleClientSecret(clientId, teamId, keyId, privateKey, duration)</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection("_superusers").authWithPassword('test@example.com', '1234567890'); await pb.settings.generateAppleClientSecret(clientId, teamId, keyId, privateKey, duration)</code></p>
+<h6 id="api-details_4">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/settings/apple/generate-client-secret</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required clientId</p>
+<p>String</p>
+<p>The identifier of your app (aka. Service ID).</p>
+<p>Required teamId</p>
+<p>String</p>
+<p>10-character string associated with your developer account (usually could be found next to your name in the Apple Developer site).</p>
+<p>Required keyId</p>
+<p>String</p>
+<p>10-character key identifier generated for the "Sign in with Apple" private key associated with your developer account.</p>
+<p>Required privateKey</p>
+<p>String</p>
+<p>PrivateKey is the private key associated to your app.</p>
+<p>Required duration</p>
+<p>Number</p>
+<p>Duration specifies how long the generated JWT token should be considered valid.<br />
+The specified value must be in seconds and max 15777000 (~6months).</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Responses</p>
+<p>200 400 401</p>
+<p><code>{ "secret": "..." }</code></p>
+<p><code>{ "status": 400, "message": "Failed to generate client secret. Raw error:...", "data": {} }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token.", "data": {} }</code></p>
+    <div id="page-nav">
+      <a href="../api/03_api-files.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">API — Fichiers</span>
+        </a>
+      <a href="../api/06_api-realtime.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">API — Temps réel</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

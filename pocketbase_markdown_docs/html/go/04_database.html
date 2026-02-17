@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Base de données — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link active" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Extend with Go <span>›</span> Base de données</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="go-database">Go - Database</h1>
+<hr />
+<p>Database</p>
+<p><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/core#App"><code>core.App</code></a> is the main interface to interact with the database.</p>
+<p><code>App.DB()</code> returns a <code>dbx.Builder</code> that can run all kinds of SQL statements, including raw queries.</p>
+<p>Most of the common DB operations are listed below, but you can find further information in the <a href="https://pkg.go.dev/github.com/pocketbase/dbx">dbx package godoc</a> .</p>
+<p>For more details and examples how to interact with Record and Collection models programmatically you could also check <a href="/docs/go-collections">Collection operations</a> and <a href="/docs/go-records">Record operations</a> sections.</p>
+<h3 id="executing-queries"><a href="#executing-queries">Executing queries</a></h3>
+<p>To execute DB queries you can start with the <code>NewQuery("...")</code> statement and then call one of:</p>
+<ul>
+<li>
+<p><code>[Execute()](#execute)</code> - for any query statement that is not meant to retrieve data:</p>
+<p><code>res, err := app.DB(). NewQuery("DELETE FROM articles WHERE status = 'archived'"). Execute()</code></p>
+</li>
+<li>
+<p><code>[One()](#execute-one)</code> - to populate a single row into a struct:</p>
+<p><code>type User struct { Id string `db:"id" json:"id"` Status bool `db:"status" json:"status"` Age int `db:"age" json:"age"` Roles types.JSONArray[string] `db:"roles" json:"roles"` } user := User{} err := app.DB(). NewQuery("SELECT id, status, age, roles FROM users WHERE id=1"). One(&amp;user)</code></p>
+</li>
+<li>
+<p><code>[All()](#execute-all)</code> - to populate multiple rows into a slice of structs:</p>
+<p><code>type User struct { Id string `db:"id" json:"id"` Status bool `db:"status" json:"status"` Age int `db:"age" json:"age"` Roles types.JSONArray[string] `db:"roles" json:"roles"` } users := []User{} err := app.DB(). NewQuery("SELECT id, status, age, roles FROM users LIMIT 100"). All(&amp;users)</code></p>
+</li>
+</ul>
+<h3 id="binding-parameters"><a href="#binding-parameters">Binding parameters</a></h3>
+<p>To prevent SQL injection attacks, you should use named parameters for any expression value that comes from user input. This could be done using the named <code>{:paramName}</code> placeholders in your SQL statement and then define the parameter values for the query with <code>Bind(params)</code>. For example:</p>
+<p><code>type Post struct { Name string `db:"name" json:"name"` Created types.DateTime `db:"created" json:"created"` } posts := []Post{} err := app.DB(). NewQuery("SELECT name, created FROM posts WHERE created &gt;= {:from} and created &lt;= {:to}"). Bind(dbx.Params{ "from": "2023-06-25 00:00:00.000Z", "to": "2023-06-28 23:59:59.999Z", }). All(&amp;posts)</code></p>
+<h3 id="query-builder"><a href="#query-builder">Query builder</a></h3>
+<p>Instead of writing plain SQLs, you can also compose SQL statements programmatically using the db query builder.<br />
+Every SQL keyword has a corresponding query building method. For example, <code>SELECT</code> corresponds to <code>Select()</code>, <code>FROM</code> corresponds to <code>From()</code>, <code>WHERE</code> corresponds to <code>Where()</code>, and so on.</p>
+<p><code>users := []struct { Id string `db:"id" json:"id"` Email string `db:"email" json:"email"` }{} app.DB(). Select("id", "email"). From("users"). AndWhere(dbx.Like("email", "example.com")). Limit(100). OrderBy("created ASC"). All(&amp;users)</code></p>
+<h5 id="select-andselect-distinct"><a href="#select-andselect-distinct">Select(), AndSelect(), Distinct()</a></h5>
+<p>The <code>Select(...cols)</code> method initializes a <code>SELECT</code> query builder. It accepts a list of the column names to be selected.<br />
+To add additional columns to an existing select query, you can call <code>AndSelect()</code>.<br />
+To select distinct rows, you can call <code>Distinct(true)</code>.</p>
+<p><code>app.DB(). Select("id", "avatar as image"). AndSelect("(firstName || ' ' || lastName) as fullName"). Distinct(true) ...</code></p>
+<h5 id="from"><a href="#from">From()</a></h5>
+<p>The <code>From(...tables)</code> method specifies which tables to select from (plain table names are automatically quoted).</p>
+<p><code>app.DB(). Select("table1.id", "table2.name"). From("table1", "table2") ...</code></p>
+<h5 id="join"><a href="#join">Join()</a></h5>
+<p>The <code>Join(type, table, on)</code> method specifies a <code>JOIN</code> clause. It takes 3 parameters:</p>
+<ul>
+<li><code>type</code> - join type string like <code>INNER JOIN</code>, <code>LEFT JOIN</code>, etc.</li>
+<li><code>table</code> - the name of the table to be joined</li>
+<li><code>on</code> - optional <code>dbx.Expression</code> as an <code>ON</code> clause</li>
+</ul>
+<p>For convenience, you can also use the shortcuts <code>InnerJoin(table, on)</code>, <code>LeftJoin(table, on)</code>, <code>RightJoin(table, on)</code> to specify <code>INNER JOIN</code>, <code>LEFT JOIN</code> and <code>RIGHT JOIN</code>, respectively.</p>
+<p><code>app.DB(). Select("users.*"). From("users"). InnerJoin("profiles", dbx.NewExp("profiles.user_id = users.id")). Join("FULL OUTER JOIN", "department", dbx.NewExp("department.id = {:id}", dbx.Params{ "id": "someId" })) ...</code></p>
+<h5 id="where-andwhere-orwhere"><a href="#where-andwhere-orwhere">Where(), AndWhere(), OrWhere()</a></h5>
+<p>The <code>Where(exp)</code> method specifies the <code>WHERE</code> condition of the query.<br />
+You can also use <code>AndWhere(exp)</code> or <code>OrWhere(exp)</code> to append additional one or more conditions to an existing <code>WHERE</code> clause.<br />
+Each where condition accepts a single <code>dbx.Expression</code> (see below for full list).</p>
+<p><code>/* SELECT users.* FROM users WHERE id = "someId" AND status = "public" AND name like "%john%" OR ( role = "manager" AND fullTime IS TRUE AND experience &gt; 10 ) */ app.DB(). Select("users.*"). From("users"). Where(dbx.NewExp("id = {:id}", dbx.Params{ "id": "someId" })). AndWhere(dbx.HashExp{"status": "public"}). AndWhere(dbx.Like("name", "john")). OrWhere(dbx.And( dbx.HashExp{ "role": "manager", "fullTime": true, }, dbx.NewExp("experience &gt; {:exp}", dbx.Params{ "exp": 10 }) )) ...</code></p>
+<p>The following <code>dbx.Expression</code> methods are available:</p>
+<ul>
+<li>
+<p><code>[dbx.NewExp(raw, optParams)](#dbx-newexpraw-optparams)</code><br />
+    Generates an expression with the specified raw query fragment. Use the <code>optParams</code> to bind <code>dbx.Params</code> to the expression.</p>
+<p><code>dbx.NewExp("status = 'public'") dbx.NewExp("total &gt; {:min} AND total &lt; {:max}", dbx.Params{ "min": 10, "max": 30 })</code></p>
+</li>
+<li>
+<p><code>[dbx.HashExp{k:v}](#dbx-hashexpkv)</code><br />
+    Generates a hash expression from a map whose keys are DB column names which need to be filtered according to the corresponding values.</p>
+<p><code>// slug = "example" AND active IS TRUE AND tags in ("tag1", "tag2", "tag3") AND parent IS NULL dbx.HashExp{ "slug": "example", "active": true, "tags": []any{"tag1", "tag2", "tag3"}, "parent": nil, }</code></p>
+</li>
+<li>
+<p><code>[dbx.Not(exp)](#dbx-notexp)</code><br />
+    Negates a single expression by wrapping it with <code>NOT()</code>.</p>
+<p><code>// NOT(status = 1) dbx.Not(dbx.NewExp("status = 1"))</code></p>
+</li>
+<li>
+<p><code>[dbx.And(...exps)](#dbx-and-exps)</code><br />
+    Creates a new expression by concatenating the specified ones with <code>AND</code>.</p>
+<p><code>// (status = 1 AND username like "%john%") dbx.And( dbx.NewExp("status = 1"), dbx.Like("username", "john"), )</code></p>
+</li>
+<li>
+<p><code>[dbx.Or(...exps)](#dbx-or-exps)</code><br />
+    Creates a new expression by concatenating the specified ones with <code>OR</code>.</p>
+<p><code>// (status = 1 OR username like "%john%") dbx.Or( dbx.NewExp("status = 1"), dbx.Like("username", "john") )</code></p>
+</li>
+<li>
+<p><code>[dbx.In(col, ...values)](#dbx-incol-values)</code><br />
+    Generates an <code>IN</code> expression for the specified column and the list of allowed values.</p>
+<p><code>// status IN ("public", "reviewed") dbx.In("status", "public", "reviewed")</code></p>
+</li>
+<li>
+<p><code>[dbx.NotIn(col, ...values)](#dbx-notincol-values)</code><br />
+    Generates an <code>NOT IN</code> expression for the specified column and the list of allowed values.</p>
+<p><code>// status NOT IN ("public", "reviewed") dbx.NotIn("status", "public", "reviewed")</code></p>
+</li>
+<li>
+<p><code>[dbx.Like(col, ...values)](#dbx-likecol-values)</code><br />
+    Generates a <code>LIKE</code> expression for the specified column and the possible strings that the column should be like. If multiple values are present, the column should be like <strong>all</strong> of them.<br />
+    By default, each value will be surrounded by <em>"%"</em> to enable partial matching. Special characters like <em>"%"</em>, <em>"\"</em>, <em>"_"</em> will also be properly escaped. You may call <code>Escape(...pairs)</code> and/or <code>Match(left, right)</code> to change the default behavior.</p>
+<p><code>// name LIKE "%test1%" AND name LIKE "%test2%" dbx.Like("name", "test1", "test2") // name LIKE "test1%" dbx.Like("name", "test1").Match(false, true)</code></p>
+</li>
+<li>
+<p><code>[dbx.NotLike(col, ...values)](#dbx-notlikecol-values)</code><br />
+    Generates a <code>NOT LIKE</code> expression in similar manner as <code>Like()</code>.</p>
+<p><code>// name NOT LIKE "%test1%" AND name NOT LIKE "%test2%" dbx.NotLike("name", "test1", "test2") // name NOT LIKE "test1%" dbx.NotLike("name", "test1").Match(false, true)</code></p>
+</li>
+<li>
+<p><code>[dbx.OrLike(col, ...values)](#dbx-orlikecol-values)</code><br />
+    This is similar to <code>Like()</code> except that the column must be one of the provided values, aka. multiple values are concatenated with <code>OR</code> instead of <code>AND</code>.</p>
+<p><code>// name LIKE "%test1%" OR name LIKE "%test2%" dbx.OrLike("name", "test1", "test2") // name LIKE "test1%" OR name LIKE "test2%" dbx.OrLike("name", "test1", "test2").Match(false, true)</code></p>
+</li>
+<li>
+<p><code>[dbx.OrNotLike(col, ...values)](#dbx-ornotlikecol-values)</code><br />
+    This is similar to <code>NotLike()</code> except that the column must not be one of the provided values, aka. multiple values are concatenated with <code>OR</code> instead of <code>AND</code>.</p>
+<p><code>// name NOT LIKE "%test1%" OR name NOT LIKE "%test2%" dbx.OrNotLike("name", "test1", "test2") // name NOT LIKE "test1%" OR name NOT LIKE "test2%" dbx.OrNotLike("name", "test1", "test2").Match(false, true)</code></p>
+</li>
+<li>
+<p><code>[dbx.Exists(exp)](#dbx-existsexp)</code><br />
+    Prefix with <code>EXISTS</code> the specified expression (usually a subquery).</p>
+<p><code>// EXISTS (SELECT 1 FROM users WHERE status = 'active') dbx.Exists(dbx.NewExp("SELECT 1 FROM users WHERE status = 'active'"))</code></p>
+</li>
+<li>
+<p><code>[dbx.NotExists(exp)](#dbx-notexistsexp)</code><br />
+    Prefix with <code>NOT EXISTS</code> the specified expression (usually a subquery).</p>
+<p><code>// NOT EXISTS (SELECT 1 FROM users WHERE status = 'active') dbx.NotExists(dbx.NewExp("SELECT 1 FROM users WHERE status = 'active'"))</code></p>
+</li>
+<li>
+<p><code>[dbx.Between(col, from, to)](#dbx-betweencol-from-to)</code><br />
+    Generates a <code>BETWEEN</code> expression with the specified range.</p>
+<p><code>// age BETWEEN 3 and 99 dbx.Between("age", 3, 99)</code></p>
+</li>
+<li>
+<p><code>[dbx.NotBetween(col, from, to)](#dbx-notbetweencol-from-to)</code><br />
+    Generates a <code>NOT BETWEEN</code> expression with the specified range.</p>
+<p><code>// age NOT BETWEEN 3 and 99 dbx.NotBetween("age", 3, 99)</code></p>
+</li>
+</ul>
+<h5 id="orderby-andorderby"><a href="#orderby-andorderby">OrderBy(), AndOrderBy()</a></h5>
+<p>The <code>OrderBy(...cols)</code> specifies the <code>ORDER BY</code> clause of the query.<br />
+A column name can contain <em>"ASC"</em> or <em>"DESC"</em> to indicate its ordering direction.<br />
+You can also use <code>AndOrderBy(...cols)</code> to append additional columns to an existing <code>ORDER BY</code> clause.</p>
+<p><code>app.DB(). Select("users.*"). From("users"). OrderBy("created ASC", "updated DESC"). AndOrderBy("title ASC") ...</code></p>
+<h5 id="groupby-andgroupby"><a href="#groupby-andgroupby">GroupBy(), AndGroupBy()</a></h5>
+<p>The <code>GroupBy(...cols)</code> specifies the <code>GROUP BY</code> clause of the query.<br />
+You can also use <code>AndGroupBy(...cols)</code> to append additional columns to an existing <code>GROUP BY</code> clause.</p>
+<p><code>app.DB(). Select("users.*"). From("users"). GroupBy("department", "level") ...</code></p>
+<h5 id="having-andhaving-orhaving"><a href="#having-andhaving-orhaving">Having(), AndHaving(), OrHaving()</a></h5>
+<p>The <code>Having(exp)</code> specifies the <code>HAVING</code> clause of the query.<br />
+Similarly to <code>Where(exp)</code>, it accept a single <code>dbx.Expression</code> (see all available expressions listed above).<br />
+You can also use <code>AndHaving(exp)</code> or <code>OrHaving(exp)</code> to append additional one or more conditions to an existing <code>HAVING</code> clause.</p>
+<p><code>app.DB(). Select("users.*"). From("users"). GroupBy("department", "level"). Having(dbx.NewExp("sum(level) &gt; {:sum}", dbx.Params{ sum: 10 })) ...</code></p>
+<h5 id="limit"><a href="#limit">Limit()</a></h5>
+<p>The <code>Limit(number)</code> method specifies the <code>LIMIT</code> clause of the query.</p>
+<p><code>app.DB(). Select("users.*"). From("users"). Limit(30) ...</code></p>
+<h5 id="offset"><a href="#offset">Offset()</a></h5>
+<p>The <code>Offset(number)</code> method specifies the <code>OFFSET</code> clause of the query. Usually used together with <code>Limit(number)</code>.</p>
+<p><code>app.DB(). Select("users.*"). From("users"). Offset(5). Limit(30) ...</code></p>
+<h3 id="transaction"><a href="#transaction">Transaction</a></h3>
+<p>To execute multiple queries in a transaction you can use <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/core#BaseApp.RunInTransaction"><code>app.RunInTransaction(fn)</code></a> .</p>
+<p>The DB operations are persisted only if the transaction returns <code>nil</code>.</p>
+<p>It is safe to nest <code>RunInTransaction</code> calls as long as you use the callback's <code>txApp</code> argument.</p>
+<p>Inside the transaction function always use its <code>txApp</code> argument and not the original <code>app</code> instance because we allow only a single writer/transaction at a time and it could result in a deadlock.</p>
+<p>To avoid performance issues, try to minimize slow/long running tasks such as sending emails, connecting to external services, etc. as part of the transaction.</p>
+<p><code>err := app.RunInTransaction(func(txApp core.App) error { // update a record record, err := txApp.FindRecordById("articles", "RECORD_ID") if err != nil { return err } record.Set("status", "active") if err := txApp.Save(record); err != nil { return err } // run a custom raw query (doesn't fire event hooks) rawQuery := "DELETE FROM articles WHERE status = 'pending'" if _, err := txApp.DB().NewQuery(rawQuery).Execute(); err != nil { return err } return nil })</code></p>
+    <div id="page-nav">
+      <a href="../go/03_routing.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Routing</span>
+        </a>
+      <a href="../go/05_record-operations.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Opérations Records</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>
