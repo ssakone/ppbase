@@ -99,6 +99,18 @@ def parse_realtime_topic(topic: str) -> ParsedRealtimeTopic:
     )
 
 
+def _normalize_request_headers(headers: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize request header keys for @request.headers.* lookups."""
+    if not headers:
+        return {}
+    normalized: dict[str, Any] = {}
+    for raw_key, value in headers.items():
+        key = str(raw_key).lower()
+        normalized[key] = value
+        normalized[key.replace("-", "_")] = value
+    return normalized
+
+
 class SubscriptionManager:
     """Manage SSE realtime client sessions and subscriptions."""
 
@@ -351,6 +363,9 @@ def _build_rule_context(
         }
 
     request_context = {
+        "context": "realtime",
+        "method": "GET",
+        "headers": {},
         "auth": auth_info,
         "data": {},
         "query": {},
@@ -378,6 +393,10 @@ async def _is_subscription_allowed_for_event(
     auth_ctx, request_context = _build_rule_context(subscription.auth_payload)
     if subscription.options_query:
         request_context["query"] = dict(subscription.options_query)
+    if subscription.options_headers:
+        request_context["headers"] = _normalize_request_headers(
+            subscription.options_headers
+        )
     rule_result = check_rule(rule, auth_ctx)
 
     # Optional per-subscription filter

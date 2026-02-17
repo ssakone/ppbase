@@ -342,4 +342,114 @@ describe('API Rules Enforcement', () => {
       await authCleanup();
     }
   });
+
+  it('should evaluate @request.context in list rules for records API', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      listRule: '@request.context = "default"',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({ title: 'Context Default' });
+
+      const unauthedPb = getFreshPb();
+      const list = await unauthedPb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(1);
+      expect(list.items[0].title).toBe('Context Default');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should evaluate @request.method in list rules', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      listRule: '@request.method = "POST"',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({ title: 'Method Rule' });
+
+      // List endpoint uses GET, therefore expression should not match.
+      const unauthedPb = getFreshPb();
+      const list = await unauthedPb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(0);
+      expect(list.items).toEqual([]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should evaluate @request.headers macros with custom headers', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      listRule: '@request.headers.x_test = "allow"',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({ title: 'Header Rule' });
+
+      const unauthedPb = getFreshPb();
+
+      const deniedList = await unauthedPb.collection(collection.name).getList(1, 50);
+      expect(deniedList.totalItems).toBe(0);
+      expect(deniedList.items).toEqual([]);
+
+      const allowedList = await unauthedPb.collection(collection.name).getList(1, 50, {
+        headers: { 'X-Test': 'allow' },
+      });
+      expect(allowedList.totalItems).toBe(1);
+      expect(allowedList.items[0].title).toBe('Header Rule');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should support datetime macros in list rule expressions', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      listRule: [
+        'created >= @todayStart',
+        'created <= @todayEnd',
+        '@yesterday < @now',
+        '@tomorrow > @now',
+        '@second >= 0',
+        '@second <= 59',
+        '@minute >= 0',
+        '@minute <= 59',
+        '@hour >= 0',
+        '@hour <= 23',
+        '@weekday >= 0',
+        '@weekday <= 6',
+        '@day >= 1',
+        '@day <= 31',
+        '@month >= 1',
+        '@month <= 12',
+        '@year >= 2000',
+      ].join(' && '),
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({ title: 'Datetime Rule' });
+
+      const unauthedPb = getFreshPb();
+      const list = await unauthedPb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(1);
+      expect(list.items[0].title).toBe('Datetime Rule');
+    } finally {
+      await cleanup();
+    }
+  });
 });

@@ -668,7 +668,60 @@ class _FilterTransformer(Transformer):
     def _resolve_macro(self, macro_name: str) -> str:
         name = macro_name.lstrip("@")
         if name == "now":
-            return "NOW()"
+            return "(TIMEZONE('UTC', NOW()) AT TIME ZONE 'UTC')"
+        if name == "second":
+            return "CAST(EXTRACT(SECOND FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "minute":
+            return "CAST(EXTRACT(MINUTE FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "hour":
+            return "CAST(EXTRACT(HOUR FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "weekday":
+            return "CAST(EXTRACT(DOW FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "day":
+            return "CAST(EXTRACT(DAY FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "month":
+            return "CAST(EXTRACT(MONTH FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "year":
+            return "CAST(EXTRACT(YEAR FROM TIMEZONE('UTC', NOW())) AS INT)"
+        if name == "yesterday":
+            return "((TIMEZONE('UTC', NOW()) - INTERVAL '1 day') AT TIME ZONE 'UTC')"
+        if name == "tomorrow":
+            return "((TIMEZONE('UTC', NOW()) + INTERVAL '1 day') AT TIME ZONE 'UTC')"
+        if name == "todayStart":
+            return "(date_trunc('day', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
+        if name == "todayEnd":
+            return "((date_trunc('day', TIMEZONE('UTC', NOW())) + INTERVAL '1 day' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+        if name == "monthStart":
+            return "(date_trunc('month', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
+        if name == "monthEnd":
+            return "((date_trunc('month', TIMEZONE('UTC', NOW())) + INTERVAL '1 month' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+        if name == "yearStart":
+            return "(date_trunc('year', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
+        if name == "yearEnd":
+            return "((date_trunc('year', TIMEZONE('UTC', NOW())) + INTERVAL '1 year' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+        if name == "request.context":
+            context = self._request_context.get("context", "")
+            pname = self._next_param(context)
+            return f":{pname}"
+        if name == "request.method":
+            method = self._request_context.get("method", "")
+            pname = self._next_param(method)
+            return f":{pname}"
+        if name.startswith("request.headers."):
+            field = name[len("request.headers."):]
+            headers = self._request_context.get("headers", {})
+            val = ""
+            if isinstance(headers, dict):
+                normalized = field.lower().replace("-", "_")
+                # Header macros can use either header-name or header_name style.
+                val = (
+                    headers.get(normalized)
+                    or headers.get(field.lower())
+                    or headers.get(field)
+                    or ""
+                )
+            pname = self._next_param(val)
+            return f":{pname}"
         if name.startswith("request.auth."):
             field = name[len("request.auth."):]
             auth = self._request_context.get("auth", {})
@@ -715,7 +768,8 @@ def parse_filter(
 
     Args:
         filter_str: The PocketBase filter string.
-        request_context: Optional dict with ``auth``, ``data``, ``query`` keys
+        request_context: Optional dict with ``context``, ``method``,
+            ``headers``, ``auth``, ``data``, ``query`` keys
             for resolving ``@request.*`` macros.
         relation_resolver: Optional mapping of relation field names to
             ``(target_table_name, max_select)`` tuples.  When provided,

@@ -440,3 +440,187 @@ async def test_realtime_filters_expression_list_rule_by_auth_context(
     event = await asyncio.wait_for(owner_session.response_queue.get(), timeout=1.0)
     assert event["topic"] == f"{coll_name}/*"
     assert event["data"]["record"]["id"] == record["id"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_allows_expression_list_rule_with_request_context_realtime(
+    app_client: AsyncClient,
+    admin_token: str,
+):
+    """Realtime rule checks should resolve @request.context as "realtime"."""
+    coll_name = f"rt_ctx_{uuid.uuid4().hex[:8]}"
+
+    create_coll = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": coll_name,
+            "type": "base",
+            "schema": [{"name": "title", "type": "text"}],
+            "createRule": "",
+            "listRule": '@request.context = "realtime"',
+        },
+    )
+    assert create_coll.status_code == 200
+
+    create_record = await app_client.post(
+        f"/api/collections/{coll_name}/records",
+        headers={"Authorization": admin_token},
+        json={"title": "visible-on-realtime"},
+    )
+    assert create_record.status_code == 200
+    record = create_record.json()
+
+    engine = get_engine()
+    collection = await resolve_collection(engine, coll_name)
+    assert collection is not None
+
+    manager = SubscriptionManager()
+    client_id = manager.register_client()
+    await manager.add_subscription(client_id, f"{coll_name}/*")
+
+    await broadcast_record_change(
+        manager,
+        coll_name,
+        record["id"],
+        "update",
+        {"id": record["id"], "title": "visible-on-realtime-updated"},
+        engine=engine,
+        collection=collection,
+    )
+
+    session = manager.get_session(client_id)
+    assert session is not None
+    assert not session.response_queue.empty()
+
+    event = await asyncio.wait_for(session.response_queue.get(), timeout=1.0)
+    assert event["topic"] == f"{coll_name}/*"
+    assert event["data"]["record"]["id"] == record["id"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_rule_uses_request_headers_from_subscription_options(
+    app_client: AsyncClient,
+    admin_token: str,
+):
+    """Realtime rules should resolve @request.headers.* from subscription options."""
+    coll_name = f"rt_hdr_{uuid.uuid4().hex[:8]}"
+
+    create_coll = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": coll_name,
+            "type": "base",
+            "schema": [{"name": "title", "type": "text"}],
+            "createRule": "",
+            "listRule": '@request.headers.x_test = "allow"',
+        },
+    )
+    assert create_coll.status_code == 200
+
+    create_record = await app_client.post(
+        f"/api/collections/{coll_name}/records",
+        headers={"Authorization": admin_token},
+        json={"title": "headers-filtered"},
+    )
+    assert create_record.status_code == 200
+    record = create_record.json()
+
+    engine = get_engine()
+    collection = await resolve_collection(engine, coll_name)
+    assert collection is not None
+
+    manager = SubscriptionManager()
+    allowed_client = manager.register_client()
+    denied_client = manager.register_client()
+
+    await manager.add_subscription(
+        allowed_client,
+        f"{coll_name}/*",
+        options_headers={"X-Test": "allow"},
+    )
+    await manager.add_subscription(
+        denied_client,
+        f"{coll_name}/*",
+    )
+
+    await broadcast_record_change(
+        manager,
+        coll_name,
+        record["id"],
+        "update",
+        {"id": record["id"], "title": "headers-filtered-updated"},
+        engine=engine,
+        collection=collection,
+    )
+
+    allowed_session = manager.get_session(allowed_client)
+    denied_session = manager.get_session(denied_client)
+    assert allowed_session is not None
+    assert denied_session is not None
+    assert not allowed_session.response_queue.empty()
+    assert denied_session.response_queue.empty()
+
+    event = await asyncio.wait_for(allowed_session.response_queue.get(), timeout=1.0)
+    assert event["topic"] == f"{coll_name}/*"
+    assert event["data"]["record"]["id"] == record["id"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_rule_supports_datetime_macros(
+    app_client: AsyncClient,
+    admin_token: str,
+):
+    """Realtime listRule expressions should allow datetime macro comparisons."""
+    coll_name = f"rt_dt_{uuid.uuid4().hex[:8]}"
+
+    create_coll = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": coll_name,
+            "type": "base",
+            "schema": [{"name": "title", "type": "text"}],
+            "createRule": "",
+            "listRule": (
+                "created >= @todayStart && created <= @todayEnd "
+                "&& @yesterday < @now && @tomorrow > @now"
+            ),
+        },
+    )
+    assert create_coll.status_code == 200
+
+    create_record = await app_client.post(
+        f"/api/collections/{coll_name}/records",
+        headers={"Authorization": admin_token},
+        json={"title": "datetime-realtime"},
+    )
+    assert create_record.status_code == 200
+    record = create_record.json()
+
+    engine = get_engine()
+    collection = await resolve_collection(engine, coll_name)
+    assert collection is not None
+
+    manager = SubscriptionManager()
+    client_id = manager.register_client()
+    await manager.add_subscription(client_id, f"{coll_name}/*")
+
+    await broadcast_record_change(
+        manager,
+        coll_name,
+        record["id"],
+        "update",
+        {"id": record["id"], "title": "datetime-realtime-updated"},
+        engine=engine,
+        collection=collection,
+    )
+
+    session = manager.get_session(client_id)
+    assert session is not None
+    assert not session.response_queue.empty()
+
+    event = await asyncio.wait_for(session.response_queue.get(), timeout=1.0)
+    assert event["topic"] == f"{coll_name}/*"
+    assert event["data"]["record"]["id"] == record["id"]

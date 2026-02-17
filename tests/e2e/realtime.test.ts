@@ -692,4 +692,56 @@ describe('Realtime SSE', () => {
       await authorsCleanup();
     }
   });
+
+  it('should evaluate @request.context and @request.headers in realtime rules', async () => {
+    const allowedPb = getFreshPb();
+    const deniedPb = getFreshPb();
+    const allowedEvents: any[] = [];
+    const deniedEvents: any[] = [];
+
+    const { collection, cleanup: macroCleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('realtime_ctx_headers'),
+      schema: [{ name: 'title', type: 'text', required: true }],
+      createRule: '',
+      listRule: '@request.context = "realtime" && @request.headers.x_test = "allow"',
+      viewRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    let recordId = '';
+    try {
+      // Same collection queried over normal records API should not match realtime-only context.
+      const listResult = await getFreshPb().collection(collection.name).getList(1, 50);
+      expect(listResult.totalItems).toBe(0);
+
+      const record = await adminPb.collection(collection.name).create({ title: 'Macro Rule Seed' });
+      recordId = record.id;
+
+      await allowedPb.collection(collection.name).subscribe('*', (data) => {
+        allowedEvents.push(data);
+      }, {
+        headers: { 'X-Test': 'allow' },
+      });
+      await deniedPb.collection(collection.name).subscribe('*', (data) => {
+        deniedEvents.push(data);
+      });
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      await adminPb.collection(collection.name).update(recordId, { title: 'Macro Rule Updated' });
+
+      await waitFor(async () => allowedEvents.some(e => e.action === 'update'), 5000);
+      await new Promise(resolve => setTimeout(resolve, 1200));
+
+      expect(allowedEvents.some(e => e.record?.id === recordId)).toBe(true);
+      expect(deniedEvents.length).toBe(0);
+    } finally {
+      await allowedPb.realtime.unsubscribe();
+      await deniedPb.realtime.unsubscribe();
+      if (recordId) {
+        try { await adminPb.collection(collection.name).delete(recordId); } catch {}
+      }
+      await macroCleanup();
+    }
+  });
 });

@@ -52,6 +52,7 @@ def _prepare_rule_context(
 
     - ``auth_context`` is passed to :func:`check_rule` to determine admin bypass.
     - ``request_context`` is passed to :func:`parse_filter` so that
+      ``@request.context``, ``@request.method``, ``@request.headers.*``,
       ``@request.auth.*`` and ``@request.data.*`` macros resolve correctly
       when a rule expression is used as a SQL WHERE filter.
     """
@@ -84,7 +85,16 @@ def _prepare_rule_context(
             "collectionName": token_payload.get("collectionName", ""),
         }
 
+    headers_info: dict[str, str] = {}
+    for key, value in request.headers.items():
+        lower = key.lower()
+        headers_info[lower] = value
+        headers_info[lower.replace("-", "_")] = value
+
     request_context: dict[str, Any] = {
+        "context": "default",
+        "method": request.method.upper(),
+        "headers": headers_info,
         "auth": auth_info,
         "data": data or {},
         "query": dict(request.query_params),
