@@ -31,6 +31,34 @@ async def request_timer(event: RouteRequestEvent):
     return result
 ```
 
+## Path & method filtering
+
+Restrict a global middleware to specific paths or HTTP methods — it won't run for anything that doesn't match:
+
+```python
+# Only runs for GET /api/custom/*
+@pb.middleware(priority=120, path="/api/custom/*", methods=["GET"])
+async def custom_get_probe(event: RouteRequestEvent):
+    print(f"[probe] {event.method} {event.path}")
+    return await event.next()
+
+# Multiple paths
+@pb.middleware(priority=90, paths=["/api/v1/*", "/api/v2/*"], methods=["POST", "PUT", "PATCH"])
+async def mutation_guard(event: RouteRequestEvent):
+    await event.load_auth()
+    if not event.has_auth():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"status": 401, "message": "Login required.", "data": {}})
+    return await event.next()
+
+# Custom predicate function
+@pb.middleware(priority=80, predicate=lambda e: e.path.startswith("/api/") and "internal" in e.path)
+async def internal_guard(event: RouteRequestEvent):
+    return await event.next()
+```
+
+Glob patterns: `*` matches a single segment, `**` matches any number of segments (e.g. `/api/**`).
+
 ## Group middleware
 
 Applies only to routes registered in a given `RouteGroup`:
@@ -57,22 +85,144 @@ async def protected():
 
 ## Route-level middleware
 
-Pass `middlewares=[...]` to a route decorator. These run **after** group middleware and **before** the route handler:
+Pass `middlewares=[...]` to a route decorator. These run **after** group middleware:
 
 ```python
-async def require_superuser(event: RouteRequestEvent):
-    await event.load_auth()
-    if not event.is_superuser():
-        return JSONResponse(
-            status_code=403,
-            content={"status": 403, "message": "Superuser required.", "data": {}},
-        )
+async def check_feature_flag(event: RouteRequestEvent):
+    if not BETA_ENABLED:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"status": 404, "message": "Not found.", "data": {}})
     return await event.next()
 
-@pb.get("/admin/dashboard", middlewares=[require_superuser])
-async def admin_dashboard():
-    return {"dashboard": "ok"}
+@pb.get("/beta/feature", middlewares=[check_feature_flag])
+async def beta_feature():
+    return {"beta": True}
 ```
+
+## Built-in auth middlewares (`pb.apis`)
+
+`pb.apis` provides ready-made route-level middlewares that mirror PocketBase's auth guards. Pass them in `middlewares=[...]`:
+
+```python
+# Require any authenticated user
+@api.get("/private", middlewares=[pb.apis.require_auth()])
+async def private(auth = pb.optional_auth()):
+    return {"id": auth["id"] if auth else None}
+
+# Require auth from a specific collection only
+@api.get("/users-only", middlewares=[pb.apis.require_auth("users")])
+async def users_only():
+    return {"ok": True}
+
+# Require superuser / admin
+@api.get("/admin", middlewares=[pb.apis.require_superuser_auth()])
+async def admin_panel():
+    return {"admin": True}
+
+# Superuser OR the record's owner (path param must be the user's ID)
+@api.get("/users/{id}/settings", middlewares=[pb.apis.require_superuser_or_owner_auth("id")])
+async def user_settings(id: str):
+    return {"userId": id}
+
+# Guest-only (reject authenticated requests)
+@api.post("/register", middlewares=[pb.apis.require_guest_only()])
+async def register(body: dict):
+    return {"registered": True}
+```
+
+| Helper | Raises | Description |
+|--------|--------|-------------|
+| `pb.apis.require_auth(*collections)` | 401 / 403 | Any auth; optionally restrict to collection name(s) |
+| `pb.apis.require_superuser_auth()` | 401 / 403 | Admin or `_superusers` member |
+| `pb.apis.require_superuser_or_owner_auth(owner_id_param)` | 401 / 403 | Superuser or the record owner (path param) |
+| `pb.apis.require_guest_only()` | 403 | Reject requests with any auth |
+
+---
+
+## Request-local store
+
+Middleware can pass data to downstream handlers and route functions via a per-request key-value store. This avoids re-computing expensive operations (e.g. loading auth once, using it everywhere).
+
+### Writing from middleware
+
+```python
+import time
+from ppbase.ext.events import RouteRequestEvent
+
+@pb.middleware(priority=110, path="/trace")
+async def trace_context(event: RouteRequestEvent):
+    event.set("traceId", f"trace-{int(time.time() * 1000)}")
+    event.set("startedAt", time.perf_counter())
+
+    result = await event.next()
+
+    elapsed = (time.perf_counter() - float(event.get("startedAt", 0))) * 1000
+    print(f"[trace] id={event.get('traceId')} elapsed={elapsed:.1f} ms")
+    return result
+```
+
+### Reading from route handler (`pb.request_store()`)
+
+```python
+@pb.get("/trace")
+async def trace_demo(store: dict = pb.request_store()):
+    return {
+        "traceId": store.get("traceId"),
+        "hasTrace": "traceId" in store,
+    }
+```
+
+### Store API on `RouteRequestEvent`
+
+| Method | Description |
+|--------|-------------|
+| `event.set(key, value)` | Write a value to the store; returns `self` (chainable) |
+| `event.get(key, default=None)` | Read a value (returns `default` if missing) |
+| `event.has(key)` | Check if key is present |
+| `event.remove(key)` | Remove a key |
+
+The store is tied to `request.state` so it is shared across all middlewares and the handler within the same HTTP request.
+
+---
+
+## Unbinding middleware
+
+Sometimes a child group or specific route needs to opt out of a middleware registered at a higher level. Use `unbind=` or `group.unbind()`.
+
+### Unbind from a specific route
+
+```python
+@pb.middleware(priority=100, id="global-auth")
+async def global_auth(event: RouteRequestEvent):
+    await event.load_auth()
+    if not event.has_auth():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=401, content={"status": 401, "message": "Login required.", "data": {}})
+    return await event.next()
+
+# This route runs without global-auth
+@pb.get("/public/ping", unbind=["global-auth"])
+async def ping():
+    return {"pong": True}
+```
+
+### Unbind from a group
+
+```python
+public = pb.group("/public").unbind("global-auth")
+
+@public.get("/status")    # skips global-auth
+async def status():
+    return {"ok": True}
+```
+
+### Remove a global middleware entirely
+
+```python
+pb.unbind_middleware("global-auth")   # removes from registry
+```
+
+---
 
 ## Auth inside middleware
 
@@ -83,11 +233,10 @@ async def admin_dashboard():
 async def auth_aware(event: RouteRequestEvent):
     await event.load_auth()
 
-    if event.has_record_auth():
-        user_id = event.auth_id()
-        print(f"Authenticated user: {user_id}")
-    elif event.is_superuser():
+    if event.is_superuser():
         print("Superuser request")
+    elif event.has_record_auth():
+        print(f"User: {event.auth_id()} ({event.auth_collection_name()})")
     else:
         print("Anonymous request")
 
@@ -100,13 +249,31 @@ Equivalent to `@pb.middleware(...)` without the decorator syntax:
 
 ```python
 async def cors_headers(event: RouteRequestEvent):
-    result = await event.next()
-    return result  # add headers via a response wrapper if needed
+    return await event.next()
 
-pb.use(cors_headers, priority=200)
+pb.use(cors_headers, priority=200, path="/api/*")
 ```
 
-## RouteRequestEvent reference
+---
+
+## Built-in API rate limiting
+
+PPBase also ships a core middleware (`RateLimitMiddleware`) for built-in API endpoints (`/api/**`).
+
+- Controlled from `settings.rateLimiting` (or legacy `settings.rateLimits`).
+- Skips `/api/health` and `/api/realtime`.
+- Returns PocketBase-style `429` on limit breach.
+
+Response headers:
+
+- `X-RateLimit-Limit`
+- `X-RateLimit-Remaining`
+- `X-RateLimit-Reset`
+- `Retry-After` (only when blocked)
+
+---
+
+## `RouteRequestEvent` reference
 
 | Property / Method | Type | Description |
 |---|---|---|
@@ -119,8 +286,12 @@ pb.use(cors_headers, priority=200)
 | `event.auth` | `dict \| None` | Decoded auth payload (after `load_auth()`) |
 | `await event.load_auth()` | `dict \| None` | Resolve Bearer token once, cache it |
 | `event.has_auth()` | `bool` | Auth is loaded and not None |
-| `event.is_superuser()` | `bool` | Auth is admin or _superusers |
+| `event.is_superuser()` | `bool` | Auth is admin or `_superusers` |
 | `event.auth_id()` | `str \| None` | Record ID from auth token |
+| `event.set(key, value)` | `self` | Write to request-local store |
+| `event.get(key, default)` | `Any` | Read from request-local store |
+| `event.has(key)` | `bool` | Check key in store |
+| `event.remove(key)` | — | Remove key from store |
 | `await event.next()` | `Any` | Continue the middleware chain |
 
 ## Execution order example
@@ -128,35 +299,24 @@ pb.use(cors_headers, priority=200)
 Given:
 
 ```python
-@pb.middleware(priority=100)   # A — global, highest priority
-@api.middleware(priority=50)   # B — group
-route = @api.get("/x", middlewares=[C])  # C — route-level
+@pb.middleware(priority=200, id="timer")       # A — global
+@pb.middleware(priority=120, path="/api/v1/*") # B — global, path-filtered
+@api.middleware(priority=50)                   # C — group
+route = @api.get("/x", middlewares=[D])        # D — route-level
 ```
 
 Order for `GET /api/v1/x`:
 
 ```
-A (global, priority=100)
-  → B (group, priority=50)
-    → C (route-level)
-      → route handler
+A (global priority=200)
+  → B (global path-filtered, priority=120, matches /api/v1/x)
+    → C (group priority=50)
+      → D (route-level)
+        → route handler
+      ← D
     ← C
   ← B
 ← A
 ```
 
-## Short-circuiting
-
-Return a response directly (without calling `event.next()`) to stop the chain:
-
-```python
-@pb.middleware(priority=200)
-async def block_bots(event: RouteRequestEvent):
-    ua = event.headers.get("user-agent", "").lower()
-    if "scraperbot" in ua:
-        return JSONResponse(
-            status_code=429,
-            content={"status": 429, "message": "Too many requests.", "data": {}},
-        )
-    return await event.next()
-```
+For `GET /api/v1/x` with `unbind=["timer"]` on the route, A is skipped entirely.

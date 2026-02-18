@@ -10,6 +10,25 @@ Loaded by run_server.py via:
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
+
+def _payload_from_result(result: Any) -> dict[str, Any]:
+    """Normalize hook result payload (dict or JSONResponse-like object)."""
+    if isinstance(result, dict):
+        return result
+
+    body = getattr(result, "body", None)
+    if isinstance(body, bytes):
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+            if isinstance(decoded, dict):
+                return decoded
+        except Exception:
+            return {}
+    return {}
+
 
 def setup(pb) -> None:
     """Register audit hooks on the pb facade."""
@@ -33,7 +52,8 @@ def setup(pb) -> None:
     @pb.on_record_create_request(priority=1)
     async def _audit_create(event: RecordRequestEvent):
         result = await event.next()
-        rec_id = result.get("id", "?") if isinstance(result, dict) else "?"
+        payload = _payload_from_result(result)
+        rec_id = payload.get("id", "?")
         print(f"[audit] CREATE {_coll(event)}/{rec_id} by {_actor(event)}")
         return result
 
@@ -56,6 +76,7 @@ def setup(pb) -> None:
     @pb.on_record_view_request(priority=1)
     async def _audit_view(event: RecordRequestEvent):
         result = await event.next()
-        rec_id = result.get("id", "?") if isinstance(result, dict) else "?"
+        payload = _payload_from_result(result)
+        rec_id = payload.get("id", "?")
         print(f"[audit] VIEW   {_coll(event)}/{rec_id} by {_actor(event)}")
         return result

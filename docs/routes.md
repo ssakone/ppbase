@@ -52,7 +52,6 @@ from fastapi import Request
 async def stripe_webhook(request: Request):
     body = await request.body()
     sig = request.headers.get("stripe-signature", "")
-    # verify signature…
     return {"received": True}
 ```
 
@@ -70,10 +69,6 @@ async def status():
 @api.post("/items")
 async def create_item(body: dict):
     return {"created": body}
-
-@api.get("/items/{id}")
-async def get_item(id: str):
-    return {"id": id}
 ```
 
 ### Nested groups
@@ -85,10 +80,6 @@ reports = admin_api.group("/reports")   # prefix = /api/admin/reports
 @reports.get("/daily")
 async def daily_report():
     return {"report": "daily"}
-
-@reports.get("/weekly")
-async def weekly_report():
-    return {"report": "weekly"}
 ```
 
 ## Auth dependencies
@@ -107,14 +98,160 @@ async def me(auth: dict[str, Any] | None = pb.optional_auth()):
 
 # Required auth record (user or superuser)
 @pb.get("/profile")
-async def profile(auth: dict[str, Any] = pb.require_auth()):
+async def profile(auth: dict[str, Any] = pb.require_record_auth()):
     return {"id": auth["id"], "type": auth["type"]}
 
-# Superuser / admin only
+# Legacy admin token only (`type="admin"`)
 @pb.get("/admin/stats")
 async def admin_stats(_: dict = pb.require_admin()):
     return {"totalUsers": 42}
+
+# Superuser guard (admin token OR _superusers auth record)
+@pb.get("/superuser/stats", middlewares=[pb.apis.require_superuser_auth()])
+async def superuser_stats():
+    return {"ok": True}
 ```
+
+`pb.require_admin()` matches legacy admin tokens only.  
+For PocketBase-style superuser guard, prefer `middlewares=[pb.apis.require_superuser_auth()]`.
+
+## Multipart file uploads in custom routes
+
+You can receive files in custom routes with FastAPI, then write them via `RecordRepository`:
+
+```python
+from fastapi import File, Form, UploadFile
+
+@pb.post("/api/custom/avatar")
+async def upload_avatar(
+    user_id: str = Form(...),
+    avatar: UploadFile = File(...),
+):
+    content = await avatar.read()
+    updated = await pb.records("users").update(
+        user_id,
+        data={},
+        files={"avatar": [(avatar.filename or "avatar.png", content)]},
+    )
+    return updated
+```
+
+Returned records keep PB-compatible file names. Build public URL as:
+
+```text
+/api/files/{collection}/{recordId}/{filename}
+```
+
+## Built-in auth route middlewares (`pb.apis`)
+
+`pb.apis` provides declarative auth guards as route-level middleware — no need to write the guard logic manually:
+
+```python
+# Any authenticated user
+@api.get("/private", middlewares=[pb.apis.require_auth()])
+async def private(auth = pb.optional_auth()):
+    return {"id": auth["id"] if auth else None}
+
+# Restricted to a specific collection
+@api.get("/users-only", middlewares=[pb.apis.require_auth("users")])
+async def users_only():
+    return {"ok": True}
+
+# Superuser only
+@api.get("/admin", middlewares=[pb.apis.require_superuser_auth()])
+async def admin():
+    return {"admin": True}
+
+# Superuser OR the record's owner (path param name defaults to "id")
+@api.get("/users/{id}", middlewares=[pb.apis.require_superuser_or_owner_auth("id")])
+async def get_user(id: str):
+    return await pb.records("users").get(id)
+
+# Guest only — reject authenticated requests
+@api.post("/register", middlewares=[pb.apis.require_guest_only()])
+async def register(body: dict):
+    return {"registered": True}
+```
+
+## Record enrichment & auth responses (`pb.apis`)
+
+### `pb.apis.enrich_record` / `pb.apis.enrich_records`
+
+Apply the `?expand=` and `?fields=` query parameters from the current request to a record or list of records:
+
+```python
+from fastapi import Request
+
+@pb.get("/posts/{id}")
+async def get_post(id: str, request: Request):
+    record = await pb.records("posts").get(id)
+    # Respects ?expand=author&fields=id,title,author
+    enriched = await pb.apis.enrich_record(request, record, collection="posts")
+    return enriched
+
+@pb.get("/posts")
+async def list_posts(request: Request):
+    result = await pb.records("posts").list(sort="-created")
+    items = await pb.apis.enrich_records(request, result["items"], collection="posts")
+    return {**result, "items": items}
+```
+
+Signature:
+
+```python
+await pb.apis.enrich_record(
+    request,          # FastAPI Request
+    record,           # dict | None
+    collection=...,   # CollectionRecord | str | None (resolved automatically from record if omitted)
+    default_expand=None,  # fallback expand string if ?expand= is not in the request
+)
+
+await pb.apis.enrich_records(
+    request,
+    records,          # list[dict]
+    collection=...,
+    default_expand=None,
+)
+```
+
+### `pb.apis.record_auth_response`
+
+Build a PocketBase-compatible `{token, record, meta}` auth response — handles token generation, record enrichment, and triggers the generic `on_record_auth_request` hook:
+
+```python
+@pb.post("/custom-login")
+async def custom_login(body: dict, request: Request):
+    # Validate credentials your way…
+    user = await pb.records("users").list(
+        filter=f'email="{body["email"]}"', per_page=1
+    )
+    if not user["items"]:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail={"status": 400, "message": "Invalid credentials.", "data": {}})
+
+    record = user["items"][0]
+
+    # Builds token automatically if `token` is omitted
+    return await pb.apis.record_auth_response(
+        request,
+        record,
+        collection="users",       # required: collection name or object
+        auth_method="custom",     # logged in hooks / response meta
+        meta={"provider": "sso"}, # optional extra fields in response
+        # token="override.jwt.here",  # supply your own token if needed
+    )
+```
+
+Response shape (matches PocketBase):
+```json
+{
+  "token": "eyJ...",
+  "record": { "id": "...", "email": "...", ... },
+  "meta": { "provider": "sso" }
+}
+```
+
+---
 
 ## JSON responses & errors
 
@@ -138,7 +275,26 @@ async def del_resource(id: str):
     return Response(status_code=204)   # always use Response, not JSONResponse, for 204
 ```
 
-## Registering via `pb.route()`
+## `pb.configure()` — override settings at runtime
+
+Call `pb.configure()` before `pb.start()` or `pb.get_app()` to change any setting programmatically. This is useful when settings depend on CLI args or environment detection at runtime:
+
+```python
+import sys
+from ppbase import pb
+
+if __name__ == "__main__":
+    db_url = next((a for a in sys.argv if a.startswith("--db=")), None)
+    if db_url:
+        pb.configure(database_url=db_url.split("=", 1)[1])
+
+    pb.configure(migrations_dir="./migrations", public_dir="./public")
+    pb.start()
+```
+
+`configure()` raises `RuntimeError` if called after `get_app()` or `start()`.
+
+## `pb.route()` — generic method registration
 
 The `route()` method is the underlying primitive and accepts a `methods` list:
 
@@ -154,26 +310,22 @@ When splitting into multiple files, wrap registrations in a `setup(pb)` function
 
 ```python
 # routes/blog.py
-from typing import Any
-
 def setup(pb):
+    from fastapi import HTTPException
 
     blog = pb.group("/api/blog")
 
     @blog.get("/posts")
     async def list_posts():
-        records = await pb.records("posts").list(sort="-created")
-        return records
+        return await pb.records("posts").list(sort="-created")
 
     @blog.get("/posts/{slug}")
-    async def get_post(slug: str):
+    async def get_post_by_slug(slug: str):
         results = await pb.records("posts").list(
-            filter=f'slug="{slug}"',
-            per_page=1,
+            filter=f'slug="{slug}"', per_page=1,
         )
         items = results.get("items", [])
         if not items:
-            from fastapi import HTTPException
             raise HTTPException(status_code=404, detail={"status": 404, "message": "Post not found.", "data": {}})
         return items[0]
 ```

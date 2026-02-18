@@ -54,6 +54,12 @@ async def _lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     extensions = getattr(app.state, "extension_registry", None)
 
+    if not settings.jwt_secret and not settings.dev:
+        logger.warning(
+            "PPBASE_JWT_SECRET is not set; PPBase will use a project-local generated "
+            "secret from data_dir/.jwt_secret."
+        )
+
     if extensions is not None:
         await extensions.hooks.get(HOOK_BOOTSTRAP).trigger(
             BootstrapEvent(app=app, settings=settings),
@@ -83,7 +89,9 @@ async def _lifespan(app: FastAPI):
 
     # Bootstrap all system collections and backfill auth options
     from ppbase.db.bootstrap import bootstrap_system_collections
+    from ppbase.db.system_tables import ParamRecord
     from ppbase.services.auth_service import generate_default_auth_options
+    from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
     from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker as _asm
 
     _boot_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
@@ -103,6 +111,12 @@ async def _lifespan(app: FastAPI):
                     is_su = (coll.name == "_superusers")
                     coll.options = generate_default_auth_options(is_superusers=is_su)
                     await _boot_session.flush()
+
+            settings_stmt = select(ParamRecord.value).where(ParamRecord.key == "settings")
+            settings_row = (await _boot_session.execute(settings_stmt)).scalar_one_or_none()
+            configure_storage_runtime_from_settings_payload(
+                settings_row if isinstance(settings_row, dict) else None
+            )
 
     # Apply pending migrations if auto_migrate is enabled
     if settings.auto_migrate:
@@ -215,6 +229,11 @@ def create_app(
     # Attach settings to app state so dependencies can access them
     app.state.settings = settings
     app.state.extension_registry = extensions
+    app.state.rate_limit_settings_version = 0
+
+    from ppbase.services.file_storage import set_storage_settings
+
+    set_storage_settings(settings)
 
     # CORS
     from ppbase.middleware.cors import setup_cors
@@ -223,7 +242,9 @@ def create_app(
 
     # Request logger
     from ppbase.middleware.request_logger import RequestLoggerMiddleware
+    from ppbase.middleware.rate_limit import RateLimitMiddleware
 
+    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(RequestLoggerMiddleware)
 
     # API routes

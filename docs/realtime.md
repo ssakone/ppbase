@@ -18,6 +18,24 @@ Server → SSE event                ← forwarded to subscribed clients
 | `collectionName/*` | `posts/*` | All events in the `posts` collection |
 | `collectionName/recordId` | `posts/abc123` | Events for a specific record |
 
+## Subscription semantics
+
+- `POST /api/realtime` **replaces** the full subscription set for the client (not incremental add).
+- To clear all subscriptions, send an empty list: `{"clientId":"...", "subscriptions":[]}`.
+- Realtime auth is session-consistent: if a later subscribe request uses a different auth identity than the first one, PPBase returns `403`.
+
+## Topic options (`options`)
+
+Each topic can carry optional query/header context via URL query string:
+
+```text
+posts/*?options={"query":{"expand":"author","fields":"id,title,author"},"headers":{"x-role":"staff"}}
+```
+
+In raw HTTP clients, URL-encode the JSON value of `options`.
+
+These options are parsed server-side and applied per subscription during event filtering/enrichment.
+
 ## Client SDK (JavaScript)
 
 ```javascript
@@ -187,7 +205,7 @@ async def publish_post(post_id: str):
 | `event.client_id` | `str` | Client UUID |
 | `event.subscriptions` | `list[str]` | Topic strings — **mutable** |
 | `event.parsed_subscriptions` | `list[RealtimeSubscription]` | Parsed objects |
-| `event.authorization` | `str \| None` | Bearer token from subscribe body |
+| `event.authorization` | `str \| None` | Raw Authorization header from subscribe request |
 | `event.auth` | `dict \| None` | Decoded auth from `authorization` |
 
 ## RealtimeMessageSendEvent reference

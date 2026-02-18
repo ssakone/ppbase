@@ -581,12 +581,24 @@ class FlaskLikePB:
 
         from ppbase.db.ensure_db import ensure_database_exists
 
+        effective_host = str(host or self.settings.host)
+        effective_port = int(port or self.settings.port)
+
+        # Keep runtime settings aligned with actual bind host/port so startup
+        # messages (setup URL/open browser) use the real endpoint.
+        self.settings.host = effective_host
+        self.settings.port = effective_port
+
         ensure_database_exists(self.settings.database_url)
         app = self.get_app()
+        app_settings = getattr(app.state, "settings", None)
+        if app_settings is not None:
+            setattr(app_settings, "host", effective_host)
+            setattr(app_settings, "port", effective_port)
         uvicorn.run(
             app,
-            host=host or self.settings.host,
-            port=port or self.settings.port,
+            host=effective_host,
+            port=effective_port,
             log_level=self.settings.log_level.lower(),
         )
 

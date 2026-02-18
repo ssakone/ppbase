@@ -103,6 +103,36 @@ async def test_route_can_use_optional_auth_dependency_helper() -> None:
     assert response.json() == {"id": "user_1"}
 
 
+def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> None:
+    app_pb = PPBase()
+    captured: dict[str, object] = {}
+
+    def _fake_ensure_database_exists(db_url: str) -> None:
+        captured["db_url"] = db_url
+
+    def _fake_uvicorn_run(app, host: str, port: int, log_level: str) -> None:
+        captured["app"] = app
+        captured["host"] = host
+        captured["port"] = port
+        captured["log_level"] = log_level
+
+    monkeypatch.setattr(
+        "ppbase.db.ensure_db.ensure_database_exists",
+        _fake_ensure_database_exists,
+    )
+    monkeypatch.setattr("uvicorn.run", _fake_uvicorn_run)
+
+    app_pb.start(host="127.0.0.1", port=8091)
+
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8091
+    assert app_pb.settings.host == "127.0.0.1"
+    assert app_pb.settings.port == 8091
+    app = app_pb.get_app()
+    assert app.state.settings.host == "127.0.0.1"
+    assert app.state.settings.port == 8091
+
+
 @pytest.mark.asyncio
 async def test_route_can_use_require_auth_dependency_helpers() -> None:
     app_pb = PPBase()

@@ -72,7 +72,7 @@ async def on_terminate(event: TerminateEvent):
 # ── global extension middleware (all custom routes) ────────────────────────────
 
 import time  # noqa: E402
-from ppbase.ext.events import RouteRequestEvent  # noqa: E402
+from ppbase.ext.events import RecordRequestEvent, RouteRequestEvent  # noqa: E402
 
 
 @pb.middleware(priority=200)
@@ -115,6 +115,61 @@ async def trace_context(event: RouteRequestEvent):
     elapsed_ms = (time.perf_counter() - started_at) * 1000
     print(f"[trace] id={event.get('traceId')} elapsed={elapsed_ms:.1f} ms")
     return result
+
+
+# ── record hooks (inline demo) ────────────────────────────────────────────────
+
+@pb.on_record_update_request("users", priority=70)
+async def users_avatar_to_grayscale(event: RecordRequestEvent):
+    """Convert uploaded users.avatar images to grayscale before saving."""
+    avatar_uploads = event.files.get("avatar") or []
+    if not avatar_uploads:
+        return await event.next()
+
+    try:
+        from PIL import Image
+    except Exception:
+        print("[users] Pillow not available; avatar grayscale hook skipped")
+        return await event.next()
+
+    import io
+
+    format_by_ext = {
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".png": "PNG",
+        ".webp": "WEBP",
+        ".gif": "GIF",
+        ".bmp": "BMP",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+    }
+
+    converted_uploads: list[tuple[str, bytes]] = []
+    for original_name, content in avatar_uploads:
+        try:
+            with Image.open(io.BytesIO(content)) as source:
+                source.load()
+                gray = source.convert("L")
+                target_format = (
+                    (source.format or "").upper()
+                    or format_by_ext.get(Path(original_name).suffix.lower(), "PNG")
+                )
+
+                output = io.BytesIO()
+                gray.save(output, format=target_format)
+
+                target_name = original_name
+                if target_format == "PNG" and Path(original_name).suffix.lower() != ".png":
+                    target_name = f"{Path(original_name).stem or 'avatar'}.png"
+
+                converted_uploads.append((target_name, output.getvalue()))
+        except Exception:
+            converted_uploads.append((original_name, content))
+
+    event.files["avatar"] = converted_uploads
+    print(f"[users] grayscale avatar conversion applied ({len(converted_uploads)} file(s))")
+    return await event.next()
 
 
 # ── simple top-level routes (registered directly) ─────────────────────────────
@@ -226,6 +281,7 @@ if __name__ == "__main__":
     print("│    @pb.middleware(priority=150)  ← UA block (demo)         │")
     print("│    @pb.middleware(path='/api/custom/*', methods=['GET'])   │")
     print("│    @pb.middleware(path='/trace') + pb.request_store()      │")
+    print("│    @pb.on_record_update_request('users') -> avatar gray    │")
     print("│    pb.apis.record_auth_response(request, record, ...)      │")
     print("│    pb.apis.enrich_record(request, record, ...)             │")
     print("│    route/group unbind: unbind=['middleware-id']            │")

@@ -113,19 +113,22 @@ deleted = await pb.records("posts").delete("record_id_here")
 
 ## Patterns inside hooks
 
+For record request hooks (`on_record_*_request`), `event.next()` usually returns a FastAPI `Response` object (not a plain dict).  
+Use `event.records(...)` for DB reads/writes, and treat the returned response as transport output.
+
 ### Enrich response after create
 
 ```python
 @pb.on_record_create_request("orders")
 async def enrich_order(event):
     result = await event.next()
-    if not result:
+    if getattr(result, "status_code", 500) >= 400:
         return result
 
     # create a related notification
     await event.records("notifications").create({
-        "user_id": result["user_id"],
-        "message": f"Order #{result['id']} confirmed",
+        "user_id": event.data.get("user_id", ""),
+        "message": "Order confirmed",
         "read": False,
     })
     return result
@@ -137,16 +140,17 @@ async def enrich_order(event):
 @pb.on_record_view_request("products")
 async def attach_reviews(event):
     result = await event.next()
-    if not result:
+    if getattr(result, "status_code", 500) >= 400:
         return result
 
+    # Example side effect on successful view request
     reviews = await event.records("reviews").list(
-        filter=f'product_id="{result["id"]}"',
+        filter=f'product_id="{event.record_id}"',
         sort="-created",
         per_page=5,
         fields="id,rating,body,created",
     )
-    result["_reviews"] = reviews["items"]
+    print(f"product {event.record_id} has {len(reviews.get('items', []))} recent review(s)")
     return result
 ```
 

@@ -8,6 +8,7 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import mimetypes
 import re
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,12 @@ from ppbase.ext.registry import (
     get_extension_registry,
 )
 from ppbase.services.auth_service import create_token, get_collection_token_config
+from ppbase.services.file_storage import (
+    get_storage_backend,
+    get_storage_path,
+    read_file_bytes,
+    set_storage_settings,
+)
 from ppbase.services.record_service import check_record_rule
 from ppbase.services.rule_engine import check_rule
 
@@ -91,6 +98,13 @@ def _parse_thumb_option(request: Request) -> str | None:
     if not value:
         return None
     return value
+
+
+def _guess_media_type(filename: str) -> str:
+    media_type, _encoding = mimetypes.guess_type(filename)
+    if media_type:
+        return media_type
+    return "application/octet-stream"
 
 
 def _normalize_thumb_options(options: dict[str, Any]) -> set[str]:
@@ -567,7 +581,8 @@ async def serve_file(
     session: AsyncSession = Depends(get_session),
     settings: Any = Depends(get_settings),
 ):
-    """Serve a file from local storage."""
+    """Serve a file from local or S3-compatible storage."""
+    set_storage_settings(settings)
     collection = await resolve_collection(session, collection_id_or_name)
 
     row_result = await session.execute(
@@ -599,15 +614,23 @@ async def serve_file(
         if not has_view_access:
             raise _not_found_error()
 
-    data_dir = settings.data_dir
-    file_path = Path(data_dir) / "storage" / collection.id / record_id / filename
-    if not file_path.is_file():
-        raise _not_found_error()
-
     thumb_option = _parse_thumb_option(request)
-    served_file_path = (
-        _resolve_thumb_path(file_path, filename, field_def, thumb_option) or file_path
-    )
+    storage_backend = get_storage_backend()
+
+    source_path = get_storage_path(collection.id, record_id) / filename
+    served_file_path: Path | None = None
+    if storage_backend != "s3":
+        if not source_path.is_file():
+            raise _not_found_error()
+        served_file_path = (
+            _resolve_thumb_path(source_path, filename, field_def, thumb_option) or source_path
+        )
+
+    source_bytes: bytes | None = None
+    if served_file_path is None:
+        source_bytes = read_file_bytes(collection.id, record_id, filename)
+        if source_bytes is None:
+            raise _not_found_error()
 
     force_download, download_filename = _parse_download_option(request)
     served_name = (download_filename or filename) if force_download else filename
@@ -618,7 +641,7 @@ async def serve_file(
         record=row_dict,
         file_field=field_def,
         filename=filename,
-        served_path=str(served_file_path),
+        served_path=str(served_file_path) if served_file_path is not None else "",
         served_name=str(served_name),
         force_download=bool(force_download),
     )
@@ -632,16 +655,36 @@ async def serve_file(
     if isinstance(hook_result, Response):
         return hook_result
 
-    resolved_served_path = Path(str(event.served_path or "")).expanduser()
-    if not resolved_served_path.is_file():
+    resolved_served_path_raw = str(event.served_path or "").strip()
+    if resolved_served_path_raw:
+        resolved_served_path = Path(resolved_served_path_raw).expanduser()
+        if not resolved_served_path.is_file():
+            raise _not_found_error()
+
+        if event.force_download:
+            safe_name = os.path.basename(str(event.served_name or filename).strip()) or filename
+            return FileResponse(
+                str(resolved_served_path),
+                filename=safe_name,
+                content_disposition_type="attachment",
+            )
+
+        return FileResponse(str(resolved_served_path), content_disposition_type="inline")
+
+    effective_filename = str(event.filename or filename).strip() or filename
+    if source_bytes is None:
+        source_bytes = read_file_bytes(collection.id, record_id, effective_filename)
+    if source_bytes is None:
         raise _not_found_error()
 
     if event.force_download:
-        safe_name = os.path.basename(str(event.served_name or filename).strip()) or filename
-        return FileResponse(
-            str(resolved_served_path),
-            filename=safe_name,
-            content_disposition_type="attachment",
+        safe_name = os.path.basename(str(event.served_name or effective_filename).strip()) or effective_filename
+        return Response(
+            content=source_bytes,
+            media_type=_guess_media_type(effective_filename),
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
+            },
         )
 
-    return FileResponse(str(resolved_served_path), content_disposition_type="inline")
+    return Response(content=source_bytes, media_type=_guess_media_type(effective_filename))

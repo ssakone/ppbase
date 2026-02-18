@@ -35,10 +35,19 @@ async def dashboard(auth: dict[str, Any] = pb.require_auth()):
 async def profile(auth: dict[str, Any] = pb.require_record_auth()):
     return {"collection": auth["collectionName"], "id": auth["id"]}
 
-# Admin / superuser only
+# Legacy admin token only
 @pb.get("/admin/panel")
 async def admin_panel(_: dict = pb.require_admin()):
     return {"admin": True}
+```
+
+`pb.require_admin()` checks only `auth["type"] == "admin"`.  
+For PocketBase-like superuser access (admin token or `_superusers` auth record), use route middleware:
+
+```python
+@pb.get("/superuser/panel", middlewares=[pb.apis.require_superuser_auth()])
+async def superuser_panel():
+    return {"ok": True}
 ```
 
 ### Decoded auth payload fields

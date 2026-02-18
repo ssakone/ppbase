@@ -22,6 +22,7 @@ from ppbase.api.deps import get_session, require_admin
 from ppbase.core.id_generator import generate_id
 from ppbase.db.system_tables import ParamRecord
 from ppbase.models.field_types import _EMAIL_RE
+from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
 
 router = APIRouter()
 
@@ -81,6 +82,11 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
     "rateLimits": {
         "enabled": False,
         "rules": [],
+    },
+    "rateLimiting": {
+        "enabled": False,
+        "maxRequests": 1000,
+        "window": 60,
     },
     "trustedProxy": {
         "headers": [],
@@ -163,6 +169,34 @@ def _smtp_config_from_settings(settings_value: dict[str, Any]) -> dict[str, Any]
         "sender_address": sender_address,
         "app_name": app_name,
     }
+
+
+def _apply_runtime_settings_to_app(request: Request, settings_value: dict[str, Any]) -> None:
+    """Apply runtime overrides that should react immediately to settings PATCH."""
+    configure_storage_runtime_from_settings_payload(settings_value)
+
+    runtime_settings = getattr(request.app.state, "settings", None)
+    if runtime_settings is None:
+        return
+
+    s3_raw = settings_value.get("s3") if isinstance(settings_value, dict) else {}
+    s3 = s3_raw if isinstance(s3_raw, dict) else {}
+
+    endpoint = str(s3.get("endpoint", "") or "").strip()
+    bucket = str(s3.get("bucket", "") or "").strip()
+    region = str(s3.get("region", "") or "").strip()
+    access_key = str(s3.get("accessKey", "") or "").strip()
+    secret_key = str(s3.get("secret", "") or "").strip()
+    enabled_raw = s3.get("enabled")
+    enabled = bool(enabled_raw) if enabled_raw is not None else bool(bucket and access_key and secret_key)
+
+    setattr(runtime_settings, "storage_backend", "s3" if enabled else "local")
+    setattr(runtime_settings, "s3_endpoint", endpoint)
+    setattr(runtime_settings, "s3_bucket", bucket)
+    setattr(runtime_settings, "s3_region", region)
+    setattr(runtime_settings, "s3_access_key", access_key)
+    setattr(runtime_settings, "s3_secret_key", secret_key)
+    setattr(runtime_settings, "s3_force_path_style", bool(s3.get("forcePathStyle", False)))
 
 
 def _test_email_subject(template: str, app_name: str) -> str:
@@ -265,6 +299,11 @@ async def update_settings(
     row.value = merged
     await session.flush()
     await session.commit()
+
+    _apply_runtime_settings_to_app(request, merged)
+
+    current_version = int(getattr(request.app.state, "rate_limit_settings_version", 0) or 0)
+    request.app.state.rate_limit_settings_version = current_version + 1
     return merged
 
 

@@ -13,6 +13,24 @@ Loaded via:
 from __future__ import annotations
 
 import datetime
+import json
+from typing import Any
+
+
+def _payload_from_result(result: Any) -> dict[str, Any]:
+    """Normalize hook result payload (dict or JSONResponse-like object)."""
+    if isinstance(result, dict):
+        return result
+
+    body = getattr(result, "body", None)
+    if isinstance(body, bytes):
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+            if isinstance(decoded, dict):
+                return decoded
+        except Exception:
+            return {}
+    return {}
 
 
 def setup(pb) -> None:
@@ -30,7 +48,10 @@ def setup(pb) -> None:
             datetime.datetime.utcnow().isoformat() + "Z",
         )
         result = await event.next()
-        print(f"[users] created user {result.get('email')} ({result.get('id')})")
+        payload = _payload_from_result(result)
+        print(
+            f"[users] created user {payload.get('email')} ({payload.get('id')})"
+        )
         return result
 
     # ── UPDATE ────────────────────────────────────────────────────────────────

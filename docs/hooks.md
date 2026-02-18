@@ -20,10 +20,13 @@ async def my_hook(event):
 
     result = await event.next()   # ← calls the next handler in chain
 
-    # runs AFTER create (result is the created record dict)
-    print(f"created {result['id']}")
+    # runs AFTER create (record request hooks usually return JSONResponse)
+    print(f"create status={getattr(result, 'status_code', 'n/a')}")
     return result
 ```
+
+For record request hooks (`on_record_*_request`), `event.next()` usually returns a FastAPI `Response` object (e.g. `JSONResponse`).  
+For auth hooks (`on_record_auth_*`), `event.next()` returns a PocketBase-style payload dict (`{"token": ..., "record": ..., ...}`).
 
 To **block** the request, raise `HTTPException` or return a custom `JSONResponse` without calling `event.next()`:
 
@@ -114,12 +117,10 @@ async def only_published(event: RecordRequestEvent):
 @pb.on_record_view_request("products")
 async def track_view(event: RecordRequestEvent):
     result = await event.next()
-    if result and isinstance(result, dict):
-        # fire-and-forget view counter
+    if getattr(result, "status_code", 500) == 200:
+        # fire-and-forget side effect on successful view
         import asyncio
-        asyncio.create_task(
-            event.records("product_views").create({"product_id": result["id"]})
-        )
+        asyncio.create_task(event.records("metrics").create({"event": "product_view"}))
     return result
 ```
 
@@ -134,7 +135,7 @@ async def before_post_create(event: RecordRequestEvent):
         event.data["author_id"] = event.auth_id()
 
     result = await event.next()
-    print(f"Post created: {result['id']}")
+    print(f"create status={getattr(result, 'status_code', 'n/a')}")
     return result
 ```
 
@@ -145,7 +146,11 @@ async def before_post_create(event: RecordRequestEvent):
 async def before_post_update(event: RecordRequestEvent):
     # only allow the author to update their own post
     if event.has_record_auth():
-        current = await event.get("posts", record_id=event.record_id, fields="id,author_id")
+        current = await event.get(
+            record_id=event.record_id,
+            collection="posts",
+            fields="id,author_id",
+        )
         if current and current.get("author_id") != event.auth_id() and not event.is_superuser():
             raise HTTPException(
                 status_code=403,
@@ -204,6 +209,68 @@ async def on_oauth2(event: RecordAuthRequestEvent):
     return await event.next()
 ```
 
+### `on_record_request_otp_request`
+
+```python
+@pb.on_record_request_otp_request("users")
+async def on_request_otp(event: RecordAuthRequestEvent):
+    identity = event.body.get("email") or event.body.get("identity")
+    print(f"OTP request: {identity}")
+    return await event.next()
+```
+
+### `on_record_auth_with_otp_request`
+
+```python
+@pb.on_record_auth_with_otp_request("users")
+async def on_auth_otp(event: RecordAuthRequestEvent):
+    print(f"OTP auth attempt: otpId={event.body.get('otpId')}")
+    return await event.next()
+```
+
+### `on_record_auth_request` (generic success hook)
+
+Runs after successful auth flows (`password`, `oauth2`, `otp`, `refresh`) and lets you adjust the final auth payload:
+
+```python
+@pb.on_record_auth_request("users")
+async def auth_success(event: RecordAuthRequestEvent):
+    result = await event.next()
+    if isinstance(result, dict):
+        meta = dict(result.get("meta") or {})
+        meta["source"] = "hook"
+        result["meta"] = meta
+    return result
+```
+
+---
+
+## File hooks
+
+### `on_file_token_request`
+
+```python
+from ppbase.ext.events import FileTokenRequestEvent
+
+@pb.on_file_token_request()
+async def log_file_token(event: FileTokenRequestEvent):
+    actor = event.auth_id() or "anonymous"
+    print(f"file token request by {actor}")
+    return await event.next()
+```
+
+### `on_file_download_request`
+
+```python
+from ppbase.ext.events import FileDownloadRequestEvent
+
+@pb.on_file_download_request("users")
+async def guard_download(event: FileDownloadRequestEvent):
+    if not event.has_auth():
+        event.require_auth()  # raises PB-style 401
+    return await event.next()
+```
+
 ---
 
 ## Hook priority
@@ -246,19 +313,31 @@ async def audit(event):
 | `event.record_id` | `str \| None` | Target record ID (view/update/delete) |
 | `event.auth` | `dict \| None` | Decoded JWT payload |
 | `event.data` | `dict` | Request body (create/update) — mutable |
+| `event.files` | `dict[str, list[tuple[str, bytes]]]` | Multipart uploaded files (create/update) — mutable |
 | `event.page` | `int \| None` | Pagination (list) |
 | `event.per_page` | `int \| None` | Page size (list) |
 | `event.sort` | `str \| None` | Sort expression (list) — mutable |
 | `event.filter` | `str \| None` | Filter expression (list) — mutable |
+| `event.expand` | `str \| None` | Expand expression — mutable |
 | `event.fields` | `str \| None` | Field selector — mutable |
+| `event.skip_total` | `bool \| None` | Skip total count (list) — mutable |
 | `event.engine` | `AsyncEngine` | SQLAlchemy engine |
 | `event.has_auth()` | `bool` | Any auth present |
 | `event.has_record_auth()` | `bool` | Auth is an auth-record token |
 | `event.is_superuser()` | `bool` | Auth is admin or _superusers record |
+| `event.is_admin()` | `bool` | Legacy admin token (`type="admin"`) |
+| `event.auth_type()` | `str \| None` | Auth type (`admin`, `authRecord`, or `None`) |
 | `event.auth_id()` | `str \| None` | ID from auth token |
 | `event.auth_collection_name()` | `str \| None` | Collection from auth token |
 | `event.require_auth()` | `dict` | Raises 401 if no auth |
+| `event.require_auth_record()` | `dict` | Raises 401/403 unless auth-record |
 | `event.require_superuser()` | `dict` | Raises 403 if not superuser |
+| `event.require_same_auth_record(record_id, collection=None)` | `dict` | Raises 403 unless token belongs to that record |
 | `await event.get_current_user()` | `dict \| None` | Fetch current auth record from DB |
 | `event.records(coll)` | `RecordRepository` | CRUD helpers for a collection |
+| `await event.get(record_id=None, collection=None, fields=None)` | `dict \| None` | Get one record |
+| `await event.list(...)` | `dict` | List records (paginated) |
+| `await event.create(data, collection=None, files=None)` | `dict` | Create record |
+| `await event.update(data, record_id=None, collection=None, files=None)` | `dict \| None` | Update record |
+| `await event.delete(record_id=None, collection=None)` | `bool` | Delete record |
 | `await event.next()` | `Any` | Continue the hook chain |

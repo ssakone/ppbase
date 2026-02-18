@@ -153,12 +153,14 @@ describe('Settings API', () => {
   let adminPb: PocketBase | null = null
   let previousMeta: Record<string, unknown> = {}
   let previousSmtp: Record<string, unknown> = {}
+  let previousS3: Record<string, unknown> = {}
 
   beforeAll(async () => {
     adminPb = await getAdminPb()
     const settings = await adminPb.settings.getAll()
     previousMeta = { ...((settings.meta || {}) as Record<string, unknown>) }
     previousSmtp = { ...((settings.smtp || {}) as Record<string, unknown>) }
+    previousS3 = { ...((settings.s3 || {}) as Record<string, unknown>) }
   })
 
   afterAll(async () => {
@@ -169,6 +171,7 @@ describe('Settings API', () => {
     await pb.settings.update({
       meta: previousMeta,
       smtp: previousSmtp,
+      s3: previousS3,
     })
   })
 
@@ -267,5 +270,37 @@ describe('Settings API', () => {
     } finally {
       await smtpServer.close()
     }
+  })
+
+  it('should persist S3 settings fields', async () => {
+    const pb = adminPb
+    if (!pb) {
+      throw new Error('Admin client is not initialized.')
+    }
+
+    const payload = {
+      endpoint: 'https://example-r2.invalid',
+      bucket: 'bucket-e2e',
+      region: 'auto',
+      accessKey: 'r2-access',
+      secret: 'r2-secret',
+      forcePathStyle: true,
+    }
+
+    const updated = await pb.settings.update({ s3: payload })
+    expect(updated?.s3?.endpoint).toBe(payload.endpoint)
+    expect(updated?.s3?.bucket).toBe(payload.bucket)
+    expect(updated?.s3?.region).toBe(payload.region)
+    expect(updated?.s3?.accessKey).toBe(payload.accessKey)
+    expect(updated?.s3?.secret).toBe(payload.secret)
+    expect(Boolean(updated?.s3?.forcePathStyle)).toBe(true)
+
+    const fetched = await pb.settings.getAll()
+    expect(fetched?.s3?.endpoint).toBe(payload.endpoint)
+    expect(fetched?.s3?.bucket).toBe(payload.bucket)
+    expect(fetched?.s3?.region).toBe(payload.region)
+    expect(fetched?.s3?.accessKey).toBe(payload.accessKey)
+    expect(fetched?.s3?.secret).toBe(payload.secret)
+    expect(Boolean(fetched?.s3?.forcePathStyle)).toBe(true)
   })
 })

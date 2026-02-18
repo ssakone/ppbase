@@ -2,6 +2,11 @@
 
 As your application grows, you'll want to split hooks and routes across multiple modules. PPBase supports this via `pb.load_hooks()`.
 
+PPBase supports two patterns that can be mixed:
+
+- Side-effect modules (`import hooks.users`) using decorators at import time.
+- Explicit registration functions (`setup(pb)` / `register(pb)`) loaded via `pb.load_hooks("module:function")`.
+
 ## The `load_hooks` pattern
 
 Each module exposes a `setup(pb)` function that receives the `pb` facade and registers its own hooks and routes:
@@ -39,6 +44,28 @@ if __name__ == "__main__":
 
 The `load_hooks` argument uses `"module.path:function_name"` syntax — any importable module path works.
 
+CLI equivalent:
+
+```bash
+python -m ppbase serve --hooks hooks.users:setup --hooks routes.blog:setup
+```
+
+## Side-effect import pattern
+
+You can also register decorators by importing modules directly:
+
+```python
+# main.py
+from ppbase import pb
+import hooks.users           # decorators execute at import time
+from hooks.admin import register
+
+register(pb)                # explicit style can coexist
+
+if __name__ == "__main__":
+    pb.start()
+```
+
 ---
 
 ## Recommended project layout
@@ -71,10 +98,11 @@ my_project/
 ### `main.py`
 
 ```python
+import sys
 from ppbase import pb
 
-# Load all modules
-pb.load_hooks("hooks.audit:setup")     # audit last (lowest priority assumed inside)
+# Load all modules — cross-cutting concerns first
+pb.load_hooks("hooks.audit:setup")
 pb.load_hooks("hooks.users:setup")
 pb.load_hooks("hooks.posts:setup")
 pb.load_hooks("routes.blog:setup")
@@ -82,8 +110,18 @@ pb.load_hooks("routes.metrics:setup")
 pb.load_hooks("routes.webhooks:setup")
 
 if __name__ == "__main__":
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
+    # Runtime settings override (must be before pb.start())
+    pb.configure(
+        migrations_dir="./migrations",
+        public_dir="./public",          # served at / as static files
+    )
+
+    # Override DB from CLI: python main.py --db postgresql+asyncpg://...
+    db_arg = next((a for a in sys.argv if a.startswith("--db=")), None)
+    if db_arg:
+        pb.configure(database_url=db_arg.split("=", 1)[1])
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8090
     pb.start(host="127.0.0.1", port=port)
 ```
 
@@ -174,12 +212,11 @@ def setup(pb):
     @pb.on_record_view_request("posts", priority=10)
     async def increment_views(event: RecordRequestEvent):
         result = await event.next()
-        if result and isinstance(result, dict):
+        if getattr(result, "status_code", 500) == 200:
             import asyncio
-            views = int(result.get("views", 0)) + 1
-            asyncio.create_task(
-                event.records("posts").update(result["id"], {"views": views})
-            )
+            # Record request hooks usually get a Response object back.
+            # Use lightweight side effects here, or decode response body when needed.
+            asyncio.create_task(event.records("metrics").create({"event": "post_view"}))
         return result
 ```
 
@@ -196,10 +233,7 @@ def setup(pb):
     @pb.on_record_create_request("users", priority=50)
     async def user_created(event: RecordRequestEvent):
         result = await event.next()
-        if result:
-            email = result.get("email", "")
-            print(f"[users] new user: {email}")
-            # await send_welcome_email(email)
+        print(f"[users] create status={getattr(result, 'status_code', 'n/a')}")
         return result
 
     @pb.on_record_delete_request("users", priority=50)
@@ -290,24 +324,15 @@ def setup(pb):
     import time
 
     _start_time = time.time()
+    # Use pb.apis.require_superuser_auth() — no manual guard needed
     metrics = pb.group("/api/metrics")
 
-    async def require_superuser(event):
-        await event.load_auth()
-        if not event.is_superuser():
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=403,
-                content={"status": 403, "message": "Superuser required.", "data": {}},
-            )
-        return await event.next()
-
-    @metrics.get("/health", middlewares=[require_superuser])
+    @metrics.get("/health", middlewares=[pb.apis.require_superuser_auth()])
     async def health():
         uptime = int(time.time() - _start_time)
         return {"uptime_seconds": uptime, "status": "ok"}
 
-    @metrics.get("/collections", middlewares=[require_superuser])
+    @metrics.get("/collections", middlewares=[pb.apis.require_superuser_auth()])
     async def collection_stats():
         """List all collections with approximate record count."""
         from ppbase.db.engine import get_engine
@@ -359,11 +384,11 @@ def setup(pb):
 
 ## Loading order matters
 
-Hooks registered first run with higher implicit priority if no `priority=` is set. Register cross-cutting concerns (audit, auth guards) before feature-specific hooks:
+When `priority=` is equal, hook execution order is stable and follows registration order (first registered runs first). Register cross-cutting concerns (audit, auth guards) before feature-specific hooks:
 
 ```python
 # Recommended order
-pb.load_hooks("hooks.audit:setup")    # cross-cutting, runs last in chain
+pb.load_hooks("hooks.audit:setup")       # cross-cutting
 pb.load_hooks("hooks.auth_guard:setup")  # security
 pb.load_hooks("hooks.users:setup")
 pb.load_hooks("hooks.posts:setup")
