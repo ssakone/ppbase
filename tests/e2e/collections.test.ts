@@ -49,6 +49,31 @@ describe('Collections API', () => {
     }
   });
 
+  it('should merge custom auth options with generated defaults on create', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      name: uniqueName('auth_opts'),
+      type: 'auth',
+      options: {
+        manageRule: '@request.auth.id != ""',
+        authToken: {
+          duration: 1234,
+        },
+      },
+    });
+
+    try {
+      expect(collection.options.manageRule).toBe('@request.auth.id != ""');
+      expect(collection.options.authToken.duration).toBe(1234);
+      expect(typeof collection.options.authToken.secret).toBe('string');
+      expect(collection.options.authToken.secret.length).toBe(50);
+      expect(collection.options.passwordResetToken).toBeTruthy();
+      expect(collection.options.verificationToken).toBeTruthy();
+      expect(collection.options.fileToken).toBeTruthy();
+    } finally {
+      await cleanup();
+    }
+  });
+
   it('should update collection schema (add field)', async () => {
     const { collection, cleanup } = await createTestCollection(adminPb);
 
@@ -101,6 +126,18 @@ describe('Collections API', () => {
     expect(list.items).toBeInstanceOf(Array);
   });
 
+  it('should return collection scaffolds metadata', async () => {
+    const scaffolds = await adminPb.send('/api/collections/meta/scaffolds', {
+      method: 'GET',
+    });
+
+    expect(scaffolds.auth?.type).toBe('auth');
+    expect(scaffolds.base?.type).toBe('base');
+    expect(scaffolds.view?.type).toBe('view');
+    expect(scaffolds.auth?.passwordAuth?.enabled).toBe(true);
+    expect(scaffolds.auth?.authToken?.duration).toBeGreaterThan(0);
+  });
+
   it('should get single collection by name', async () => {
     const { collection, cleanup } = await createTestCollection(adminPb);
 
@@ -144,7 +181,7 @@ describe('Collections API', () => {
 
       // Truncate via raw send (SDK might not have this method)
       await adminPb.send(`/api/collections/${collection.id}/truncate`, {
-        method: 'POST',
+        method: 'DELETE',
       });
 
       // Verify all records cleared

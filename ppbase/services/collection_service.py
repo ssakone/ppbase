@@ -72,6 +72,17 @@ def _validate_collection_name(name: str) -> None:
         raise ValueError(f"Collection name '{name}' is reserved.")
 
 
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``override`` into ``base`` and return a new dict."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -260,12 +271,14 @@ async def create_collection(
 
     # Auth collections need default auth options (per-collection token secrets)
     # if the client didn't provide them.
-    options = data.options
+    options = data.options if isinstance(data.options, dict) else {}
     if data.type == "auth":
         from ppbase.services.auth_service import generate_default_auth_options
 
-        if not options or not options.get("authToken"):
-            options = generate_default_auth_options(is_superusers=False)
+        options = _deep_merge_dicts(
+            generate_default_auth_options(is_superusers=False),
+            options,
+        )
 
     now = datetime.now(timezone.utc)
     record = CollectionRecord(
@@ -570,11 +583,16 @@ async def import_collections(
         else:
             # Create new
             import_options = coll_data.get("options", {})
+            if not isinstance(import_options, dict):
+                import_options = {}
             import_type = coll_data.get("type", "base")
             # Auth collections need default auth options if not provided
-            if import_type == "auth" and (not import_options or not import_options.get("authToken")):
+            if import_type == "auth":
                 from ppbase.services.auth_service import generate_default_auth_options
-                import_options = generate_default_auth_options(is_superusers=False)
+                import_options = _deep_merge_dicts(
+                    generate_default_auth_options(is_superusers=False),
+                    import_options,
+                )
 
             create_data = CollectionCreate(
                 id=coll_data.get("id"),

@@ -96,3 +96,47 @@ async def send_password_reset_email(
         logger.info("[DEV] Password-reset token for %s: %s", to, token)
 
     await _send_email(to, subject, body, settings)
+
+
+async def send_confirm_email_change_email(
+    to: str,
+    token: str,
+    settings: Any,
+    *,
+    base_url: str = "",
+) -> None:
+    """Send (or log) an email change confirmation email."""
+    url = f"{base_url}/_/#/auth/confirm-email-change/{token}"
+    subject = "Confirm your new email address"
+    body = (
+        f"Hello,\n\n"
+        f"Click the link below to confirm your new email address.\n\n"
+        f"{url}\n\n"
+        f"If you did not request this email you can safely ignore it."
+    )
+
+    if not _smtp_configured(settings):
+        logger.info("[DEV] Email-change token for %s: %s", to, token)
+
+    await _send_email(to, subject, body, settings)
+
+
+async def send_otp_email(
+    to: str,
+    otp_id: str,
+    otp_code: str,
+    settings: Any,
+) -> None:
+    """Send (or log) an OTP authentication code."""
+    subject = "Your one-time password"
+    body = (
+        f"Hello,\n\n"
+        f"Your one-time password is:\n\n"
+        f"{otp_code}\n\n"
+        f"If you did not request this email you can safely ignore it."
+    )
+
+    if not _smtp_configured(settings):
+        logger.info("[DEV] OTP for %s (otpId=%s): %s", to, otp_id, otp_code)
+
+    await _send_email(to, subject, body, settings)

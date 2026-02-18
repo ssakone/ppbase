@@ -170,7 +170,12 @@ def create_admin_token(
 
 
 def create_record_auth_token(
-    record: Any, collection: Any, settings: Any = None
+    record: Any,
+    collection: Any,
+    settings: Any = None,
+    *,
+    refreshable: bool = True,
+    duration_seconds: int | None = None,
 ) -> str:
     """Create a record auth JWT token.
 
@@ -190,10 +195,14 @@ def create_record_auth_token(
         "id": record_id,
         "type": "authRecord",
         "collectionId": collection_id,
+        "refreshable": bool(refreshable),
     }
     auth_secret, auth_duration = get_collection_token_config(collection, 'authToken')
     secret = token_key + auth_secret
-    return create_token(payload, secret, auth_duration)
+    duration = int(duration_seconds) if duration_seconds is not None else auth_duration
+    if duration < 1:
+        duration = auth_duration
+    return create_token(payload, secret, duration)
 
 
 # ---------------------------------------------------------------------------
@@ -249,5 +258,24 @@ def create_password_reset_token(
         "collectionId": collection_id,
         "email": email,
         "type": "passwordReset",
+    }
+    return create_token(payload, secret, duration)
+
+
+def create_email_change_token(
+    record_id: str,
+    collection_id: str,
+    email: str,
+    new_email: str,
+    secret: str,
+    duration: int,
+) -> str:
+    """Create a JWT for email change confirmation."""
+    payload = {
+        "id": record_id,
+        "collectionId": collection_id,
+        "email": email,
+        "newEmail": new_email,
+        "type": "emailChange",
     }
     return create_token(payload, secret, duration)

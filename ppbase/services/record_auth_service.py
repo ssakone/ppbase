@@ -7,13 +7,18 @@ and password reset for collections of type ``auth``.
 from __future__ import annotations
 
 import logging
+import secrets
+import string
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.db.system_tables import CollectionRecord
+from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services.auth_service import (
+    create_email_change_token,
     create_password_reset_token,
     create_record_auth_token,
     create_verification_token,
@@ -25,6 +30,8 @@ from ppbase.services.auth_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+_OTP_ALPHABET = string.digits
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +52,13 @@ def _get_identity_fields(collection: CollectionRecord) -> list[str]:
     opts = collection.options or {}
     pa = opts.get("passwordAuth", {})
     return pa.get("identityFields", ["email"])
+
+
+def _is_password_auth_enabled(collection: CollectionRecord) -> bool:
+    """Return whether password auth is enabled for the collection."""
+    opts = collection.options or {}
+    pa = opts.get("passwordAuth", {}) or {}
+    return bool(pa.get("enabled", True))
 
 
 async def _get_raw_record_by_id(
@@ -89,6 +103,23 @@ async def _update_record_columns(
     params = {**updates, "_rid": record_id}
     async with engine.begin() as conn:
         await conn.execute(text(sql), params)
+
+
+def _otp_config(collection: CollectionRecord) -> tuple[int, int]:
+    """Return ``(duration_seconds, length)`` for OTP auth."""
+    opts = collection.options or {}
+    otp = opts.get("otp", {}) or {}
+    duration = int(otp.get("duration", 180) or 180)
+    length = int(otp.get("length", 8) or 8)
+    if duration < 1:
+        duration = 180
+    if length < 4:
+        length = 8
+    return duration, length
+
+
+def _generate_otp_password(length: int) -> str:
+    return "".join(secrets.choice(_OTP_ALPHABET) for _ in range(length))
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +167,19 @@ async def auth_with_password(
     """
     from ppbase.models.record import build_record_response
 
+    if not _is_password_auth_enabled(collection):
+        return None
+
     fields = _get_identity_fields(collection)
+    if not fields:
+        fields = ["email"]
+
+    if identity_field and identity_field not in fields:
+        return None
+
     field = identity_field or fields[0]
+    if not field.replace("_", "").isalnum():
+        return None
 
     row = await _get_raw_record_by_field(engine, collection, field, identity)
     if row is None:
@@ -161,6 +203,183 @@ async def auth_with_password(
 
 
 # ---------------------------------------------------------------------------
+# OTP auth
+# ---------------------------------------------------------------------------
+
+
+async def request_otp(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    email: str,
+    settings: Any,
+) -> tuple[str, bool]:
+    """Create an OTP request for an email and send/log the password.
+
+    Returns:
+        (otp_id, rate_limited)
+    """
+    normalized_email = email.strip()
+    otp_id = ""
+
+    row = await _get_raw_record_by_field(engine, collection, "email", normalized_email)
+    if row is None:
+        # Enumeration protection: always return an otpId.
+        from ppbase.core.id_generator import generate_id
+
+        return generate_id(), False
+
+    duration, length = _otp_config(collection)
+    now = datetime.now(timezone.utc)
+    cooldown_start = now.timestamp() - 60
+
+    # Basic flood control per record/email.
+    rate_sql = (
+        'SELECT 1 FROM "_otps" '
+        'WHERE "collectionRef" = :collection_ref '
+        'AND "recordRef" = :record_ref '
+        'AND "sentTo" = :sent_to '
+        'AND EXTRACT(EPOCH FROM "created") >= :cooldown_start '
+        "LIMIT 1"
+    )
+    async with engine.connect() as conn:
+        rate_hit = (
+            await conn.execute(
+                text(rate_sql),
+                {
+                    "collection_ref": collection.id,
+                    "record_ref": row["id"],
+                    "sent_to": normalized_email,
+                    "cooldown_start": cooldown_start,
+                },
+            )
+        ).first()
+    if rate_hit is not None:
+        from ppbase.core.id_generator import generate_id
+
+        return generate_id(), True
+
+    # Remove stale OTP rows for this record before inserting a new one.
+    prune_sql = (
+        'DELETE FROM "_otps" '
+        'WHERE "collectionRef" = :collection_ref '
+        'AND "recordRef" = :record_ref '
+        'AND EXTRACT(EPOCH FROM "created") < :min_epoch'
+    )
+    min_epoch = now.timestamp() - duration
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(prune_sql),
+            {
+                "collection_ref": collection.id,
+                "record_ref": row["id"],
+                "min_epoch": min_epoch,
+            },
+        )
+
+    from ppbase.core.id_generator import generate_id
+
+    otp_id = generate_id()
+    otp_password = _generate_otp_password(length)
+    otp_hash = hash_password(otp_password)
+
+    insert_sql = (
+        'INSERT INTO "_otps" '
+        '("id", "created", "updated", "collectionRef", "recordRef", "password", "sentTo") '
+        'VALUES (:id, :created, :updated, :collection_ref, :record_ref, :password, :sent_to)'
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(insert_sql),
+            {
+                "id": otp_id,
+                "created": now,
+                "updated": now,
+                "collection_ref": collection.id,
+                "record_ref": row["id"],
+                "password": otp_hash,
+                "sent_to": normalized_email,
+            },
+        )
+
+    from ppbase.services.mail_service import send_otp_email
+
+    await send_otp_email(
+        normalized_email,
+        otp_id,
+        otp_password,
+        settings,
+    )
+    return otp_id, False
+
+
+async def auth_with_otp(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    otp_id: str,
+    otp_password: str,
+    settings: Any,
+) -> dict[str, Any] | None:
+    """Authenticate a user using ``otp_id`` and OTP password."""
+    from ppbase.models.record import build_record_response
+
+    duration, _ = _otp_config(collection)
+    now_epoch = datetime.now(timezone.utc).timestamp()
+
+    sql = (
+        'SELECT * FROM "_otps" '
+        'WHERE "id" = :otp_id AND "collectionRef" = :collection_ref '
+        "LIMIT 1"
+    )
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(sql),
+            {
+                "otp_id": otp_id,
+                "collection_ref": collection.id,
+            },
+        )
+        otp_row = result.mappings().first()
+
+    if otp_row is None:
+        return None
+
+    created = otp_row.get("created")
+    if created is None or (now_epoch - created.timestamp()) > duration:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text('DELETE FROM "_otps" WHERE "id" = :otp_id'),
+                {"otp_id": otp_id},
+            )
+        return None
+
+    otp_hash = otp_row.get("password", "")
+    if not otp_hash or not verify_password(otp_password, otp_hash):
+        return None
+
+    record_id = otp_row.get("recordRef", "")
+    row = await _get_raw_record_by_id(engine, collection, record_id)
+    if row is None:
+        return None
+
+    # OTP is single-use.
+    async with engine.begin() as conn:
+        await conn.execute(
+            text('DELETE FROM "_otps" WHERE "id" = :otp_id'),
+            {"otp_id": otp_id},
+        )
+
+    token = create_record_auth_token(row, collection, settings)
+    record = build_record_response(
+        row,
+        collection.id,
+        collection.name,
+        collection.schema or [],
+        is_auth_collection=True,
+    )
+    return {"token": token, "record": record}
+
+
+# ---------------------------------------------------------------------------
 # Auth-refresh
 # ---------------------------------------------------------------------------
 
@@ -180,6 +399,10 @@ async def auth_refresh(
     """
     from ppbase.models.record import build_record_response
 
+    # Impersonation tokens are intentionally non-refreshable.
+    if token_payload.get("refreshable") is False:
+        return None
+
     record_id = token_payload.get("id")
     if not record_id:
         return None
@@ -198,6 +421,38 @@ async def auth_refresh(
         is_auth_collection=True,
     )
 
+    return {"token": token, "record": record}
+
+
+async def impersonate_auth_record(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    record_id: str,
+    settings: Any,
+    *,
+    duration: int | None = None,
+) -> dict[str, Any] | None:
+    """Generate a non-refreshable auth token for an existing auth record."""
+    from ppbase.models.record import build_record_response
+
+    row = await _get_raw_record_by_id(engine, collection, record_id)
+    if row is None:
+        return None
+
+    token = create_record_auth_token(
+        row,
+        collection,
+        settings,
+        refreshable=False,
+        duration_seconds=duration,
+    )
+    record = build_record_response(
+        row,
+        collection.id,
+        collection.name,
+        collection.schema or [],
+        is_auth_collection=True,
+    )
     return {"token": token, "record": record}
 
 
@@ -466,5 +721,157 @@ async def confirm_password_reset(
     await _update_record_columns(
         engine, collection, record_id,
         {"password_hash": new_hash, "token_key": new_token_key},
+    )
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Email change
+# ---------------------------------------------------------------------------
+
+
+def _invalid_email_change_token_error() -> dict[str, Any]:
+    return {
+        "token": {
+            "code": "validation_invalid_token",
+            "message": "Invalid or expired token.",
+        }
+    }
+
+
+async def request_email_change(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    record_id: str,
+    new_email: str,
+    settings: Any,
+    base_url: str = "",
+) -> tuple[bool, dict[str, Any] | None]:
+    """Send an email change confirmation token to ``new_email``."""
+    row = await _get_raw_record_by_id(engine, collection, record_id)
+    if row is None:
+        return False, {
+            "auth": {
+                "code": "validation_invalid_token",
+                "message": "Invalid or expired token.",
+            }
+        }
+
+    normalized_email = (new_email or "").strip()
+    if not normalized_email:
+        return False, {
+            "newEmail": {
+                "code": "validation_required",
+                "message": "Cannot be blank.",
+            }
+        }
+
+    if not _EMAIL_RE.match(normalized_email):
+        return False, {
+            "newEmail": {
+                "code": "validation_invalid_email",
+                "message": "Must be a valid email address.",
+            }
+        }
+
+    dup = await _get_raw_record_by_field(engine, collection, "email", normalized_email)
+    if dup is not None and dup.get("id") != record_id:
+        return False, {
+            "newEmail": {
+                "code": "validation_not_unique",
+                "message": "The email is already in use.",
+            }
+        }
+
+    token_key = row.get("token_key", "")
+    secret, duration = get_collection_token_config(collection, 'emailChangeToken')
+    token = create_email_change_token(
+        row["id"],
+        collection.id,
+        row.get("email", ""),
+        normalized_email,
+        token_key + secret,
+        duration,
+    )
+
+    from ppbase.services.mail_service import send_confirm_email_change_email
+
+    await send_confirm_email_change_email(
+        normalized_email,
+        token,
+        settings,
+        base_url=base_url,
+    )
+    return True, None
+
+
+async def confirm_email_change(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    token_str: str,
+    password: str,
+    settings: Any,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Confirm an email change token and update the auth record email."""
+    import jwt as _jwt
+
+    try:
+        unverified = _jwt.decode(token_str, options={"verify_signature": False})
+    except _jwt.InvalidTokenError:
+        return False, _invalid_email_change_token_error()
+
+    if unverified.get("type") != "emailChange":
+        return False, _invalid_email_change_token_error()
+
+    record_id = unverified.get("id")
+    if not record_id:
+        return False, _invalid_email_change_token_error()
+
+    row = await _get_raw_record_by_id(engine, collection, record_id)
+    if row is None:
+        return False, _invalid_email_change_token_error()
+
+    token_key_val = row.get("token_key", "")
+    secret, _ = get_collection_token_config(collection, 'emailChangeToken')
+    payload = verify_purpose_token(token_str, token_key_val + secret, "emailChange")
+    if payload is None:
+        return False, _invalid_email_change_token_error()
+
+    # Token is bound to the current record email. If it changed meanwhile,
+    # reject the token as stale.
+    if payload.get("email") != row.get("email"):
+        return False, _invalid_email_change_token_error()
+
+    new_email = str(payload.get("newEmail", "")).strip()
+    if not new_email or not _EMAIL_RE.match(new_email):
+        return False, _invalid_email_change_token_error()
+
+    pw_hash = row.get("password_hash", "")
+    if not pw_hash or not verify_password(password, pw_hash):
+        return False, {
+            "password": {
+                "code": "validation_invalid_credentials",
+                "message": "Invalid login credentials.",
+            }
+        }
+
+    dup = await _get_raw_record_by_field(engine, collection, "email", new_email)
+    if dup is not None and dup.get("id") != record_id:
+        return False, {
+            "newEmail": {
+                "code": "validation_not_unique",
+                "message": "The email is already in use.",
+            }
+        }
+
+    await _update_record_columns(
+        engine,
+        collection,
+        record_id,
+        {
+            "email": new_email,
+            "verified": True,
+            "token_key": generate_token_key(),
+        },
     )
     return True, None

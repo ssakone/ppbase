@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type PocketBase from 'pocketbase';
-import { getAdminPb, getFreshPb, createTestCollection, registerAndLogin } from './helpers';
+import { getAdminPb, getFreshPb, createTestCollection, registerAndLogin, uniqueName } from './helpers';
 
 describe('API Rules Enforcement', () => {
   let adminPb: PocketBase;
@@ -450,6 +450,311 @@ describe('API Rules Enforcement', () => {
       expect(list.items[0].title).toBe('Datetime Rule');
     } finally {
       await cleanup();
+    }
+  });
+
+  it('should enforce @request.body.*:isset in createRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        { name: 'role', type: 'text', required: false },
+      ],
+      createRule: '@request.body.role:isset = false',
+      listRule: '',
+      viewRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+
+      // Missing role is allowed.
+      const created = await pb.collection(collection.name).create({ title: 'No Role' });
+      expect(created.title).toBe('No Role');
+
+      // Sending role should be rejected by rule.
+      await expect(
+        pb.collection(collection.name).create({
+          title: 'Has Role',
+          role: 'admin',
+        })
+      ).rejects.toThrow();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce @request.body.*:changed in updateRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [{ name: 'title', type: 'text', required: true }],
+      createRule: '',
+      // Disallow changing title, but allow resubmitting same value.
+      updateRule: '@request.body.title:changed = false',
+      listRule: '',
+      viewRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+      const record = await pb.collection(collection.name).create({ title: 'Original' });
+
+      const same = await pb.collection(collection.name).update(record.id, { title: 'Original' });
+      expect(same.title).toBe('Original');
+
+      await expect(
+        pb.collection(collection.name).update(record.id, { title: 'Changed' })
+      ).rejects.toThrow();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce @request.body.*:length in createRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        {
+          name: 'tags',
+          type: 'select',
+          required: false,
+          options: { maxSelect: 3, values: ['a', 'b', 'c'] },
+        },
+      ],
+      createRule: '@request.body.tags:length >= 2',
+      listRule: '',
+      viewRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+
+      await expect(
+        pb.collection(collection.name).create({ title: 'Too Short', tags: ['a'] })
+      ).rejects.toThrow();
+
+      const ok = await pb.collection(collection.name).create({
+        title: 'Enough Tags',
+        tags: ['a', 'b'],
+      });
+      expect(ok.title).toBe('Enough Tags');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce field:length in listRule for array-like fields', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        {
+          name: 'tags',
+          type: 'select',
+          required: false,
+          options: { maxSelect: 3, values: ['x', 'y', 'z'] },
+        },
+      ],
+      listRule: 'tags:length >= 2',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({
+        title: 'One Tag',
+        tags: ['x'],
+      });
+      await adminPb.collection(collection.name).create({
+        title: 'Two Tags',
+        tags: ['x', 'y'],
+      });
+
+      const pb = getFreshPb();
+      const list = await pb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(1);
+      expect(list.items[0].title).toBe('Two Tags');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce @request.body.*:lower in createRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [{ name: 'email', type: 'text', required: true }],
+      createRule: '@request.body.email:lower = "admin@example.com"',
+      listRule: '',
+      viewRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+
+      const ok = await pb.collection(collection.name).create({
+        email: 'Admin@Example.com',
+      });
+      expect(ok.email).toBe('Admin@Example.com');
+
+      await expect(
+        pb.collection(collection.name).create({
+          email: 'user@example.com',
+        })
+      ).rejects.toThrow();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce field:lower in listRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [{ name: 'title', type: 'text', required: true }],
+      listRule: 'title:lower = "hello world"',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({ title: 'HELLO WORLD' });
+      await adminPb.collection(collection.name).create({ title: 'Different' });
+
+      const pb = getFreshPb();
+      const list = await pb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(1);
+      expect(list.items[0].title).toBe('HELLO WORLD');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce @request.body.*:each in createRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        {
+          name: 'tags',
+          type: 'select',
+          required: false,
+          options: { maxSelect: 3, values: ['pb_create', 'pb_read', 'other'] },
+        },
+      ],
+      createRule: '@request.body.tags:each ~ "pb_"',
+      listRule: '',
+      viewRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+
+      const ok = await pb.collection(collection.name).create({
+        title: 'Only Prefixed',
+        tags: ['pb_create', 'pb_read'],
+      });
+      expect(ok.title).toBe('Only Prefixed');
+
+      await expect(
+        pb.collection(collection.name).create({
+          title: 'Mixed',
+          tags: ['pb_create', 'other'],
+        })
+      ).rejects.toThrow();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce field:each in listRule', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        {
+          name: 'tags',
+          type: 'select',
+          required: false,
+          options: { maxSelect: 3, values: ['pb_a', 'pb_b', 'other'] },
+        },
+      ],
+      listRule: 'tags:each ~ "pb_"',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(collection.name).create({
+        title: 'All Prefixed',
+        tags: ['pb_a', 'pb_b'],
+      });
+      await adminPb.collection(collection.name).create({
+        title: 'Has Other',
+        tags: ['pb_a', 'other'],
+      });
+
+      const pb = getFreshPb();
+      const list = await pb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(1);
+      expect(list.items[0].title).toBe('All Prefixed');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should support @collection aliases in listRule', async () => {
+    const refs = await createTestCollection(adminPb, {
+      name: uniqueName('refs'),
+      schema: [
+        { name: 'linkKey', type: 'text', required: true },
+        { name: 'tag', type: 'text', required: true },
+      ],
+      listRule: '',
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      schema: [
+        { name: 'title', type: 'text', required: true },
+        { name: 'itemKey', type: 'text', required: true },
+      ],
+      listRule: [
+        `@collection.${refs.collection.name}:first.linkKey = itemKey`,
+        `@collection.${refs.collection.name}:first.tag = "a"`,
+        `@collection.${refs.collection.name}:second.linkKey = itemKey`,
+        `@collection.${refs.collection.name}:second.tag = "b"`,
+      ].join(' && '),
+      viewRule: '',
+      createRule: '',
+      updateRule: '',
+      deleteRule: '',
+    });
+
+    try {
+      await adminPb.collection(refs.collection.name).create({ linkKey: 'k1', tag: 'a' });
+      await adminPb.collection(refs.collection.name).create({ linkKey: 'k1', tag: 'b' });
+      await adminPb.collection(refs.collection.name).create({ linkKey: 'k2', tag: 'a' });
+
+      await adminPb.collection(collection.name).create({ title: 'Both Tags', itemKey: 'k1' });
+      await adminPb.collection(collection.name).create({ title: 'Only A', itemKey: 'k2' });
+
+      const pb = getFreshPb();
+      const list = await pb.collection(collection.name).getList(1, 50);
+      expect(list.totalItems).toBe(1);
+      expect(list.items[0].title).toBe('Both Tags');
+    } finally {
+      await cleanup();
+      await refs.cleanup();
     }
   });
 });

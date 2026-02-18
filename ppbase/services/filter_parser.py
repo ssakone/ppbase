@@ -57,11 +57,11 @@ null: "null"
 
 macro: MACRO
 
-MACRO: /@[a-zA-Z_][a-zA-Z0-9_.]*/
+MACRO: /@[a-zA-Z_][a-zA-Z0-9_.:]*/
 
 field_path: FIELD_IDENT ("." FIELD_IDENT)*
 
-FIELD_IDENT: /[a-zA-Z_][a-zA-Z0-9_]*/
+FIELD_IDENT: /[a-zA-Z_][a-zA-Z0-9_:]*/
 
 %import common.ESCAPED_STRING
 %import common.SIGNED_NUMBER
@@ -119,10 +119,11 @@ class _CollectionCondition:
     condition gets its own ``EXISTS``.
     """
 
-    __slots__ = ("coll_name", "inner_sql")
+    __slots__ = ("table_name", "group_key", "inner_sql")
 
-    def __init__(self, coll_name: str, inner_sql: str) -> None:
-        self.coll_name = coll_name
+    def __init__(self, table_name: str, group_key: str, inner_sql: str) -> None:
+        self.table_name = table_name
+        self.group_key = group_key
         self.inner_sql = inner_sql
 
 
@@ -170,6 +171,7 @@ _SAFE_IDENT_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "0123456789_"
 )
+_MODIFIER_NAMES = {"isset", "changed", "length", "each", "lower"}
 
 
 def _sanitize_ident(s: str) -> str:
@@ -247,14 +249,30 @@ class _FilterTransformer(Transformer):
                     f"Relation traversal in @collection not yet supported: @{stripped}. "
                     "Use @collection.collectionName.fieldName format."
                 )
-            coll_name = _sanitize_ident(parts[1])
+            coll_ref = parts[1]
+            alias_key = ""
+            if ":" in coll_ref:
+                raw_coll, raw_alias = coll_ref.split(":", 1)
+                coll_name = _sanitize_ident(raw_coll)
+                alias_key = _sanitize_ident(raw_alias)
+                group_key = f"{coll_name}:{alias_key}"
+            else:
+                coll_name = _sanitize_ident(coll_ref)
+                group_key = coll_name
             field_name = _sanitize_ident(parts[2])
-            return ("collection_ref", coll_name, field_name)
+            return ("collection_ref", coll_name, field_name, group_key)
 
         return ("macro", name)
 
     def field_path(self, items: list) -> tuple:
         parts = [str(t) for t in items]
+        modifier: str | None = None
+
+        # Support field modifiers suffixes, e.g. "tags:length".
+        base_last, maybe_modifier = self._split_modifier(parts[-1])
+        if maybe_modifier:
+            parts[-1] = base_last
+            modifier = maybe_modifier
 
         # Detect relation field traversal (e.g. author.name)
         if len(parts) >= 2 and self._relation_resolver:
@@ -269,6 +287,8 @@ class _FilterTransformer(Transformer):
                 target_table, max_select = self._relation_resolver[first]
                 return ("relation_ref", first, traversed, target_table, max_select)
 
+        if modifier:
+            return ("field_modifier", ".".join(parts), modifier)
         return ("field", ".".join(parts))
 
     # -- Comparisons ---------------------------------------------------------
@@ -301,17 +321,25 @@ class _FilterTransformer(Transformer):
         # ── @collection references → generate _CollectionCondition ──────
         left_is_coll = (
             isinstance(left, tuple)
-            and len(left) == 3
+            and len(left) == 4
             and left[0] == "collection_ref"
         )
         right_is_coll = (
             isinstance(right, tuple)
-            and len(right) == 3
+            and len(right) == 4
             and right[0] == "collection_ref"
         )
         if left_is_coll or right_is_coll:
             return self._collection_comparison(
                 left, op, right, left_is_coll, right_is_coll,
+            )
+
+        # ── :each modifier comparisons (array "all items match") ──────
+        left_each = self._extract_each_operand(left)
+        right_each = self._extract_each_operand(right)
+        if left_each is not None or right_each is not None:
+            return self._each_comparison(
+                left, op, right, left_each, right_each,
             )
 
         # ── Regular comparisons ────────────────────────────────────────
@@ -374,27 +402,27 @@ class _FilterTransformer(Transformer):
 
         # Both sides reference @collection -----------------------------------
         if left_is_coll and right_is_coll:
-            l_coll, l_field = left[1], left[2]
-            r_coll, r_field = right[1], right[2]
+            l_coll, l_field, l_group = left[1], left[2], left[3]
+            r_coll, r_field, r_group = right[1], right[2], right[3]
             l_col = f'"{l_coll}"."{l_field}"'
             r_col = f'"{r_coll}"."{r_field}"'
             sql_op = _STANDARD_OPS.get(op, "=")
-            if l_coll == r_coll:
-                return _CollectionCondition(l_coll, f"{l_col} {sql_op} {r_col}")
+            if l_group == r_group:
+                return _CollectionCondition(l_coll, l_group, f"{l_col} {sql_op} {r_col}")
             # Cross-collection → inline EXISTS with two tables
             return (
-                f'EXISTS (SELECT 1 FROM "{l_coll}", "{r_coll}" '
-                f"WHERE {l_col} {sql_op} {r_col})"
+                f'EXISTS (SELECT 1 FROM "{l_coll}" AS "_cl" , "{r_coll}" AS "_cr" '
+                f'WHERE "_cl"."{l_field}" {sql_op} "_cr"."{r_field}")'
             )
 
         # One side is @collection -------------------------------------------
         if left_is_coll:
-            coll_name, coll_field = left[1], left[2]
+            coll_name, coll_field, coll_group = left[1], left[2], left[3]
             coll_col = f'"{coll_name}"."{coll_field}"'
             other = right
             coll_is_left = True
         else:
-            coll_name, coll_field = right[1], right[2]
+            coll_name, coll_field, coll_group = right[1], right[2], right[3]
             coll_col = f'"{coll_name}"."{coll_field}"'
             other = left
             coll_is_left = False
@@ -406,12 +434,12 @@ class _FilterTransformer(Transformer):
             sql_op = _STANDARD_OPS[op]
             if other[0] == "null":
                 if sql_op == "=":
-                    return _CollectionCondition(coll_name, f"{coll_col} IS NULL")
+                    return _CollectionCondition(coll_name, coll_group, f"{coll_col} IS NULL")
                 if sql_op == "!=":
-                    return _CollectionCondition(coll_name, f"{coll_col} IS NOT NULL")
+                    return _CollectionCondition(coll_name, coll_group, f"{coll_col} IS NOT NULL")
             if coll_is_left:
-                return _CollectionCondition(coll_name, f"{coll_col} {sql_op} {other_sql}")
-            return _CollectionCondition(coll_name, f"{other_sql} {sql_op} {coll_col}")
+                return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} {other_sql}")
+            return _CollectionCondition(coll_name, coll_group, f"{other_sql} {sql_op} {coll_col}")
 
         # LIKE operators -----------------------------------------------------
         if op in _LIKE_OPS:
@@ -420,24 +448,24 @@ class _FilterTransformer(Transformer):
                 if other[0] == "literal" and isinstance(other[1], str):
                     wrapped = f"%{other[1]}%"
                     pname = self._next_param(wrapped)
-                    return _CollectionCondition(coll_name, f"{coll_col} {sql_op} :{pname}")
-                return _CollectionCondition(coll_name, f"{coll_col} {sql_op} {other_sql}")
+                    return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} :{pname}")
+                return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} {other_sql}")
             else:
                 if other[0] == "literal" and isinstance(other[1], str):
                     wrapped = f"%{other[1]}%"
                     pname = self._next_param(wrapped)
-                    return _CollectionCondition(coll_name, f":{pname} {sql_op} {coll_col}")
-                return _CollectionCondition(coll_name, f"{other_sql} {sql_op} {coll_col}")
+                    return _CollectionCondition(coll_name, coll_group, f":{pname} {sql_op} {coll_col}")
+                return _CollectionCondition(coll_name, coll_group, f"{other_sql} {sql_op} {coll_col}")
 
         # ANY standard operators ---------------------------------------------
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
             if coll_is_left:
                 # @collection.X.Y ?= val → val = ANY("X"."Y")
-                return _CollectionCondition(coll_name, f"{other_sql} {sql_op} ANY({coll_col})")
+                return _CollectionCondition(coll_name, coll_group, f"{other_sql} {sql_op} ANY({coll_col})")
             else:
                 # field ?= @collection.X.Y → "X"."Y" = ANY(field)
-                return _CollectionCondition(coll_name, f"{coll_col} {sql_op} ANY({other_sql})")
+                return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} ANY({other_sql})")
 
         # ANY LIKE operators -------------------------------------------------
         if op in _ANY_LIKE_OPS:
@@ -448,25 +476,28 @@ class _FilterTransformer(Transformer):
                     pname = self._next_param(wrapped)
                     return _CollectionCondition(
                         coll_name,
+                        coll_group,
                         f"EXISTS (SELECT 1 FROM unnest({coll_col}) AS _elem "
                         f"WHERE _elem {sql_op} :{pname})",
                     )
                 return _CollectionCondition(
                     coll_name,
+                    coll_group,
                     f"EXISTS (SELECT 1 FROM unnest({coll_col}) AS _elem "
                     f"WHERE _elem {sql_op} {other_sql})",
                 )
             else:
                 return _CollectionCondition(
                     coll_name,
+                    coll_group,
                     f"EXISTS (SELECT 1 FROM unnest({other_sql}) AS _elem "
                     f"WHERE _elem {sql_op} {coll_col})",
                 )
 
         # Fallback
         if coll_is_left:
-            return _CollectionCondition(coll_name, f"{coll_col} = {other_sql}")
-        return _CollectionCondition(coll_name, f"{other_sql} = {coll_col}")
+            return _CollectionCondition(coll_name, coll_group, f"{coll_col} = {other_sql}")
+        return _CollectionCondition(coll_name, coll_group, f"{other_sql} = {coll_col}")
 
     # -- Relation traversal comparison helpers --------------------------------
 
@@ -588,6 +619,130 @@ class _FilterTransformer(Transformer):
             where_cond = f"{other_sql} = {rel_col}"
         return _RelationCondition(rel_field, target, join_cond, where_cond)
 
+    # -- :each modifier helpers ---------------------------------------------
+
+    def _extract_request_data_field_value(
+        self,
+        field_name: str,
+    ) -> tuple[bool, Any]:
+        """Resolve a field from ``request_context.data`` with leaf fallback."""
+        data = self._request_context.get("data", {}) if isinstance(
+            self._request_context, dict
+        ) else {}
+        if not isinstance(data, dict):
+            return (False, None)
+        if field_name in data:
+            return (True, data.get(field_name))
+        leaf = field_name.split(".")[-1]
+        if leaf in data:
+            return (True, data.get(leaf))
+        return (False, None)
+
+    def _extract_each_operand(self, node: tuple[str, Any]) -> tuple[str, str] | None:
+        """Extract SQL array expression for ``:each`` from an operand."""
+        if not isinstance(node, tuple) or len(node) < 2:
+            return None
+
+        # Collection field modifier: field:each
+        if node[0] == "field_modifier" and len(node) >= 3 and node[2] == "each":
+            field_sql = self._field_expr(node[1])
+            return ("field", f"COALESCE({field_sql}::text[], ARRAY[]::text[])")
+
+        # Request body/data modifier: @request.body.field:each
+        if node[0] == "macro":
+            name = str(node[1]).lstrip("@")
+            if name.startswith("request.data.") or name.startswith("request.body."):
+                prefix = "request.body." if name.startswith("request.body.") else "request.data."
+                field_and_modifier = name[len(prefix):]
+                field_name, modifier = self._split_modifier(field_and_modifier)
+                if modifier != "each":
+                    return None
+
+                has_field, raw_val = self._extract_request_data_field_value(field_name)
+                values: list[str]
+                if not has_field or raw_val is None:
+                    values = []
+                elif isinstance(raw_val, (list, tuple, set)):
+                    values = [str(v) for v in raw_val]
+                else:
+                    values = [str(raw_val)]
+
+                pname = self._next_param(values)
+                return ("request", f"COALESCE(CAST(:{pname} AS text[]), ARRAY[]::text[])")
+
+        return None
+
+    def _build_each_item_condition(
+        self,
+        item_sql: str,
+        op: str,
+        other: tuple[str, Any],
+        *,
+        each_is_left: bool,
+    ) -> str:
+        """Build per-item comparison SQL for an ``:each`` operand."""
+        other_sql = self._operand_to_sql(other)
+
+        if op in _STANDARD_OPS:
+            sql_op = _STANDARD_OPS[op]
+            if other[0] == "null":
+                if sql_op == "=":
+                    return f"{item_sql} IS NULL"
+                if sql_op == "!=":
+                    return f"{item_sql} IS NOT NULL"
+                return f"{item_sql} {sql_op} NULL"
+            if each_is_left:
+                return f"{item_sql} {sql_op} {other_sql}"
+            return f"{other_sql} {sql_op} {item_sql}"
+
+        if op in _LIKE_OPS:
+            sql_op = _LIKE_OPS[op]
+            if each_is_left:
+                if other[0] == "literal" and isinstance(other[1], str):
+                    wrapped = f"%{other[1]}%"
+                    pname = self._next_param(wrapped)
+                    return f"{item_sql} {sql_op} :{pname}"
+                return f"{item_sql} {sql_op} {other_sql}"
+            if other[0] == "literal" and isinstance(other[1], str):
+                wrapped = f"%{other[1]}%"
+                pname = self._next_param(wrapped)
+                return f":{pname} {sql_op} {item_sql}"
+            return f"{other_sql} {sql_op} {item_sql}"
+
+        # Fallback to "=" semantics for unsupported operator combos.
+        if each_is_left:
+            return f"{item_sql} = {other_sql}"
+        return f"{other_sql} = {item_sql}"
+
+    def _each_comparison(
+        self,
+        left: tuple[str, Any],
+        op: str,
+        right: tuple[str, Any],
+        left_each: tuple[str, str] | None,
+        right_each: tuple[str, str] | None,
+    ) -> str:
+        """Handle comparisons where at least one side uses ``:each``."""
+        if left_each and right_each:
+            raise ValueError("Comparisons with :each on both sides are not supported.")
+
+        if left_each:
+            array_sql = left_each[1]
+            condition = self._build_each_item_condition(
+                "_elem", op, right, each_is_left=True,
+            )
+        else:
+            array_sql = right_each[1] if right_each else "ARRAY[]::text[]"
+            condition = self._build_each_item_condition(
+                "_elem", op, left, each_is_left=False,
+            )
+
+        # "All items match" semantics; empty arrays evaluate to true.
+        return (
+            f"NOT EXISTS (SELECT 1 FROM unnest({array_sql}) AS _elem "
+            f"WHERE NOT COALESCE(({condition}), FALSE))"
+        )
+
     # -- Logical operators ---------------------------------------------------
 
     def or_expr(self, items: list) -> str:
@@ -596,7 +751,7 @@ class _FilterTransformer(Transformer):
         for item in items:
             if isinstance(item, _CollectionCondition):
                 parts.append(
-                    f'EXISTS (SELECT 1 FROM "{item.coll_name}" WHERE {item.inner_sql})'
+                    f'EXISTS (SELECT 1 FROM "{item.table_name}" WHERE {item.inner_sql})'
                 )
             elif isinstance(item, _RelationCondition):
                 conds = " AND ".join([item.join_cond, item.where_cond])
@@ -613,22 +768,25 @@ class _FilterTransformer(Transformer):
         """AND: @collection / relation conditions for the **same** target are
         merged into a single EXISTS so all conditions match the same row."""
         coll_groups: dict[str, list[str]] = {}
+        coll_tables: dict[str, str] = {}
         rel_groups: dict[str, list[_RelationCondition]] = {}
         regular_parts: list[str] = []
 
         for item in items:
             if isinstance(item, _CollectionCondition):
-                coll_groups.setdefault(item.coll_name, []).append(item.inner_sql)
+                coll_groups.setdefault(item.group_key, []).append(item.inner_sql)
+                coll_tables.setdefault(item.group_key, item.table_name)
             elif isinstance(item, _RelationCondition):
                 rel_groups.setdefault(item.relation_key, []).append(item)
             else:
                 regular_parts.append(str(item))
 
         # @collection groups
-        for coll_name, conditions in coll_groups.items():
+        for group_key, conditions in coll_groups.items():
+            table_name = coll_tables[group_key]
             inner = " AND ".join(conditions)
             regular_parts.append(
-                f'EXISTS (SELECT 1 FROM "{coll_name}" WHERE {inner})'
+                f'EXISTS (SELECT 1 FROM "{table_name}" WHERE {inner})'
             )
 
         # Relation traversal groups — join_cond is the same for all items
@@ -648,22 +806,95 @@ class _FilterTransformer(Transformer):
     # -- Helpers -------------------------------------------------------------
 
     def _operand_to_sql(self, node: tuple[str, Any]) -> str:
-        kind, value = node
+        kind = node[0]
+        value = node[1] if len(node) > 1 else None
         if kind == "literal":
+            if isinstance(value, bool):
+                return "TRUE" if value else "FALSE"
+            if isinstance(value, (int, float)):
+                return str(value)
             pname = self._next_param(value)
             return f":{pname}"
         if kind == "null":
             return "NULL"
         if kind == "field":
-            # Sanitize: only allow alphanumeric, underscore, and dot
-            safe = value
-            for ch in safe:
-                if ch not in _SAFE_IDENT_CHARS and ch != ".":
-                    raise ValueError(f"Invalid character in field name: {ch!r}")
-            return f'"{safe}"' if "." not in safe else safe
+            return self._field_expr(value)
+        if kind == "field_modifier":
+            field_name = value
+            modifier = node[2]
+            return self._resolve_field_modifier(field_name, modifier)
         if kind == "macro":
             return self._resolve_macro(value)
         return str(value)
+
+    def _split_modifier(self, raw_value: str) -> tuple[str, str | None]:
+        """Split optional modifier suffix from an operand token."""
+        if ":" not in raw_value:
+            return raw_value, None
+        base, suffix = raw_value.rsplit(":", 1)
+        if base and suffix in _MODIFIER_NAMES:
+            return base, suffix
+        return raw_value, None
+
+    def _field_expr(self, field_name: str) -> str:
+        """Build a SQL expression for a field reference."""
+        safe = field_name
+        for ch in safe:
+            if ch not in _SAFE_IDENT_CHARS and ch != ".":
+                raise ValueError(f"Invalid character in field name: {ch!r}")
+        return f'"{safe}"' if "." not in safe else safe
+
+    def _value_length(self, value: Any) -> int:
+        """Compute a PocketBase-like length for request payload values."""
+        if value is None:
+            return 0
+        if isinstance(value, (str, bytes, bytearray, list, tuple, set, dict)):
+            return len(value)
+        return 1
+
+    def _resolve_field_modifier(self, field_name: str, modifier: str) -> str:
+        """Resolve a ``field:modifier`` operand to SQL."""
+        field_sql = self._field_expr(field_name)
+        if modifier == "isset":
+            return f"({field_sql} IS NOT NULL)"
+        if modifier == "length":
+            return (
+                f"(CASE "
+                f"WHEN {field_sql} IS NULL THEN 0 "
+                f"WHEN jsonb_typeof(to_jsonb({field_sql})) = 'array' "
+                f"THEN jsonb_array_length(to_jsonb({field_sql})) "
+                f"ELSE char_length({field_sql}::text) END)"
+            )
+        if modifier == "changed":
+            # Mirrors @request.body.field:changed behavior for convenience.
+            data = self._request_context.get("data", {}) if isinstance(
+                self._request_context, dict
+            ) else {}
+            raw_val = None
+            has_field = False
+            if isinstance(data, dict):
+                if field_name in data:
+                    has_field = True
+                    raw_val = data.get(field_name)
+                else:
+                    leaf = field_name.split(".")[-1]
+                    if leaf in data:
+                        has_field = True
+                        raw_val = data.get(leaf)
+            if not has_field:
+                return "FALSE"
+            pname = self._next_param(raw_val)
+            return (
+                f"(COALESCE({field_sql}::text, '') "
+                f"<> COALESCE(CAST(:{pname} AS TEXT), ''))"
+            )
+        if modifier == "lower":
+            return f"LOWER(COALESCE({field_sql}::text, ''))"
+        if modifier == "each":
+            raise ValueError(
+                "The :each modifier can only be used as part of a comparison expression."
+            )
+        raise ValueError(f"Unknown field modifier: {modifier}")
 
     def _resolve_macro(self, macro_name: str) -> str:
         name = macro_name.lstrip("@")
@@ -738,10 +969,46 @@ class _FilterTransformer(Transformer):
         if name.startswith("request.data.") or name.startswith("request.body."):
             # PocketBase v0.22: @request.data.*  /  v0.23+: @request.body.*
             prefix = "request.body." if name.startswith("request.body.") else "request.data."
-            field = name[len(prefix):]
+            field_and_modifier = name[len(prefix):]
+            field, modifier = self._split_modifier(field_and_modifier)
             data = self._request_context.get("data", {})
-            val = data.get(field, "")
-            pname = self._next_param(val)
+            has_field = isinstance(data, dict) and field in data
+            val = data.get(field) if isinstance(data, dict) else None
+
+            if modifier == "isset":
+                pname = self._next_param(has_field)
+                return f":{pname}"
+            if modifier == "length":
+                pname = self._next_param(self._value_length(val) if has_field else 0)
+                return f":{pname}"
+            if modifier == "changed":
+                if not has_field:
+                    return "FALSE"
+                safe_field = _sanitize_ident(field)
+                field_sql = f'"{safe_field}"'
+                pname = self._next_param(val)
+                return (
+                    f"(COALESCE({field_sql}::text, '') "
+                    f"<> COALESCE(CAST(:{pname} AS TEXT), ''))"
+                )
+            if modifier == "each":
+                values: list[str]
+                if has_field and isinstance(val, (list, tuple, set)):
+                    values = [str(v) for v in val]
+                elif has_field and val is not None:
+                    values = [str(val)]
+                else:
+                    values = []
+                pname = self._next_param(values)
+                return f"CAST(:{pname} AS text[])"
+            if modifier == "lower":
+                lowered = ""
+                if has_field and val is not None:
+                    lowered = str(val).lower()
+                pname = self._next_param(lowered)
+                return f":{pname}"
+
+            pname = self._next_param(val if has_field else "")
             return f":{pname}"
         if name.startswith("request.query."):
             field = name[len("request.query."):]

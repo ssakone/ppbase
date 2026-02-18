@@ -96,6 +96,204 @@ def _filter_item_fields(
     return [{k: v for k, v in item.items() if k in fields} for item in items]
 
 
+def _collection_scaffolds() -> dict[str, Any]:
+    """Return PocketBase-like collection scaffolds for Dashboard usage."""
+    auth = {
+        "id": "",
+        "name": "",
+        "type": "auth",
+        "system": False,
+        "listRule": None,
+        "viewRule": None,
+        "createRule": None,
+        "updateRule": None,
+        "deleteRule": None,
+        "fields": [
+            {
+                "id": "text_id",
+                "name": "id",
+                "type": "text",
+                "required": True,
+                "system": True,
+                "hidden": False,
+                "presentable": False,
+                "primaryKey": True,
+                "autogeneratePattern": "[a-z0-9]{15}",
+                "min": 15,
+                "max": 15,
+                "pattern": "^[a-z0-9]+$",
+            },
+            {
+                "id": "password_field",
+                "name": "password",
+                "type": "password",
+                "required": True,
+                "system": True,
+                "hidden": True,
+                "presentable": False,
+                "min": 8,
+                "max": 0,
+                "cost": 0,
+                "pattern": "",
+            },
+            {
+                "id": "token_key",
+                "name": "tokenKey",
+                "type": "text",
+                "required": True,
+                "system": True,
+                "hidden": True,
+                "presentable": False,
+                "primaryKey": False,
+                "autogeneratePattern": "[a-zA-Z0-9]{50}",
+                "min": 30,
+                "max": 60,
+                "pattern": "",
+            },
+            {
+                "id": "email_field",
+                "name": "email",
+                "type": "email",
+                "required": True,
+                "system": True,
+                "hidden": False,
+                "presentable": False,
+                "onlyDomains": None,
+                "exceptDomains": None,
+            },
+            {
+                "id": "email_visibility",
+                "name": "emailVisibility",
+                "type": "bool",
+                "required": False,
+                "system": True,
+                "hidden": False,
+                "presentable": False,
+            },
+            {
+                "id": "verified",
+                "name": "verified",
+                "type": "bool",
+                "required": False,
+                "system": True,
+                "hidden": False,
+                "presentable": False,
+            },
+        ],
+        "indexes": [],
+        "created": "",
+        "updated": "",
+        "authRule": "",
+        "manageRule": None,
+        "authAlert": {
+            "enabled": True,
+            "emailTemplate": {
+                "subject": "Login from a new location",
+                "body": "...",
+            },
+        },
+        "oauth2": {
+            "enabled": False,
+            "providers": [],
+            "mappedFields": {
+                "id": "",
+                "name": "",
+                "username": "",
+                "avatarURL": "",
+            },
+        },
+        "passwordAuth": {
+            "enabled": True,
+            "identityFields": ["email"],
+        },
+        "mfa": {
+            "enabled": False,
+            "duration": 1800,
+            "rule": "",
+        },
+        "otp": {
+            "enabled": False,
+            "duration": 180,
+            "length": 8,
+            "emailTemplate": {
+                "subject": "OTP for {APP_NAME}",
+                "body": "...",
+            },
+        },
+        "authToken": {"duration": 604800},
+        "passwordResetToken": {"duration": 1800},
+        "emailChangeToken": {"duration": 1800},
+        "verificationToken": {"duration": 259200},
+        "fileToken": {"duration": 180},
+        "verificationTemplate": {
+            "subject": "Verify your {APP_NAME} email",
+            "body": "...",
+        },
+        "resetPasswordTemplate": {
+            "subject": "Reset your {APP_NAME} password",
+            "body": "...",
+        },
+        "confirmEmailChangeTemplate": {
+            "subject": "Confirm your {APP_NAME} new email address",
+            "body": "...",
+        },
+    }
+
+    base = {
+        "id": "",
+        "name": "",
+        "type": "base",
+        "system": False,
+        "listRule": None,
+        "viewRule": None,
+        "createRule": None,
+        "updateRule": None,
+        "deleteRule": None,
+        "fields": [
+            {
+                "id": "text_id",
+                "name": "id",
+                "type": "text",
+                "required": True,
+                "system": True,
+                "hidden": False,
+                "presentable": False,
+                "primaryKey": True,
+                "autogeneratePattern": "[a-z0-9]{15}",
+                "min": 15,
+                "max": 15,
+                "pattern": "^[a-z0-9]+$",
+            }
+        ],
+        "indexes": [],
+        "created": "",
+        "updated": "",
+    }
+
+    view = {
+        "id": "",
+        "name": "",
+        "type": "view",
+        "system": False,
+        "listRule": None,
+        "viewRule": None,
+        "createRule": None,
+        "updateRule": None,
+        "deleteRule": None,
+        "fields": [],
+        "indexes": [],
+        "created": "",
+        "updated": "",
+        "viewQuery": "",
+    }
+
+    return {
+        "auth": auth,
+        "base": base,
+        "view": view,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -167,6 +365,14 @@ async def list_database_tables(
 ) -> list[dict]:
     """Return all database tables and their columns for SQL editor autocomplete."""
     return await get_database_tables(engine)
+
+
+@router.get("/meta/scaffolds")
+async def get_collection_scaffolds(
+    _admin: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """Return collection type scaffolds used by PocketBase dashboard clients."""
+    return _collection_scaffolds()
 
 
 @router.get("/{idOrName}")
@@ -287,6 +493,7 @@ async def import_collections(
 
 
 @router.post("/{idOrName}/truncate", status_code=204)
+@router.delete("/{idOrName}/truncate", status_code=204)
 async def truncate_collection(
     idOrName: str,
     session: AsyncSession = Depends(_get_session),

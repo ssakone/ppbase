@@ -48,6 +48,7 @@ export interface TestCollectionOptions {
   name?: string;
   type?: 'base' | 'auth' | 'view';
   schema?: any[];
+  options?: Record<string, any>;
   listRule?: string | null;
   viewRule?: string | null;
   createRule?: string | null;
@@ -70,6 +71,7 @@ export async function createTestCollection(
     schema: opts.schema || [
       { name: 'title', type: 'text', required: false },
     ],
+    options: opts.options || {},
     listRule: opts.listRule === undefined ? '' : opts.listRule,
     viewRule: opts.viewRule === undefined ? '' : opts.viewRule,
     createRule: opts.createRule === undefined ? '' : opts.createRule,
