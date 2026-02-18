@@ -13,6 +13,7 @@ from ppbase.ext.events import (
 )
 from ppbase.ext.flask_like_pb import FlaskLikePB
 from ppbase.ext.hooks import Hook
+from ppbase.ext.record_repository import RecordRepository
 from ppbase.ext.registry import ExtensionRegistry
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "FlaskLikePB",
     "Hook",
     "HookEvent",
+    "RecordRepository",
     "RealtimeConnectEvent",
     "RealtimeMessageSendEvent",
     "RealtimeSubscribeEvent",

@@ -4,8 +4,17 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from fastapi import Depends
+
+from ppbase.api.deps import (
+    get_optional_auth,
+    require_admin,
+    require_auth,
+    require_record_auth,
+)
 from ppbase.config import Settings
 from ppbase.ext.loading import load_hook_target
+from ppbase.ext.record_repository import RecordRepository
 from ppbase.ext.registry import (
     ExtensionRegistry,
     HOOK_BOOTSTRAP,
@@ -119,6 +128,31 @@ class FlaskLikePB:
 
     def head(self, path: str, **fastapi_kwargs: Any):
         return self.route(path, methods=["HEAD"], **fastapi_kwargs)
+
+    def records(
+        self,
+        collection_id_or_name: str,
+        *,
+        engine: Any | None = None,
+    ) -> RecordRepository:
+        """Return a repository-like accessor for record CRUD operations."""
+        return RecordRepository(collection_id_or_name, engine=engine)
+
+    def optional_auth(self):
+        """FastAPI dependency returning auth payload or ``None``."""
+        return Depends(get_optional_auth)
+
+    def require_admin(self):
+        """FastAPI dependency requiring an admin token."""
+        return Depends(require_admin)
+
+    def require_auth(self):
+        """FastAPI dependency requiring any valid auth token."""
+        return Depends(require_auth)
+
+    def require_record_auth(self):
+        """FastAPI dependency requiring an auth-record token."""
+        return Depends(require_record_auth)
 
     def _hook_decorator(
         self,

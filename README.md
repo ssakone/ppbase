@@ -205,6 +205,31 @@ async def normalize_post(e):
 pb.start(host="127.0.0.1", port=8090)
 ```
 
+### Access records and current user in custom code
+
+Use repository-style helpers in routes and hooks:
+
+```python
+from ppbase import pb
+
+@pb.get("/api/me")
+async def me(auth: dict = pb.require_record_auth()):
+    user = await pb.records(auth["collectionName"]).get(auth["id"])
+    return {"user": user}
+
+
+@pb.on_record_update_request("users")
+async def before_user_update(e):
+    e.require_auth_record()  # raises 401/403 with PocketBase-style body
+    e.require_same_auth_record(e.record_id or "")
+    if not e.is_superuser():
+        e.data.setdefault("updatedByHook", True)
+    current = await e.get_current_user(fields="id,email")
+    if current:
+        e.data.setdefault("updatedBy", current["id"])  # mutate payload before default handler
+    return await e.next()
+```
+
 ### Multi-file usage
 
 - Side-effects style: import modules that register decorators on `pb`.

@@ -53,6 +53,21 @@ async def echo(body: dict[str, Any]):
     return {"echo": body}
 
 
+@pb.get("/api/custom/me")
+async def custom_me(auth: dict[str, Any] | None = pb.optional_auth()):
+    """Return current auth record using pb repository helpers."""
+    if not auth or auth.get("type") != "authRecord":
+        return {"user": None}
+
+    collection_ref = auth.get("collectionName") or auth.get("collectionId")
+    user_id = auth.get("id")
+    if not collection_ref or not user_id:
+        return {"user": None}
+
+    user = await pb.records(str(collection_ref)).get(str(user_id), fields="id,email,verified")
+    return {"user": user}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Lifecycle hooks
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +112,9 @@ async def before_user_create(event: RecordRequestEvent):
 async def before_user_update(event: RecordRequestEvent):
     """Log all user updates."""
     print(f"[hook] update users/{event.record_id} — patch: {list(event.data.keys())}")
+    current = await event.get_current_user(fields="id,email")
+    if current:
+        print(f"[hook] current user = {current.get('email')}")
     return await event.next()
 
 
@@ -164,6 +182,7 @@ if __name__ == "__main__":
     print("  API      : http://127.0.0.1:8090/api/")
     print("  Routes   : GET  /hello")
     print("             GET  /api/custom/status")
+    print("             GET  /api/custom/me")
     print("             POST /api/custom/echo")
     print("  Ctrl+C to stop")
     pb.start(host="127.0.0.1", port=8090)

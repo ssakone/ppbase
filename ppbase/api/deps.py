@@ -168,6 +168,47 @@ async def require_admin(
     return auth
 
 
+async def require_auth(
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
+) -> dict[str, Any]:
+    """Require that the request has any valid auth token."""
+    if auth is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": 401,
+                "message": "The request requires authentication.",
+                "data": {},
+            },
+        )
+    return auth
+
+
+async def require_record_auth(
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
+) -> dict[str, Any]:
+    """Require that the request has an auth-record token."""
+    if auth is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": 401,
+                "message": "The request requires authentication.",
+                "data": {},
+            },
+        )
+    if auth.get("type") != "authRecord":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": 403,
+                "message": "The authorized auth model is not allowed to perform this action.",
+                "data": {},
+            },
+        )
+    return auth
+
+
 # ---------------------------------------------------------------------------
 # Collection resolver
 # ---------------------------------------------------------------------------

@@ -27,6 +27,11 @@ Available methods:
 - `pb.delete(path, **fastapi_kwargs)`
 - `pb.options(path, **fastapi_kwargs)`
 - `pb.head(path, **fastapi_kwargs)`
+- `pb.optional_auth()` (FastAPI dependency helper)
+- `pb.require_auth()` (FastAPI dependency helper)
+- `pb.require_record_auth()` (FastAPI dependency helper)
+- `pb.require_admin()` (FastAPI dependency helper)
+- `pb.records(collection)` (repository-style records accessor)
 
 Route handlers are standard FastAPI handlers, including typed parameters and `Depends`.
 
@@ -74,6 +79,31 @@ Behavior:
 - fail-closed default: exceptions stop request flow
 - `e.next()` can be called only once per handler
 - if `e.next()` is not called, chain is short-circuited
+
+## Record access helpers (ORM-like DX)
+
+For hooks and custom routes, you can use repository-style helpers:
+
+- `pb.records("posts").create({...})`
+- `pb.records("posts").get(record_id)`
+- `pb.records("posts").list(...)`
+- `pb.records("posts").update(record_id, {...})`
+- `pb.records("posts").delete(record_id)`
+
+`RecordRequestEvent` includes convenience methods scoped to the current request:
+
+- `await e.get()` / `await e.list()`
+- `await e.create({...})`
+- `await e.update({...})`
+- `await e.delete()`
+- `await e.get_current_user()`
+- `e.current_auth()`, `e.current_user_id()`, `e.is_admin()`
+- `e.has_superuser_auth()`, `e.is_superuser()` (PocketBase-like)
+- `e.has_auth()`, `e.has_record_auth()`
+- `e.auth_id()`, `e.auth_type()`, `e.auth_collection_id()`, `e.auth_collection_name()`
+- `e.require_auth()`, `e.require_auth_record()`, `e.require_superuser()`
+- `e.is_auth_collection("users")`, `e.is_same_auth_record(record_id, collection?)`
+- `e.require_same_auth_record(record_id, collection?)`
 
 ## Transaction behavior (mutations)
 

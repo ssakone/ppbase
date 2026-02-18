@@ -11,6 +11,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -196,6 +197,39 @@ class ExternalAuthRecord(Base):
             "provider_id",
             name="uq_external_auths_provider",
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# _requests (request logs)
+# ---------------------------------------------------------------------------
+
+
+class RequestLogRecord(Base):
+    """Stores HTTP request logs for the admin logs UI."""
+
+    __tablename__ = "_requests"
+
+    id: Mapped[str] = mapped_column(String(15), primary_key=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    method: Mapped[str] = mapped_column(String(10), nullable=False)
+    status: Mapped[int] = mapped_column(Integer, nullable=False)
+    exec_time: Mapped[float] = mapped_column(
+        Float, nullable=False, server_default="0"
+    )
+    remote_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    referer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    meta: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )
 
 

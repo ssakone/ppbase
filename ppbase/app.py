@@ -207,6 +207,11 @@ def create_app(
 
     setup_cors(app, settings.origins)
 
+    # Request logger
+    from ppbase.middleware.request_logger import RequestLoggerMiddleware
+
+    app.add_middleware(RequestLoggerMiddleware)
+
     # API routes
     from ppbase.api.router import (
         api_router,

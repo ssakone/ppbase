@@ -8,6 +8,7 @@ from fastapi import Depends
 from httpx import ASGITransport, AsyncClient
 
 from ppbase import PPBase, pb
+from ppbase.api.deps import get_optional_auth, require_auth, require_record_auth
 
 
 @pytest.mark.asyncio
@@ -79,3 +80,49 @@ async def test_side_effect_module_and_register_function_can_mix(tmp_path: Path, 
     assert reg.json()["source"] == "register"
 
     pb._reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_route_can_use_optional_auth_dependency_helper() -> None:
+    app_pb = PPBase()
+
+    @app_pb.get("/ext/whoami")
+    async def whoami(auth: dict | None = app_pb.optional_auth()):
+        return {"id": auth.get("id") if auth else None}
+
+    app = app_pb.get_app()
+    app.dependency_overrides[get_optional_auth] = lambda: {"id": "user_1", "type": "authRecord"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/ext/whoami")
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "user_1"}
+
+
+@pytest.mark.asyncio
+async def test_route_can_use_require_auth_dependency_helpers() -> None:
+    app_pb = PPBase()
+
+    @app_pb.get("/ext/need-auth")
+    async def need_auth(auth: dict = app_pb.require_auth()):
+        return {"id": auth.get("id"), "type": auth.get("type")}
+
+    @app_pb.get("/ext/need-record-auth")
+    async def need_record_auth(auth: dict = app_pb.require_record_auth()):
+        return {"id": auth.get("id"), "type": auth.get("type")}
+
+    app = app_pb.get_app()
+    app.dependency_overrides[require_auth] = lambda: {"id": "any_1", "type": "admin"}
+    app.dependency_overrides[require_record_auth] = (
+        lambda: {"id": "user_42", "type": "authRecord"}
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        auth_response = await client.get("/ext/need-auth")
+        record_auth_response = await client.get("/ext/need-record-auth")
+
+    assert auth_response.status_code == 200
+    assert auth_response.json() == {"id": "any_1", "type": "admin"}
+    assert record_auth_response.status_code == 200
+    assert record_auth_response.json() == {"id": "user_42", "type": "authRecord"}

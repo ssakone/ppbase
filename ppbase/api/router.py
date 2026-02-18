@@ -9,6 +9,7 @@ from ppbase.api.health import router as health_router
 from ppbase.api.admins import router as admins_router
 from ppbase.api.settings import router as settings_router
 from ppbase.api.files import router as files_router
+from ppbase.api.logs import router as logs_router
 from ppbase.api.deps import get_session
 
 api_router = APIRouter()
@@ -33,6 +34,7 @@ api_router.include_router(health_router, prefix="/health", tags=["health"])
 api_router.include_router(admins_router, prefix="/admins", tags=["admins"])
 api_router.include_router(settings_router, prefix="/settings", tags=["settings"])
 api_router.include_router(files_router, prefix="/files", tags=["files"])
+api_router.include_router(logs_router, tags=["logs"])
 
 # Collections router -- built by another agent; import gracefully.
 # NOTE: The collections router already defines prefix="/collections" internally.
