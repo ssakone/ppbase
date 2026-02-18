@@ -43,7 +43,6 @@ export function SidebarCollectionsPanel() {
     navigate('/collections?new=1')
   }
 
-  // Hide panel when not on collections routes
   const showPanel = location.pathname.startsWith('/collections')
   if (!showPanel) return null
 
@@ -53,14 +52,14 @@ export function SidebarCollectionsPanel() {
       <button
         key={col.id}
         className={cn(
-          'flex items-center gap-2.5 w-full px-3 mb-0.5 py-1.5 text-[13.5px] rounded-md text-left transition-colors',
+          'flex items-center gap-3 w-full px-3.5 mb-0.5 py-2.5 text-[15px] rounded-xl text-left transition-all duration-150',
           isActive
-            ? 'bg-indigo-50 text-indigo-700 font-medium'
-            : 'text-slate-600 hover:bg-slate-100',
+            ? 'bg-indigo-50 text-indigo-700 font-semibold shadow-sm'
+            : 'text-slate-600 hover:bg-slate-100 hover:text-slate-800',
         )}
         onClick={() => handleClick(col)}
       >
-        <CollectionIcon type={col.type} />
+        <CollectionIcon type={col.type} active={isActive} />
         <span className="truncate">{col.name}</span>
       </button>
     )
@@ -68,16 +67,16 @@ export function SidebarCollectionsPanel() {
 
   return (
     <div
-      className="flex flex-col border-r bg-white shrink-0"
+      className="flex flex-col border-r bg-white shrink-0 transition-all duration-200"
       style={{ width: collectionsPanelWidth }}
     >
       {/* Search */}
-      <div className="px-4 pt-3 pb-2">
+      <div className="px-4 pt-4 pb-3">
         <div className="relative">
-          <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
           <input
             type="text"
-            className="w-full h-9 pl-9 pr-3 text-sm rounded-md border bg-background placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            className="w-full h-11 pl-10 pr-3.5 text-[15px] rounded-xl border bg-slate-50/60 placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:bg-white hover:border-slate-300 transition-all duration-150"
             placeholder="Search collections..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -88,31 +87,29 @@ export function SidebarCollectionsPanel() {
       {/* Collection list */}
       <nav className="flex-1 overflow-y-auto px-3 py-1">
         {isLoading ? (
-          <div className="space-y-2 px-2 py-1">
-            {[1, 2, 3].map((i) => (
-              <div key={i} className="h-8 rounded-md bg-slate-100 animate-pulse" />
+          <div className="space-y-1.5 px-1 py-1">
+            {[1, 2, 3, 4].map((i) => (
+              <div key={i} className="h-10 rounded-xl bg-slate-100 animate-pulse" />
             ))}
           </div>
         ) : filtered.length === 0 ? (
-          <div className="px-3 py-3 text-xs text-muted-foreground">
+          <div className="px-3 py-4 text-[14px] text-muted-foreground text-center">
             {search ? 'No matching collections' : 'No collections yet'}
           </div>
         ) : (
           <>
-            {/* User collections */}
             {userCollections.map(renderCollectionItem)}
 
-            {/* System collections section */}
             {systemCollections.length > 0 && (
-              <div className="mt-2 pt-2 border-t border-slate-100">
+              <div className="mt-3 pt-3 border-t border-slate-100">
                 <button
-                  className="flex items-center gap-1 w-full px-3 py-1 text-[11px] font-medium uppercase tracking-wider text-slate-400 hover:text-slate-500 transition-colors"
+                  className="flex items-center gap-1.5 w-full px-3 py-1.5 text-[11px] font-bold uppercase tracking-widest text-slate-400 hover:text-slate-500 transition-colors mb-1"
                   onClick={() => setSystemCollapsed(!systemCollapsed)}
                 >
                   System
                   <ChevronRight
                     className={cn(
-                      'h-3 w-3 transition-transform',
+                      'h-3 w-3 transition-transform duration-200',
                       !systemCollapsed && 'rotate-90',
                     )}
                   />
@@ -125,13 +122,13 @@ export function SidebarCollectionsPanel() {
       </nav>
 
       {/* New collection button */}
-      <div className="px-3 pb-3 pt-2">
+      <div className="px-4 pb-4 pt-2">
         <Button
           variant="outline"
-          className="w-full border-dashed border-slate-300 text-slate-500 hover:text-slate-700 hover:border-slate-400 h-9 text-[13px]"
+          className="w-full border-dashed border-slate-300 text-slate-500 hover:text-indigo-600 hover:border-indigo-400 hover:bg-indigo-50/50"
           onClick={handleNewCollection}
         >
-          <Plus className="h-3.5 w-3.5 mr-1" />
+          <Plus className="h-4 w-4" />
           New collection
         </Button>
       </div>
@@ -139,12 +136,12 @@ export function SidebarCollectionsPanel() {
   )
 }
 
-function CollectionIcon({ type }: { type: string }) {
-  if (type === 'auth') {
-    return <User className="h-4 w-4 shrink-0 text-slate-400" />
-  }
-  if (type === 'view') {
-    return <Table2 className="h-4 w-4 shrink-0 text-slate-400" />
-  }
-  return <Folder className="h-4 w-4 shrink-0 text-slate-400" />
+function CollectionIcon({ type, active }: { type: string; active?: boolean }) {
+  const cls = cn(
+    'h-[18px] w-[18px] shrink-0 transition-colors',
+    active ? 'text-indigo-500' : 'text-slate-400',
+  )
+  if (type === 'auth') return <User className={cls} />
+  if (type === 'view') return <Table2 className={cls} />
+  return <Folder className={cls} />
 }

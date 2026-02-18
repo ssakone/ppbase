@@ -21,10 +21,18 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from ppbase.api.deps import get_optional_auth
 from ppbase.db.engine import get_engine
+from ppbase.ext.events import RecordAuthRequestEvent
+from ppbase.ext.registry import (
+    HOOK_RECORD_AUTH_REFRESH_REQUEST,
+    HOOK_RECORD_AUTH_REQUEST,
+    HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
+    HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
+    get_extension_registry,
+)
 from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
@@ -79,6 +87,25 @@ def _extract_auth_token(request: Request) -> str:
     if token.lower().startswith("bearer "):
         token = token[7:]
     return token.strip()
+
+
+async def _trigger_record_auth_hooks(
+    request: Request,
+    specific_hook_name: str,
+    event: RecordAuthRequestEvent,
+    default_handler,
+):
+    extensions = get_extension_registry(request.app)
+    if extensions is None:
+        return await default_handler(event)
+
+    generic_hook = extensions.hooks.get(HOOK_RECORD_AUTH_REQUEST)
+    specific_hook = extensions.hooks.get(specific_hook_name)
+
+    async def _run_specific(e: RecordAuthRequestEvent):
+        return await specific_hook.trigger(e, default_handler)
+
+    return await generic_hook.trigger(event, _run_specific)
 
 
 _AUTH_INVALID_CREDENTIALS_DATA = {
@@ -333,77 +360,97 @@ async def api_auth_with_password(
         body = await request.json()
     except Exception:
         return _error_response(400, "Invalid JSON body.")
+    if not isinstance(body, dict):
+        return _error_response(400, "Request body must be a JSON object.")
 
-    identity = body.get("identity", "")
-    password = body.get("password", "")
-    identity_field = body.get("identityField")
-
-    if not identity or not password:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            {
-                "identity": {"code": "validation_required", "message": "Cannot be blank."}
-                if not identity
-                else {},
-                "password": {"code": "validation_required", "message": "Cannot be blank."}
-                if not password
-                else {},
-            },
-        )
-
-    settings = request.app.state.settings
-
-    from ppbase.services.record_auth_service import auth_with_password
-
-    result = await auth_with_password(
-        engine,
-        collection,
-        identity,
-        password,
-        settings,
-        identity_field=identity_field,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="password",
+        body=body,
     )
 
-    if result is None:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            _AUTH_INVALID_CREDENTIALS_DATA,
+    async def _default_auth_with_password(e: RecordAuthRequestEvent) -> JSONResponse:
+        if not isinstance(e.body, dict):
+            return _error_response(400, "Request body must be a JSON object.")
+
+        payload = dict(e.body)
+        identity = payload.get("identity", "")
+        password = payload.get("password", "")
+        identity_field = payload.get("identityField")
+
+        if not identity or not password:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                {
+                    "identity": {"code": "validation_required", "message": "Cannot be blank."}
+                    if not identity
+                    else {},
+                    "password": {"code": "validation_required", "message": "Cannot be blank."}
+                    if not password
+                    else {},
+                },
+            )
+
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import auth_with_password
+
+        result = await auth_with_password(
+            engine,
+            collection,
+            identity,
+            password,
+            settings,
+            identity_field=identity_field,
         )
 
-    rule_request_context = _build_rule_request_context(
+        if result is None:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                _AUTH_INVALID_CREDENTIALS_DATA,
+            )
+
+        rule_request_context = _build_rule_request_context(
+            request,
+            context="password",
+            data=payload,
+        )
+        if not await _passes_auth_rule(
+            engine,
+            collection,
+            result["record"]["id"],
+            rule_request_context,
+        ):
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                _AUTH_INVALID_CREDENTIALS_DATA,
+            )
+
+        expand_str = request.query_params.get("expand", "")
+        if expand_str and result.get("record"):
+            all_colls = await get_all_collections(engine)
+            records = await expand_records(
+                engine, collection, [result["record"]], expand_str, all_colls,
+            )
+            result["record"] = records[0] if records else result["record"]
+
+        fields_param = request.query_params.get("fields", "")
+        if fields_param and result.get("record"):
+            result["record"] = _apply_fields_filter(result["record"], fields_param)
+
+        return JSONResponse(content=result)
+
+    return await _trigger_record_auth_hooks(
         request,
-        context="password",
-        data=body if isinstance(body, dict) else {},
+        HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
+        event,
+        _default_auth_with_password,
     )
-    if not await _passes_auth_rule(
-        engine,
-        collection,
-        result["record"]["id"],
-        rule_request_context,
-    ):
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            _AUTH_INVALID_CREDENTIALS_DATA,
-        )
-
-    # Apply expand if requested
-    expand_str = request.query_params.get("expand", "")
-    if expand_str and result.get("record"):
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [result["record"]], expand_str, all_colls,
-        )
-        result["record"] = records[0] if records else result["record"]
-
-    # Apply fields filter if requested
-    fields_param = request.query_params.get("fields", "")
-    if fields_param and result.get("record"):
-        result["record"] = _apply_fields_filter(result["record"], fields_param)
-
-    return JSONResponse(content=result)
 
 
 # ---------------------------------------------------------------------------
@@ -618,133 +665,153 @@ async def api_auth_with_oauth2(
         body = await request.json()
     except Exception:
         return _error_response(400, "Invalid JSON body.")
+    if not isinstance(body, dict):
+        return _error_response(400, "Request body must be a JSON object.")
 
-    provider = body.get("provider", "").strip()
-    code = body.get("code", "").strip()
-    code_verifier = body.get("codeVerifier", "").strip()
-    redirect_url = body.get("redirectUrl", "").strip()
-    create_data = body.get("createData", {})
-
-    if not provider:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            {"provider": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    if not code:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            {"code": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    if not code_verifier:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            {"codeVerifier": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    if not redirect_url:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            {"redirectUrl": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    # Check OAuth2 is enabled for this collection
-    opts = collection.options or {}
-    oauth2_config = opts.get("oauth2", {})
-    if not oauth2_config.get("enabled", False):
-        return _error_response(
-            400,
-            f"OAuth2 authentication is not enabled for collection \"{collection.name}\".",
-        )
-
-    settings = request.app.state.settings
-
-    from ppbase.services.oauth2_service import (
-        get_provider_class,
-        get_provider_credentials,
-        link_or_create_oauth_user,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="oauth2",
+        body=body,
     )
 
-    try:
-        # Get provider credentials and instantiate provider
-        client_id, client_secret = get_provider_credentials(provider, settings, opts)
-        provider_class = get_provider_class(provider)
-        provider_instance = provider_class(client_id, client_secret)
+    async def _default_auth_with_oauth2(e: RecordAuthRequestEvent) -> JSONResponse:
+        if not isinstance(e.body, dict):
+            return _error_response(400, "Request body must be a JSON object.")
 
-        # Exchange code for access token
-        token_data = await provider_instance.exchange_code(code, redirect_url, code_verifier)
+        payload = dict(e.body)
+        provider = str(payload.get("provider", "")).strip()
+        code = str(payload.get("code", "")).strip()
+        code_verifier = str(payload.get("codeVerifier", "")).strip()
+        redirect_url = str(payload.get("redirectUrl", "")).strip()
+        create_data = payload.get("createData", {})
 
-        # Get user info from provider
-        user_info = await provider_instance.get_user_info(token_data.get("access_token"))
-
-        # Link or create user
-        result = await link_or_create_oauth_user(
-            engine,
-            collection,
-            provider,
-            user_info,
-            token_data,
-            create_data,
-        )
-
-        rule_request_context = _build_rule_request_context(
-            request,
-            context="oauth2",
-            data=body if isinstance(body, dict) else {},
-        )
-        if not await _passes_auth_rule(
-            engine,
-            collection,
-            result["record"]["id"],
-            rule_request_context,
-        ):
+        if not provider:
             return _error_response(
                 400,
                 "Failed to authenticate.",
-                _AUTH_INVALID_CREDENTIALS_DATA,
+                {"provider": {"code": "validation_required", "message": "Cannot be blank."}},
             )
 
-        # Generate JWT token for the user
-        from ppbase.services.record_auth_service import generate_record_auth_token
-
-        token = await generate_record_auth_token(
-            engine, collection, result["record"]["id"], settings
-        )
-
-        # Build response
-        response_data = {
-            "token": token,
-            "record": result["record"],
-            "meta": result["meta"],
-        }
-
-        # Apply expand if requested
-        expand_str = request.query_params.get("expand", "")
-        if expand_str and response_data.get("record"):
-            all_colls = await get_all_collections(engine)
-            records = await expand_records(
-                engine, collection, [response_data["record"]], expand_str, all_colls,
+        if not code:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                {"code": {"code": "validation_required", "message": "Cannot be blank."}},
             )
-            response_data["record"] = records[0] if records else response_data["record"]
 
-        # Apply fields filter if requested
-        fields_param = request.query_params.get("fields", "")
-        if fields_param and response_data.get("record"):
-            response_data["record"] = _apply_fields_filter(response_data["record"], fields_param)
+        if not code_verifier:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                {"codeVerifier": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
 
-        return JSONResponse(content=response_data)
+        if not redirect_url:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                {"redirectUrl": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
 
-    except Exception as e:
-        return _error_response(
-            400,
-            f"Failed to authenticate with OAuth2: {str(e)}",
-            {"provider": {"code": "validation_oauth2_failed", "message": str(e)}},
+        opts = collection.options or {}
+        oauth2_config = opts.get("oauth2", {})
+        if not oauth2_config.get("enabled", False):
+            return _error_response(
+                400,
+                f"OAuth2 authentication is not enabled for collection \"{collection.name}\".",
+            )
+
+        settings = request.app.state.settings
+        from ppbase.services.oauth2_service import (
+            get_provider_class,
+            get_provider_credentials,
+            link_or_create_oauth_user,
         )
+
+        try:
+            client_id, client_secret = get_provider_credentials(provider, settings, opts)
+            provider_class = get_provider_class(provider)
+            provider_instance = provider_class(client_id, client_secret)
+
+            token_data = await provider_instance.exchange_code(
+                code,
+                redirect_url,
+                code_verifier,
+            )
+            user_info = await provider_instance.get_user_info(token_data.get("access_token"))
+
+            result = await link_or_create_oauth_user(
+                engine,
+                collection,
+                provider,
+                user_info,
+                token_data,
+                create_data,
+            )
+
+            rule_request_context = _build_rule_request_context(
+                request,
+                context="oauth2",
+                data=payload,
+            )
+            if not await _passes_auth_rule(
+                engine,
+                collection,
+                result["record"]["id"],
+                rule_request_context,
+            ):
+                return _error_response(
+                    400,
+                    "Failed to authenticate.",
+                    _AUTH_INVALID_CREDENTIALS_DATA,
+                )
+
+            from ppbase.services.record_auth_service import generate_record_auth_token
+
+            token = await generate_record_auth_token(
+                engine, collection, result["record"]["id"], settings
+            )
+
+            response_data = {
+                "token": token,
+                "record": result["record"],
+                "meta": result["meta"],
+            }
+
+            expand_str = request.query_params.get("expand", "")
+            if expand_str and response_data.get("record"):
+                all_colls = await get_all_collections(engine)
+                records = await expand_records(
+                    engine, collection, [response_data["record"]], expand_str, all_colls,
+                )
+                response_data["record"] = records[0] if records else response_data["record"]
+
+            fields_param = request.query_params.get("fields", "")
+            if fields_param and response_data.get("record"):
+                response_data["record"] = _apply_fields_filter(
+                    response_data["record"],
+                    fields_param,
+                )
+
+            return JSONResponse(content=response_data)
+
+        except Exception as exc:
+            message = str(exc)
+            return _error_response(
+                400,
+                f"Failed to authenticate with OAuth2: {message}",
+                {"provider": {"code": "validation_oauth2_failed", "message": message}},
+            )
+
+    return await _trigger_record_auth_hooks(
+        request,
+        HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
+        event,
+        _default_auth_with_oauth2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -768,59 +835,74 @@ async def api_auth_refresh(
     if err:
         return err
 
-    # Extract raw token for full verification
-    auth_header = request.headers.get("Authorization", "")
-    token_str = auth_header
-    if token_str.lower().startswith("bearer "):
-        token_str = token_str[7:]
-    token_str = token_str.strip()
-
-    if not token_str:
-        return _error_response(401, "The request requires valid auth token to be set.")
-
-    settings = request.app.state.settings
-
-    from ppbase.services.record_auth_service import (
-        auth_refresh,
-        verify_record_auth_token,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        auth=auth,
+        method="refresh",
+        body={},
     )
 
-    payload = await verify_record_auth_token(engine, collection, token_str, settings)
-    if payload is None:
-        return _error_response(401, "The request requires valid auth token to be set.")
+    async def _default_auth_refresh(e: RecordAuthRequestEvent) -> JSONResponse:
+        auth_header = request.headers.get("Authorization", "")
+        token_str = auth_header
+        if token_str.lower().startswith("bearer "):
+            token_str = token_str[7:]
+        token_str = token_str.strip()
 
-    result = await auth_refresh(engine, collection, payload, settings)
-    if result is None:
-        return _error_response(401, "The request requires valid auth token to be set.")
+        if not token_str:
+            return _error_response(401, "The request requires valid auth token to be set.")
 
-    rule_request_context = _build_rule_request_context(
-        request,
-        context="default",
-        auth_payload=payload,
-    )
-    if not await _passes_auth_rule(
-        engine,
-        collection,
-        result["record"]["id"],
-        rule_request_context,
-    ):
-        return _error_response(401, "The request requires valid auth token to be set.")
-
-    # Apply expand if requested
-    expand_str = request.query_params.get("expand", "")
-    if expand_str and result.get("record"):
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [result["record"]], expand_str, all_colls,
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import (
+            auth_refresh,
+            verify_record_auth_token,
         )
-        result["record"] = records[0] if records else result["record"]
 
-    # Apply fields filter if requested
-    fields_param = request.query_params.get("fields", "")
-    if fields_param and result.get("record"):
-        result["record"] = _apply_fields_filter(result["record"], fields_param)
+        payload = await verify_record_auth_token(engine, collection, token_str, settings)
+        if payload is None:
+            return _error_response(401, "The request requires valid auth token to be set.")
 
-    return JSONResponse(content=result)
+        e.payload = payload
+        result = await auth_refresh(engine, collection, payload, settings)
+        if result is None:
+            return _error_response(401, "The request requires valid auth token to be set.")
+
+        rule_request_context = _build_rule_request_context(
+            request,
+            context="default",
+            auth_payload=payload,
+        )
+        if not await _passes_auth_rule(
+            engine,
+            collection,
+            result["record"]["id"],
+            rule_request_context,
+        ):
+            return _error_response(401, "The request requires valid auth token to be set.")
+
+        expand_str = request.query_params.get("expand", "")
+        if expand_str and result.get("record"):
+            all_colls = await get_all_collections(engine)
+            records = await expand_records(
+                engine, collection, [result["record"]], expand_str, all_colls,
+            )
+            result["record"] = records[0] if records else result["record"]
+
+        fields_param = request.query_params.get("fields", "")
+        if fields_param and result.get("record"):
+            result["record"] = _apply_fields_filter(result["record"], fields_param)
+
+        return JSONResponse(content=result)
+
+    return await _trigger_record_auth_hooks(
+        request,
+        HOOK_RECORD_AUTH_REFRESH_REQUEST,
+        event,
+        _default_auth_refresh,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +1055,7 @@ async def api_request_verification(
     await _req_verif(engine, collection, email, settings, base_url=base_url)
 
     # Always 204 to avoid enumeration
-    return JSONResponse(content=None, status_code=204)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1021,7 +1103,7 @@ async def api_confirm_verification(
             {"token": {"code": "validation_invalid_token", "message": "Invalid or expired token."}},
         )
 
-    return JSONResponse(content=None, status_code=204)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1146,7 @@ async def api_request_password_reset(
 
     await _req_reset(engine, collection, email, settings, base_url=base_url)
 
-    return JSONResponse(content=None, status_code=204)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1118,7 +1200,7 @@ async def api_confirm_password_reset(
             errors or {},
         )
 
-    return JSONResponse(content=None, status_code=204)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1213,7 +1295,7 @@ async def api_request_email_change(
             errors or {},
         )
 
-    return JSONResponse(content=None, status_code=204)
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1276,4 +1358,4 @@ async def api_confirm_email_change(
             errors or {},
         )
 
-    return JSONResponse(content=None, status_code=204)
+    return Response(status_code=204)

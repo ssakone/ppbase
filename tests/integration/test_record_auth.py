@@ -1356,6 +1356,7 @@ class TestEmailUniquenessOnUpdate:
         self,
         app_client: AsyncClient,
         auth_collection: dict,
+        admin_token: str,
     ):
         """Updating email to one already in use returns proper error."""
         import uuid
@@ -1387,6 +1388,7 @@ class TestEmailUniquenessOnUpdate:
         # Try to update user1's email to user2's email
         patch_resp = await app_client.patch(
             f"/api/collections/users/records/{user1['id']}",
+            headers={"Authorization": admin_token},
             json={"email": email2},
         )
         assert patch_resp.status_code == 400, patch_resp.text
@@ -1398,6 +1400,7 @@ class TestEmailUniquenessOnUpdate:
         self,
         app_client: AsyncClient,
         auth_collection: dict,
+        admin_token: str,
     ):
         """Updating a record with the same email (no change) succeeds."""
         import uuid
@@ -1416,6 +1419,7 @@ class TestEmailUniquenessOnUpdate:
         # Update with same email
         patch_resp = await app_client.patch(
             f"/api/collections/users/records/{user['id']}",
+            headers={"Authorization": admin_token},
             json={"email": email},
         )
         assert patch_resp.status_code == 200, patch_resp.text
@@ -1424,6 +1428,7 @@ class TestEmailUniquenessOnUpdate:
         self,
         app_client: AsyncClient,
         auth_collection: dict,
+        admin_token: str,
     ):
         """Updating email to invalid format fails."""
         import uuid
@@ -1441,6 +1446,7 @@ class TestEmailUniquenessOnUpdate:
 
         patch_resp = await app_client.patch(
             f"/api/collections/users/records/{user['id']}",
+            headers={"Authorization": admin_token},
             json={"email": "not-valid"},
         )
         assert patch_resp.status_code == 400, patch_resp.text

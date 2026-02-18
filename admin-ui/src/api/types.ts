@@ -103,3 +103,41 @@ export interface ApiError {
   message: string
   data: { [key: string]: unknown }
 }
+
+export interface LogRecord {
+  id: string
+  url: string
+  method: string
+  status: number
+  execTime: number
+  remoteIp: string
+  referer?: string
+  userAgent?: string
+  meta?: Record<string, unknown>
+  created: string
+  updated: string
+}
+
+export interface LogStats {
+  total: number
+  errors: number
+  avgMs: number
+  uniqueIps: number
+}
+
+export interface OAuth2ProviderConfig {
+  name: string
+  clientId: string
+  clientSecret: string
+}
+
+export interface CollectionOAuth2Options {
+  enabled: boolean
+  mappedFields: {
+    id?: string
+    name?: string
+    username?: string
+    avatarURL?: string
+  }
+  providers: OAuth2ProviderConfig[]
+}

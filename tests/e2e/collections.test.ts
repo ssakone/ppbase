@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import type PocketBase from 'pocketbase';
-import { getAdminPb, createTestCollection, uniqueName } from './helpers';
+import { getAdminPb, getFreshPb, createTestCollection, uniqueName } from './helpers';
 
 describe('Collections API', () => {
   let adminPb: PocketBase;
@@ -124,6 +124,21 @@ describe('Collections API', () => {
     expect(list.perPage).toBe(10);
     expect(list.totalItems).toBeGreaterThan(0);
     expect(list.items).toBeInstanceOf(Array);
+  });
+
+  it('should reject collections list with invalid admin token', async () => {
+    const pb = getFreshPb();
+
+    await expect(
+      pb.send('/api/collections', {
+        method: 'GET',
+        headers: {
+          Authorization: 'invalid.jwt.token',
+        },
+      })
+    ).rejects.toMatchObject({
+      status: 401,
+    });
   });
 
   it('should return collection scaffolds metadata', async () => {

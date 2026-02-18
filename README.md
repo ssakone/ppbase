@@ -180,6 +180,56 @@ pytest tests/ -v
 pytest tests/test_specific.py::test_name -v
 ```
 
+## Flask-like Extension API
+
+PPBase can be used as a Python-extensible app with global decorators.
+
+### Single-file usage
+
+```python
+from ppbase import pb
+
+
+@pb.get("/hello/{name}")
+async def hello(name: str):
+    return {"message": f"Hello {name}"}
+
+
+@pb.on_record_create_request("posts")
+async def normalize_post(e):
+    if "title" in e.data and "slug" not in e.data:
+        e.data["slug"] = str(e.data["title"]).strip().lower().replace(" ", "-")
+    return await e.next()
+
+
+pb.start(host="127.0.0.1", port=8090)
+```
+
+### Multi-file usage
+
+- Side-effects style: import modules that register decorators on `pb`.
+- Register function style: expose `register(pb)` and call it manually.
+
+```python
+from ppbase import pb
+import my_hooks_side_effects
+from my_hooks_register import register
+
+register(pb)
+pb.start()
+```
+
+### CLI hooks loading
+
+You can load hook modules when starting the server:
+
+```bash
+python -m ppbase serve --hooks myapp.hooks:register
+python -m ppbase serve --hooks myapp.hooks:register --hooks myapp.more_hooks:setup
+```
+
+The hook target format is strict: `module:function`. The function receives `pb`.
+
 ## Tech Stack
 
 - **FastAPI** -- async web framework

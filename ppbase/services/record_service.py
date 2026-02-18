@@ -589,7 +589,10 @@ async def update_record(
 
         modifier = None
         field_name = key
-        if key.endswith("+"):
+        if key.startswith("+"):
+            modifier = "prepend"
+            field_name = key[1:]
+        elif key.endswith("+"):
             modifier = "+"
             field_name = key[:-1]
         elif key.endswith("-"):
@@ -607,6 +610,15 @@ async def update_record(
         if modifier == "+":
             current = raw_row.get(field_name)
             merged = _apply_append(current, value, field_def)
+            try:
+                validated = validate_field_value(field_def, merged)
+                updates[field_name] = _serialize_for_pg(validated, field_def)
+            except FieldValidationError as exc:
+                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+
+        elif modifier == "prepend":
+            current = raw_row.get(field_name)
+            merged = _apply_prepend(current, value, field_def)
             try:
                 validated = validate_field_value(field_def, merged)
                 updates[field_name] = _serialize_for_pg(validated, field_def)
@@ -712,6 +724,28 @@ def _apply_append(
     elif new_values is not None:
         cur_list.append(new_values)
     return cur_list
+
+
+def _apply_prepend(
+    current: Any,
+    new_values: Any,
+    field_def: FieldDefinition,
+) -> Any:
+    """Prepend values for multi-value fields or increment for numbers."""
+    if field_def.type == FieldType.NUMBER:
+        cur = float(current) if current is not None else 0.0
+        inc = float(new_values) if new_values is not None else 0.0
+        return cur + inc
+
+    cur_list = list(current) if isinstance(current, (list, tuple)) else []
+    prepend_values: list[Any]
+    if isinstance(new_values, list):
+        prepend_values = list(new_values)
+    elif new_values is not None:
+        prepend_values = [new_values]
+    else:
+        prepend_values = []
+    return prepend_values + cur_list
 
 
 def _apply_remove(

@@ -10,6 +10,7 @@ Provides CRUD endpoints for records in dynamic collection tables:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
@@ -17,12 +18,21 @@ from typing import Any, AsyncIterator
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from ppbase.api.deps import get_optional_auth
 from ppbase.db.engine import get_engine
+from ppbase.ext.events import RecordRequestEvent
+from ppbase.ext.registry import (
+    HOOK_RECORD_CREATE_REQUEST,
+    HOOK_RECORD_DELETE_REQUEST,
+    HOOK_RECORDS_LIST_REQUEST,
+    HOOK_RECORD_UPDATE_REQUEST,
+    HOOK_RECORD_VIEW_REQUEST,
+    get_extension_registry,
+)
 from ppbase.models.record import build_list_response
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
@@ -131,6 +141,8 @@ _AUTH_SELF_ALLOWED_UPDATE_FIELDS = frozenset({"password", "passwordConfirm"})
 
 _DEFAULT_BATCH_ENABLED = True
 _DEFAULT_BATCH_MAX_REQUESTS = 50
+_DEFAULT_BATCH_MAX_BODY_SIZE = 0
+_DEFAULT_BATCH_TIMEOUT = 3
 
 _BATCH_RECORDS_RE = re.compile(r"^/api/collections/([^/]+)/records/?$")
 _BATCH_RECORD_RE = re.compile(r"^/api/collections/([^/]+)/records/([^/]+)/?$")
@@ -159,6 +171,27 @@ class _ConnectionEngineAdapter:
     @asynccontextmanager
     async def begin(self) -> AsyncIterator[AsyncConnection]:
         yield self._conn
+
+
+class _AbortWithResponse(Exception):
+    """Rollback marker carrying an HTTP response."""
+
+    def __init__(self, response: JSONResponse):
+        super().__init__("Abort request with HTTP response.")
+        self.response = response
+
+
+async def _trigger_record_request_hook(
+    request: Request,
+    hook_name: str,
+    event: RecordRequestEvent,
+    default_handler,
+):
+    extensions = get_extension_registry(request.app)
+    if extensions is None:
+        return await default_handler(event)
+    hook = extensions.hooks.get(hook_name)
+    return await hook.trigger(event, default_handler)
 
 
 def _is_self_auth_target(
@@ -254,10 +287,28 @@ def _coerce_positive_int(value: Any, default: int) -> int:
         return default
 
 
-async def _get_batch_settings(engine: Any) -> tuple[bool, int]:
-    """Return ``(enabled, max_requests)`` from app settings."""
+def _coerce_non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else default
+    except Exception:
+        return default
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else default
+    except Exception:
+        return default
+
+
+async def _get_batch_settings(engine: Any) -> tuple[bool, int, int, float]:
+    """Return ``(enabled, max_requests, max_body_size, timeout_seconds)`` from app settings."""
     enabled = _DEFAULT_BATCH_ENABLED
     max_requests = _DEFAULT_BATCH_MAX_REQUESTS
+    max_body_size = _DEFAULT_BATCH_MAX_BODY_SIZE
+    timeout_seconds = float(_DEFAULT_BATCH_TIMEOUT)
 
     try:
         async with engine.connect() as conn:
@@ -267,7 +318,7 @@ async def _get_batch_settings(engine: Any) -> tuple[bool, int]:
             )
             row = result.mappings().first()
     except Exception:
-        return enabled, max_requests
+        return enabled, max_requests, max_body_size, timeout_seconds
 
     settings_value = row.get("value") if row else None
     if isinstance(settings_value, dict):
@@ -279,8 +330,16 @@ async def _get_batch_settings(engine: Any) -> tuple[bool, int]:
                 batch_value.get("maxRequests", max_requests),
                 max_requests,
             )
+            max_body_size = _coerce_non_negative_int(
+                batch_value.get("maxBodySize", max_body_size),
+                max_body_size,
+            )
+            timeout_seconds = _coerce_positive_float(
+                batch_value.get("timeout", timeout_seconds),
+                timeout_seconds,
+            )
 
-    return enabled, max_requests
+    return enabled, max_requests, max_body_size, timeout_seconds
 
 
 async def _parse_batch_payload(
@@ -830,48 +889,72 @@ async def api_list_records(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
-    # --- Rule enforcement ---
-    auth_ctx, request_context = _prepare_rule_context(request, auth)
-    rule_result = check_rule(collection.list_rule, auth_ctx)
+    event = RecordRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        auth=auth,
+        page=page,
+        per_page=perPage,
+        sort=sort,
+        filter=filter,
+        expand=expand,
+        fields=fields,
+        skip_total=skipTotal,
+        engine=engine,
+    )
 
-    if rule_result is False:
-        # PocketBase returns 403 for locked (null) rules
-        return _error_response(
-            403,
-            "Only superusers can perform this action.",
-        )
+    async def _default_list_handler(e: RecordRequestEvent) -> JSONResponse:
+        auth_ctx, request_context = _prepare_rule_context(request, e.auth)
+        rule_result = check_rule(collection.list_rule, auth_ctx)
 
-    # Merge rule expression with user-supplied filter
-    effective_filter = filter
-    if isinstance(rule_result, str):
-        if effective_filter:
-            effective_filter = f"({rule_result}) && ({effective_filter})"
-        else:
-            effective_filter = rule_result
+        if rule_result is False:
+            return _error_response(
+                403,
+                "Only superusers can perform this action.",
+            )
 
-    try:
-        result = await list_records(
-            engine,
-            collection,
-            page=page,
-            per_page=perPage,
-            sort=sort,
-            filter_str=effective_filter,
-            fields=fields,
-            skip_total=skipTotal,
-            request_context=request_context,
-        )
-    except ValueError as exc:
-        return _error_response(400, str(exc))
+        effective_filter = e.filter
+        if isinstance(rule_result, str):
+            if effective_filter:
+                effective_filter = f"({rule_result}) && ({effective_filter})"
+            else:
+                effective_filter = rule_result
 
-    # Expand relations if requested
-    if expand and result["items"]:
-        all_colls = await get_all_collections(engine)
-        await expand_records(
-            engine, collection, result["items"], expand, all_colls,
-        )
+        try:
+            result = await list_records(
+                e.engine or engine,
+                collection,
+                page=e.page or 1,
+                per_page=e.per_page or 30,
+                sort=e.sort,
+                filter_str=effective_filter,
+                fields=e.fields,
+                skip_total=bool(e.skip_total),
+                request_context=request_context,
+            )
+        except ValueError as exc:
+            return _error_response(400, str(exc))
 
-    return JSONResponse(content=result, status_code=200)
+        if e.expand and result["items"]:
+            all_colls = await get_all_collections(e.engine or engine)
+            await expand_records(
+                e.engine or engine,
+                collection,
+                result["items"],
+                e.expand,
+                all_colls,
+            )
+
+        return JSONResponse(content=result, status_code=200)
+
+    return await _trigger_record_request_hook(
+        request,
+        HOOK_RECORDS_LIST_REQUEST,
+        event,
+        _default_list_handler,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -934,71 +1017,113 @@ async def api_create_record(
     if not isinstance(data, dict):
         return _error_response(400, "Request body must be a JSON object.")
 
-    # --- Rule enforcement ---
-    auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
-    rule_result = check_rule(collection.create_rule, auth_ctx)
-    col_type = getattr(collection, "type", "base") or "base"
-    managed_create_keys: set[str] = set()
-    if col_type == "auth":
-        managed_create_keys = {k for k in data.keys() if k in _AUTH_MANAGED_CREATE_FIELDS}
+    event = RecordRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        auth=auth,
+        data=data,
+        files=files,
+        expand=expand,
+        fields=fields,
+        engine=engine,
+    )
 
-    if rule_result is False:
-        # PocketBase returns 403 for locked (null) rules
-        return _error_response(
-            403,
-            "Only superusers can perform this action.",
-        )
+    async def _default_create_handler(e: RecordRequestEvent) -> JSONResponse:
+        active_engine = e.engine or engine
+        if not isinstance(e.data, dict):
+            return _error_response(400, "Request body must be a JSON object.")
 
-    try:
-        record = await create_record(engine, collection, data, files=files)
-    except _ValidationErrors as exc:
-        return _error_response(400, _validation_message("Failed to create record.", exc.errors), exc.errors)
-    except Exception as exc:
-        import logging
-        logging.getLogger("ppbase").exception("Record creation failed")
-        return _error_response(400, "Failed to create record.", {})
+        payload = dict(e.data)
+        payload_files = dict(e.files)
 
-    # If rule is an expression, verify the created record matches it.
-    # PocketBase evaluates the rule via a CTE before commit; we check
-    # after insert and rollback (delete) on mismatch.
-    if isinstance(rule_result, str):
-        matches = await check_record_rule(
-            engine, collection, record["id"], rule_result, request_context,
-        )
-        if not matches:
-            await delete_record(engine, collection, record["id"])
-            return _error_response(
-                400,
-                "Failed to create record.",
-                {"rule": {"code": "validation_rule_failed", "message": "Action not allowed."}},
-            )
+        auth_ctx, request_context = _prepare_rule_context(request, e.auth, data=payload)
+        rule_result = check_rule(collection.create_rule, auth_ctx)
+        col_type = getattr(collection, "type", "base") or "base"
+        managed_create_keys: set[str] = set()
+        if col_type == "auth":
+            managed_create_keys = {
+                key for key in payload.keys() if key in _AUTH_MANAGED_CREATE_FIELDS
+            }
 
-    # For auth collections, certain managed fields during create require
-    # manageRule permission (or superuser).
-    if managed_create_keys:
-        has_manage_access = await _has_manage_access_for_auth_record(
-            engine,
-            collection,
-            record["id"],
-            auth_ctx,
-            request_context,
-        )
-        if not has_manage_access:
-            await delete_record(engine, collection, record["id"])
+        if rule_result is False:
             return _error_response(
                 403,
-                "The authorized record model is not allowed to perform this action.",
+                "Only superusers can perform this action.",
             )
 
-    # Expand relations if requested
-    if expand and record:
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [record], expand, all_colls,
-        )
-        record = records[0] if records else record
+        try:
+            record = await create_record(active_engine, collection, payload, files=payload_files)
+        except _ValidationErrors as exc:
+            return _error_response(
+                400,
+                _validation_message("Failed to create record.", exc.errors),
+                exc.errors,
+            )
+        except Exception:
+            import logging
 
-    return JSONResponse(content=record, status_code=200)
+            logging.getLogger("ppbase").exception("Record creation failed")
+            return _error_response(400, "Failed to create record.", {})
+
+        if isinstance(rule_result, str):
+            matches = await check_record_rule(
+                active_engine,
+                collection,
+                record["id"],
+                rule_result,
+                request_context,
+            )
+            if not matches:
+                raise _AbortWithResponse(
+                    _error_response(
+                        400,
+                        "Failed to create record.",
+                        {"rule": {"code": "validation_rule_failed", "message": "Action not allowed."}},
+                    )
+                )
+
+        if managed_create_keys:
+            has_manage_access = await _has_manage_access_for_auth_record(
+                active_engine,
+                collection,
+                record["id"],
+                auth_ctx,
+                request_context,
+            )
+            if not has_manage_access:
+                raise _AbortWithResponse(
+                    _error_response(
+                        403,
+                        "The authorized record model is not allowed to perform this action.",
+                    )
+                )
+
+        if e.expand and record:
+            all_colls = await get_all_collections(active_engine)
+            records = await expand_records(
+                active_engine,
+                collection,
+                [record],
+                e.expand,
+                all_colls,
+            )
+            record = records[0] if records else record
+
+        return JSONResponse(content=record, status_code=200)
+
+    try:
+        async with engine.begin() as conn:
+            event.engine = _ConnectionEngineAdapter(conn)
+            return await _trigger_record_request_hook(
+                request,
+                HOOK_RECORD_CREATE_REQUEST,
+                event,
+                _default_create_handler,
+            )
+    except _AbortWithResponse as abort:
+        return abort.response
 
 
 # ---------------------------------------------------------------------------
@@ -1022,38 +1147,64 @@ async def api_get_record(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
-    # --- Rule enforcement ---
-    auth_ctx, request_context = _prepare_rule_context(request, auth)
-    rule_result = check_rule(collection.view_rule, auth_ctx)
+    event = RecordRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        record_id=recordId,
+        auth=auth,
+        expand=expand,
+        fields=fields,
+        engine=engine,
+    )
 
-    if rule_result is False:
-        # PocketBase returns 403 for locked (null) rules
-        return _error_response(
-            403,
-            "Only superusers can perform this action.",
+    async def _default_view_handler(e: RecordRequestEvent) -> JSONResponse:
+        active_engine = e.engine or engine
+        auth_ctx, request_context = _prepare_rule_context(request, e.auth)
+        rule_result = check_rule(collection.view_rule, auth_ctx)
+
+        if rule_result is False:
+            return _error_response(
+                403,
+                "Only superusers can perform this action.",
+            )
+
+        record = await get_record(
+            active_engine,
+            collection,
+            e.record_id or recordId,
+            fields=e.fields,
         )
-
-    record = await get_record(engine, collection, recordId, fields=fields)
-    if record is None:
-        return _error_response(404, "The requested resource wasn't found.")
-
-    # If rule is an expression, verify the record matches it
-    if isinstance(rule_result, str):
-        matches = await check_record_rule(
-            engine, collection, recordId, rule_result, request_context,
-        )
-        if not matches:
+        if record is None:
             return _error_response(404, "The requested resource wasn't found.")
 
-    # Expand relations if requested
-    if expand and record:
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [record], expand, all_colls,
-        )
-        record = records[0] if records else record
+        if isinstance(rule_result, str):
+            matches = await check_record_rule(
+                active_engine,
+                collection,
+                e.record_id or recordId,
+                rule_result,
+                request_context,
+            )
+            if not matches:
+                return _error_response(404, "The requested resource wasn't found.")
 
-    return JSONResponse(content=record, status_code=200)
+        if e.expand and record:
+            all_colls = await get_all_collections(active_engine)
+            records = await expand_records(
+                active_engine, collection, [record], e.expand, all_colls,
+            )
+            record = records[0] if records else record
+
+        return JSONResponse(content=record, status_code=200)
+
+    return await _trigger_record_request_hook(
+        request,
+        HOOK_RECORD_VIEW_REQUEST,
+        event,
+        _default_view_handler,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1117,69 +1268,119 @@ async def api_update_record(
     if not isinstance(data, dict):
         return _error_response(400, "Request body must be a JSON object.")
 
-    # --- Rule enforcement ---
-    auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
-    rule_result = check_rule(collection.update_rule, auth_ctx)
+    event = RecordRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        record_id=recordId,
+        auth=auth,
+        data=data,
+        files=files,
+        expand=expand,
+        fields=fields,
+        engine=engine,
+    )
 
-    if rule_result is False:
-        # PocketBase returns 403 for locked (null) rules
-        return _error_response(
-            403,
-            "Only superusers can perform this action.",
-        )
+    async def _default_update_handler(e: RecordRequestEvent) -> JSONResponse:
+        active_engine = e.engine or engine
+        if not isinstance(e.data, dict):
+            return _error_response(400, "Request body must be a JSON object.")
 
-    # If rule is an expression, verify the existing record matches it
-    if isinstance(rule_result, str):
-        matches = await check_record_rule(
-            engine, collection, recordId, rule_result, request_context,
-        )
-        if not matches:
-            return _error_response(404, "The requested resource wasn't found.")
+        payload = dict(e.data)
+        payload_files = dict(e.files)
+        target_record_id = e.record_id or recordId
 
-    # Auth collections have additional manageRule-based restrictions for
-    # sensitive fields like verified/email/password edits.
-    col_type = getattr(collection, "type", "base") or "base"
-    if col_type == "auth":
-        managed_keys = {k for k in data.keys() if k in _AUTH_MANAGED_UPDATE_FIELDS}
-        if managed_keys:
-            has_manage_access = await _has_manage_access_for_auth_record(
-                engine,
+        auth_ctx, request_context = _prepare_rule_context(request, e.auth, data=payload)
+        rule_result = check_rule(collection.update_rule, auth_ctx)
+
+        if rule_result is False:
+            return _error_response(
+                403,
+                "Only superusers can perform this action.",
+            )
+
+        if isinstance(rule_result, str):
+            matches = await check_record_rule(
+                active_engine,
                 collection,
-                recordId,
-                auth_ctx,
+                target_record_id,
+                rule_result,
                 request_context,
             )
-            if not has_manage_access:
-                if not (
-                    _is_self_auth_target(auth, collection, recordId)
-                    and managed_keys.issubset(_AUTH_SELF_ALLOWED_UPDATE_FIELDS)
-                ):
-                    return _error_response(
-                        403,
-                        "The authorized record model is not allowed to perform this action.",
-                    )
+            if not matches:
+                return _error_response(404, "The requested resource wasn't found.")
+
+        col_type = getattr(collection, "type", "base") or "base"
+        if col_type == "auth":
+            managed_keys = {
+                key for key in payload.keys() if key in _AUTH_MANAGED_UPDATE_FIELDS
+            }
+            if managed_keys:
+                has_manage_access = await _has_manage_access_for_auth_record(
+                    active_engine,
+                    collection,
+                    target_record_id,
+                    auth_ctx,
+                    request_context,
+                )
+                if not has_manage_access:
+                    if not (
+                        _is_self_auth_target(e.auth, collection, target_record_id)
+                        and managed_keys.issubset(_AUTH_SELF_ALLOWED_UPDATE_FIELDS)
+                    ):
+                        return _error_response(
+                            403,
+                            "The authorized record model is not allowed to perform this action.",
+                        )
+
+        try:
+            record = await update_record(
+                active_engine,
+                collection,
+                target_record_id,
+                payload,
+                files=payload_files,
+            )
+        except _ValidationErrors as exc:
+            return _error_response(
+                400,
+                _validation_message("Failed to update record.", exc.errors),
+                exc.errors,
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger("ppbase").exception("Record update failed")
+            return _error_response(400, "Failed to update record.", {})
+
+        if record is None:
+            return _error_response(404, "The requested resource wasn't found.")
+
+        if e.expand and record:
+            all_colls = await get_all_collections(active_engine)
+            records = await expand_records(
+                active_engine,
+                collection,
+                [record],
+                e.expand,
+                all_colls,
+            )
+            record = records[0] if records else record
+
+        return JSONResponse(content=record, status_code=200)
 
     try:
-        record = await update_record(engine, collection, recordId, data, files=files)
-    except _ValidationErrors as exc:
-        return _error_response(400, _validation_message("Failed to update record.", exc.errors), exc.errors)
-    except Exception as exc:
-        import logging
-        logging.getLogger("ppbase").exception("Record update failed")
-        return _error_response(400, "Failed to update record.", {})
-
-    if record is None:
-        return _error_response(404, "The requested resource wasn't found.")
-
-    # Expand relations if requested
-    if expand and record:
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [record], expand, all_colls,
-        )
-        record = records[0] if records else record
-
-    return JSONResponse(content=record, status_code=200)
+        async with engine.begin() as conn:
+            event.engine = _ConnectionEngineAdapter(conn)
+            return await _trigger_record_request_hook(
+                request,
+                HOOK_RECORD_UPDATE_REQUEST,
+                event,
+                _default_update_handler,
+            )
+    except _AbortWithResponse as abort:
+        return abort.response
 
 
 # ---------------------------------------------------------------------------
@@ -1209,34 +1410,63 @@ async def api_delete_record(
             "Use the admin auth endpoints instead.",
         )
 
-    # --- Rule enforcement ---
-    auth_ctx, request_context = _prepare_rule_context(request, auth)
-    rule_result = check_rule(collection.delete_rule, auth_ctx)
-
-    if rule_result is False:
-        # PocketBase returns 403 for locked (null) rules
-        return _error_response(
-            403,
-            "Only superusers can perform this action.",
-        )
-
-    # If rule is an expression, verify the existing record matches it
-    if isinstance(rule_result, str):
-        matches = await check_record_rule(
-            engine, collection, recordId, rule_result, request_context,
-        )
-        if not matches:
-            return _error_response(404, "The requested resource wasn't found.")
-
-    all_colls = await get_all_collections(engine)
-    deleted = await delete_record(
-        engine, collection, recordId, all_collections=all_colls,
+    event = RecordRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        record_id=recordId,
+        auth=auth,
+        engine=engine,
     )
 
-    if not deleted:
-        return _error_response(404, "The requested resource wasn't found.")
+    async def _default_delete_handler(e: RecordRequestEvent) -> JSONResponse:
+        active_engine = e.engine or engine
+        target_record_id = e.record_id or recordId
+        auth_ctx, request_context = _prepare_rule_context(request, e.auth)
+        rule_result = check_rule(collection.delete_rule, auth_ctx)
 
-    return JSONResponse(content=None, status_code=204)
+        if rule_result is False:
+            return _error_response(
+                403,
+                "Only superusers can perform this action.",
+            )
+
+        if isinstance(rule_result, str):
+            matches = await check_record_rule(
+                active_engine,
+                collection,
+                target_record_id,
+                rule_result,
+                request_context,
+            )
+            if not matches:
+                return _error_response(404, "The requested resource wasn't found.")
+
+        all_colls = await get_all_collections(active_engine)
+        deleted = await delete_record(
+            active_engine,
+            collection,
+            target_record_id,
+            all_collections=all_colls,
+        )
+
+        if not deleted:
+            return _error_response(404, "The requested resource wasn't found.")
+
+        return Response(status_code=204)
+
+    try:
+        async with engine.begin() as conn:
+            event.engine = _ConnectionEngineAdapter(conn)
+            return await _trigger_record_request_hook(
+                request,
+                HOOK_RECORD_DELETE_REQUEST,
+                event,
+                _default_delete_handler,
+            )
+    except _AbortWithResponse as abort:
+        return abort.response
 
 
 # ---------------------------------------------------------------------------
@@ -1252,9 +1482,16 @@ async def api_batch_records(
     """Execute multiple record actions in a single transaction."""
     engine = get_engine()
 
-    batch_enabled, max_requests = await _get_batch_settings(engine)
+    batch_enabled, max_requests, max_body_size, timeout_seconds = await _get_batch_settings(engine)
     if not batch_enabled:
         return _error_response(403, "Batch requests are not allowed.")
+
+    request_body = await request.body()
+    if max_body_size > 0 and len(request_body) > max_body_size:
+        return _error_response(
+            400,
+            f"The allowed max batch request body size is {max_body_size} bytes.",
+        )
 
     payload, files_by_request, parse_error = await _parse_batch_payload(request)
     if parse_error is not None:
@@ -1274,29 +1511,30 @@ async def api_batch_records(
     result_items: list[dict[str, Any]] = []
     created_targets: set[tuple[str, str]] = set()
     try:
-        async with engine.begin() as conn:
-            batch_engine = _ConnectionEngineAdapter(conn)
-            all_collections = await get_all_collections(batch_engine)
+        async with asyncio.timeout(timeout_seconds):
+            async with engine.begin() as conn:
+                batch_engine = _ConnectionEngineAdapter(conn)
+                all_collections = await get_all_collections(batch_engine)
 
-            for index, item in enumerate(requests_payload):
-                response_or_error = await _execute_batch_request(
-                    batch_engine,
-                    request,
-                    auth,
-                    item,
-                    files_by_request.get(index, {}),
-                    all_collections,
-                )
-                if isinstance(response_or_error, JSONResponse):
-                    raise _BatchRequestFailed(index, _response_json_body(response_or_error))
+                for index, item in enumerate(requests_payload):
+                    response_or_error = await _execute_batch_request(
+                        batch_engine,
+                        request,
+                        auth,
+                        item,
+                        files_by_request.get(index, {}),
+                        all_collections,
+                    )
+                    if isinstance(response_or_error, JSONResponse):
+                        raise _BatchRequestFailed(index, _response_json_body(response_or_error))
 
-                status, body, created_target = response_or_error
-                if created_target is not None:
-                    created_targets.add(created_target)
-                result_items.append({
-                    "status": status,
-                    "body": body,
-                })
+                    status, body, created_target = response_or_error
+                    if created_target is not None:
+                        created_targets.add(created_target)
+                    result_items.append({
+                        "status": status,
+                        "body": body,
+                    })
     except _BatchRequestFailed as exc:
         if created_targets:
             from ppbase.services.file_storage import delete_all_files
@@ -1313,6 +1551,22 @@ async def api_batch_records(
                         "message": "Batch request failed.",
                         "response": exc.response,
                     },
+                },
+            },
+        )
+    except TimeoutError:
+        if created_targets:
+            from ppbase.services.file_storage import delete_all_files
+
+            for collection_id, record_id in created_targets:
+                delete_all_files(collection_id, record_id)
+        return _error_response(
+            400,
+            "Batch transaction failed.",
+            {
+                "timeout": {
+                    "code": "batch_timeout",
+                    "message": "Batch request timeout reached.",
                 },
             },
         )

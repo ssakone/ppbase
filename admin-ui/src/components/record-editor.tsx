@@ -58,12 +58,17 @@ export function RecordEditor({
   const [formData, setFormData] = useState<Record<string, unknown>>({})
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
-  // Password change state for _superusers collection
+  // Auth collection detection — includes _superusers and any collection with type=auth
   const isSuperusersCollection = collection.name === '_superusers'
+  const isAuthCollection = collection.type === 'auth' || isSuperusersCollection
   const [changePassword, setChangePassword] = useState(false)
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [isChangingPassword, setIsChangingPassword] = useState(false)
+  // Auth field state for create form on auth collections
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authPasswordConfirm, setAuthPasswordConfirm] = useState('')
 
   // Initialize form data
   useEffect(() => {
@@ -95,12 +100,30 @@ export function RecordEditor({
 
   const handleSave = async () => {
     console.log('[RecordEditor] handleSave formData:', JSON.stringify(formData, (k, v) => v instanceof File ? `[File: ${v.name}]` : v, 2))
+
+    // Validate auth fields on create for auth collections
+    if (!isEditing && isAuthCollection) {
+      if (!authEmail) { toast.error('Email is required'); return }
+      if (!authPassword) { toast.error('Password is required'); return }
+      if (authPassword !== authPasswordConfirm) { toast.error('Passwords do not match'); return }
+      if (authPassword.length < 8) { toast.error('Password must be at least 8 characters'); return }
+    }
+
+    const payload = {
+      ...formData,
+      ...((!isEditing && isAuthCollection) ? {
+        email: authEmail,
+        password: authPassword,
+        passwordConfirm: authPasswordConfirm,
+      } : {}),
+    }
+
     try {
       if (isEditing) {
         await updateMutation.mutateAsync({ id: recordId!, data: formData })
         toast.success('Record updated successfully')
       } else {
-        await createMutation.mutateAsync(formData)
+        await createMutation.mutateAsync(payload)
         toast.success('Record created successfully')
       }
       onClose()
@@ -219,6 +242,44 @@ export function RecordEditor({
               </div>
             ) : (
               <div className="space-y-4 py-4">
+                {/* Auth fields for create on auth collections */}
+                {!isEditing && isAuthCollection && (
+                  <div className="space-y-3 pb-2 border-b">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="auth-email">Email *</Label>
+                      <Input
+                        id="auth-email"
+                        type="email"
+                        placeholder="user@example.com"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                      />
+                    </div>
+                    <div className="flex gap-3">
+                      <div className="flex-1 space-y-1.5">
+                        <Label htmlFor="auth-password">Password *</Label>
+                        <Input
+                          id="auth-password"
+                          type="password"
+                          placeholder="Min. 8 characters"
+                          value={authPassword}
+                          onChange={(e) => setAuthPassword(e.target.value)}
+                        />
+                      </div>
+                      <div className="flex-1 space-y-1.5">
+                        <Label htmlFor="auth-password-confirm">Confirm *</Label>
+                        <Input
+                          id="auth-password-confirm"
+                          type="password"
+                          placeholder="Repeat password"
+                          value={authPasswordConfirm}
+                          onChange={(e) => setAuthPasswordConfirm(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {fields.map((field) => (
                   <RecordFieldInput
                     key={field.name}
@@ -230,14 +291,14 @@ export function RecordEditor({
                     collectionId={collection.id}
                   />
                 ))}
-                {fields.length === 0 && (
+                {fields.length === 0 && !isAuthCollection && (
                   <p className="text-sm text-muted-foreground py-4">
                     This collection has no editable fields.
                   </p>
                 )}
 
-                {/* Password change section for _superusers */}
-                {isSuperusersCollection && isEditing && (
+                {/* Password change section for auth collections */}
+                {isAuthCollection && isEditing && (
                   <div className="border-t pt-4 mt-4 space-y-4">
                     <div className="flex items-center gap-3">
                       <Checkbox
@@ -303,7 +364,7 @@ export function RecordEditor({
             <Button variant="outline" onClick={onClose} disabled={isSaving}>
               Cancel
             </Button>
-            <Button onClick={handleSave} disabled={isSaving || fields.length === 0}>
+            <Button onClick={handleSave} disabled={isSaving || (fields.length === 0 && !isAuthCollection)}>
               {isSaving && <LoadingSpinner size="sm" className="mr-2" />}
               {isEditing ? 'Save changes' : 'Create'}
             </Button>

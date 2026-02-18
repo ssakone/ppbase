@@ -61,6 +61,25 @@ async function findOtpCode(email: string, otpId: string, timeoutMs = 2500): Prom
   return null;
 }
 
+async function expectPbError(
+  action: () => Promise<unknown>,
+  status: number,
+  code?: string
+): Promise<any> {
+  try {
+    await action();
+    throw new Error(`Expected request to fail with status ${status}`);
+  } catch (err: any) {
+    expect(err).toBeTruthy();
+    expect(err.status).toBe(status);
+    if (code) {
+      expect(err.response?.data).toBeTruthy();
+      expect(err.response.data.email?.code).toBe(code);
+    }
+    return err;
+  }
+}
+
 describe('Auth Collection Flows', () => {
   let adminPb: PocketBase;
   let authCollection: any;
@@ -588,6 +607,120 @@ describe('Auth Collection Flows', () => {
     } finally {
       await cleanup();
     }
+  });
+
+  it('should reject self email update without manageRule access', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      type: 'auth',
+      createRule: '',
+      listRule: '',
+      viewRule: '',
+      updateRule: 'id = @request.auth.id',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+      const email = `self_email_${Date.now()}@example.com`;
+      const newEmail = `self_email_new_${Date.now()}@example.com`;
+      const password = 'password123';
+
+      const user = await pb.collection(collection.name).create({
+        email,
+        password,
+        passwordConfirm: password,
+      });
+      await pb.collection(collection.name).authWithPassword(email, password);
+
+      await expectPbError(
+        () => pb.collection(collection.name).update(user.id, { email: newEmail }),
+        403
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should allow self password update without manageRule and require new password', async () => {
+    const { collection, cleanup } = await createTestCollection(adminPb, {
+      type: 'auth',
+      createRule: '',
+      listRule: '',
+      viewRule: '',
+      updateRule: 'id = @request.auth.id',
+      deleteRule: '',
+    });
+
+    try {
+      const pb = getFreshPb();
+      const email = `self_pwd_${Date.now()}@example.com`;
+      const oldPassword = 'password123';
+      const newPassword = 'password456';
+
+      const user = await pb.collection(collection.name).create({
+        email,
+        password: oldPassword,
+        passwordConfirm: oldPassword,
+      });
+      await pb.collection(collection.name).authWithPassword(email, oldPassword);
+
+      await pb.collection(collection.name).update(user.id, {
+        password: newPassword,
+        passwordConfirm: newPassword,
+      });
+
+      const fresh = getFreshPb();
+      await expect(
+        fresh.collection(collection.name).authWithPassword(email, oldPassword)
+      ).rejects.toThrow();
+
+      const reauth = await fresh.collection(collection.name).authWithPassword(email, newPassword);
+      expect(reauth.record.id).toBe(user.id);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('should enforce unique email validation on admin auth-record update', async () => {
+    const pb = getFreshPb();
+    const email1 = `update_unique_1_${Date.now()}@example.com`;
+    const email2 = `update_unique_2_${Date.now()}@example.com`;
+    const password = 'password123';
+
+    const user1 = await pb.collection(authCollection.name).create({
+      email: email1,
+      password,
+      passwordConfirm: password,
+    });
+    await pb.collection(authCollection.name).create({
+      email: email2,
+      password,
+      passwordConfirm: password,
+    });
+
+    await expectPbError(
+      () => adminPb.collection(authCollection.name).update(user1.id, { email: email2 }),
+      400,
+      'validation_not_unique'
+    );
+  });
+
+  it('should enforce email format validation on admin auth-record update', async () => {
+    const pb = getFreshPb();
+    const email = `update_format_${Date.now()}@example.com`;
+    const password = 'password123';
+
+    const user = await pb.collection(authCollection.name).create({
+      email,
+      password,
+      passwordConfirm: password,
+    });
+
+    await expectPbError(
+      () => adminPb.collection(authCollection.name).update(user.id, { email: 'not-valid' }),
+      400,
+      'validation_invalid_email'
+    );
   });
 
   it('should request email change for an authenticated record', async () => {

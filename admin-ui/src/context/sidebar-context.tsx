@@ -1,9 +1,9 @@
 import React, { createContext, useContext, useState, useCallback } from 'react'
 
 const COLLECTIONS_PANEL_WIDTH_KEY = 'ppbase_collections_panel_width'
-const DEFAULT_WIDTH = 300
-const MIN_WIDTH = 200
-const MAX_WIDTH = 500
+const DEFAULT_WIDTH = 340
+const MIN_WIDTH = 220
+const MAX_WIDTH = 520
 
 interface SidebarContextType {
   activeSection: 'collections' | 'migrations' | 'settings'

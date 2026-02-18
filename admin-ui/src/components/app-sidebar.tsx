@@ -49,7 +49,7 @@ function SidebarResizeHandle() {
       aria-orientation="vertical"
       aria-valuenow={collectionsPanelWidth}
       onMouseDown={handleMouseDown}
-      className="w-1 shrink-0 cursor-col-resize border-r border-transparent hover:border-slate-200 hover:bg-slate-100 group transition-colors flex items-center justify-center"
+      className="w-1.5 shrink-0 cursor-col-resize border-r border-transparent hover:border-slate-200 hover:bg-slate-100/80 group transition-all duration-150 flex items-center justify-center"
       title="Drag to resize"
     >
       <div className="w-0.5 h-8 rounded-full bg-slate-300 opacity-0 group-hover:opacity-100 transition-opacity" />

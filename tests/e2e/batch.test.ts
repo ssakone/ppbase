@@ -95,6 +95,153 @@ describe('Batch API', () => {
     expect(upsert.count).toBe(3)
   })
 
+  it('should reject batch requests when batch setting is disabled', async () => {
+    const settings = await adminPb.settings.getAll()
+    const previousBatch = { ...(settings.batch || {}) }
+
+    try {
+      await adminPb.settings.update({
+        batch: {
+          ...previousBatch,
+          enabled: false,
+        },
+      })
+
+      await expect(
+        adminPb.send('/api/batch', {
+          method: 'POST',
+          body: {
+            requests: [
+              {
+                method: 'POST',
+                url: `/api/collections/${collection.name}/records`,
+                body: { id: randomRecordId(), title: 'disabled-batch' },
+              },
+            ],
+          },
+        }),
+      ).rejects.toThrow(/Batch requests are not allowed/i)
+    } finally {
+      await adminPb.settings.update({
+        batch: previousBatch,
+      })
+    }
+  })
+
+  it('should enforce batch maxRequests setting', async () => {
+    const settings = await adminPb.settings.getAll()
+    const previousBatch = { ...(settings.batch || {}) }
+
+    try {
+      await adminPb.settings.update({
+        batch: {
+          ...previousBatch,
+          enabled: true,
+          maxRequests: 1,
+        },
+      })
+
+      await expect(
+        adminPb.send('/api/batch', {
+          method: 'POST',
+          body: {
+            requests: [
+              {
+                method: 'POST',
+                url: `/api/collections/${collection.name}/records`,
+                body: { id: randomRecordId(), title: 'first' },
+              },
+              {
+                method: 'POST',
+                url: `/api/collections/${collection.name}/records`,
+                body: { id: randomRecordId(), title: 'second' },
+              },
+            ],
+          },
+        }),
+      ).rejects.toThrow(/allowed max number of batch requests is 1/i)
+    } finally {
+      await adminPb.settings.update({
+        batch: previousBatch,
+      })
+    }
+  })
+
+  it('should enforce batch maxBodySize setting', async () => {
+    const settings = await adminPb.settings.getAll()
+    const previousBatch = { ...(settings.batch || {}) }
+
+    try {
+      await adminPb.settings.update({
+        batch: {
+          ...previousBatch,
+          enabled: true,
+          maxBodySize: 80,
+        },
+      })
+
+      await expect(
+        adminPb.send('/api/batch', {
+          method: 'POST',
+          body: {
+            requests: [
+              {
+                method: 'POST',
+                url: `/api/collections/${collection.name}/records`,
+                body: {
+                  id: randomRecordId(),
+                  title: 'this-title-is-long-enough-to-force-a-larger-json-payload',
+                },
+              },
+            ],
+          },
+        }),
+      ).rejects.toThrow(/max batch request body size/i)
+    } finally {
+      await adminPb.settings.update({
+        batch: previousBatch,
+      })
+    }
+  })
+
+  it('should rollback and fail when batch processing exceeds timeout setting', async () => {
+    const settings = await adminPb.settings.getAll()
+    const previousBatch = { ...(settings.batch || {}) }
+
+    try {
+      await adminPb.settings.update({
+        batch: {
+          ...previousBatch,
+          enabled: true,
+          timeout: 0.001,
+          maxRequests: 200,
+        },
+      })
+
+      const requestItems = Array.from({ length: 180 }, () => ({
+        method: 'POST',
+        url: `/api/collections/${collection.name}/records`,
+        body: {
+          id: randomRecordId(),
+          title: 'timeout-check',
+        },
+      }))
+
+      await expect(
+        adminPb.send('/api/batch', {
+          method: 'POST',
+          body: {
+            requests: requestItems,
+          },
+        }),
+      ).rejects.toThrow(/Batch transaction failed/i)
+    } finally {
+      await adminPb.settings.update({
+        batch: previousBatch,
+      })
+    }
+  })
+
   it('should rollback all operations when one nested request fails', async () => {
     const rollbackId = randomRecordId()
 

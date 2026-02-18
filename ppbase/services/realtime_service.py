@@ -12,6 +12,9 @@ from urllib.parse import parse_qs
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from ppbase.ext.events import RealtimeMessageSendEvent
+from ppbase.ext.registry import HOOK_REALTIME_MESSAGE_SEND
+
 logger = logging.getLogger(__name__)
 
 
@@ -114,9 +117,10 @@ def _normalize_request_headers(headers: dict[str, Any] | None) -> dict[str, Any]
 class SubscriptionManager:
     """Manage SSE realtime client sessions and subscriptions."""
 
-    def __init__(self):
+    def __init__(self, extension_registry: Any | None = None):
         self.sessions: dict[str, RealtimeSession] = {}
         self._lock = asyncio.Lock()
+        self.extension_registry = extension_registry
 
     def register_client(self) -> str:
         """Register a new client and return client ID."""
@@ -315,15 +319,46 @@ async def broadcast_record_change(
                 sub_event_data = maybe_event_data
 
             try:
-                # Use the subscription topic as the SSE event name
-                await session.response_queue.put(
-                    {
-                        "topic": sub.topic,  # subscription topic = SSE event name
-                        "data": sub_event_data,
-                    }
+                await _send_realtime_message(
+                    subscription_manager=subscription_manager,
+                    session=session,
+                    client_id=client_id,
+                    subscription=sub,
+                    topic=sub.topic,
+                    data=sub_event_data,
                 )
-            except Exception as e:
-                logger.error(f"Failed to queue event for client {client_id}: {e}")
+            except Exception as exc:
+                logger.error("Failed to queue event for client %s: %s", client_id, exc)
+
+
+async def _send_realtime_message(
+    *,
+    subscription_manager: SubscriptionManager,
+    session: RealtimeSession,
+    client_id: str,
+    subscription: RealtimeSubscription,
+    topic: str,
+    data: dict[str, Any],
+) -> None:
+    extension_registry = getattr(subscription_manager, "extension_registry", None)
+    if extension_registry is None:
+        await session.response_queue.put({"topic": topic, "data": data})
+        return
+
+    event = RealtimeMessageSendEvent(
+        subscription_manager=subscription_manager,
+        session=session,
+        client_id=client_id,
+        subscription=subscription,
+        topic=topic,
+        data=data,
+    )
+    hook = extension_registry.hooks.get(HOOK_REALTIME_MESSAGE_SEND)
+
+    async def _default_send_handler(e: RealtimeMessageSendEvent) -> None:
+        await session.response_queue.put({"topic": e.topic, "data": e.data})
+
+    await hook.trigger(event, _default_send_handler)
 
 
 def _build_rule_context(

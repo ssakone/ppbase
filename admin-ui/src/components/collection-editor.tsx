@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Field } from '@/api/types'
+import { Field, CollectionOAuth2Options } from '@/api/types'
 import {
   useCollection,
   useCreateCollection,
@@ -64,6 +64,11 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
     deleteRule: '',
   })
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [oauth2Options, setOAuth2Options] = useState<CollectionOAuth2Options>({
+    enabled: false,
+    mappedFields: { name: 'name', username: 'username', avatarURL: 'avatar' },
+    providers: [],
+  })
 
   // Populate form when editing
   useEffect(() => {
@@ -81,6 +86,9 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
       if (existingCollection.type === 'view' && existingCollection.options?.query) {
         setViewQuery(existingCollection.options.query as string)
       }
+      if (existingCollection.type === 'auth' && existingCollection.options?.oauth2) {
+        setOAuth2Options(existingCollection.options.oauth2 as CollectionOAuth2Options)
+      }
     }
   }, [mode, existingCollection])
 
@@ -92,6 +100,7 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
       setFields([])
       setViewQuery('')
       setRules({ listRule: '', viewRule: '', createRule: '', updateRule: '', deleteRule: '' })
+      setOAuth2Options({ enabled: false, mappedFields: { name: 'name', username: 'username', avatarURL: 'avatar' }, providers: [] })
     }
   }, [mode, open])
 
@@ -130,6 +139,8 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
 
     if (type === 'view') {
       payload.options = { query: viewQuery.trim() }
+    } else if (type === 'auth') {
+      payload.options = { oauth2: oauth2Options }
     } else {
       // Filter out empty-named fields
       const schema = fields.filter((f) => f.name.trim())
@@ -260,6 +271,8 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
                   setRules={setRules}
                   viewQuery={viewQuery}
                   setViewQuery={setViewQuery}
+                  oauth2Options={type === 'auth' ? oauth2Options : undefined}
+                  setOAuth2Options={type === 'auth' ? setOAuth2Options : undefined}
                 />
               </div>
 

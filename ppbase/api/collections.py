@@ -7,9 +7,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from ppbase.api.deps import require_admin
 from ppbase.db.engine import get_async_session, get_engine
 from ppbase.models.collection import (
     CollectionCreate,
@@ -21,34 +22,6 @@ from ppbase.db.schema_manager import get_database_tables
 from ppbase.services import collection_service
 
 router = APIRouter(prefix="/collections", tags=["collections"])
-
-
-# ---------------------------------------------------------------------------
-# Admin auth dependency
-# ---------------------------------------------------------------------------
-
-
-async def require_admin(
-    authorization: str | None = Header(default=None),
-) -> str:
-    """Simple admin auth dependency.
-
-    For now, checks that an Authorization header is present and non-empty.
-    Full JWT validation will be wired up when the auth module is ready.
-
-    Returns the raw token string.
-    """
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "status": 401,
-                "message": "The request requires admin authorization token to be set.",
-                "data": {},
-            },
-        )
-    # TODO: validate JWT and ensure admin role
-    return authorization
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +281,7 @@ async def list_collections(
     fields: str | None = Query(default=None),
     skipTotal: bool = Query(default=False),
     session: AsyncSession = Depends(_get_session),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """List all collections with pagination."""
     result = await collection_service.list_collections(
@@ -330,7 +303,7 @@ async def create_collection(
     data: CollectionCreate,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """Create a new collection."""
     try:
@@ -361,7 +334,7 @@ async def create_collection(
 @router.get("/meta/tables")
 async def list_database_tables(
     engine: AsyncEngine = Depends(_get_engine),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> list[dict]:
     """Return all database tables and their columns for SQL editor autocomplete."""
     return await get_database_tables(engine)
@@ -369,7 +342,7 @@ async def list_database_tables(
 
 @router.get("/meta/scaffolds")
 async def get_collection_scaffolds(
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """Return collection type scaffolds used by PocketBase dashboard clients."""
     return _collection_scaffolds()
@@ -379,7 +352,7 @@ async def get_collection_scaffolds(
 async def view_collection(
     idOrName: str,
     session: AsyncSession = Depends(_get_session),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """View a single collection by ID or name."""
     try:
@@ -403,7 +376,7 @@ async def update_collection(
     data: CollectionUpdate,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """Update an existing collection."""
     try:
@@ -437,7 +410,7 @@ async def delete_collection(
     idOrName: str,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> None:
     """Delete a collection."""
     try:
@@ -470,7 +443,7 @@ async def import_collections(
     payload: CollectionImportPayload,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> None:
     """Bulk import collections."""
     try:
@@ -498,7 +471,7 @@ async def truncate_collection(
     idOrName: str,
     session: AsyncSession = Depends(_get_session),
     engine: AsyncEngine = Depends(_get_engine),
-    _admin: str = Depends(require_admin),
+    _admin: dict[str, Any] = Depends(require_admin),
 ) -> None:
     """Truncate all records in a collection."""
     try:

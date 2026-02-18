@@ -86,7 +86,13 @@ def _stop_server() -> bool:
 _DEFAULT_DB_URL = "postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase"
 
 
-def _start_daemon(host: str, port: int, db: str | None = None) -> None:
+def _start_daemon(
+    host: str,
+    port: int,
+    db: str | None = None,
+    hooks: list[str] | None = None,
+    automigrate: bool | None = None,
+) -> None:
     """Start PPBase as a background daemon."""
     if _find_pid() is not None:
         print(f"PPBase is already running (PID {_find_pid()}).")
@@ -95,6 +101,12 @@ def _start_daemon(host: str, port: int, db: str | None = None) -> None:
     cmd = [sys.executable, "-m", "ppbase", "serve", "--host", host, "--port", str(port)]
     if db:
         cmd += ["--db", db]
+    for target in hooks or []:
+        cmd += ["--hooks", target]
+    if automigrate is True:
+        cmd += ["--automigrate"]
+    elif automigrate is False:
+        cmd += ["--no-automigrate"]
 
     env = os.environ.copy()
     env.setdefault("PPBASE_DATABASE_URL", db or _DEFAULT_DB_URL)
@@ -127,7 +139,7 @@ def _start_daemon(host: str, port: int, db: str | None = None) -> None:
 
 def _cmd_serve(args: argparse.Namespace) -> None:
     """Start the PPBase server (foreground or daemon)."""
-    from ppbase import PPBase
+    from ppbase import pb
 
     overrides: dict = {}
     if args.db:
@@ -135,12 +147,22 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     if args.automigrate is not None:
         overrides["auto_migrate"] = args.automigrate
 
-    pb = PPBase(**overrides)
+    if overrides:
+        pb.configure(**overrides)
+    for target in args.hooks:
+        pb.load_hooks(target)
+
     host = args.host or pb.settings.host
     port = args.port or pb.settings.port
 
     if getattr(args, "daemon", False):
-        _start_daemon(host, port, args.db)
+        _start_daemon(
+            host,
+            port,
+            args.db,
+            hooks=args.hooks,
+            automigrate=args.automigrate,
+        )
     else:
         print(f"Starting PPBase server at http://{host}:{port}")
         pb.start(host=host, port=port)
@@ -576,6 +598,13 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable/disable auto-migration (default: from settings)",
+    )
+    serve_parser.add_argument(
+        "--hooks",
+        action="append",
+        default=[],
+        metavar="MODULE:FUNCTION",
+        help="Load hook registration target (repeatable).",
     )
 
     # stop

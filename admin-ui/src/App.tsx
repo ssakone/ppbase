@@ -10,6 +10,7 @@ import { CollectionsPage } from '@/routes/collections/index'
 import { RecordsPage } from '@/routes/collections/[id]'
 import { MigrationsPage } from '@/routes/migrations'
 import { SettingsPage } from '@/routes/settings'
+import { LogsPage } from '@/routes/logs'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -35,6 +36,7 @@ export default function App() {
                 <Route path="/collections" element={<CollectionsPage />} />
                 <Route path="/collections/:id" element={<RecordsPage />} />
                 <Route path="/migrations" element={<MigrationsPage />} />
+                <Route path="/logs" element={<LogsPage />} />
                 <Route path="/settings" element={<SettingsPage />} />
               </Route>
               <Route path="*" element={<Navigate to="/collections" replace />} />

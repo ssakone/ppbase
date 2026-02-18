@@ -6,12 +6,16 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from ppbase.config import Settings
+
+if TYPE_CHECKING:
+    from ppbase.ext.registry import ExtensionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +47,17 @@ async def _lifespan(app: FastAPI):
     import asyncio
     from ppbase.db.engine import init_engine, close_engine
     from ppbase.db.system_tables import create_system_tables
+    from ppbase.ext.events import BootstrapEvent, ServeEvent, TerminateEvent
+    from ppbase.ext.registry import HOOK_BOOTSTRAP, HOOK_SERVE, HOOK_TERMINATE
     from ppbase.services.realtime_service import SubscriptionManager, listen_for_db_events
 
     settings: Settings = app.state.settings
+    extensions = getattr(app.state, "extension_registry", None)
+
+    if extensions is not None:
+        await extensions.hooks.get(HOOK_BOOTSTRAP).trigger(
+            BootstrapEvent(app=app, settings=settings),
+        )
 
     # Startup: create engine and ensure system tables exist
     try:
@@ -60,7 +72,7 @@ async def _lifespan(app: FastAPI):
         _handle_db_connection_error(settings.database_url, exc)
 
     # Initialize realtime subscription manager
-    subscription_manager = SubscriptionManager()
+    subscription_manager = SubscriptionManager(extension_registry=extensions)
     app.state.subscription_manager = subscription_manager
 
     # Start PostgreSQL LISTEN task for realtime events
@@ -138,7 +150,17 @@ async def _lifespan(app: FastAPI):
             f"Open {setup_url} to set up your first admin.\n"
         )
 
+    if extensions is not None:
+        await extensions.hooks.get(HOOK_SERVE).trigger(
+            ServeEvent(app=app, settings=settings),
+        )
+
     yield
+
+    if extensions is not None:
+        await extensions.hooks.get(HOOK_TERMINATE).trigger(
+            TerminateEvent(app=app, settings=settings),
+        )
 
     # Shutdown: cancel LISTEN task and dispose of the connection pool
     logger.info("Shutting down PostgreSQL LISTEN task")
@@ -151,7 +173,11 @@ async def _lifespan(app: FastAPI):
     await close_engine()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    extensions: "ExtensionRegistry | None" = None,
+) -> FastAPI:
     """Build and return the FastAPI application.
 
     Args:
@@ -174,6 +200,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Attach settings to app state so dependencies can access them
     app.state.settings = settings
+    app.state.extension_registry = extensions
 
     # CORS
     from ppbase.middleware.cors import setup_cors
@@ -204,6 +231,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # so it must also be included at the root level.
     if _realtime_router is not None:
         app.include_router(_realtime_router, tags=["realtime"])
+
+    if extensions is not None:
+        extensions.mount_routes(app)
 
     # Admin UI - serve static files from ppbase/admin/dist/
     import pathlib

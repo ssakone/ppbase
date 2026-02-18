@@ -212,4 +212,17 @@ describe('Records API', () => {
     expect(updated.tags).not.toContain('b');
     expect(updated.tags).toContain('c');
   });
+
+  it('should prepend to multi-select field with +field modifier', async () => {
+    const created = await adminPb.collection(collection.name).create({
+      title: 'Modifier Prepend Test',
+      tags: ['b', 'c'],
+    });
+
+    const updated = await adminPb.collection(collection.name).update(created.id, {
+      '+tags': 'a',
+    });
+
+    expect(updated.tags).toEqual(['a', 'b', 'c']);
+  });
 });
