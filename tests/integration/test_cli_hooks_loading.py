@@ -52,7 +52,7 @@ def test_load_hooks_errors_are_explicit() -> None:
         app_pb.load_hooks("ppbase.config:missing_register")
 
 
-def test_daemon_relay_includes_all_hooks(monkeypatch, tmp_path: Path) -> None:
+def test_daemon_relay_includes_all_hooks_and_dirs(monkeypatch, tmp_path: Path) -> None:
     pid_file = tmp_path / ".ppbase.pid"
     log_file = tmp_path / ".ppbase.log"
     captured: dict[str, object] = {}
@@ -76,6 +76,9 @@ def test_daemon_relay_includes_all_hooks(monkeypatch, tmp_path: Path) -> None:
     cli._start_daemon(
         host="127.0.0.1",
         port=8090,
+        data_dir="/tmp/pb_data_test",
+        public_dir="/tmp/pb_public_test",
+        migrations_dir="/tmp/pb_migrations_test",
         hooks=["pkg.mod:register_one", "pkg.mod:register_two"],
         automigrate=False,
     )
@@ -85,4 +88,10 @@ def test_daemon_relay_includes_all_hooks(monkeypatch, tmp_path: Path) -> None:
     assert cmd.count("--hooks") == 2
     assert "pkg.mod:register_one" in cmd
     assert "pkg.mod:register_two" in cmd
+    assert "--dir" in cmd
+    assert "/tmp/pb_data_test" in cmd
+    assert "--publicDir" in cmd
+    assert "/tmp/pb_public_test" in cmd
+    assert "--migrationsDir" in cmd
+    assert "/tmp/pb_migrations_test" in cmd
     assert "--no-automigrate" in cmd

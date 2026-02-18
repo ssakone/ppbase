@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     # ---- Storage ----
     data_dir: str = "./pb_data"
+    public_dir: str | None = None
     storage_backend: str = "local"  # "local" or "s3"
     s3_endpoint: str = ""
     s3_bucket: str = ""

@@ -535,6 +535,7 @@ class FlaskLikePB:
         self,
         database_url: str | None = None,
         data_dir: str | None = None,
+        public_dir: str | None = None,
         dev: bool | None = None,
         origins: list[str] | None = None,
         **overrides: object,
@@ -544,6 +545,8 @@ class FlaskLikePB:
             kwargs["database_url"] = database_url
         if data_dir is not None:
             kwargs["data_dir"] = data_dir
+        if public_dir is not None:
+            kwargs["public_dir"] = public_dir
         if dev is not None:
             kwargs["dev"] = dev
         if origins is not None:

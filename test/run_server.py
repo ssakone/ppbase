@@ -20,10 +20,12 @@ Usage
 -----
     python test/run_server.py           # foreground, port 8090
     python test/run_server.py 9000      # custom port
+    python test/run_server.py --publicDir ./test/public_site
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,7 +184,20 @@ pb.load_hooks("routes.webhooks:setup")   # /api/webhooks/*
 # ── start ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
+    parser = argparse.ArgumentParser(description="Run PPBase dev server example.")
+    parser.add_argument("port", nargs="?", type=int, default=8090)
+    parser.add_argument(
+        "--publicDir",
+        "--public-dir",
+        dest="public_dir",
+        default=None,
+        help="Serve this directory at / (PocketBase-like publicDir).",
+    )
+    args = parser.parse_args()
+    port = args.port
+
+    if args.public_dir:
+        pb.configure(public_dir=args.public_dir)
 
     print()
     print("┌─────────────────────────────────────────────────────────────┐")
@@ -190,6 +205,8 @@ if __name__ == "__main__":
     print("├─────────────────────────────────────────────────────────────┤")
     print(f"│  Admin UI  →  http://127.0.0.1:{port}/_/                       │")
     print(f"│  API       →  http://127.0.0.1:{port}/api/                      │")
+    if args.public_dir:
+        print(f"│  Public    →  {args.public_dir:<48} │")
     print("├─────────────────────────────────────────────────────────────┤")
     print("│  Custom routes                                              │")
     print("│    GET   /hello                                             │")

@@ -243,7 +243,7 @@ def create_app(
     # Admin UI - serve static files from ppbase/admin/dist/
     import pathlib
 
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
     from fastapi.staticfiles import StaticFiles
 
     admin_dist = pathlib.Path(__file__).parent / "admin" / "dist"
@@ -271,6 +271,41 @@ def create_app(
             from fastapi.responses import RedirectResponse
 
             return RedirectResponse("/_/")
+
+    # Public directory (PocketBase-like): files are served at /
+    # without directory listing; "/" serves index.html when present.
+    public_dir = str(settings.public_dir or "").strip()
+    if public_dir:
+        public_root = pathlib.Path(public_dir).expanduser().resolve()
+
+        @app.get("/", include_in_schema=False)
+        async def _public_index() -> Response:
+            index = public_root / "index.html"
+            if index.is_file():
+                return FileResponse(str(index))
+            return Response(status_code=404)
+
+        @app.get("/{public_path:path}", include_in_schema=False)
+        async def _public_file(public_path: str) -> Response:
+            normalized = public_path.strip("/")
+            if not normalized:
+                return Response(status_code=404)
+            if (
+                normalized in {"api", "_"}
+                or normalized.startswith("api/")
+                or normalized.startswith("_/")
+            ):
+                raise HTTPException(status_code=404, detail="Not Found")
+
+            candidate = (public_root / normalized).resolve()
+            try:
+                candidate.relative_to(public_root)
+            except ValueError:
+                return Response(status_code=404)
+
+            if not candidate.is_file():
+                return Response(status_code=404)
+            return FileResponse(str(candidate))
 
     # Custom exception handler: PocketBase returns flat error objects, not
     # FastAPI's default {"detail": ...} wrapper.

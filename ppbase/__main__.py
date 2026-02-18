@@ -90,6 +90,9 @@ def _start_daemon(
     host: str,
     port: int,
     db: str | None = None,
+    data_dir: str | None = None,
+    public_dir: str | None = None,
+    migrations_dir: str | None = None,
     hooks: list[str] | None = None,
     automigrate: bool | None = None,
 ) -> None:
@@ -101,6 +104,12 @@ def _start_daemon(
     cmd = [sys.executable, "-m", "ppbase", "serve", "--host", host, "--port", str(port)]
     if db:
         cmd += ["--db", db]
+    if data_dir:
+        cmd += ["--dir", data_dir]
+    if public_dir:
+        cmd += ["--publicDir", public_dir]
+    if migrations_dir:
+        cmd += ["--migrationsDir", migrations_dir]
     for target in hooks or []:
         cmd += ["--hooks", target]
     if automigrate is True:
@@ -144,6 +153,12 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     overrides: dict = {}
     if args.db:
         overrides["database_url"] = args.db
+    if args.data_dir:
+        overrides["data_dir"] = args.data_dir
+    if args.public_dir:
+        overrides["public_dir"] = args.public_dir
+    if args.migrations_dir:
+        overrides["migrations_dir"] = args.migrations_dir
     if args.automigrate is not None:
         overrides["auto_migrate"] = args.automigrate
 
@@ -160,6 +175,9 @@ def _cmd_serve(args: argparse.Namespace) -> None:
             host,
             port,
             args.db,
+            data_dir=args.data_dir,
+            public_dir=args.public_dir,
+            migrations_dir=args.migrations_dir,
             hooks=args.hooks,
             automigrate=args.automigrate,
         )
@@ -592,6 +610,29 @@ def main() -> None:
     serve_parser.add_argument("--host", type=str, default=None)
     serve_parser.add_argument("--port", type=int, default=None)
     serve_parser.add_argument("--db", type=str, default=None, help="Database URL")
+    serve_parser.add_argument(
+        "--dir",
+        dest="data_dir",
+        type=str,
+        default=None,
+        help="Data directory (PocketBase compatible option name).",
+    )
+    serve_parser.add_argument(
+        "--publicDir",
+        "--public-dir",
+        dest="public_dir",
+        type=str,
+        default=None,
+        help="Public static directory served at /.",
+    )
+    serve_parser.add_argument(
+        "--migrationsDir",
+        "--migrations-dir",
+        dest="migrations_dir",
+        type=str,
+        default=None,
+        help="Migrations directory (used for auto-migrate on startup).",
+    )
     serve_parser.add_argument("-d", "--daemon", action="store_true", help="Run in background")
     serve_parser.add_argument(
         "--automigrate",
