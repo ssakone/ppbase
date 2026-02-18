@@ -1,8 +1,11 @@
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useSidebar } from '@/context/sidebar-context'
 import { useAuth } from '@/context/auth-context'
+import { useCommandPalette } from '@/context/command-palette-context'
 import { cn } from '@/lib/utils'
-import { LayoutGrid, GitBranch, Settings, LogOut, Activity, Users2 } from 'lucide-react'
+import { prefetchRoute } from '@/lib/route-prefetch'
+import { navigateWithTransition } from '@/lib/navigation'
+import { LayoutGrid, GitBranch, Settings, LogOut, Activity, Users2, Home, Command } from 'lucide-react'
 import {
   Tooltip,
   TooltipContent,
@@ -15,8 +18,10 @@ export function SidebarIconStrip() {
   const location = useLocation()
   const { setActiveSection, setSidebarOpen } = useSidebar()
   const { logout } = useAuth()
+  const { openPalette } = useCommandPalette()
 
   const isActive = (section: string) => {
+    if (section === 'dashboard') return location.pathname === '/dashboard'
     if (section === 'collections') return location.pathname.startsWith('/collections')
     if (section === 'migrations') return location.pathname === '/migrations'
     if (section === 'logs') return location.pathname === '/logs'
@@ -24,10 +29,16 @@ export function SidebarIconStrip() {
     return false
   }
 
-  const handleNav = (path: string, section?: 'collections' | 'migrations' | 'settings') => {
+  const handleNav = (
+    path: string,
+    section?: 'dashboard' | 'collections' | 'migrations' | 'logs' | 'settings',
+  ) => {
     if (section) setActiveSection(section)
     setSidebarOpen(false)
-    navigate(path)
+    if (location.pathname === path) {
+      return
+    }
+    navigateWithTransition(navigate, path)
   }
 
   const btnClass =
@@ -40,7 +51,9 @@ export function SidebarIconStrip() {
         {/* Logo */}
         <button
           className="mb-4 cursor-pointer hover:scale-105 transition-transform duration-150"
-          onClick={() => handleNav('/collections', 'collections')}
+          onClick={() => handleNav('/dashboard', 'dashboard')}
+          onMouseEnter={() => prefetchRoute('dashboard')}
+          onFocus={() => prefetchRoute('dashboard')}
         >
           <svg width="42" height="42" viewBox="0 0 36 36" fill="none">
             <rect width="36" height="36" rx="10" fill="#4f46e5" />
@@ -49,12 +62,45 @@ export function SidebarIconStrip() {
           </svg>
         </button>
 
+        {/* Dashboard */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className={cn(btnClass, isActive('dashboard') && activeClass)}
+              onClick={() => handleNav('/dashboard', 'dashboard')}
+              onMouseEnter={() => prefetchRoute('dashboard')}
+              onFocus={() => prefetchRoute('dashboard')}
+            >
+              <Home className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-sm">Dashboard</TooltipContent>
+        </Tooltip>
+
+        {/* Command palette */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className={btnClass}
+              onClick={openPalette}
+              aria-label="Open quick actions"
+            >
+              <Command className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-sm">
+            Quick actions (Ctrl/Cmd+K)
+          </TooltipContent>
+        </Tooltip>
+
         {/* Collections */}
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               className={cn(btnClass, isActive('collections') && activeClass)}
               onClick={() => handleNav('/collections', 'collections')}
+              onMouseEnter={() => prefetchRoute('collections')}
+              onFocus={() => prefetchRoute('collections')}
             >
               <LayoutGrid className="h-5 w-5" />
             </button>
@@ -68,6 +114,8 @@ export function SidebarIconStrip() {
             <button
               className={cn(btnClass, location.pathname === '/collections/_superusers' && activeClass)}
               onClick={() => handleNav('/collections/_superusers', 'collections')}
+              onMouseEnter={() => prefetchRoute('records')}
+              onFocus={() => prefetchRoute('records')}
             >
               <Users2 className="h-5 w-5" />
             </button>
@@ -81,6 +129,8 @@ export function SidebarIconStrip() {
             <button
               className={cn(btnClass, isActive('migrations') && activeClass)}
               onClick={() => handleNav('/migrations', 'migrations')}
+              onMouseEnter={() => prefetchRoute('migrations')}
+              onFocus={() => prefetchRoute('migrations')}
             >
               <GitBranch className="h-5 w-5" />
             </button>
@@ -93,7 +143,9 @@ export function SidebarIconStrip() {
           <TooltipTrigger asChild>
             <button
               className={cn(btnClass, isActive('logs') && activeClass)}
-              onClick={() => handleNav('/logs')}
+              onClick={() => handleNav('/logs', 'logs')}
+              onMouseEnter={() => prefetchRoute('logs')}
+              onFocus={() => prefetchRoute('logs')}
             >
               <Activity className="h-5 w-5" />
             </button>
@@ -107,6 +159,8 @@ export function SidebarIconStrip() {
             <button
               className={cn(btnClass, isActive('settings') && activeClass)}
               onClick={() => handleNav('/settings', 'settings')}
+              onMouseEnter={() => prefetchRoute('settings')}
+              onFocus={() => prefetchRoute('settings')}
             >
               <Settings className="h-5 w-5" />
             </button>

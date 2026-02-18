@@ -1,10 +1,11 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/context/auth-context'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { LoadingSpinner } from '@/components/loading-spinner'
+import { navigateWithTransition } from '@/lib/navigation'
 
 export function LoginPage() {
   const { login, isAuthenticated, needsSetup } = useAuth()
@@ -15,13 +16,11 @@ export function LoginPage() {
   const [isLoading, setIsLoading] = useState(false)
 
   if (isAuthenticated) {
-    navigate('/collections', { replace: true })
-    return null
+    return <Navigate to="/dashboard" replace />
   }
 
   if (needsSetup) {
-    navigate('/setup', { replace: true })
-    return null
+    return <Navigate to="/setup" replace />
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -33,7 +32,7 @@ export function LoginPage() {
 
     try {
       await login(email.trim(), password)
-      navigate('/collections', { replace: true })
+      navigateWithTransition(navigate, '/dashboard', { replace: true })
     } catch (err: unknown) {
       const message = (err as { message?: string })?.message || 'Invalid email or password.'
       setError(message)

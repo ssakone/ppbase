@@ -45,6 +45,9 @@ def build_record_response(
     fields_filter: list[str] | None = None,
     hidden_fields: set[str] | None = None,
     is_auth_collection: bool = False,
+    is_view_collection: bool = False,
+    request_auth: dict[str, Any] | None = None,
+    apply_email_visibility: bool = False,
 ) -> dict[str, Any]:
     """Build a record response dict from a raw database row.
 
@@ -58,6 +61,8 @@ def build_record_response(
         hidden_fields: Set of field names marked as hidden in the schema.
         is_auth_collection: If True, add auth system columns (email,
             emailVisibility, verified) and hide password_hash/token_key.
+        is_view_collection: If True and no schema is defined, include raw row
+            columns (except system/hidden auth internals).
 
     Returns:
         A dict suitable for JSON serialization as a record response.
@@ -72,9 +77,30 @@ def build_record_response(
         "updated": format_datetime(row.get("updated")),
     }
 
+    def _can_view_auth_email() -> bool:
+        if not apply_email_visibility:
+            return True
+        if bool(row.get("email_visibility", False)):
+            return True
+        if not request_auth:
+            return False
+        auth_type = request_auth.get("type")
+        if auth_type == "admin":
+            return True
+        if auth_type != "authRecord":
+            return False
+        auth_id = str(request_auth.get("id", "") or "")
+        row_id = str(row.get("id", "") or "")
+        if auth_id != row_id:
+            return False
+        auth_coll_id = str(request_auth.get("collectionId", "") or "")
+        auth_coll_name = str(request_auth.get("collectionName", "") or "")
+        return auth_coll_id == collection_id or auth_coll_name == collection_name
+
     # Auth collection: add system auth columns (camelCase)
     if is_auth_collection:
-        result["email"] = row.get("email", "")
+        if _can_view_auth_email():
+            result["email"] = row.get("email", "")
         result["emailVisibility"] = row.get("email_visibility", False)
         result["verified"] = row.get("verified", False)
 
@@ -98,8 +124,8 @@ def build_record_response(
             if isinstance(val, float) and val == int(val):
                 val = int(val)
             result[fname] = val
-    else:
-        # View collections have no schema — include all row columns
+    elif is_view_collection:
+        # View collections have no schema — include all row columns.
         system_keys = {"id", "created", "updated"}
         for key, val in row.items():
             if key in system_keys:

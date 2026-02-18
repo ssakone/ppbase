@@ -1,188 +1,231 @@
 #!/usr/bin/env python3
-"""PPBase dev server with example routes and hooks.
+"""PPBase dev server — multi-file example.
 
-Usage:
-    python test/run_server.py
+Demonstrates loading hooks and routes from separate modules using
+pb.load_hooks("module.path:setup").
+
+Layout
+------
+test/
+├── run_server.py          ← this file (entry-point)
+├── hooks/
+│   ├── audit.py           ← cross-cutting audit log (all collections)
+│   ├── users.py           ← users collection: inject defaults, auth logging
+│   └── realtime.py        ← SSE: connection guard, topic filter, payload tag
+└── routes/
+    ├── custom_api.py      ← /api/custom/* group with middleware + auth helpers
+    └── webhooks.py        ← /api/webhooks/* receivers
+
+Usage
+-----
+    python test/run_server.py           # foreground, port 8090
+    python test/run_server.py 9000      # custom port
 """
 
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+
+# ── path setup ───────────────────────────────────────────────────────────────
+# Allow imports of both ppbase and the test-local hooks/routes packages.
 
 _root = Path(__file__).resolve().parent.parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
+_test = Path(__file__).resolve().parent
 
-from ppbase import pb
-from ppbase.ext.events import (
-    BootstrapEvent,
-    ServeEvent,
-    TerminateEvent,
-    RecordRequestEvent,
-    RecordAuthRequestEvent,
-    RealtimeConnectEvent,
-    RealtimeSubscribeEvent,
-)
+for _p in (_root, _test):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom routes
-# ─────────────────────────────────────────────────────────────────────────────
+# ── import the pb facade ──────────────────────────────────────────────────────
 
-@pb.get("/hello")
-async def hello():
-    """Simple health/greeting endpoint."""
-    return {"message": "Hello from PPBase!", "ok": True}
+from ppbase import pb  # noqa: E402
+from fastapi import Request  # noqa: E402
 
+# ── lifecycle hooks (registered inline — not split out) ───────────────────────
 
-@pb.get("/api/custom/status")
-async def custom_status():
-    """Extended status endpoint with uptime info."""
-    return {
-        "status": "running",
-        "timestamp": time.time(),
-        "version": "dev",
-    }
+from ppbase.ext.events import BootstrapEvent, ServeEvent, TerminateEvent  # noqa: E402
 
-
-@pb.post("/api/custom/echo")
-async def echo(body: dict[str, Any]):
-    """Echo back whatever JSON body you send."""
-    return {"echo": body}
-
-
-@pb.get("/api/custom/me")
-async def custom_me(auth: dict[str, Any] | None = pb.optional_auth()):
-    """Return current auth record using pb repository helpers."""
-    if not auth or auth.get("type") != "authRecord":
-        return {"user": None}
-
-    collection_ref = auth.get("collectionName") or auth.get("collectionId")
-    user_id = auth.get("id")
-    if not collection_ref or not user_id:
-        return {"user": None}
-
-    user = await pb.records(str(collection_ref)).get(str(user_id), fields="id,email,verified")
-    return {"user": user}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifecycle hooks
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pb.on_bootstrap()
 async def on_bootstrap(event: BootstrapEvent):
-    """Runs once before the database is initialised."""
-    print("[hook] bootstrap — settings loaded")
+    print("[lifecycle] bootstrap — settings ready")
     await event.next()
 
 
 @pb.on_serve()
 async def on_serve(event: ServeEvent):
-    """Runs once after the app is fully ready."""
-    print("[hook] serve — server is ready ✓")
+    print("[lifecycle] serve — server is up ✓")
     await event.next()
 
 
 @pb.on_terminate()
 async def on_terminate(event: TerminateEvent):
-    """Runs on graceful shutdown."""
-    print("[hook] terminate — cleaning up…")
+    print("[lifecycle] terminate — shutting down…")
     await event.next()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Record CRUD hooks
-# ─────────────────────────────────────────────────────────────────────────────
+# ── global extension middleware (all custom routes) ────────────────────────────
 
-@pb.on_record_create_request("users")
-async def before_user_create(event: RecordRequestEvent):
-    """Intercept user creation — inject a server-side field."""
-    print(f"[hook] create users — data: {event.data}")
-    # Add a server-controlled field before the record is written
-    event.data.setdefault("source", "api")
+import time  # noqa: E402
+from ppbase.ext.events import RouteRequestEvent  # noqa: E402
+
+
+@pb.middleware(priority=200)
+async def global_timer(event: RouteRequestEvent):
+    """Time every extension-route request and log it."""
+    started = time.perf_counter()
     result = await event.next()
-    print(f"[hook] user created — id: {result.get('id') if isinstance(result, dict) else '?'}")
+    elapsed = (time.perf_counter() - started) * 1000
+    print(f"[global] {event.method} {event.path} → {elapsed:.1f} ms")
     return result
 
 
-@pb.on_record_update_request("users")
-async def before_user_update(event: RecordRequestEvent):
-    """Log all user updates."""
-    print(f"[hook] update users/{event.record_id} — patch: {list(event.data.keys())}")
-    current = await event.get_current_user(fields="id,email")
-    if current:
-        print(f"[hook] current user = {current.get('email')}")
+@pb.middleware(priority=150)
+async def block_demo_ua(event: RouteRequestEvent):
+    """Example: block a specific User-Agent (demo only)."""
+    ua = event.headers.get("user-agent", "").lower()
+    if "blockme" in ua:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=403,
+            content={"status": 403, "message": "Blocked client.", "data": {}},
+        )
     return await event.next()
 
 
-@pb.on_record_delete_request()
-async def before_any_delete(event: RecordRequestEvent):
-    """Log every delete across all collections."""
-    coll = event.collection.name if event.collection else event.collection_id_or_name
-    print(f"[hook] delete {coll}/{event.record_id}")
+@pb.middleware(priority=120, path="/api/custom/*", methods=["GET"])
+async def custom_get_probe(event: RouteRequestEvent):
+    """Run only for GET /api/custom/* extension routes."""
+    print(f"[custom-get] {event.method} {event.path}")
     return await event.next()
 
 
-@pb.on_record_view_request()
-async def on_record_view(event: RecordRequestEvent):
-    """Passthrough view hook — useful for audit logging."""
+@pb.middleware(priority=110, path="/trace", methods=["GET"])
+async def trace_context(event: RouteRequestEvent):
+    """Request-local store example (middleware -> handler)."""
+    event.set("traceId", f"trace-{int(time.time() * 1000)}")
+    event.set("startedAt", time.perf_counter())
     result = await event.next()
+    started_at = float(event.get("startedAt", time.perf_counter()))
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    print(f"[trace] id={event.get('traceId')} elapsed={elapsed_ms:.1f} ms")
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Auth hooks
-# ─────────────────────────────────────────────────────────────────────────────
+# ── simple top-level routes (registered directly) ─────────────────────────────
 
-@pb.on_record_auth_with_password_request()
-async def on_password_auth(event: RecordAuthRequestEvent):
-    """Log password auth attempts (never log the password itself)."""
-    coll = event.collection.name if event.collection else event.collection_id_or_name
-    identity = event.body.get("identity", "?")
-    print(f"[hook] auth/password — {coll} / identity={identity}")
-    return await event.next()
+@pb.get("/hello")
+async def hello():
+    """Basic smoke-test endpoint."""
+    return {"message": "Hello from PPBase!", "ok": True}
 
 
-@pb.on_record_auth_refresh_request()
-async def on_auth_refresh(event: RecordAuthRequestEvent):
-    """Log token refresh events."""
-    coll = event.collection.name if event.collection else event.collection_id_or_name
-    print(f"[hook] auth/refresh — {coll}")
-    return await event.next()
+@pb.get("/hello/{name}")
+async def hello_name(name: str):
+    """Greet by name — demonstrates path parameters."""
+    return {"message": f"Hello, {name}!", "name": name}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Realtime hooks
-# ─────────────────────────────────────────────────────────────────────────────
-
-@pb.on_realtime_connect_request()
-async def on_realtime_connect(event: RealtimeConnectEvent):
-    """Log new SSE connections."""
-    print(f"[hook] realtime connect — client={event.client_id}")
-    return await event.next()
+@pb.post("/reflect")
+async def reflect(body: dict):
+    """Echo the request body back — useful for debugging client payloads."""
+    return {"reflected": body, "keys": list(body.keys())}
 
 
-@pb.on_realtime_subscribe_request()
-async def on_realtime_subscribe(event: RealtimeSubscribeEvent):
-    """Log subscription changes."""
-    print(f"[hook] realtime subscribe — client={event.client_id} topics={event.subscriptions}")
-    return await event.next()
+@pb.get("/trace")
+async def trace_demo(store: dict = pb.request_store()):
+    """Read values set by middleware from request-local store."""
+    return {
+        "traceId": store.get("traceId"),
+        "hasTrace": "traceId" in store,
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Start
-# ─────────────────────────────────────────────────────────────────────────────
+@pb.get("/auth-response-preview")
+async def auth_response_preview(request: Request):
+    """Demo of pb.apis.record_auth_response + pb.apis.enrich_record."""
+    fake_collection = SimpleNamespace(id="users_id", name="users")
+    fake_record = {
+        "id": "preview_user",
+        "email": "demo@example.com",
+        "title": "Preview Record",
+        "internal": "hidden-by-fields-if-requested",
+    }
+    enriched = await pb.apis.enrich_record(
+        request,
+        fake_record,
+        collection=fake_collection,
+    )
+    return await pb.apis.record_auth_response(
+        request,
+        enriched or fake_record,
+        collection=fake_collection,
+        token="preview.token.value",
+        auth_method="preview",
+        meta={"source": "run_server.py"},
+    )
+
+
+# ── load external modules ─────────────────────────────────────────────────────
+# Order matters: cross-cutting concerns first, feature hooks second.
+
+pb.load_hooks("hooks.audit:setup")       # runs at priority=1 — logs after every mutation
+pb.load_hooks("hooks.users:setup")       # users-specific: defaults, ownership, login log
+pb.load_hooks("hooks.realtime:setup")    # SSE: connect guard, topic filter, payload tag
+
+pb.load_hooks("routes.custom_api:setup") # /api/custom/*  (with group middleware)
+pb.load_hooks("routes.webhooks:setup")   # /api/webhooks/*
+
+
+# ── start ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Starting PPBase dev server…")
-    print("  Admin UI : http://127.0.0.1:8090/_/")
-    print("  API      : http://127.0.0.1:8090/api/")
-    print("  Routes   : GET  /hello")
-    print("             GET  /api/custom/status")
-    print("             GET  /api/custom/me")
-    print("             POST /api/custom/echo")
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8090
+
+    print()
+    print("┌─────────────────────────────────────────────────────────────┐")
+    print("│  PPBase dev server  (multi-file example)                    │")
+    print("├─────────────────────────────────────────────────────────────┤")
+    print(f"│  Admin UI  →  http://127.0.0.1:{port}/_/                       │")
+    print(f"│  API       →  http://127.0.0.1:{port}/api/                      │")
+    print("├─────────────────────────────────────────────────────────────┤")
+    print("│  Custom routes                                              │")
+    print("│    GET   /hello                                             │")
+    print("│    GET   /hello/:name                                       │")
+    print("│    POST  /reflect                                           │")
+    print("│    GET   /trace                     (middleware store demo) │")
+    print("│    GET   /auth-response-preview     (apis auth/enrich demo)│")
+    print("│    GET   /api/custom/status                                 │")
+    print("│    GET   /api/custom/me              (optional auth)        │")
+    print("│    GET   /api/custom/search?q=...    (query params)         │")
+    print("│    POST  /api/custom/echo                                   │")
+    print("│    GET   /api/custom/private         (auth required)        │")
+    print("│    GET   /api/custom/admin           (superuser only)       │")
+    print("│    GET   /api/custom/stats           (superuser only)       │")
+    print("│    GET   /api/custom/health          (plaintext OK)         │")
+    print("│    POST  /api/webhooks/generic                              │")
+    print("│    POST  /api/webhooks/github                               │")
+    print("│    POST  /api/webhooks/stripe                               │")
+    print("├─────────────────────────────────────────────────────────────┤")
+    print("│  Hook modules loaded                                        │")
+    print("│    hooks/audit.py       ← create/update/delete/view logs   │")
+    print("│    hooks/users.py       ← defaults, ownership, login log   │")
+    print("│    hooks/realtime.py    ← SSE filter + payload tag         │")
+    print("│    routes/custom_api.py ← group middleware + auth deps     │")
+    print("│    routes/webhooks.py   ← GitHub / Stripe receivers        │")
+    print("│  Global middleware                                          │")
+    print("│    @pb.middleware(priority=200)  ← request timer           │")
+    print("│    @pb.middleware(priority=150)  ← UA block (demo)         │")
+    print("│    @pb.middleware(path='/api/custom/*', methods=['GET'])   │")
+    print("│    @pb.middleware(path='/trace') + pb.request_store()      │")
+    print("│    pb.apis.record_auth_response(request, record, ...)      │")
+    print("│    pb.apis.enrich_record(request, record, ...)             │")
+    print("│    route/group unbind: unbind=['middleware-id']            │")
+    print("└─────────────────────────────────────────────────────────────┘")
+    print()
     print("  Ctrl+C to stop")
-    pb.start(host="127.0.0.1", port=8090)
+    print()
+
+    pb.start(host="127.0.0.1", port=port)

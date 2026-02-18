@@ -500,9 +500,22 @@ async def _build_subscription_event_data(
     from ppbase.services.expand_service import expand_records
     from ppbase.services.record_service import get_all_collections, get_record
 
+    _auth_ctx, request_context = _build_rule_context(subscription.auth_payload)
+    if subscription.options_query:
+        request_context["query"] = dict(subscription.options_query)
+    if subscription.options_headers:
+        request_context["headers"] = _normalize_request_headers(
+            subscription.options_headers
+        )
+
     record = dict(base_record) if isinstance(base_record, dict) else None
     if record is None:
-        record = await get_record(engine, collection, record_id)
+        record = await get_record(
+            engine,
+            collection,
+            record_id,
+            request_context=request_context,
+        )
         if record is None:
             return None
 
@@ -512,7 +525,14 @@ async def _build_subscription_event_data(
         all_colls = await get_all_collections(engine)
         items = [record]
         try:
-            await expand_records(engine, collection, items, expand, all_colls)
+            await expand_records(
+                engine,
+                collection,
+                items,
+                expand,
+                all_colls,
+                request_context=request_context,
+            )
             record = items[0]
         except Exception as exc:
             logger.warning(

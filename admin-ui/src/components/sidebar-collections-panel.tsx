@@ -1,8 +1,10 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useDeferredValue } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useCollections } from '@/hooks/use-collections'
 import { useSidebar } from '@/context/sidebar-context'
 import { cn } from '@/lib/utils'
+import { prefetchRoute } from '@/lib/route-prefetch'
+import { navigateWithTransition } from '@/lib/navigation'
 import { Plus, Search, ChevronRight, Folder, User, Table2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import type { Collection } from '@/api/types'
@@ -13,13 +15,14 @@ export function SidebarCollectionsPanel() {
   const { data: collections = [], isLoading } = useCollections()
   const { setSelectedCollectionId, setActiveSection, setSidebarOpen, collectionsPanelWidth } = useSidebar()
   const [search, setSearch] = useState('')
+  const deferredSearch = useDeferredValue(search)
   const [systemCollapsed, setSystemCollapsed] = useState(false)
 
   const filtered = useMemo(() => {
-    if (!search) return collections
-    const q = search.toLowerCase()
+    if (!deferredSearch) return collections
+    const q = deferredSearch.toLowerCase()
     return collections.filter((c: Collection) => c.name.toLowerCase().includes(q))
-  }, [collections, search])
+  }, [collections, deferredSearch])
 
   const userCollections = useMemo(
     () => filtered.filter((c: Collection) => !c.system),
@@ -35,12 +38,16 @@ export function SidebarCollectionsPanel() {
     setActiveSection('collections')
     setSelectedCollectionId(col.id)
     setSidebarOpen(false)
-    navigate(`/collections/${col.id}`)
+    const path = `/collections/${col.id}`
+    if (location.pathname === path) {
+      return
+    }
+    navigateWithTransition(navigate, path)
   }
 
   const handleNewCollection = () => {
     setSidebarOpen(false)
-    navigate('/collections?new=1')
+    navigateWithTransition(navigate, '/collections?new=1')
   }
 
   const showPanel = location.pathname.startsWith('/collections')
@@ -55,9 +62,11 @@ export function SidebarCollectionsPanel() {
           'flex items-center gap-3 w-full px-3.5 mb-0.5 py-2.5 text-[15px] rounded-xl text-left transition-all duration-150',
           isActive
             ? 'bg-indigo-50 text-indigo-700 font-semibold shadow-sm'
-            : 'text-slate-600 hover:bg-slate-100 hover:text-slate-800',
+            : 'text-slate-600 hover:bg-slate-100 hover:text-slate-800 hover:translate-x-[1px]',
         )}
         onClick={() => handleClick(col)}
+        onMouseEnter={() => prefetchRoute('records')}
+        onFocus={() => prefetchRoute('records')}
       >
         <CollectionIcon type={col.type} active={isActive} />
         <span className="truncate">{col.name}</span>
@@ -89,7 +98,7 @@ export function SidebarCollectionsPanel() {
         {isLoading ? (
           <div className="space-y-1.5 px-1 py-1">
             {[1, 2, 3, 4].map((i) => (
-              <div key={i} className="h-10 rounded-xl bg-slate-100 animate-pulse" />
+              <div key={i} className="h-10 rounded-xl skeleton-shimmer" />
             ))}
           </div>
         ) : filtered.length === 0 ? (
@@ -127,6 +136,8 @@ export function SidebarCollectionsPanel() {
           variant="outline"
           className="w-full border-dashed border-slate-300 text-slate-500 hover:text-indigo-600 hover:border-indigo-400 hover:bg-indigo-50/50"
           onClick={handleNewCollection}
+          onMouseEnter={() => prefetchRoute('collections')}
+          onFocus={() => prefetchRoute('collections')}
         >
           <Plus className="h-4 w-4" />
           New collection

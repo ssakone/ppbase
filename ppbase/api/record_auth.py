@@ -27,10 +27,12 @@ from ppbase.api.deps import get_optional_auth
 from ppbase.db.engine import get_engine
 from ppbase.ext.events import RecordAuthRequestEvent
 from ppbase.ext.registry import (
+    HOOK_RECORD_AUTH_WITH_OTP_REQUEST,
     HOOK_RECORD_AUTH_REFRESH_REQUEST,
     HOOK_RECORD_AUTH_REQUEST,
     HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
     HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
+    HOOK_RECORD_REQUEST_OTP_REQUEST,
     get_extension_registry,
 )
 from ppbase.models.field_types import _EMAIL_RE
@@ -89,23 +91,53 @@ def _extract_auth_token(request: Request) -> str:
     return token.strip()
 
 
-async def _trigger_record_auth_hooks(
+async def _trigger_record_auth_request_hook(
     request: Request,
     specific_hook_name: str,
     event: RecordAuthRequestEvent,
     default_handler,
 ):
+    """Trigger auth request hook for a specific auth API action."""
     extensions = get_extension_registry(request.app)
     if extensions is None:
         return await default_handler(event)
+    specific_hook = extensions.hooks.get(specific_hook_name)
+    return await specific_hook.trigger(event, default_handler)
+
+
+async def _trigger_record_auth_success_hook(
+    request: Request,
+    event: RecordAuthRequestEvent,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    """Trigger the generic auth-success hook after successful authentication."""
+    extensions = get_extension_registry(request.app)
+    if extensions is None:
+        return data
 
     generic_hook = extensions.hooks.get(HOOK_RECORD_AUTH_REQUEST)
-    specific_hook = extensions.hooks.get(specific_hook_name)
 
-    async def _run_specific(e: RecordAuthRequestEvent):
-        return await specific_hook.trigger(e, default_handler)
+    # Keep event fields in sync with mutable auth result payload.
+    if "record" in data:
+        event.record = data.get("record")
+    if "token" in data:
+        token_value = data.get("token")
+        event.token = str(token_value) if token_value is not None else None
+    if "meta" in data and isinstance(data.get("meta"), dict):
+        event.meta = dict(data.get("meta") or {})
 
-    return await generic_hook.trigger(event, _run_specific)
+    async def _default(e: RecordAuthRequestEvent) -> dict[str, Any]:
+        result = dict(data)
+        if e.record is not None:
+            result["record"] = e.record
+        if e.token is not None:
+            result["token"] = e.token
+        if e.meta is not None:
+            result["meta"] = e.meta
+        return result
+
+    hooked_result = await generic_hook.trigger(event, _default)
+    return hooked_result if isinstance(hooked_result, dict) else data
 
 
 _AUTH_INVALID_CREDENTIALS_DATA = {
@@ -369,7 +401,11 @@ async def api_auth_with_password(
         collection=collection,
         collection_id_or_name=collectionIdOrName,
         method="password",
+        auth_method="password",
         body=body,
+        identity=str(body.get("identity", "") or ""),
+        identity_field=str(body.get("identityField", "") or "") or None,
+        password=str(body.get("password", "") or ""),
     )
 
     async def _default_auth_with_password(e: RecordAuthRequestEvent) -> JSONResponse:
@@ -377,9 +413,16 @@ async def api_auth_with_password(
             return _error_response(400, "Request body must be a JSON object.")
 
         payload = dict(e.body)
-        identity = payload.get("identity", "")
-        password = payload.get("password", "")
-        identity_field = payload.get("identityField")
+        identity = str(
+            e.identity if e.identity is not None else payload.get("identity", "")
+        ).strip()
+        password = str(
+            e.password if e.password is not None else payload.get("password", "")
+        )
+        identity_field: str | None = e.identity_field
+        if identity_field is None:
+            raw_identity_field = payload.get("identityField")
+            identity_field = str(raw_identity_field).strip() if raw_identity_field else None
 
         if not identity or not password:
             return _error_response(
@@ -443,9 +486,10 @@ async def api_auth_with_password(
         if fields_param and result.get("record"):
             result["record"] = _apply_fields_filter(result["record"], fields_param)
 
+        result = await _trigger_record_auth_success_hook(request, e, result)
         return JSONResponse(content=result)
 
-    return await _trigger_record_auth_hooks(
+    return await _trigger_record_auth_request_hook(
         request,
         HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
         event,
@@ -492,38 +536,67 @@ async def api_request_otp(
         body = await request.json()
     except Exception:
         return _error_response(400, "Invalid JSON body.")
+    if not isinstance(body, dict):
+        return _error_response(400, "Request body must be a JSON object.")
 
-    email = str(body.get("email", "")).strip()
-    if not email:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"email": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-    if not _EMAIL_RE.match(email):
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"email": {"code": "validation_invalid_email", "message": "Must be a valid email address."}},
-        )
-
-    settings = request.app.state.settings
-
-    from ppbase.services.record_auth_service import request_otp as _request_otp
-
-    otp_id, rate_limited = await _request_otp(
-        engine,
-        collection,
-        email,
-        settings,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="requestOtp",
+        auth_method="requestOtp",
+        body=body,
+        email=str(body.get("email", "") or ""),
     )
-    if rate_limited:
-        return _error_response(
-            429,
-            "You've send too many OTP requests, please try again later.",
-        )
 
-    return JSONResponse(content={"otpId": otp_id}, status_code=200)
+    async def _default_request_otp(e: RecordAuthRequestEvent) -> JSONResponse:
+        if not isinstance(e.body, dict):
+            return _error_response(400, "Request body must be a JSON object.")
+
+        payload = dict(e.body)
+        email = str(e.email if e.email is not None else payload.get("email", "")).strip()
+        if not email:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"email": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
+        if not _EMAIL_RE.match(email):
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {
+                    "email": {
+                        "code": "validation_invalid_email",
+                        "message": "Must be a valid email address.",
+                    }
+                },
+            )
+
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import request_otp as _request_otp
+
+        otp_id, rate_limited = await _request_otp(
+            engine,
+            collection,
+            email,
+            settings,
+        )
+        if rate_limited:
+            return _error_response(
+                429,
+                "You've send too many OTP requests, please try again later.",
+            )
+
+        return JSONResponse(content={"otpId": otp_id}, status_code=200)
+
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_REQUEST_OTP_REQUEST,
+        event,
+        _default_request_otp,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -565,73 +638,102 @@ async def api_auth_with_otp(
         body = await request.json()
     except Exception:
         return _error_response(400, "Invalid JSON body.")
+    if not isinstance(body, dict):
+        return _error_response(400, "Request body must be a JSON object.")
 
-    otp_id = str(body.get("otpId", "")).strip()
-    password = str(body.get("password", ""))
-    if not otp_id or not password:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            {
-                "otpId": {"code": "validation_required", "message": "Cannot be blank."}
-                if not otp_id
-                else {},
-                "password": {"code": "validation_required", "message": "Cannot be blank."}
-                if not password
-                else {},
-            },
-        )
-
-    settings = request.app.state.settings
-
-    from ppbase.services.record_auth_service import auth_with_otp
-
-    result = await auth_with_otp(
-        engine,
-        collection,
-        otp_id,
-        password,
-        settings,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="otp",
+        auth_method="otp",
+        body=body,
+        otp_id=str(body.get("otpId", "") or ""),
+        otp=str(body.get("password", "") or ""),
+        password=str(body.get("password", "") or ""),
     )
-    if result is None:
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            _AUTH_INVALID_CREDENTIALS_DATA,
-        )
 
-    rule_request_context = _build_rule_request_context(
+    async def _default_auth_with_otp(e: RecordAuthRequestEvent) -> JSONResponse:
+        if not isinstance(e.body, dict):
+            return _error_response(400, "Request body must be a JSON object.")
+
+        payload = dict(e.body)
+        otp_id = str(
+            e.otp_id if e.otp_id is not None else payload.get("otpId", "")
+        ).strip()
+        password = str(
+            e.otp if e.otp is not None else payload.get("password", "")
+        )
+        if not otp_id or not password:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                {
+                    "otpId": {"code": "validation_required", "message": "Cannot be blank."}
+                    if not otp_id
+                    else {},
+                    "password": {"code": "validation_required", "message": "Cannot be blank."}
+                    if not password
+                    else {},
+                },
+            )
+
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import auth_with_otp
+
+        result = await auth_with_otp(
+            engine,
+            collection,
+            otp_id,
+            password,
+            settings,
+        )
+        if result is None:
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                _AUTH_INVALID_CREDENTIALS_DATA,
+            )
+
+        rule_request_context = _build_rule_request_context(
+            request,
+            context="otp",
+            data=payload,
+        )
+        if not await _passes_auth_rule(
+            engine,
+            collection,
+            result["record"]["id"],
+            rule_request_context,
+        ):
+            return _error_response(
+                400,
+                "Failed to authenticate.",
+                _AUTH_INVALID_CREDENTIALS_DATA,
+            )
+
+        expand_str = request.query_params.get("expand", "")
+        if expand_str and result.get("record"):
+            all_colls = await get_all_collections(engine)
+            records = await expand_records(
+                engine, collection, [result["record"]], expand_str, all_colls,
+            )
+            result["record"] = records[0] if records else result["record"]
+
+        fields_param = request.query_params.get("fields", "")
+        if fields_param and result.get("record"):
+            result["record"] = _apply_fields_filter(result["record"], fields_param)
+
+        result = await _trigger_record_auth_success_hook(request, e, result)
+        return JSONResponse(content=result)
+
+    return await _trigger_record_auth_request_hook(
         request,
-        context="otp",
-        data=body if isinstance(body, dict) else {},
+        HOOK_RECORD_AUTH_WITH_OTP_REQUEST,
+        event,
+        _default_auth_with_otp,
     )
-    if not await _passes_auth_rule(
-        engine,
-        collection,
-        result["record"]["id"],
-        rule_request_context,
-    ):
-        return _error_response(
-            400,
-            "Failed to authenticate.",
-            _AUTH_INVALID_CREDENTIALS_DATA,
-        )
-
-    # Apply expand if requested
-    expand_str = request.query_params.get("expand", "")
-    if expand_str and result.get("record"):
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [result["record"]], expand_str, all_colls,
-        )
-        result["record"] = records[0] if records else result["record"]
-
-    # Apply fields filter if requested
-    fields_param = request.query_params.get("fields", "")
-    if fields_param and result.get("record"):
-        result["record"] = _apply_fields_filter(result["record"], fields_param)
-
-    return JSONResponse(content=result)
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +776,7 @@ async def api_auth_with_oauth2(
         collection=collection,
         collection_id_or_name=collectionIdOrName,
         method="oauth2",
+        auth_method="oauth2",
         body=body,
     )
 
@@ -796,6 +899,9 @@ async def api_auth_with_oauth2(
                     fields_param,
                 )
 
+            response_data = await _trigger_record_auth_success_hook(
+                request, e, response_data
+            )
             return JSONResponse(content=response_data)
 
         except Exception as exc:
@@ -806,7 +912,7 @@ async def api_auth_with_oauth2(
                 {"provider": {"code": "validation_oauth2_failed", "message": message}},
             )
 
-    return await _trigger_record_auth_hooks(
+    return await _trigger_record_auth_request_hook(
         request,
         HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
         event,
@@ -842,6 +948,7 @@ async def api_auth_refresh(
         collection_id_or_name=collectionIdOrName,
         auth=auth,
         method="refresh",
+        auth_method="refresh",
         body={},
     )
 
@@ -895,9 +1002,10 @@ async def api_auth_refresh(
         if fields_param and result.get("record"):
             result["record"] = _apply_fields_filter(result["record"], fields_param)
 
+        result = await _trigger_record_auth_success_hook(request, e, result)
         return JSONResponse(content=result)
 
-    return await _trigger_record_auth_hooks(
+    return await _trigger_record_auth_request_hook(
         request,
         HOOK_RECORD_AUTH_REFRESH_REQUEST,
         event,

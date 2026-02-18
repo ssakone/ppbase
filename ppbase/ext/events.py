@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from ppbase.ext.record_repository import RecordRepository
 
 NextHandler = Callable[[], Awaitable[Any]]
+ROUTE_REQUEST_STORE_ATTR = "_ppbase_route_store"
 
 
 @dataclass
@@ -230,6 +231,95 @@ class TerminateEvent(HookEvent):
 
 
 @dataclass
+class RouteRequestEvent(HookEvent):
+    """HTTP extension middleware event payload."""
+
+    request: Any | None = None
+    path: str = ""
+    methods: tuple[str, ...] = field(default_factory=tuple)
+    auth: dict[str, Any] | None = None
+    _auth_loaded: bool = field(default=False, init=False, repr=False)
+    _store: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+
+    @property
+    def method(self) -> str:
+        if self.request is None:
+            return ""
+        return str(getattr(self.request, "method", "")).upper()
+
+    @property
+    def headers(self) -> dict[str, str]:
+        if self.request is None:
+            return {}
+        return {str(key): str(value) for key, value in self.request.headers.items()}
+
+    @property
+    def query_params(self) -> dict[str, str]:
+        if self.request is None:
+            return {}
+        return {str(key): str(value) for key, value in self.request.query_params.items()}
+
+    @property
+    def path_params(self) -> dict[str, Any]:
+        if self.request is None:
+            return {}
+        return dict(getattr(self.request, "path_params", {}) or {})
+
+    def _ensure_store(self) -> dict[str, Any]:
+        if self.request is None:
+            return self._store
+
+        state = getattr(self.request, "state", None)
+        if state is None:
+            return self._store
+
+        current = getattr(state, ROUTE_REQUEST_STORE_ATTR, None)
+        if isinstance(current, dict):
+            return current
+
+        current = {}
+        setattr(state, ROUTE_REQUEST_STORE_ATTR, current)
+        return current
+
+    def set(self, key: str, value: Any) -> "RouteRequestEvent":
+        self._ensure_store()[str(key)] = value
+        return self
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._ensure_store().get(str(key), default)
+
+    def has(self, key: str) -> bool:
+        return str(key) in self._ensure_store()
+
+    def remove(self, key: str) -> "RouteRequestEvent":
+        self._ensure_store().pop(str(key), None)
+        return self
+
+    async def load_auth(self) -> dict[str, Any] | None:
+        """Resolve request auth payload once and cache it."""
+        if self._auth_loaded:
+            return self.auth
+
+        self._auth_loaded = True
+        if self.request is None:
+            return self.auth
+
+        from ppbase.api.deps import get_optional_auth
+        from ppbase.db.engine import get_async_session
+
+        try:
+            async for session in get_async_session():
+                self.auth = await get_optional_auth(self.request, session=session)
+                break
+        except RuntimeError as exc:
+            if "Session factory not initialised" not in str(exc):
+                raise
+            self.auth = None
+
+        return self.auth
+
+
+@dataclass
 class RecordRequestEvent(HookEvent):
     request: Any | None = None
     collection: Any | None = None
@@ -347,8 +437,39 @@ class RecordAuthRequestEvent(HookEvent):
     collection_id_or_name: str = ""
     auth: dict[str, Any] | None = None
     method: str = "default"
+    auth_method: str | None = None
     body: dict[str, Any] = field(default_factory=dict)
     payload: dict[str, Any] | None = None
+    record: dict[str, Any] | None = None
+    token: str | None = None
+    meta: dict[str, Any] | None = None
+    identity: str | None = None
+    identity_field: str | None = None
+    password: str | None = None
+    email: str | None = None
+    otp_id: str | None = None
+    otp: str | None = None
+
+
+@dataclass
+class FileTokenRequestEvent(HookEvent):
+    request: Any | None = None
+    collection: Any | None = None
+    record: dict[str, Any] | None = None
+    auth: dict[str, Any] | None = None
+    token: str | None = None
+
+
+@dataclass
+class FileDownloadRequestEvent(HookEvent):
+    request: Any | None = None
+    collection: Any | None = None
+    record: dict[str, Any] | None = None
+    file_field: dict[str, Any] | None = None
+    filename: str = ""
+    served_path: str = ""
+    served_name: str = ""
+    force_download: bool = False
 
 
 @dataclass

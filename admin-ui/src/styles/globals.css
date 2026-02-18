@@ -79,6 +79,11 @@
     animation: fadeIn 180ms cubic-bezier(0.4, 0, 0.2, 1) both;
   }
 
+  .animate-page-swap {
+    animation: pageSwapIn 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    will-change: opacity, transform;
+  }
+
   @keyframes fadeIn {
     from { opacity: 0; transform: translateY(5px); }
     to   { opacity: 1; transform: translateY(0);   }
@@ -90,5 +95,86 @@
   .card-lift:hover {
     box-shadow: 0 4px 20px -4px rgba(0,0,0,0.08);
     transform: translateY(-1px);
+  }
+
+  .animate-enter-up {
+    animation: enterUp 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .animate-enter-delay-1 {
+    animation-delay: 50ms;
+  }
+
+  .animate-enter-delay-2 {
+    animation-delay: 100ms;
+  }
+
+  .animate-enter-delay-3 {
+    animation-delay: 150ms;
+  }
+
+  .skeleton-shimmer {
+    position: relative;
+    overflow: hidden;
+    background: hsl(214.3 31.8% 94%);
+  }
+
+  .skeleton-shimmer::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.7) 45%,
+      rgba(255, 255, 255, 0.95) 50%,
+      rgba(255, 255, 255, 0.7) 55%,
+      transparent 100%
+    );
+    animation: shimmer 1.2s ease-in-out infinite;
+  }
+
+  @keyframes enterUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes shimmer {
+    to {
+      transform: translateX(100%);
+    }
+  }
+
+  @keyframes pageSwapIn {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+@supports (view-transition-name: root) {
+  :root {
+    view-transition-name: root;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 180ms;
+    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
   }
 }

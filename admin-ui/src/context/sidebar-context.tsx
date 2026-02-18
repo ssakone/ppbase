@@ -5,12 +5,14 @@ const DEFAULT_WIDTH = 340
 const MIN_WIDTH = 220
 const MAX_WIDTH = 520
 
+type SidebarSection = 'dashboard' | 'collections' | 'migrations' | 'logs' | 'settings'
+
 interface SidebarContextType {
-  activeSection: 'collections' | 'migrations' | 'settings'
+  activeSection: SidebarSection
   selectedCollectionId: string | null
   sidebarOpen: boolean
   collectionsPanelWidth: number
-  setActiveSection: (section: 'collections' | 'migrations' | 'settings') => void
+  setActiveSection: (section: SidebarSection) => void
   setSelectedCollectionId: (id: string | null) => void
   setSidebarOpen: (open: boolean) => void
   setCollectionsPanelWidth: (width: number) => void
@@ -27,7 +29,7 @@ function getStoredWidth(): number {
 }
 
 export function SidebarProvider({ children }: { children: React.ReactNode }) {
-  const [activeSection, setActiveSection] = useState<'collections' | 'migrations' | 'settings'>('collections')
+  const [activeSection, setActiveSection] = useState<SidebarSection>('dashboard')
   const [selectedCollectionId, setSelectedCollectionId] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [collectionsPanelWidth, setCollectionsPanelWidthState] = useState(getStoredWidth)

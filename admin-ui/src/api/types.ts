@@ -125,6 +125,12 @@ export interface LogStats {
   uniqueIps: number
 }
 
+export interface HealthStatus {
+  code: number
+  message: string
+  data: Record<string, unknown>
+}
+
 export interface OAuth2ProviderConfig {
   name: string
   clientId: string

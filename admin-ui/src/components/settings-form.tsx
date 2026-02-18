@@ -1,14 +1,30 @@
 import { useState, useEffect } from 'react'
 import { useSettings, useUpdateSettings } from '@/hooks/use-settings'
+import { testSettingsEmail, type TestEmailTemplate } from '@/api/endpoints/settings'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { toast } from 'sonner'
 
 type SettingsData = Record<string, Record<string, unknown>>
+type SaveHandler = (d: SettingsData) => Promise<void>
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error && typeof error === 'object') {
+    const maybe = error as { message?: unknown }
+    if (typeof maybe.message === 'string' && maybe.message.trim()) {
+      return maybe.message
+    }
+  }
+  if (error instanceof Error && error.message.trim()) {
+    return error.message
+  }
+  return fallback
+}
 
 function SectionCard({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
   return (
@@ -32,7 +48,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 // ── Meta Tab ──────────────────────────────────────────────────────────────────
-function MetaTab({ settings, onSave, saving }: { settings: SettingsData; onSave: (d: SettingsData) => void; saving: boolean }) {
+function MetaTab({ settings, onSave, saving }: { settings: SettingsData; onSave: SaveHandler; saving: boolean }) {
   const [appName, setAppName] = useState('')
   const [appUrl, setAppUrl] = useState('')
   const [supportEmail, setSupportEmail] = useState('')
@@ -50,7 +66,7 @@ function MetaTab({ settings, onSave, saving }: { settings: SettingsData; onSave:
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSave({ meta: { appName, appUrl, supportEmail, senderName, senderAddress } })
+    void onSave({ meta: { appName, appUrl, supportEmail, senderName, senderAddress } })
   }
 
   return (
@@ -72,12 +88,15 @@ function MetaTab({ settings, onSave, saving }: { settings: SettingsData; onSave:
 }
 
 // ── SMTP Tab ──────────────────────────────────────────────────────────────────
-function SmtpTab({ settings, onSave, saving }: { settings: SettingsData; onSave: (d: SettingsData) => void; saving: boolean }) {
+function SmtpTab({ settings, onSave, saving }: { settings: SettingsData; onSave: SaveHandler; saving: boolean }) {
   const [host, setHost] = useState('')
   const [port, setPort] = useState('587')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [tls, setTls] = useState(true)
+  const [testEmail, setTestEmail] = useState('')
+  const [testTemplate, setTestTemplate] = useState<TestEmailTemplate>('verification')
+  const [isTesting, setIsTesting] = useState(false)
 
   useEffect(() => {
     const s = settings.smtp ?? {}
@@ -88,9 +107,35 @@ function SmtpTab({ settings, onSave, saving }: { settings: SettingsData; onSave:
     setTls(s.tls !== false)
   }, [settings])
 
+  useEffect(() => {
+    const meta = settings.meta ?? {}
+    const preferred = String(meta.supportEmail ?? meta.senderAddress ?? '').trim()
+    if (!preferred) return
+    setTestEmail((prev) => prev || preferred)
+  }, [settings])
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSave({ smtp: { host, port: Number(port), username, password, tls } })
+    void onSave({ smtp: { host, port: Number(port), username, password, tls } })
+  }
+
+  const handleSendTestEmail = async () => {
+    const recipient = testEmail.trim()
+    if (!recipient) {
+      toast.error('Please provide a recipient email.')
+      return
+    }
+
+    setIsTesting(true)
+    try {
+      await onSave({ smtp: { host, port: Number(port), username, password, tls } })
+      await testSettingsEmail(recipient, testTemplate)
+      toast.success(`Test email sent to ${recipient}.`)
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to send test email.'))
+    } finally {
+      setIsTesting(false)
+    }
   }
 
   return (
@@ -110,16 +155,59 @@ function SmtpTab({ settings, onSave, saving }: { settings: SettingsData; onSave:
           <Checkbox id="smtp-tls" checked={tls} onCheckedChange={(v) => setTls(!!v)} />
           <Label htmlFor="smtp-tls" className="cursor-pointer text-sm">Enable TLS</Label>
         </div>
-        <Button type="submit" disabled={saving}>
+        <Button type="submit" disabled={saving || isTesting}>
           {saving && <LoadingSpinner size="sm" className="mr-2" />}Save
         </Button>
       </form>
+
+      <div className="rounded-lg border border-indigo-100 bg-indigo-50/40 p-4 space-y-3">
+        <h3 className="text-sm font-semibold text-indigo-900">Send test email</h3>
+        <p className="text-xs text-indigo-800/80">
+          Saves the SMTP values above, then sends a test message.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="md:col-span-2">
+            <Field label="Recipient">
+              <Input
+                type="email"
+                value={testEmail}
+                onChange={(e) => setTestEmail(e.target.value)}
+                placeholder="you@example.com"
+              />
+            </Field>
+          </div>
+          <Field label="Template">
+            <Select
+              value={testTemplate}
+              onValueChange={(value) => setTestTemplate(value as TestEmailTemplate)}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="verification">verification</SelectItem>
+                <SelectItem value="password-reset">password-reset</SelectItem>
+                <SelectItem value="email-change">email-change</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={handleSendTestEmail}
+          disabled={saving || isTesting}
+        >
+          {isTesting && <LoadingSpinner size="sm" className="mr-2" />}
+          Send test email
+        </Button>
+      </div>
     </SectionCard>
   )
 }
 
 // ── S3 Tab ────────────────────────────────────────────────────────────────────
-function S3Tab({ settings, onSave, saving }: { settings: SettingsData; onSave: (d: SettingsData) => void; saving: boolean }) {
+function S3Tab({ settings, onSave, saving }: { settings: SettingsData; onSave: SaveHandler; saving: boolean }) {
   const [endpoint, setEndpoint] = useState('')
   const [bucket, setBucket] = useState('')
   const [region, setRegion] = useState('')
@@ -139,7 +227,7 @@ function S3Tab({ settings, onSave, saving }: { settings: SettingsData; onSave: (
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSave({ s3: { endpoint, bucket, region, accessKey, secret, forcePathStyle } })
+    void onSave({ s3: { endpoint, bucket, region, accessKey, secret, forcePathStyle } })
   }
 
   return (
@@ -167,7 +255,7 @@ function S3Tab({ settings, onSave, saving }: { settings: SettingsData; onSave: (
 }
 
 // ── Logs Tab ──────────────────────────────────────────────────────────────────
-function LogsTab({ settings, onSave, saving }: { settings: SettingsData; onSave: (d: SettingsData) => void; saving: boolean }) {
+function LogsTab({ settings, onSave, saving }: { settings: SettingsData; onSave: SaveHandler; saving: boolean }) {
   const [maxDays, setMaxDays] = useState('5')
   const [logIp, setLogIp] = useState(true)
 
@@ -179,7 +267,7 @@ function LogsTab({ settings, onSave, saving }: { settings: SettingsData; onSave:
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSave({ logs: { maxDays: Number(maxDays), logIp } })
+    void onSave({ logs: { maxDays: Number(maxDays), logIp } })
   }
 
   return (
@@ -209,7 +297,7 @@ function LogsTab({ settings, onSave, saving }: { settings: SettingsData; onSave:
 }
 
 // ── Rate Limiting Tab ─────────────────────────────────────────────────────────
-function RateLimitTab({ settings, onSave, saving }: { settings: SettingsData; onSave: (d: SettingsData) => void; saving: boolean }) {
+function RateLimitTab({ settings, onSave, saving }: { settings: SettingsData; onSave: SaveHandler; saving: boolean }) {
   const [enabled, setEnabled] = useState(false)
   const [maxRequests, setMaxRequests] = useState('1000')
   const [window, setWindow] = useState('60')
@@ -223,7 +311,7 @@ function RateLimitTab({ settings, onSave, saving }: { settings: SettingsData; on
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSave({ rateLimiting: { enabled, maxRequests: Number(maxRequests), window: Number(window) } })
+    void onSave({ rateLimiting: { enabled, maxRequests: Number(maxRequests), window: Number(window) } })
   }
 
   return (
@@ -261,8 +349,9 @@ export function SettingsForm() {
       await updateSettings.mutateAsync(data)
       toast.success('Settings saved successfully.')
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to save settings.'
+      const message = getErrorMessage(err, 'Failed to save settings.')
       toast.error(message)
+      throw err
     }
   }
 

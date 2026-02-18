@@ -1,11 +1,12 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/context/auth-context'
 import { createFirstAdmin } from '@/api/endpoints/init'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { LoadingSpinner } from '@/components/loading-spinner'
+import { navigateWithTransition } from '@/lib/navigation'
 
 export function SetupPage() {
   const { isAuthenticated, needsSetup, loginWithToken } = useAuth()
@@ -16,16 +17,14 @@ export function SetupPage() {
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
 
-  // If already authenticated, go to collections
+  // If already authenticated, go to dashboard
   if (isAuthenticated) {
-    navigate('/collections', { replace: true })
-    return null
+    return <Navigate to="/dashboard" replace />
   }
 
   // If setup is not needed, go to login
   if (!needsSetup) {
-    navigate('/login', { replace: true })
-    return null
+    return <Navigate to="/login" replace />
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -48,7 +47,7 @@ export function SetupPage() {
     try {
       const result = await createFirstAdmin(email.trim(), password, passwordConfirm)
       loginWithToken(result.token)
-      navigate('/collections', { replace: true })
+      navigateWithTransition(navigate, '/dashboard', { replace: true })
     } catch (err: unknown) {
       const message = (err as { message?: string })?.message || 'Failed to create admin account.'
       setError(message)

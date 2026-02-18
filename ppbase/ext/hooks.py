@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from ppbase.ext.events import HookEvent
 
@@ -30,6 +30,35 @@ class HookBinding:
         if self.predicate is None:
             return True
         return self.predicate(event)
+
+
+async def run_hook_chain(
+    event: HookEvent,
+    bindings: Sequence[HookBinding],
+    default_handler: HookCallable | None = None,
+) -> Any:
+    """Execute a hook/middleware chain with ``await event.next()`` semantics."""
+
+    ordered_bindings = list(bindings)
+
+    async def dispatch(index: int) -> Any:
+        if index >= len(ordered_bindings):
+            if default_handler is None:
+                return None
+            return await _maybe_await(default_handler(event))
+
+        binding = ordered_bindings[index]
+
+        async def _next() -> Any:
+            return await dispatch(index + 1)
+
+        event._set_next_handler(_next)
+        try:
+            return await _maybe_await(binding.handler(event))
+        finally:
+            event._clear_next_handler()
+
+    return await dispatch(0)
 
 
 class Hook:
@@ -105,22 +134,4 @@ class Hook:
         Handlers can call ``await event.next()`` exactly once to continue.
         """
         bindings = self._ordered_bindings(event)
-
-        async def dispatch(index: int) -> Any:
-            if index >= len(bindings):
-                if default_handler is None:
-                    return None
-                return await _maybe_await(default_handler(event))
-
-            binding = bindings[index]
-
-            async def _next() -> Any:
-                return await dispatch(index + 1)
-
-            event._set_next_handler(_next)
-            try:
-                return await _maybe_await(binding.handler(event))
-            finally:
-                event._clear_next_handler()
-
-        return await dispatch(0)
+        return await run_hook_chain(event, bindings, default_handler)

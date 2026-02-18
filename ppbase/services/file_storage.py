@@ -6,7 +6,9 @@ Files are stored at: {data_dir}/storage/{collection_id}/{record_id}/{filename}
 from __future__ import annotations
 
 import os
-import uuid
+import re
+import secrets
+import string
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,8 @@ from ppbase.config import Settings
 
 # Cached settings instance
 _settings: Settings | None = None
+_SAFE_STEM_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+_ALPHANUM = string.ascii_letters + string.digits
 
 
 def _get_settings() -> Settings:
@@ -28,6 +32,33 @@ def get_storage_path(collection_id: str, record_id: str) -> Path:
     """Get the storage directory path for a record."""
     settings = _get_settings()
     return Path(settings.data_dir) / "storage" / collection_id / record_id
+
+
+def _sanitize_stem(original_name: str) -> str:
+    """Return a storage-safe filename stem from the original upload name."""
+    stem = Path(original_name).stem.strip()
+    if not stem:
+        return "file"
+
+    stem = stem.replace(" ", "_")
+    stem = _SAFE_STEM_PATTERN.sub("_", stem)
+    stem = re.sub(r"_+", "_", stem).strip("_")
+    return stem or "file"
+
+
+def _random_suffix(length: int = 10) -> str:
+    """Generate a cryptographically random alphanumeric suffix."""
+    return "".join(secrets.choice(_ALPHANUM) for _ in range(length))
+
+
+def _generate_storage_filename(original_name: str) -> str:
+    """Generate a PocketBase-like stored filename.
+
+    Format: {sanitized_original_stem}_{random_alnum}{extension}
+    """
+    ext = Path(original_name).suffix
+    stem = _sanitize_stem(original_name)
+    return f"{stem}_{_random_suffix()}{ext}"
 
 
 def save_files(
@@ -56,10 +87,16 @@ def save_files(
     
     for original_name, content in files:
         # Generate unique filename to avoid conflicts
-        ext = Path(original_name).suffix
-        unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
-        
-        file_path = storage_dir / unique_name
+        unique_name = ""
+        file_path = storage_dir
+        for _ in range(20):
+            unique_name = _generate_storage_filename(original_name)
+            file_path = storage_dir / unique_name
+            if not file_path.exists():
+                break
+        else:
+            raise RuntimeError("Unable to generate a unique filename for uploaded file")
+
         file_path.write_bytes(content)
         saved.append(unique_name)
         

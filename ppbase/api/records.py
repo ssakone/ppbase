@@ -541,6 +541,7 @@ async def _apply_batch_create(
             collection,
             record["id"],
             fields=fields,
+            request_context=request_context,
         )
         if selected_record is not None:
             record = selected_record
@@ -553,6 +554,7 @@ async def _apply_batch_create(
             [record],
             expand,
             all_collections,
+            request_context=request_context,
         )
         record = expanded_records[0] if expanded_records else record
 
@@ -642,6 +644,7 @@ async def _apply_batch_update(
             collection,
             record_id,
             fields=fields,
+            request_context=request_context,
         )
         if selected_record is not None:
             record = selected_record
@@ -654,6 +657,7 @@ async def _apply_batch_update(
             [record],
             expand,
             all_collections,
+            request_context=request_context,
         )
         record = expanded_records[0] if expanded_records else record
 
@@ -945,6 +949,7 @@ async def api_list_records(
                 result["items"],
                 e.expand,
                 all_colls,
+                request_context=request_context,
             )
 
         return JSONResponse(content=result, status_code=200)
@@ -1108,6 +1113,7 @@ async def api_create_record(
                 [record],
                 e.expand,
                 all_colls,
+                request_context=request_context,
             )
             record = records[0] if records else record
 
@@ -1175,6 +1181,7 @@ async def api_get_record(
             collection,
             e.record_id or recordId,
             fields=e.fields,
+            request_context=request_context,
         )
         if record is None:
             return _error_response(404, "The requested resource wasn't found.")
@@ -1193,7 +1200,12 @@ async def api_get_record(
         if e.expand and record:
             all_colls = await get_all_collections(active_engine)
             records = await expand_records(
-                active_engine, collection, [record], e.expand, all_colls,
+                active_engine,
+                collection,
+                [record],
+                e.expand,
+                all_colls,
+                request_context=request_context,
             )
             record = records[0] if records else record
 
@@ -1365,6 +1377,7 @@ async def api_update_record(
                 [record],
                 e.expand,
                 all_colls,
+                request_context=request_context,
             )
             record = records[0] if records else record
 

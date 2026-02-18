@@ -7,6 +7,7 @@ dynamically-created collection tables.  All SQL is parameterized.
 from __future__ import annotations
 
 import json as _json
+import mimetypes
 from datetime import datetime, timezone
 from typing import Any
 
@@ -52,6 +53,57 @@ def _normalize_field(f: dict[str, Any]) -> dict[str, Any]:
     return core
 
 
+def _normalize_file_options(field_def: FieldDefinition) -> dict[str, Any]:
+    """Return file options, supporting both nested and legacy flat schemas."""
+    opts = dict(field_def.options or {})
+    for key in ("maxSelect", "maxSize", "mimeTypes", "thumbs", "protected"):
+        if hasattr(field_def, key) and key not in opts:  # defensive fallback
+            opts[key] = getattr(field_def, key)
+    return opts
+
+
+def _matches_mime_pattern(mime_type: str, pattern: str) -> bool:
+    candidate = str(mime_type or "").strip().lower()
+    rule = str(pattern or "").strip().lower()
+    if not candidate or not rule:
+        return False
+    if rule.endswith("/*"):
+        return candidate.startswith(rule[:-1])
+    return candidate == rule
+
+
+def _validate_uploaded_file_constraints(
+    field_def: FieldDefinition,
+    filename: str,
+    content: bytes,
+) -> None:
+    """Validate uploaded file bytes against file field options."""
+    options = _normalize_file_options(field_def)
+    max_size = options.get("maxSize")
+    if max_size not in (None, "", 0):
+        try:
+            limit = int(max_size)
+        except Exception:
+            limit = 0
+        if limit > 0 and len(content) > limit:
+            raise FieldValidationError(
+                field_def.name,
+                "validation_max_size_constraint",
+                f"Must be at most {limit} byte(s).",
+            )
+
+    mime_patterns = options.get("mimeTypes")
+    if isinstance(mime_patterns, list) and mime_patterns:
+        guessed_mime, _encoding = mimetypes.guess_type(filename)
+        mime_type = (guessed_mime or "application/octet-stream").lower()
+        if not any(_matches_mime_pattern(mime_type, p) for p in mime_patterns):
+            raise FieldValidationError(
+                field_def.name,
+                "validation_invalid_mime_type",
+                f"Unsupported file type: {mime_type}.",
+            )
+
+
 def _get_schema_fields(collection: CollectionRecord) -> list[FieldDefinition]:
     """Parse the collection's schema JSONB into FieldDefinition objects.
 
@@ -88,6 +140,11 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
 def _table_name(collection: CollectionRecord) -> str:
     # _superusers is now a real table (no longer mapped to _admins)
     return collection.name
+
+
+def _collection_type(collection: CollectionRecord) -> str:
+    """Return a normalized collection type string."""
+    return str(getattr(collection, "type", "base") or "base").strip().lower()
 
 
 # Columns from the _superusers table that must never be exposed through the API
@@ -175,7 +232,7 @@ async def list_records(
 
     # Build ORDER BY clause
     # View collections may lack "created" — fall back to no explicit order
-    col_type = getattr(collection, "type", "base") or "base"
+    col_type = _collection_type(collection)
     if col_type == "view":
         # Check if the view has a "created" column
         view_field_names = {f.name for f in schema_fields}
@@ -246,12 +303,24 @@ async def list_records(
     if collection.name == "_superusers":
         rows = [{k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS} for row in rows]
 
-    _is_auth = getattr(collection, "type", "base") == "auth"
+    _type = _collection_type(collection)
+    _is_auth = _type == "auth"
+    _is_view = _type == "view"
+    auth_payload = None
+    apply_email_visibility = False
+    if isinstance(request_context, dict):
+        apply_email_visibility = True
+        raw_auth = request_context.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_payload = raw_auth
     items = [
         build_record_response(
             row, collection.id, collection.name, collection.schema or [],
             fields_filter=ff, hidden_fields=hidden,
             is_auth_collection=_is_auth,
+            is_view_collection=_is_view,
+            request_auth=auth_payload,
+            apply_email_visibility=apply_email_visibility,
         )
         for row in rows
     ]
@@ -270,6 +339,7 @@ async def get_record(
     record_id: str,
     *,
     fields: str | None = None,
+    request_context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Fetch a single record by ID.  Returns None if not found."""
     table = _table_name(collection)
@@ -292,11 +362,23 @@ async def get_record(
     if collection.name == "_superusers":
         row_dict = {k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
 
-    _is_auth = getattr(collection, "type", "base") == "auth"
+    _type = _collection_type(collection)
+    _is_auth = _type == "auth"
+    _is_view = _type == "view"
+    auth_payload = None
+    apply_email_visibility = False
+    if isinstance(request_context, dict):
+        apply_email_visibility = True
+        raw_auth = request_context.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_payload = raw_auth
     return build_record_response(
         row_dict, collection.id, collection.name, collection.schema or [],
         fields_filter=ff, hidden_fields=hidden,
         is_auth_collection=_is_auth,
+        is_view_collection=_is_view,
+        request_auth=auth_payload,
+        apply_email_visibility=apply_email_visibility,
     )
 
 
@@ -343,7 +425,7 @@ async def create_record(
     errors: dict[str, dict[str, str]] = {}
 
     # --- Auth collection: password & system columns ---
-    col_type = getattr(collection, "type", "base") or "base"
+    col_type = _collection_type(collection)
     if col_type == "auth":
         from ppbase.services.auth_service import hash_password, generate_token_key
 
@@ -403,6 +485,22 @@ async def create_record(
         for field_name, file_list in files.items():
             field_def = field_map.get(field_name)
             if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            upload_has_error = False
+            for uploaded_name, uploaded_content in file_list:
+                try:
+                    _validate_uploaded_file_constraints(
+                        field_def,
+                        uploaded_name,
+                        uploaded_content,
+                    )
+                except FieldValidationError as exc:
+                    errors[exc.field_name] = {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+                    upload_has_error = True
+            if upload_has_error:
                 continue
             max_select = field_def.options.get("maxSelect", 1) or 1
             saved_names = save_files(
@@ -510,7 +608,7 @@ async def update_record(
     errors: dict[str, dict[str, str]] = {}
 
     # --- Auth collection: password update handling ---
-    col_type = getattr(collection, "type", "base") or "base"
+    col_type = _collection_type(collection)
     if col_type == "auth":
         from ppbase.services.auth_service import hash_password, generate_token_key
 
@@ -563,6 +661,22 @@ async def update_record(
         for field_name, file_list in files.items():
             field_def = field_map.get(field_name)
             if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            upload_has_error = False
+            for uploaded_name, uploaded_content in file_list:
+                try:
+                    _validate_uploaded_file_constraints(
+                        field_def,
+                        uploaded_name,
+                        uploaded_content,
+                    )
+                except FieldValidationError as exc:
+                    errors[exc.field_name] = {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+                    upload_has_error = True
+            if upload_has_error:
                 continue
             max_select = field_def.options.get("maxSelect", 1) or 1
             saved_names = save_files(

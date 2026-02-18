@@ -1072,6 +1072,36 @@ describe('Auth Collection Flows', () => {
     expect(fetched.token_key).toBeUndefined();
   });
 
+  it('should hide auth emails from other non-admin users when emailVisibility is false', async () => {
+    const pb = getFreshPb();
+    const user1Email = `visibility_1_${Date.now()}@example.com`;
+    const user2Email = `visibility_2_${Date.now()}@example.com`;
+
+    const user1 = await pb.collection(authCollection.name).create({
+      email: user1Email,
+      password: 'password123',
+      passwordConfirm: 'password123',
+    });
+    const user2 = await pb.collection(authCollection.name).create({
+      email: user2Email,
+      password: 'password123',
+      passwordConfirm: 'password123',
+    });
+
+    const user2Client = getFreshPb();
+    await user2Client.collection(authCollection.name).authWithPassword(user2Email, 'password123');
+
+    const otherUser = await user2Client.collection(authCollection.name).getOne(user1.id);
+    expect(otherUser.email).toBeUndefined();
+    expect(otherUser.emailVisibility).toBe(false);
+
+    const selfRecord = await user2Client.collection(authCollection.name).getOne(user2.id);
+    expect(selfRecord.email).toBe(user2Email);
+
+    const adminView = await adminPb.collection(authCollection.name).getOne(user1.id);
+    expect(adminView.email).toBe(user1Email);
+  });
+
   it('should contain correct token claims', async () => {
     const pb = getFreshPb();
     const email = `claims_${Date.now()}@example.com`;
