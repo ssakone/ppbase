@@ -133,22 +133,36 @@ async def _lifespan(app: FastAPI):
     else:
         logger.info("Auto-migrate disabled, skipping migration check")
 
-    # Check if any admin exists — if not, print setup URL
+    # Check if any admin exists — if not, generate setup token and print unique URL
     from ppbase.services.admin_service import count_admins
+    from ppbase.services.setup_service import get_or_create_setup_token
     from sqlalchemy.ext.asyncio import AsyncSession as _CheckAS, async_sessionmaker as _check_asm
 
     _check_factory = _check_asm(bind=engine, class_=_CheckAS, expire_on_commit=False)
     async with _check_factory() as _check_session:
         admin_count = await count_admins(_check_session)
+        if admin_count == 0:
+            setup_token = await get_or_create_setup_token(_check_session)
+            await _check_session.commit()
 
     if admin_count == 0:
         display_host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-        setup_url = f"http://{display_host}:{settings.port}/_/"
+        setup_url = f"http://{display_host}:{settings.port}/_/setup?token={setup_token}"
         print(
             "\n"
-            "No admin account found.\n"
-            f"Open {setup_url} to set up your first admin.\n"
+            "  No admin account found. Create your first admin:\n"
+            "\n"
+            f"  {setup_url}\n"
+            "\n"
+            "  This is a one-time link — open it in your browser.\n"
         )
+        # Try to open in browser (PocketBase-style)
+        try:
+            import webbrowser
+            if sys.stdin.isatty():
+                webbrowser.open(setup_url)
+        except Exception:
+            pass
 
     if extensions is not None:
         await extensions.hooks.get(HOOK_SERVE).trigger(

@@ -102,6 +102,23 @@ async def app_client(pg_url: str) -> AsyncGenerator[AsyncClient, None]:
 # Admin setup
 # ---------------------------------------------------------------------------
 
+async def _get_setup_token(pg_url: str) -> str | None:
+    """Get the setup token from _params (created by lifespan when no admins)."""
+    from ppbase.db.engine import get_engine
+    from ppbase.db.system_tables import ParamRecord
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+
+    engine = get_engine()
+    factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as session:
+        q = select(ParamRecord).where(ParamRecord.key == "_setup_token")
+        row = (await session.execute(q)).scalars().first()
+        if row and isinstance(row.value, dict):
+            return row.value.get("token")
+    return None
+
+
 @pytest_asyncio.fixture(scope="session")
 async def admin_token(app_client: AsyncClient, pg_url: str) -> str:
     """Create an admin account (or login if one exists) and return a valid admin JWT.
@@ -113,14 +130,19 @@ async def admin_token(app_client: AsyncClient, pg_url: str) -> str:
     email = os.environ.get("PPBASE_TEST_ADMIN_EMAIL", "admin@test.com")
     password = os.environ.get("PPBASE_TEST_ADMIN_PASSWORD", "adminpass123")
 
-    resp = await app_client.post(
-        "/api/admins/init",
-        json={
-            "email": email,
-            "password": password,
-            "passwordConfirm": password,
-        },
-    )
+    # Trigger lifespan (creates setup token when no admins), then get token
+    await app_client.get("/api/health")
+    setup_token = await _get_setup_token(pg_url)
+
+    init_body = {
+        "email": email,
+        "password": password,
+        "passwordConfirm": password,
+    }
+    if setup_token:
+        init_body["setupToken"] = setup_token
+
+    resp = await app_client.post("/api/admins/init", json=init_body)
     if resp.status_code == 200:
         return resp.json()["token"]
 

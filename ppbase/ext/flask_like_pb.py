@@ -579,6 +579,9 @@ class FlaskLikePB:
         """Start the server with uvicorn (blocking)."""
         import uvicorn
 
+        from ppbase.db.ensure_db import ensure_database_exists
+
+        ensure_database_exists(self.settings.database_url)
         app = self.get_app()
         uvicorn.run(
             app,

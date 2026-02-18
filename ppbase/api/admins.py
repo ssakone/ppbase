@@ -56,6 +56,7 @@ class InitBody(BaseModel):
     email: str
     password: str
     passwordConfirm: str
+    setupToken: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,7 @@ async def init_admin(
     """Create the first admin account.
 
     This endpoint is public and only works when no admins exist yet.
+    Requires a valid setupToken (from the one-time URL printed at startup).
     Once an admin has been created, subsequent calls return 400.
     """
     count = await admin_service.count_admins(session)
@@ -117,6 +119,17 @@ async def init_admin(
 
     from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
     from ppbase.services.auth_service import create_admin_token
+    from ppbase.services.setup_service import consume_setup_token
+
+    if not await consume_setup_token(session, body.setupToken):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": 403,
+                "message": "Invalid or expired setup token. Use the URL printed in the server console.",
+                "data": {},
+            },
+        )
 
     admin = await admin_service.create_admin(session, body.email, body.password)
     await session.commit()

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Navigate, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/context/auth-context'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -8,7 +8,7 @@ import { LoadingSpinner } from '@/components/loading-spinner'
 import { navigateWithTransition } from '@/lib/navigation'
 
 export function LoginPage() {
-  const { login, isAuthenticated, needsSetup } = useAuth()
+  const { login, isAuthenticated } = useAuth()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -17,10 +17,6 @@ export function LoginPage() {
 
   if (isAuthenticated) {
     return <Navigate to="/dashboard" replace />
-  }
-
-  if (needsSetup) {
-    return <Navigate to="/setup" replace />
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -97,6 +93,12 @@ export function LoginPage() {
             <Button type="submit" className="w-full h-11 text-sm font-medium" disabled={isLoading}>
               {isLoading ? <LoadingSpinner size="sm" /> : 'Sign in'}
             </Button>
+
+            <p className="text-center text-sm text-muted-foreground mt-4">
+              <Link to="/setup" className="hover:underline text-indigo-600">
+                Create your first admin
+              </Link>
+            </p>
           </form>
         </div>
       </div>

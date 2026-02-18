@@ -21,12 +21,21 @@ api_router = APIRouter()
 
 
 @api_router.get("/init", tags=["init"])
-async def init_status(session: AsyncSession = Depends(get_session)):
-    """Check if the application needs initial setup (no admins exist)."""
-    from ppbase.services.admin_service import count_admins
+async def init_status(
+    session: AsyncSession = Depends(get_session),
+    token: str | None = None,
+):
+    """Check if the application needs initial setup (no admins exist).
 
-    count = await count_admins(session)
-    return {"needsSetup": count == 0}
+    When no admins exist, returns needsSetup: true only if a valid setup token
+    is provided (from the one-time URL printed at startup). Otherwise returns
+    needsSetup: false to avoid leaking that setup is required.
+    """
+    from ppbase.services.setup_service import validate_setup_token
+
+    if await validate_setup_token(session, token):
+        return {"needsSetup": True}
+    return {"needsSetup": False}
 
 
 # Always-available routes

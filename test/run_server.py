@@ -21,6 +21,7 @@ Usage
     python test/run_server.py           # foreground, port 8090
     python test/run_server.py 9000      # custom port
     python test/run_server.py --publicDir ./test/public_site
+    python test/run_server.py --db postgresql+asyncpg://user:pass@host:5432/mydb
 """
 
 from __future__ import annotations
@@ -184,29 +185,17 @@ pb.load_hooks("routes.webhooks:setup")   # /api/webhooks/*
 # ── start ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run PPBase dev server example.")
-    parser.add_argument("port", nargs="?", type=int, default=8090)
-    parser.add_argument(
-        "--publicDir",
-        "--public-dir",
-        dest="public_dir",
-        default=None,
-        help="Serve this directory at / (PocketBase-like publicDir).",
-    )
-    args = parser.parse_args()
-    port = args.port
-
-    if args.public_dir:
-        pb.configure(public_dir=args.public_dir)
+    pb.configure(database_url="postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase2", migrations_dir="./test/migrations")
 
     print()
     print("┌─────────────────────────────────────────────────────────────┐")
     print("│  PPBase dev server  (multi-file example)                    │")
     print("├─────────────────────────────────────────────────────────────┤")
-    print(f"│  Admin UI  →  http://127.0.0.1:{port}/_/                       │")
-    print(f"│  API       →  http://127.0.0.1:{port}/api/                      │")
-    if args.public_dir:
-        print(f"│  Public    →  {args.public_dir:<48} │")
+    print(f"│  Admin UI  →  http://127.0.0.1:8090/_/                       │")
+    print(f"│  API       →  http://127.0.0.1:8090/api/                      │")
+    print(f"│  DB        →  postgresql+asyncpg://ppbase*:*@localhost:5433/ppbase2 │")
+    print(f"│  Migrations →  ./test/migrations │")
+    print(f"│  Public    →  ./test/public_site │")
     print("├─────────────────────────────────────────────────────────────┤")
     print("│  Custom routes                                              │")
     print("│    GET   /hello                                             │")
@@ -245,4 +234,4 @@ if __name__ == "__main__":
     print("  Ctrl+C to stop")
     print()
 
-    pb.start(host="127.0.0.1", port=port)
+    pb.start(host="127.0.0.1", port=8090)
