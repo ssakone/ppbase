@@ -69,12 +69,14 @@ async def _trigger_realtime_hook(
 async def realtime_connect(
     request: Request,
     subscription_manager: SubscriptionManager = Depends(get_subscription_manager),
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
 ):
     """Establish SSE connection and return clientId."""
     event = RealtimeConnectEvent(
         app=request.app,
         request=request,
         subscription_manager=subscription_manager,
+        auth=auth,
     )
 
     async def _default_connect_handler(e: RealtimeConnectEvent):

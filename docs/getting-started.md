@@ -216,3 +216,5 @@ if __name__ == "__main__":
 ```bash
 python -c "from ppbase.app import create_app; app = create_app(); print('OK')"
 ```
+
+For production rollout guidance, see [Production Deployment](./production.md).

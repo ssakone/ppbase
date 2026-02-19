@@ -7,6 +7,7 @@ PPBase is a Python reimplementation of [PocketBase](https://pocketbase.io/) back
 | Guide | Description |
 |-------|-------------|
 | [Getting Started](./getting-started.md) | Installation, first run, create-admin |
+| [Production Deployment](./production.md) | Deployment checklist, scaling and hardening |
 | [Custom Routes](./routes.md) | `@pb.get`, `@pb.post`, route groups, `pb.configure()`, `pb.apis` |
 | [Hooks](./hooks.md) | Lifecycle & record event hooks |
 | [Middleware](./middleware.md) | Global/group/route extension middleware, plus built-in API rate limiting |

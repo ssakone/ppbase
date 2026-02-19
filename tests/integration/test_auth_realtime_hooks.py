@@ -168,6 +168,7 @@ async def test_realtime_connect_and_subscribe_hooks_are_triggered(monkeypatch) -
     connect_response = await realtime_api.realtime_connect(
         connect_request,
         subscription_manager=manager,
+        auth=None,
     )
     assert connect_response.status_code == 200
     assert connect_calls >= 1
@@ -189,6 +190,56 @@ async def test_realtime_connect_and_subscribe_hooks_are_triggered(monkeypatch) -
     assert session is not None
     assert len(session.subscriptions) == 1
     assert session.subscriptions[0].topic == "posts/*"
+
+
+@pytest.mark.asyncio
+async def test_realtime_connect_hook_receives_auth_payload() -> None:
+    app = FastAPI()
+    app.include_router(realtime_api.router)
+    extensions = ExtensionRegistry()
+    manager = SubscriptionManager(extension_registry=extensions)
+    app.state.extension_registry = extensions
+    app.state.subscription_manager = manager
+
+    seen_auth: dict[str, str] | None = None
+
+    async def _connect(e):
+        nonlocal seen_auth
+        if isinstance(e.auth, dict):
+            seen_auth = {
+                "id": str(e.auth.get("id", "")),
+                "type": str(e.auth.get("type", "")),
+                "collectionName": str(e.auth.get("collectionName", "")),
+            }
+        return await e.next()
+
+    extensions.hooks.get(HOOK_REALTIME_CONNECT_REQUEST).bind_func(_connect)
+
+    connect_request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/realtime",
+            "headers": [],
+            "app": app,
+        }
+    )
+    connect_response = await realtime_api.realtime_connect(
+        connect_request,
+        subscription_manager=manager,
+        auth={
+            "id": "user_1",
+            "type": "authRecord",
+            "collectionName": "users",
+        },
+    )
+
+    assert connect_response.status_code == 200
+    assert seen_auth == {
+        "id": "user_1",
+        "type": "authRecord",
+        "collectionName": "users",
+    }
 
 
 @pytest.mark.asyncio
