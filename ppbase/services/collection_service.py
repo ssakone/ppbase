@@ -388,7 +388,21 @@ async def update_collection(
         record.delete_rule = data.delete_rule
 
     if data.options is not None:
-        record.options = data.options
+        incoming_options = data.options if isinstance(data.options, dict) else {}
+        # Dashboard updates often send partial auth options (e.g. only oauth2).
+        # Preserve existing token/password settings and merge in provided keys.
+        if (record.type or "base") == "auth":
+            from ppbase.services.auth_service import generate_default_auth_options
+
+            existing_options = record.options if isinstance(record.options, dict) else {}
+            is_superusers = record.name == "_superusers"
+            merged = _deep_merge_dicts(
+                generate_default_auth_options(is_superusers=is_superusers),
+                existing_options,
+            )
+            record.options = _deep_merge_dicts(merged, incoming_options)
+        else:
+            record.options = incoming_options
 
     record.updated = datetime.now(timezone.utc)
 

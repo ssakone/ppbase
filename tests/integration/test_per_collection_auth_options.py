@@ -81,6 +81,8 @@ class TestAuthOptionsPopulated:
         oauth2 = data["options"]["oauth2"]
         assert oauth2["enabled"] is True
         assert oauth2["providers"][0]["name"] == "google"
+        assert "authToken" in data["options"]
+        assert "passwordAuth" in data["options"]
 
     async def test_new_auth_collection_gets_created(self, app_client: AsyncClient, admin_token: str):
         """Creating a new auth collection should succeed."""
