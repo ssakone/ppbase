@@ -1,6 +1,7 @@
 """Admin API routes.
 
 Endpoints:
+    POST   /api/admins/init               (public, first-run only)
     POST   /api/admins/auth-with-password
     POST   /api/admins/auth-refresh
     GET    /api/admins
@@ -49,6 +50,93 @@ class AdminUpdateBody(BaseModel):
 class ChangePasswordBody(BaseModel):
     password: str
     passwordConfirm: str
+
+
+class InitBody(BaseModel):
+    email: str
+    password: str
+    passwordConfirm: str
+    setupToken: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Init endpoint (public, first-run only)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/init")
+async def init_admin(
+    body: InitBody,
+    session: AsyncSession = Depends(get_session),
+    settings: Any = Depends(get_settings),
+):
+    """Create the first admin account.
+
+    This endpoint is public and only works when no admins exist yet.
+    Requires a valid setupToken (from the one-time URL printed at startup).
+    Once an admin has been created, subsequent calls return 400.
+    """
+    count = await admin_service.count_admins(session)
+    if count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "An admin already exists. Use the login endpoint instead.",
+                "data": {},
+            },
+        )
+
+    if body.password != body.passwordConfirm:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "Password and confirmation do not match.",
+                "data": {
+                    "passwordConfirm": {
+                        "code": "validation_values_mismatch",
+                        "message": "Values don't match.",
+                    }
+                },
+            },
+        )
+
+    if len(body.password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "Password must be at least 8 characters.",
+                "data": {
+                    "password": {
+                        "code": "validation_length_out_of_range",
+                        "message": "The length must be at least 8 characters.",
+                    }
+                },
+            },
+        )
+
+    from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
+    from ppbase.services.auth_service import create_admin_token
+    from ppbase.services.setup_service import consume_setup_token
+
+    if not await consume_setup_token(session, body.setupToken):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": 403,
+                "message": "Invalid or expired setup token. Use the URL printed in the server console.",
+                "data": {},
+            },
+        )
+
+    admin = await admin_service.create_admin(session, body.email, body.password)
+    await session.commit()
+
+    su_coll = await _get_superusers_collection(session)
+    token = create_admin_token(admin, settings, superusers_collection=su_coll)
+    return {"token": token, "admin": _admin_to_dict(admin)}
 
 
 # ---------------------------------------------------------------------------

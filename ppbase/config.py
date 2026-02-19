@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import string
+from pathlib import Path
 from typing import ClassVar
 
 from pydantic_settings import BaseSettings
@@ -34,17 +36,40 @@ class Settings(BaseSettings):
 
     # ---- Storage ----
     data_dir: str = "./pb_data"
+    public_dir: str | None = None
     storage_backend: str = "local"  # "local" or "s3"
     s3_endpoint: str = ""
     s3_bucket: str = ""
     s3_region: str = ""
     s3_access_key: str = ""
     s3_secret_key: str = ""
+    s3_force_path_style: bool = False
 
     # ---- Auth ----
     jwt_secret: str = ""
     admin_token_duration: int = 1_209_600  # 14 days in seconds
-    record_token_duration: int = 1_209_600  # 14 days in seconds
+    record_token_duration: int = 604_800  # 7 days in seconds
+    verification_token_duration: int = 259_200  # 3 days in seconds
+    password_reset_token_duration: int = 1_800  # 30 minutes in seconds
+
+    # ---- OAuth2 Provider Credentials ----
+    oauth2_google_client_id: str = ""
+    oauth2_google_client_secret: str = ""
+    oauth2_github_client_id: str = ""
+    oauth2_github_client_secret: str = ""
+    oauth2_gitlab_client_id: str = ""
+    oauth2_gitlab_client_secret: str = ""
+    oauth2_discord_client_id: str = ""
+    oauth2_discord_client_secret: str = ""
+    oauth2_facebook_client_id: str = ""
+    oauth2_facebook_client_secret: str = ""
+
+    # ---- SMTP (optional — if not configured, tokens are logged) ----
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "noreply@ppbase.local"
 
     # ---- CORS ----
     origins: list[str] = ["*"]
@@ -58,7 +83,7 @@ class Settings(BaseSettings):
     max_request_body_size: int = 5_242_880  # 5 MB
 
     # ---- Internal ----
-    _resolved_jwt_secret: ClassVar[str] = ""
+    _resolved_jwt_secret: ClassVar[dict[str, str]] = {}
 
     model_config = {
         "env_prefix": "PPBASE_",
@@ -69,7 +94,46 @@ class Settings(BaseSettings):
         """Return the JWT secret, auto-generating one if not configured."""
         if self.jwt_secret:
             return self.jwt_secret
-        # Generate once per process and cache on the class
-        if not Settings._resolved_jwt_secret:
-            Settings._resolved_jwt_secret = _generate_jwt_secret()
-        return Settings._resolved_jwt_secret
+
+        project_data_dir = Path(self.data_dir or "./pb_data").expanduser()
+        cache_key = os.path.abspath(str(project_data_dir))
+
+        cached = Settings._resolved_jwt_secret.get(cache_key)
+        if cached:
+            return cached
+
+        secret_file = project_data_dir / ".jwt_secret"
+
+        # Prefer an already persisted project secret.
+        try:
+            existing = secret_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing = ""
+        if existing:
+            Settings._resolved_jwt_secret[cache_key] = existing
+            return existing
+
+        generated = _generate_jwt_secret()
+
+        # Persist the generated secret so tokens remain stable across restarts.
+        try:
+            project_data_dir.mkdir(parents=True, exist_ok=True)
+            if secret_file.exists():
+                existing = secret_file.read_text(encoding="utf-8").strip()
+                if existing:
+                    generated = existing
+                else:
+                    secret_file.write_text(generated + "\n", encoding="utf-8")
+            else:
+                secret_file.write_text(generated + "\n", encoding="utf-8")
+
+            try:
+                os.chmod(secret_file, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            # Fall back to process memory only when filesystem write isn't possible.
+            pass
+
+        Settings._resolved_jwt_secret[cache_key] = generated
+        return generated

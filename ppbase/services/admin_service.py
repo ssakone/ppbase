@@ -19,6 +19,13 @@ from ppbase.services.auth_service import (
 )
 
 
+async def _get_superusers_collection(session: AsyncSession):
+    """Fetch the _superusers CollectionRecord."""
+    from ppbase.db.system_tables import CollectionRecord
+    stmt = select(CollectionRecord).where(CollectionRecord.name == "_superusers")
+    return (await session.execute(stmt)).scalars().first()
+
+
 def _fmt_dt(dt: datetime | None) -> str:
     """Format datetime to PocketBase API format."""
     if dt is None:
@@ -35,6 +42,12 @@ def _admin_to_dict(admin: SuperuserRecord) -> dict[str, Any]:
         "email": admin.email,
         "avatar": admin.avatar,
     }
+
+
+async def count_admins(session: AsyncSession) -> int:
+    """Return the total number of admin (superuser) records."""
+    count_q = select(func.count()).select_from(SuperuserRecord)
+    return (await session.execute(count_q)).scalar() or 0
 
 
 async def list_admins(
@@ -151,7 +164,8 @@ async def auth_with_password(
     if not verify_password(password, admin.password_hash):
         return None
 
-    token = create_admin_token(admin, settings)
+    su_coll = await _get_superusers_collection(session)
+    token = create_admin_token(admin, settings, superusers_collection=su_coll)
     return {"token": token, "admin": _admin_to_dict(admin)}
 
 
@@ -170,5 +184,6 @@ async def auth_refresh(
     if admin is None:
         return None
 
-    token = create_admin_token(admin, settings)
+    su_coll = await _get_superusers_collection(session)
+    token = create_admin_token(admin, settings, superusers_collection=su_coll)
     return {"token": token, "admin": _admin_to_dict(admin)}

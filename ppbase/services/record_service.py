@@ -7,6 +7,7 @@ dynamically-created collection tables.  All SQL is parameterized.
 from __future__ import annotations
 
 import json as _json
+import mimetypes
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +21,7 @@ from ppbase.models.field_types import (
     FieldDefinition,
     FieldType,
     FieldValidationError,
+    _EMAIL_RE,
     validate_field_value,
 )
 from ppbase.models.record import (
@@ -49,6 +51,57 @@ def _normalize_field(f: dict[str, Any]) -> dict[str, Any]:
     existing = core.pop("options", None) or {}
     core["options"] = {**extra, **existing}
     return core
+
+
+def _normalize_file_options(field_def: FieldDefinition) -> dict[str, Any]:
+    """Return file options, supporting both nested and legacy flat schemas."""
+    opts = dict(field_def.options or {})
+    for key in ("maxSelect", "maxSize", "mimeTypes", "thumbs", "protected"):
+        if hasattr(field_def, key) and key not in opts:  # defensive fallback
+            opts[key] = getattr(field_def, key)
+    return opts
+
+
+def _matches_mime_pattern(mime_type: str, pattern: str) -> bool:
+    candidate = str(mime_type or "").strip().lower()
+    rule = str(pattern or "").strip().lower()
+    if not candidate or not rule:
+        return False
+    if rule.endswith("/*"):
+        return candidate.startswith(rule[:-1])
+    return candidate == rule
+
+
+def _validate_uploaded_file_constraints(
+    field_def: FieldDefinition,
+    filename: str,
+    content: bytes,
+) -> None:
+    """Validate uploaded file bytes against file field options."""
+    options = _normalize_file_options(field_def)
+    max_size = options.get("maxSize")
+    if max_size not in (None, "", 0):
+        try:
+            limit = int(max_size)
+        except Exception:
+            limit = 0
+        if limit > 0 and len(content) > limit:
+            raise FieldValidationError(
+                field_def.name,
+                "validation_max_size_constraint",
+                f"Must be at most {limit} byte(s).",
+            )
+
+    mime_patterns = options.get("mimeTypes")
+    if isinstance(mime_patterns, list) and mime_patterns:
+        guessed_mime, _encoding = mimetypes.guess_type(filename)
+        mime_type = (guessed_mime or "application/octet-stream").lower()
+        if not any(_matches_mime_pattern(mime_type, p) for p in mime_patterns):
+            raise FieldValidationError(
+                field_def.name,
+                "validation_invalid_mime_type",
+                f"Unsupported file type: {mime_type}.",
+            )
 
 
 def _get_schema_fields(collection: CollectionRecord) -> list[FieldDefinition]:
@@ -89,10 +142,56 @@ def _table_name(collection: CollectionRecord) -> str:
     return collection.name
 
 
+def _collection_type(collection: CollectionRecord) -> str:
+    """Return a normalized collection type string."""
+    return str(getattr(collection, "type", "base") or "base").strip().lower()
+
+
 # Columns from the _superusers table that must never be exposed through the API
 _SUPERUSERS_HIDDEN_COLUMNS = frozenset({
     "password_hash", "token_key", "last_reset_sent_at",
 })
+
+
+async def _build_relation_resolver(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+) -> dict[str, tuple[str, int]]:
+    """Map relation field names to ``(target_table_name, max_select)``.
+
+    This allows the filter parser to translate dotted paths like
+    ``author.name`` into proper ``EXISTS`` subqueries against the related
+    collection's table.
+    """
+    schema: list[dict[str, Any]] = collection.schema or []
+    # Collect (field_name, target_collection_id, max_select)
+    targets: list[tuple[str, str, int]] = []
+    for raw in schema:
+        f = _normalize_field(raw)
+        if f.get("type") != "relation":
+            continue
+        opts = f.get("options") or {}
+        coll_id = opts.get("collectionId")
+        max_select = opts.get("maxSelect", 1) or 1
+        if coll_id:
+            targets.append((f["name"], coll_id, max_select))
+
+    if not targets:
+        return {}
+
+    # Resolve unique collection IDs to table names in one pass
+    unique_ids = {cid for _, cid, _ in targets}
+    id_to_name: dict[str, str] = {}
+    for cid in unique_ids:
+        target = await resolve_collection(engine, cid)
+        if target is not None:
+            id_to_name[cid] = _table_name(target)
+
+    resolver: dict[str, tuple[str, int]] = {}
+    for field_name, coll_id, max_select in targets:
+        if coll_id in id_to_name:
+            resolver[field_name] = (id_to_name[coll_id], max_select)
+    return resolver
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +224,15 @@ async def list_records(
     where_sql = "1=1"
     params: dict[str, Any] = {}
     if filter_str:
-        where_sql, params = parse_filter(filter_str, request_context)
+        # Only resolve relations when the filter contains a dotted path
+        relation_resolver = None
+        if "." in filter_str:
+            relation_resolver = await _build_relation_resolver(engine, collection)
+        where_sql, params = parse_filter(filter_str, request_context, relation_resolver)
 
     # Build ORDER BY clause
     # View collections may lack "created" — fall back to no explicit order
-    col_type = getattr(collection, "type", "base") or "base"
+    col_type = _collection_type(collection)
     if col_type == "view":
         # Check if the view has a "created" column
         view_field_names = {f.name for f in schema_fields}
@@ -200,10 +303,24 @@ async def list_records(
     if collection.name == "_superusers":
         rows = [{k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS} for row in rows]
 
+    _type = _collection_type(collection)
+    _is_auth = _type == "auth"
+    _is_view = _type == "view"
+    auth_payload = None
+    apply_email_visibility = False
+    if isinstance(request_context, dict):
+        apply_email_visibility = True
+        raw_auth = request_context.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_payload = raw_auth
     items = [
         build_record_response(
             row, collection.id, collection.name, collection.schema or [],
             fields_filter=ff, hidden_fields=hidden,
+            is_auth_collection=_is_auth,
+            is_view_collection=_is_view,
+            request_auth=auth_payload,
+            apply_email_visibility=apply_email_visibility,
         )
         for row in rows
     ]
@@ -222,6 +339,7 @@ async def get_record(
     record_id: str,
     *,
     fields: str | None = None,
+    request_context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Fetch a single record by ID.  Returns None if not found."""
     table = _table_name(collection)
@@ -244,9 +362,23 @@ async def get_record(
     if collection.name == "_superusers":
         row_dict = {k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
 
+    _type = _collection_type(collection)
+    _is_auth = _type == "auth"
+    _is_view = _type == "view"
+    auth_payload = None
+    apply_email_visibility = False
+    if isinstance(request_context, dict):
+        apply_email_visibility = True
+        raw_auth = request_context.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_payload = raw_auth
     return build_record_response(
         row_dict, collection.id, collection.name, collection.schema or [],
         fields_filter=ff, hidden_fields=hidden,
+        is_auth_collection=_is_auth,
+        is_view_collection=_is_view,
+        request_auth=auth_payload,
+        apply_email_visibility=apply_email_visibility,
     )
 
 
@@ -265,6 +397,9 @@ async def create_record(
 
     Validates all fields, generates an ID, and sets timestamps.
     Handles file uploads if files dict is provided.
+
+    For auth collections, handles password hashing, token_key generation,
+    and auth system column defaults.
 
     Raises:
         FieldValidationError: If any field fails validation.
@@ -289,6 +424,59 @@ async def create_record(
 
     errors: dict[str, dict[str, str]] = {}
 
+    # --- Auth collection: password & system columns ---
+    col_type = _collection_type(collection)
+    if col_type == "auth":
+        from ppbase.services.auth_service import hash_password, generate_token_key
+
+        # Reject client-supplied internal columns
+        data.pop("password_hash", None)
+        data.pop("token_key", None)
+
+        password = data.pop("password", None)
+        password_confirm = data.pop("passwordConfirm", None)
+
+        if not password:
+            errors["password"] = {
+                "code": "validation_required",
+                "message": "Cannot be blank.",
+            }
+        elif len(password) < 8:
+            errors["password"] = {
+                "code": "validation_length_out_of_range",
+                "message": "The length must be between 8 and 72.",
+            }
+        elif password_confirm != password:
+            errors["passwordConfirm"] = {
+                "code": "validation_values_mismatch",
+                "message": "Values don't match.",
+            }
+
+        if not errors:
+            columns["password_hash"] = hash_password(password)
+            columns["token_key"] = generate_token_key()
+
+        # Auth system column: email (required for auth, from data)
+        email_val = data.pop("email", None)
+        if email_val is None or (isinstance(email_val, str) and not email_val.strip()):
+            errors["email"] = {"code": "validation_required", "message": "Cannot be blank."}
+        else:
+            email_str = str(email_val).strip()
+            if not _EMAIL_RE.match(email_str):
+                errors["email"] = {"code": "validation_invalid_email", "message": "Must be a valid email address."}
+            else:
+                columns["email"] = email_str
+
+        # Auth system column defaults
+        if "email_visibility" not in data:
+            columns["email_visibility"] = False
+        else:
+            columns["email_visibility"] = bool(data.pop("email_visibility", False))
+        if "verified" not in data:
+            columns["verified"] = False
+        else:
+            columns["verified"] = bool(data.pop("verified", False))
+
     # Build field map for file handling
     field_map = {f.name: f for f in schema_fields}
 
@@ -297,6 +485,22 @@ async def create_record(
         for field_name, file_list in files.items():
             field_def = field_map.get(field_name)
             if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            upload_has_error = False
+            for uploaded_name, uploaded_content in file_list:
+                try:
+                    _validate_uploaded_file_constraints(
+                        field_def,
+                        uploaded_name,
+                        uploaded_content,
+                    )
+                except FieldValidationError as exc:
+                    errors[exc.field_name] = {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+                    upload_has_error = True
+            if upload_has_error:
                 continue
             max_select = field_def.options.get("maxSelect", 1) or 1
             saved_names = save_files(
@@ -323,6 +527,16 @@ async def create_record(
     if errors:
         raise _ValidationErrors(errors)
 
+    # Email uniqueness check for auth collections
+    if col_type == "auth" and "email" in columns:
+        dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email LIMIT 1'
+        async with engine.connect() as conn:
+            dup = (await conn.execute(text(dup_sql), {"email": columns["email"]})).first()
+        if dup:
+            raise _ValidationErrors({
+                "email": {"code": "validation_not_unique", "message": "The email is already in use."}
+            })
+
     # Build INSERT
     col_names = ", ".join(f'"{c}"' for c in columns)
     placeholders = ", ".join(f":{c}" for c in columns)
@@ -330,6 +544,16 @@ async def create_record(
 
     async with engine.begin() as conn:
         await conn.execute(text(insert_sql), columns)
+
+        # Send PostgreSQL NOTIFY for realtime updates
+        notify_payload = _json.dumps({
+            "collection": collection.name,
+            "record_id": record_id,
+            "action": "create",
+        })
+        # NOTIFY requires string literal, escape single quotes
+        escaped_payload = notify_payload.replace("'", "''")
+        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
 
     # Fetch and return the created record
     return (await get_record(engine, collection, record_id)) or {
@@ -383,17 +607,76 @@ async def update_record(
     updates: dict[str, Any] = {"updated": now}
     errors: dict[str, dict[str, str]] = {}
 
-    field_map = {f.name: f for f in schema_fields}
+    # --- Auth collection: password update handling ---
+    col_type = _collection_type(collection)
+    if col_type == "auth":
+        from ppbase.services.auth_service import hash_password, generate_token_key
 
-    print(f"[DEBUG] update_record called: record_id={record_id}")
-    print(f"[DEBUG] data keys: {list(data.keys())}, data values: {data}")
-    print(f"[DEBUG] files keys: {list(files.keys()) if files else []}")
+        # Strip internal columns from client data
+        data.pop("password_hash", None)
+        data.pop("token_key", None)
+
+        password = data.pop("password", None)
+        password_confirm = data.pop("passwordConfirm", None)
+
+        if password is not None:
+            if len(password) < 8:
+                errors["password"] = {
+                    "code": "validation_length_out_of_range",
+                    "message": "The length must be between 8 and 72.",
+                }
+            elif password_confirm != password:
+                errors["passwordConfirm"] = {
+                    "code": "validation_values_mismatch",
+                    "message": "Values don't match.",
+                }
+            else:
+                updates["password_hash"] = hash_password(password)
+                updates["token_key"] = generate_token_key()
+
+        # Handle email update with format validation
+        if "email" in data:
+            email_val = data.pop("email")
+            if email_val is None or (isinstance(email_val, str) and not email_val.strip()):
+                errors["email"] = {"code": "validation_required", "message": "Cannot be blank."}
+            else:
+                email_str = str(email_val).strip()
+                if not _EMAIL_RE.match(email_str):
+                    errors["email"] = {"code": "validation_invalid_email", "message": "Must be a valid email address."}
+                else:
+                    updates["email"] = email_str
+
+        # Handle camelCase-to-snake_case for auth system columns
+        if "email_visibility" in data:
+            updates["email_visibility"] = bool(data.pop("email_visibility"))
+        elif "emailVisibility" in data:
+            updates["email_visibility"] = bool(data.pop("emailVisibility"))
+        if "verified" in data:
+            updates["verified"] = bool(data.pop("verified"))
+
+    field_map = {f.name: f for f in schema_fields}
 
     # Process uploaded files
     if files:
         for field_name, file_list in files.items():
             field_def = field_map.get(field_name)
             if field_def is None or field_def.type != FieldType.FILE:
+                continue
+            upload_has_error = False
+            for uploaded_name, uploaded_content in file_list:
+                try:
+                    _validate_uploaded_file_constraints(
+                        field_def,
+                        uploaded_name,
+                        uploaded_content,
+                    )
+                except FieldValidationError as exc:
+                    errors[exc.field_name] = {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+                    upload_has_error = True
+            if upload_has_error:
                 continue
             max_select = field_def.options.get("maxSelect", 1) or 1
             saved_names = save_files(
@@ -420,7 +703,10 @@ async def update_record(
 
         modifier = None
         field_name = key
-        if key.endswith("+"):
+        if key.startswith("+"):
+            modifier = "prepend"
+            field_name = key[1:]
+        elif key.endswith("+"):
             modifier = "+"
             field_name = key[:-1]
         elif key.endswith("-"):
@@ -438,6 +724,15 @@ async def update_record(
         if modifier == "+":
             current = raw_row.get(field_name)
             merged = _apply_append(current, value, field_def)
+            try:
+                validated = validate_field_value(field_def, merged)
+                updates[field_name] = _serialize_for_pg(validated, field_def)
+            except FieldValidationError as exc:
+                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+
+        elif modifier == "prepend":
+            current = raw_row.get(field_name)
+            merged = _apply_prepend(current, value, field_def)
             try:
                 validated = validate_field_value(field_def, merged)
                 updates[field_name] = _serialize_for_pg(validated, field_def)
@@ -475,7 +770,6 @@ async def update_record(
                     new_files = {str(value)}
 
                 removed = old_files - new_files
-                print(f"[DEBUG] File field '{field_name}': old_val={old_val}, old_files={old_files}, new_files={new_files}, removed={removed}")
                 files_to_delete.extend(removed)
 
             try:
@@ -486,6 +780,16 @@ async def update_record(
 
     if errors:
         raise _ValidationErrors(errors)
+
+    # Email uniqueness check for auth collections on update
+    if col_type == "auth" and "email" in updates and updates["email"]:
+        dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email AND "id" != :rid LIMIT 1'
+        async with engine.connect() as conn:
+            dup = (await conn.execute(text(dup_sql), {"email": updates["email"], "rid": record_id})).first()
+        if dup:
+            raise _ValidationErrors({
+                "email": {"code": "validation_not_unique", "message": "The email is already in use."}
+            })
 
     if len(updates) <= 1:
         # Only "updated" timestamp -- nothing else changed
@@ -499,10 +803,18 @@ async def update_record(
     async with engine.begin() as conn:
         await conn.execute(text(update_sql), params)
 
+        # Send PostgreSQL NOTIFY for realtime updates
+        notify_payload = _json.dumps({
+            "collection": collection.name,
+            "record_id": record_id,
+            "action": "update",
+        })
+        # NOTIFY requires string literal, escape single quotes
+        escaped_payload = notify_payload.replace("'", "''")
+        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+
     # Delete removed files from disk
-    print(f"[DEBUG] files_to_delete: {files_to_delete}")
     if files_to_delete:
-        print(f"[DEBUG] Calling delete_files for record {record_id}: {files_to_delete}")
         delete_files(collection.id, record_id, files_to_delete)
 
     return await get_record(engine, collection, record_id)
@@ -526,6 +838,28 @@ def _apply_append(
     elif new_values is not None:
         cur_list.append(new_values)
     return cur_list
+
+
+def _apply_prepend(
+    current: Any,
+    new_values: Any,
+    field_def: FieldDefinition,
+) -> Any:
+    """Prepend values for multi-value fields or increment for numbers."""
+    if field_def.type == FieldType.NUMBER:
+        cur = float(current) if current is not None else 0.0
+        inc = float(new_values) if new_values is not None else 0.0
+        return cur + inc
+
+    cur_list = list(current) if isinstance(current, (list, tuple)) else []
+    prepend_values: list[Any]
+    if isinstance(new_values, list):
+        prepend_values = list(new_values)
+    elif new_values is not None:
+        prepend_values = [new_values]
+    else:
+        prepend_values = []
+    return prepend_values + cur_list
 
 
 def _apply_remove(
@@ -590,6 +924,16 @@ async def delete_record(
     async with engine.begin() as conn:
         await conn.execute(text(delete_sql), {"id": record_id})
 
+        # Send PostgreSQL NOTIFY for realtime updates
+        notify_payload = _json.dumps({
+            "collection": collection.name,
+            "record_id": record_id,
+            "action": "delete",
+        })
+        # NOTIFY requires string literal, escape single quotes
+        escaped_payload = notify_payload.replace("'", "''")
+        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+
     # Delete all associated files from disk
     delete_all_files(collection.id, record_id)
 
@@ -644,6 +988,42 @@ async def _cascade_delete(
                     engine, other_coll, related_id,
                     all_collections=all_collections,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Rule filter check
+# ---------------------------------------------------------------------------
+
+
+async def check_record_rule(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    record_id: str,
+    rule_filter: str,
+    request_context: dict[str, Any] | None = None,
+) -> bool:
+    """Check if a record matches a rule filter expression.
+
+    Used for view/update/delete rule enforcement.  Parses the rule as a
+    PocketBase filter expression and runs it as a WHERE clause against the
+    record's row.
+
+    Returns True if the record matches the rule, False otherwise.
+    """
+    table = _table_name(collection)
+    # Resolve relation fields for dotted paths in the rule
+    relation_resolver = None
+    if "." in rule_filter:
+        relation_resolver = await _build_relation_resolver(engine, collection)
+    where_sql, params = parse_filter(rule_filter, request_context, relation_resolver)
+    sql = (
+        f'SELECT 1 FROM "{table}" '
+        f'WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'
+    )
+    params["_rule_rec_id"] = record_id
+    async with engine.connect() as conn:
+        result = await conn.execute(text(sql), params)
+        return result.first() is not None
 
 
 # ---------------------------------------------------------------------------

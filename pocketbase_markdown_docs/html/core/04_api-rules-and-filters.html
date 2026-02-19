@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Règles API et filtres — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link active" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Documentation principale <span>›</span> Règles API et filtres</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="api-rules-and-filters">API Rules and Filters</h1>
+<hr />
+<p>API rules and filters</p>
+<h3 id="api-rules"><a href="#api-rules">API rules</a></h3>
+<p><strong>API Rules</strong> are your collection access controls and data filters.</p>
+<p>Each collection has <strong>5 rules</strong>, corresponding to the specific API action:</p>
+<ul>
+<li><code>listRule</code></li>
+<li><code>viewRule</code></li>
+<li><code>createRule</code></li>
+<li><code>updateRule</code></li>
+<li><code>deleteRule</code></li>
+</ul>
+<p>Auth collections have an additional <code>options.manageRule</code> used to allow one user (it could be even from a different collection) to be able to fully manage the data of another user (ex. changing their email, password, etc.).</p>
+<p>Each rule could be set to:</p>
+<ul>
+<li><strong>"locked"</strong> - aka. <code>null</code>, which means that the action could be performed only by an authorized superuser (<strong>this is the default</strong>)</li>
+<li><strong>Empty string</strong> - anyone will be able to perform the action (superusers, authorized users and guests)</li>
+<li><strong>Non-empty string</strong> - only users (authorized or not) that satisfy the rule filter expression will be able to perform this action</li>
+</ul>
+<p><strong>PocketBase API Rules act also as records filter!</strong><br />
+Or in other words, you could for example allow listing only the "active" records of your collection, by using a simple filter expression such as: <code>status = "active"</code> (where "status" is a field defined in your Collection).</p>
+<p>Because of the above, the API will return 200 empty items response in case a request doesn't satisfy a <code>listRule</code>, 400 for unsatisfied <code>createRule</code> and 404 for unsatisfied <code>viewRule</code>, <code>updateRule</code> and <code>deleteRule</code>.<br />
+All rules will return 403 in case they were "locked" (aka. superuser only) and the request client is not a superuser.</p>
+<p>The API Rules are ignored when the action is performed by an authorized superuser (<strong>superusers can access everything</strong>)!</p>
+<h3 id="filters-syntax"><a href="#filters-syntax">Filters syntax</a></h3>
+<p>You can find information about the available fields in your collection API rules tab:</p>
+<p><img alt="Collection API Rules filters screenshot" src="/images/screenshots/collection-rules.png" /></p>
+<p>There is autocomplete to help guide you while typing the rule filter expression, but in general you have access to <strong>3 groups of fields</strong>:</p>
+<ul>
+<li><strong>Your Collection schema fields</strong><br />
+    This includes all nested relation fields too, ex. <code>someRelField.status != "pending"</code></li>
+<li><code>**@request.***</code><br />
+    Used to access the current request data, such as query parameters, body/form fields, authorized user state, etc.<ul>
+<li><code>@request.context</code> - the context where the rule is used (ex. <code>@request.context != "oauth2"</code>)<br />
+    The currently supported context values are <code>default</code>, <code>oauth2</code>, <code>otp</code>, <code>password</code>, <code>realtime</code>, <code>protectedFile</code>.</li>
+<li><code>@request.method</code> - the HTTP request method (ex. <code>@request.method = "GET"</code>)</li>
+<li><code>@request.headers.*</code> - the request headers as string values (ex. <code>@request.headers.x_token = "test"</code>)<br />
+    Note: All header keys are normalized to lowercase and "-" is replaced with "_" (for example "X-Token" is "x_token").</li>
+<li><code>@request.query.*</code> - the request query parameters as string values (ex. <code>@request.query.page = "1"</code>)</li>
+<li><code>@request.auth.*</code> - the current authenticated model (ex. <code>@request.auth.id != ""</code>)</li>
+<li><code>@request.body.*</code> - the submitted body parameters (ex. <code>@request.body.title != ""</code>)<br />
+    Note: Uploaded files are not part of the <code>@request.body</code> because they are evaluated separately (<em>this behavior may change in the future</em>).</li>
+</ul>
+</li>
+<li>
+<p><code>**@collection.***</code></p>
+<p>This filter could be used to target other collections that are not directly related to the current one (aka. there is no relation field pointing to it) but both shares a common field value, like for example a category id:</p>
+<p><code>@collection.news.categoryId ?= categoryId &amp;&amp; @collection.news.author ?= @request.auth.id</code></p>
+<p>In case you want to join the same collection multiple times but based on different criteria, you can define an alias by appending <code>:alias</code> suffix to the collection name.</p>
+<p><code>// see https://github.com/pocketbase/pocketbase/discussions/3805#discussioncomment-7634791 @request.auth.id != "" &amp;&amp; @collection.courseRegistrations.user ?= id &amp;&amp; @collection.courseRegistrations:auth.user ?= @request.auth.id &amp;&amp; @collection.courseRegistrations.courseGroup ?= @collection.courseRegistrations:auth.courseGroup</code></p>
+</li>
+</ul>
+<p>The syntax basically follows the format <code>OPERAND OPERATOR OPERAND</code>, where:</p>
+<ul>
+<li><code>OPERAND</code> - could be any field literal, string (single or double quoted), number, null, true, false</li>
+<li><code>OPERATOR</code> - is one of:<ul>
+<li><code>=</code> Equal</li>
+<li><code>!=</code> NOT equal</li>
+<li><code>&gt;</code> Greater than</li>
+<li><code>&gt;=</code> Greater than or equal</li>
+<li><code>&lt;</code> Less than</li>
+<li><code>&lt;=</code> Less than or equal</li>
+<li><code>~</code> Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+<li><code>!~</code> NOT Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+<li><code>?=</code> <em>Any/At least one of</em> Equal</li>
+<li><code>?!=</code> <em>Any/At least one of</em> NOT equal</li>
+<li><code>?&gt;</code> <em>Any/At least one of</em> Greater than</li>
+<li><code>?&gt;=</code> <em>Any/At least one of</em> Greater than or equal</li>
+<li><code>?&lt;</code> <em>Any/At least one of</em> Less than</li>
+<li><code>?&lt;=</code> <em>Any/At least one of</em> Less than or equal</li>
+<li><code>?~</code> <em>Any/At least one of</em> Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+<li><code>?!~</code> <em>Any/At least one of</em> NOT Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+</ul>
+</li>
+</ul>
+<p>To group and combine several expressions you can use parenthesis <code>(...)</code>, <code>&amp;&amp;</code> (AND) and <code>||</code> (OR) tokens.</p>
+<p>Single line comments are also supported: <code>// Example comment</code>.</p>
+<p>Field expressions with array-like value or nested fields that originate from a source with multiple records will apply a <strong>match-all</strong> constraint by default. If you want <strong>any/at-least-one-of</strong> type of constraint for such fields you'll have to prefix your operator with <code>?</code> (e.g. <code>multiRelation.title ?= "test"</code>).</p>
+<h3 id="special-identifiers-and-modifiers"><a href="#special-identifiers-and-modifiers">Special identifiers and modifiers</a></h3>
+<h5 id="macros"><a href="#-macros">@ macros</a></h5>
+<p>The following datetime macros are available and can be used as part of the filter expression:</p>
+<p><code>// all macros are UTC based // (for more complex date operation check the strftime() function) @now - the current datetime as string @second - @now second number (0-59) @minute - @now minute number (0-59) @hour - @now hour number (0-23) @weekday - @now weekday number (0-6) @day - @now day number @month - @now month number @year - @now year number @yesterday - the yesterday datetime relative to @now as string @tomorrow - the tomorrow datetime relative to @now as string @todayStart - beginning of the current day as datetime string @todayEnd - end of the current day as datetime string @monthStart - beginning of the current month as datetime string @monthEnd - end of the current month as datetime string @yearStart - beginning of the current year as datetime string @yearEnd - end of the current year as datetime string</code></p>
+<p>For example:</p>
+<p><code>@request.body.publicDate &gt;= @now</code></p>
+<h5 id="isset-modifier"><a href="#isset-modifier">:isset modifier</a></h5>
+<p>The <code>:isset</code> field modifier is available only for the <code>@request.*</code> fields and can be used to check whether the client submitted a specific data with the request. Here is for example a rule that disallows submitting a "role" field:</p>
+<p><code>@request.body.role:isset = false</code></p>
+<p>Note that <code>@request.body.*:isset</code> at the moment doesn't support checking for new uploaded files because they are evaluated separately and cannot be serialized (<em>this behavior may change in the future</em>).</p>
+<h5 id="changed-modifier"><a href="#changed-modifier">:changed modifier</a></h5>
+<p>The <code>:changed</code> field modifier is available only for the <code>@request.body.*</code> fields and can be used to check whether the client submitted AND changed a specific record field with the request. Here is for example a rule that disallows changing a "role" field:</p>
+<p><code>// the same as: (@request.body.role:isset = false || @request.body.role = role) @request.body.role:changed = false</code></p>
+<p>Note that <code>@request.body.*:changed</code> at the moment doesn't support checking for new uploaded files because they are evaluated separately and cannot be serialized (<em>this behavior may change in the future</em>).</p>
+<h5 id="length-modifier"><a href="#length-modifier">:length modifier</a></h5>
+<p>The <code>:length</code> field modifier could be used to check the number of items in an array field (multiple <code>file</code>, <code>select</code>, <code>relation</code>).<br />
+Could be used with both the collection schema fields and the <code>@request.body.*</code> fields. For example:</p>
+<p><code>// check example submitted data: {"someSelectField": ["val1", "val2"]} @request.body.someSelectField:length &gt; 1 // check existing record field length someRelationField:length = 2</code></p>
+<p>Note that <code>@request.body.*:length</code> at the moment doesn't support checking for new uploaded files because they are evaluated separately and cannot be serialized (<em>this behavior may change in the future</em>).</p>
+<h5 id="each-modifier"><a href="#each-modifier">:each modifier</a></h5>
+<p>The <code>:each</code> field modifier works only with multiple <code>select</code>, <code>file</code> and <code>relation</code> type fields. It could be used to apply a condition on each item from the field array. For example:</p>
+<p><code>// check if all submitted select options contain the "create" text @request.body.someSelectField:each ~ "create" // check if all existing someSelectField has "pb_" prefix someSelectField:each ~ "pb_%"</code></p>
+<p>Note that <code>@request.body.*:each</code> at the moment doesn't support checking for new uploaded files because they are evaluated separately and cannot be serialized (<em>this behavior may change in the future</em>).</p>
+<h5 id="lower-modifier"><a href="#lower-modifier">:lower modifier</a></h5>
+<p>The <code>:lower</code> field modifier could be used to perform lower-case string comparisons. For example:</p>
+<p><code>// check if the submitted lower-cased body "title" field is equal to "test" ("Test", "tEsT", etc.) @request.body.title:lower = "test" // match existing records with lower-cased "title" equal to "test" ("Test", "tEsT", etc.) title:lower ~ "test"</code></p>
+<p>Under the hood it uses the <a href="https://www.sqlite.org/lang_corefunc.html#lower">SQLite <code>LOWER</code> scalar function</a> and by default works only for ASCII characters, unless the ICU extension is loaded.</p>
+<h5 id="geodistancelona-lata-lonb-latb"><a href="#geodistancelona-lata-lonb-latb">geoDistance(lonA, latA, lonB, latB)</a></h5>
+<p>The <code>geoDistance(lonA, latA, lonB, latB)</code> function could be used to calculate the Haversine distance between 2 geographic points in kilometres.</p>
+<p>The function is intended to be used primarily with the <code>geoPoint</code> field type, but the accepted arguments could be any plain number or collection field identifier. If the identifier cannot be resolved and converted to a numeric value, it resolves to <code>null</code>. Note that the <code>geoDistance</code> function always results in a single row/record value meaning that "any/at-least-one-of" type of constraint will be applied even if some of its arguments originate from a multiple relation field.</p>
+<p>For example:</p>
+<p><code>// offices that are less than 25km from my location (address is a geoPoint field in the offices collection) geoDistance(address.lon, address.lat, 23.32, 42.69) &lt; 25</code></p>
+<h5 id="strftimeformat-time-value-modifiers"><a href="#strftimeformat-time-value-modifiers-">strftime(format, [time-value, modifiers...])</a></h5>
+<p>The <code>strftime(format, [time-value, modifiers...])</code> returns a date string formatted according to the specified format argument.</p>
+<p>The function is similar to the builtin SQLite <a href="https://sqlite.org/lang_datefunc.html"><code>strftime</code></a> with the main difference that NULL results will be normalized for consistency with the non-nullable PocketBase <code>text</code> and <code>date</code> fields.</p>
+<p>The function accepts 1, 2 or 3+ arguments.</p>
+<ol>
+<li>The first (<strong>format</strong>) argument must be a formatting string with valid substitution characters as listed in <a href="https://sqlite.org/lang_datefunc.html">https://sqlite.org/lang_datefunc.html</a> .</li>
+<li>The second (<strong>time-value</strong>) argument is optional and must be either a date <strong>string</strong>, <strong>number</strong> or <strong>collection field identifier</strong> with value matching one of the formats listed in <a href="https://sqlite.org/lang_datefunc.html#time_values">https://sqlite.org/lang_datefunc.html#time_values</a> . If not set the function fallbacks to the current datetime.</li>
+<li>The remaining (<strong>modifiers</strong>) optional arguments are expected to be string literals matching the listed modifiers in <a href="https://sqlite.org/lang_datefunc.html#modifiers">https://sqlite.org/lang_datefunc.html#modifiers</a> (up to 8 max).</li>
+</ol>
+<p>A match-all constraint will be also applied in case the time-value is an identifier as a result of a multi-value relation field. For example:</p>
+<p><code>// requires ALL multiRel records to have "created" that match the formatted string "2026-01" strftime('%Y-%m', multiRel.created) = "2026-01" // requires ANY/AT-LEAST-ONE-OF multiRel records to have "created" that match the formatted string "2026-01" strftime('%Y-%m', multiRel.created) ?= "2026-01"</code></p>
+<h3 id="examples"><a href="#examples">Examples</a></h3>
+<ul>
+<li>
+<p>Allow only registered users:</p>
+<p><code>@request.auth.id != ""</code></p>
+</li>
+<li>
+<p>Allow only registered users and return records that are either "active" or "pending":</p>
+<p><code>@request.auth.id != "" &amp;&amp; (status = "active" || status = "pending")</code></p>
+</li>
+<li>
+<p>Allow only registered users who are listed in an <em>allowed_users</em> multi-relation field value:</p>
+<p><code>@request.auth.id != "" &amp;&amp; allowed_users.id ?= @request.auth.id</code></p>
+</li>
+<li>
+<p>Allow access by anyone and return only the records where the <em>title</em> field value starts with "Lorem" (ex. "Lorem ipsum"):</p>
+<p><code>title ~ "Lorem%"</code></p>
+</li>
+</ul>
+    <div id="page-nav">
+      <a href="../core/03_collections.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Collections</span>
+        </a>
+      <a href="../core/05_authentication.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Authentification</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

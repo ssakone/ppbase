@@ -179,13 +179,17 @@ def _schema_to_fields(schema: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class CollectionResponse(BaseModel):
     """Single collection representation returned by the API.
 
-    Uses ``fields`` (PocketBase v0.23+ format).
+    Returns both ``schema`` (internal nested-options format, for SDK
+    compatibility) and ``fields`` (PocketBase v0.23+ flat format).
+    Many PocketBase SDKs iterate over ``collection.schema`` so it
+    must always be present as a list.
     """
 
     id: str
     name: str
     type: str
     system: bool
+    schema: list[dict[str, Any]] = Field(default_factory=list)
     fields: list[dict[str, Any]] = Field(default_factory=list)
     indexes: list[str] = Field(default_factory=list)
     options: dict[str, Any] = Field(default_factory=dict)
@@ -197,6 +201,8 @@ class CollectionResponse(BaseModel):
     created: str = ""
     updated: str = ""
 
+    model_config = {"protected_namespaces": ()}
+
     @classmethod
     def from_record(cls, record: Any) -> CollectionResponse:
         """Build a response from a ``CollectionRecord`` ORM instance."""
@@ -207,6 +213,7 @@ class CollectionResponse(BaseModel):
             name=record.name,
             type=record.type,
             system=record.system,
+            schema=raw_schema,
             fields=_schema_to_fields(raw_schema),
             indexes=record.indexes if isinstance(record.indexes, list) else [],
             options=raw_options,

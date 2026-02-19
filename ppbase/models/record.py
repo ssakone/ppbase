@@ -10,6 +10,8 @@ import math
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel
+
 
 def format_datetime(dt: datetime | str | None) -> str:
     """Format a datetime value to PocketBase's string format.
@@ -23,6 +25,17 @@ def format_datetime(dt: datetime | str | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+# Auth collection columns that must NEVER appear in API responses
+_AUTH_HIDDEN_COLUMNS = frozenset({
+    "password_hash", "token_key",
+})
+
+# Auth collection columns that need snake_case → camelCase mapping
+_AUTH_COLUMN_MAP = {
+    "email_visibility": "emailVisibility",
+}
+
+
 def build_record_response(
     row: dict[str, Any],
     collection_id: str,
@@ -31,6 +44,10 @@ def build_record_response(
     *,
     fields_filter: list[str] | None = None,
     hidden_fields: set[str] | None = None,
+    is_auth_collection: bool = False,
+    is_view_collection: bool = False,
+    request_auth: dict[str, Any] | None = None,
+    apply_email_visibility: bool = False,
 ) -> dict[str, Any]:
     """Build a record response dict from a raw database row.
 
@@ -42,6 +59,10 @@ def build_record_response(
         fields_filter: Optional list of field names to include in response.
             If None, all non-hidden fields are included.
         hidden_fields: Set of field names marked as hidden in the schema.
+        is_auth_collection: If True, add auth system columns (email,
+            emailVisibility, verified) and hide password_hash/token_key.
+        is_view_collection: If True and no schema is defined, include raw row
+            columns (except system/hidden auth internals).
 
     Returns:
         A dict suitable for JSON serialization as a record response.
@@ -55,6 +76,33 @@ def build_record_response(
         "created": format_datetime(row.get("created")),
         "updated": format_datetime(row.get("updated")),
     }
+
+    def _can_view_auth_email() -> bool:
+        if not apply_email_visibility:
+            return True
+        if bool(row.get("email_visibility", False)):
+            return True
+        if not request_auth:
+            return False
+        auth_type = request_auth.get("type")
+        if auth_type == "admin":
+            return True
+        if auth_type != "authRecord":
+            return False
+        auth_id = str(request_auth.get("id", "") or "")
+        row_id = str(row.get("id", "") or "")
+        if auth_id != row_id:
+            return False
+        auth_coll_id = str(request_auth.get("collectionId", "") or "")
+        auth_coll_name = str(request_auth.get("collectionName", "") or "")
+        return auth_coll_id == collection_id or auth_coll_name == collection_name
+
+    # Auth collection: add system auth columns (camelCase)
+    if is_auth_collection:
+        if _can_view_auth_email():
+            result["email"] = row.get("email", "")
+        result["emailVisibility"] = row.get("email_visibility", False)
+        result["verified"] = row.get("verified", False)
 
     # Add schema-defined fields
     if schema:
@@ -76,17 +124,30 @@ def build_record_response(
             if isinstance(val, float) and val == int(val):
                 val = int(val)
             result[fname] = val
-    else:
-        # View collections have no schema — include all row columns
+    elif is_view_collection:
+        # View collections have no schema — include all row columns.
         system_keys = {"id", "created", "updated"}
         for key, val in row.items():
             if key in system_keys:
+                continue
+            # Always hide auth internal columns
+            if key in _AUTH_HIDDEN_COLUMNS:
                 continue
             if isinstance(val, datetime):
                 val = format_datetime(val)
             if isinstance(val, float) and val == int(val):
                 val = int(val)
-            result[key] = val
+            # Map snake_case auth columns to camelCase
+            output_key = _AUTH_COLUMN_MAP.get(key, key)
+            result[output_key] = val
+
+    # Strip auth-internal columns if they leaked through schema
+    for col in _AUTH_HIDDEN_COLUMNS:
+        result.pop(col, None)
+    # Remove snake_case duplicates of mapped auth columns
+    for snake in _AUTH_COLUMN_MAP:
+        if snake in result and _AUTH_COLUMN_MAP[snake] in result:
+            del result[snake]
 
     # Apply fields filter if specified
     if fields_filter:
@@ -135,3 +196,32 @@ def build_list_response(
         "totalPages": total_pages,
         "items": items,
     }
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 Models
+# ---------------------------------------------------------------------------
+
+
+class OAuth2AuthRequest(BaseModel):
+    """Request model for OAuth2 authentication."""
+
+    provider: str
+    code: str
+    codeVerifier: str
+    redirectUrl: str
+    createData: dict[str, Any] = {}
+
+
+class OAuth2Meta(BaseModel):
+    """OAuth2 metadata returned in auth response."""
+
+    id: str
+    name: str | None = None
+    email: str | None = None
+    username: str | None = None
+    avatarURL: str | None = None
+    isNew: bool
+    accessToken: str
+    refreshToken: str | None = None
+    expiry: float | None = None

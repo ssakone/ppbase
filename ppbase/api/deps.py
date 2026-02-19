@@ -81,21 +81,69 @@ async def get_optional_auth(
         admin = await session.get(SuperuserRecord, token_id)
         if admin is None:
             return None
-        full_secret = admin.token_key + secret
+        # Look up _superusers collection for per-collection secret
+        su_stmt = select(CollectionRecord).where(CollectionRecord.name == "_superusers")
+        su_coll = (await session.execute(su_stmt)).scalars().first()
+        if su_coll is not None:
+            from ppbase.services.auth_service import get_collection_token_config
+            auth_secret, _ = get_collection_token_config(su_coll, 'authToken')
+            full_secret = admin.token_key + auth_secret
+        else:
+            full_secret = admin.token_key + secret  # fallback
         try:
             payload = jwt.decode(token, full_secret, algorithms=["HS256"])
             return payload
         except jwt.InvalidTokenError:
             return None
 
-    # For auth record tokens, the caller will need to validate further.
-    # For now, return the unverified payload with a flag so downstream
-    # can do additional verification if needed.
+    # For auth record tokens, do full verification with the record's token_key
     if token_type == "authRecord":
-        # We cannot fully verify without the record's token_key, but we
-        # return the payload for the auth context so rules can reference it.
-        # Full verification happens in record-specific auth endpoints.
-        return unverified
+        collection_id = unverified.get("collectionId")
+        if not collection_id:
+            return None
+
+        # Look up the auth collection's record to get token_key
+        from sqlalchemy import text as _text
+        from ppbase.db.engine import get_engine
+
+        engine = get_engine()
+        # First resolve the collection to get its table name
+        stmt = select(CollectionRecord).where(
+            CollectionRecord.id == collection_id
+        )
+        coll = (await session.execute(stmt)).scalars().first()
+        if coll is None:
+            # Token claims a collection that doesn't exist - reject explicitly.
+            # PocketBase returns 404 when the referenced collection is missing.
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "status": 404,
+                    "message": f"Missing collection with id \"{collection_id}\".",
+                    "data": {},
+                },
+            )
+
+        table_name = coll.name
+        sql = _text(
+            f'SELECT "token_key" FROM "{table_name}" WHERE "id" = :rid LIMIT 1'
+        )
+        async with engine.connect() as conn:
+            result = await conn.execute(sql, {"rid": token_id})
+            row = result.mappings().first()
+
+        if row is None:
+            return None
+
+        record_token_key = row["token_key"]
+        from ppbase.services.auth_service import get_collection_token_config
+        auth_secret, _ = get_collection_token_config(coll, 'authToken')
+        full_secret = record_token_key + auth_secret
+        try:
+            payload = jwt.decode(token, full_secret, algorithms=["HS256"])
+            return payload
+        except jwt.InvalidTokenError:
+            return None
 
     return None
 
@@ -114,6 +162,47 @@ async def require_admin(
             detail={
                 "status": 401,
                 "message": "The request requires admin authorization token to be set.",
+                "data": {},
+            },
+        )
+    return auth
+
+
+async def require_auth(
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
+) -> dict[str, Any]:
+    """Require that the request has any valid auth token."""
+    if auth is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": 401,
+                "message": "The request requires authentication.",
+                "data": {},
+            },
+        )
+    return auth
+
+
+async def require_record_auth(
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
+) -> dict[str, Any]:
+    """Require that the request has an auth-record token."""
+    if auth is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "status": 401,
+                "message": "The request requires authentication.",
+                "data": {},
+            },
+        )
+    if auth.get("type") != "authRecord":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": 403,
+                "message": "The authorized auth model is not allowed to perform this action.",
                 "data": {},
             },
         )

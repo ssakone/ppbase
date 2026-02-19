@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -12,35 +14,109 @@ from fastapi.responses import JSONResponse
 
 from ppbase.config import Settings
 
+if TYPE_CHECKING:
+    from ppbase.ext.registry import ExtensionRegistry
+
 logger = logging.getLogger(__name__)
+
+
+def _handle_db_connection_error(database_url: str, exc: BaseException) -> None:
+    """Print a clear message when PostgreSQL is unreachable and exit."""
+    import re
+    # Mask password in URL for display
+    safe_url = re.sub(r"://([^:]*):([^@]*)@", r"://\1:****@", database_url)
+
+    msg = (
+        "\n"
+        "PostgreSQL is not reachable. PPBase cannot start without a database.\n"
+        "\n"
+        "  Database URL: %s\n"
+        "\n"
+        "  Make sure PostgreSQL is running, then try:\n"
+        "    python -m ppbase db start   # start PostgreSQL via Docker\n"
+        "\n"
+        "  Or set PPBASE_DATABASE_URL if using a different database.\n"
+    ) % safe_url
+    print(msg, file=sys.stderr)
+    os._exit(1)  # Exit immediately without raising (avoids traceback)
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Manage startup and shutdown of the database engine."""
+    import asyncio
     from ppbase.db.engine import init_engine, close_engine
     from ppbase.db.system_tables import create_system_tables
+    from ppbase.ext.events import BootstrapEvent, ServeEvent, TerminateEvent
+    from ppbase.ext.registry import HOOK_BOOTSTRAP, HOOK_SERVE, HOOK_TERMINATE
+    from ppbase.services.realtime_service import SubscriptionManager, listen_for_db_events
 
     settings: Settings = app.state.settings
+    extensions = getattr(app.state, "extension_registry", None)
+
+    if not settings.jwt_secret and not settings.dev:
+        logger.warning(
+            "PPBASE_JWT_SECRET is not set; PPBase will use a project-local generated "
+            "secret from data_dir/.jwt_secret."
+        )
+
+    if extensions is not None:
+        await extensions.hooks.get(HOOK_BOOTSTRAP).trigger(
+            BootstrapEvent(app=app, settings=settings),
+        )
 
     # Startup: create engine and ensure system tables exist
-    engine = await init_engine(
-        settings.database_url,
-        pool_size=settings.pool_size,
-        max_overflow=settings.max_overflow,
-        echo=settings.dev,
-    )
-    await create_system_tables(engine)
+    try:
+        engine = await init_engine(
+            settings.database_url,
+            pool_size=settings.pool_size,
+            max_overflow=settings.max_overflow,
+            echo=settings.dev,
+        )
+        await create_system_tables(engine)
+    except (ConnectionRefusedError, OSError) as exc:
+        _handle_db_connection_error(settings.database_url, exc)
 
-    # Ensure the _superusers and _external_auths system collections are registered
-    from ppbase.db.bootstrap import ensure_superusers_collection, ensure_external_auths_collection
+    # Initialize realtime subscription manager
+    subscription_manager = SubscriptionManager(extension_registry=extensions)
+    app.state.subscription_manager = subscription_manager
+
+    # Start PostgreSQL LISTEN task for realtime events
+    listen_task = asyncio.create_task(
+        listen_for_db_events(engine, subscription_manager)
+    )
+    logger.info("Started PostgreSQL LISTEN task for realtime events")
+
+    # Bootstrap all system collections and backfill auth options
+    from ppbase.db.bootstrap import bootstrap_system_collections
+    from ppbase.db.system_tables import ParamRecord
+    from ppbase.services.auth_service import generate_default_auth_options
+    from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
     from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker as _asm
 
     _boot_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
     async with _boot_factory() as _boot_session:
         async with _boot_session.begin():
-            await ensure_superusers_collection(_boot_session)
-            await ensure_external_auths_collection(_boot_session)
+            await bootstrap_system_collections(_boot_session, engine)
+
+            # Backfill auth options for existing auth collections
+            from ppbase.db.system_tables import CollectionRecord
+            from sqlalchemy import select
+
+            stmt = select(CollectionRecord).where(CollectionRecord.type == "auth")
+            auth_colls = (await _boot_session.execute(stmt)).scalars().all()
+            for coll in auth_colls:
+                opts = coll.options or {}
+                if not opts.get("authToken"):
+                    is_su = (coll.name == "_superusers")
+                    coll.options = generate_default_auth_options(is_superusers=is_su)
+                    await _boot_session.flush()
+
+            settings_stmt = select(ParamRecord.value).where(ParamRecord.key == "settings")
+            settings_row = (await _boot_session.execute(settings_stmt)).scalar_one_or_none()
+            configure_storage_runtime_from_settings_payload(
+                settings_row if isinstance(settings_row, dict) else None
+            )
 
     # Apply pending migrations if auto_migrate is enabled
     if settings.auto_migrate:
@@ -71,13 +147,65 @@ async def _lifespan(app: FastAPI):
     else:
         logger.info("Auto-migrate disabled, skipping migration check")
 
+    # Check if any admin exists — if not, generate setup token and print unique URL
+    from ppbase.services.admin_service import count_admins
+    from ppbase.services.setup_service import get_or_create_setup_token
+    from sqlalchemy.ext.asyncio import AsyncSession as _CheckAS, async_sessionmaker as _check_asm
+
+    _check_factory = _check_asm(bind=engine, class_=_CheckAS, expire_on_commit=False)
+    async with _check_factory() as _check_session:
+        admin_count = await count_admins(_check_session)
+        if admin_count == 0:
+            setup_token = await get_or_create_setup_token(_check_session)
+            await _check_session.commit()
+
+    if admin_count == 0:
+        display_host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
+        setup_url = f"http://{display_host}:{settings.port}/_/setup?token={setup_token}"
+        print(
+            "\n"
+            "  No admin account found. Create your first admin:\n"
+            "\n"
+            f"  {setup_url}\n"
+            "\n"
+            "  This is a one-time link — open it in your browser.\n"
+        )
+        # Try to open in browser (PocketBase-style)
+        try:
+            import webbrowser
+            if sys.stdin.isatty():
+                webbrowser.open(setup_url)
+        except Exception:
+            pass
+
+    if extensions is not None:
+        await extensions.hooks.get(HOOK_SERVE).trigger(
+            ServeEvent(app=app, settings=settings),
+        )
+
     yield
 
-    # Shutdown: dispose of the connection pool
+    if extensions is not None:
+        await extensions.hooks.get(HOOK_TERMINATE).trigger(
+            TerminateEvent(app=app, settings=settings),
+        )
+
+    # Shutdown: cancel LISTEN task and dispose of the connection pool
+    logger.info("Shutting down PostgreSQL LISTEN task")
+    listen_task.cancel()
+    try:
+        await listen_task
+    except asyncio.CancelledError:
+        pass
+
     await close_engine()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    extensions: "ExtensionRegistry | None" = None,
+) -> FastAPI:
     """Build and return the FastAPI application.
 
     Args:
@@ -100,14 +228,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Attach settings to app state so dependencies can access them
     app.state.settings = settings
+    app.state.extension_registry = extensions
+    app.state.rate_limit_settings_version = 0
+
+    from ppbase.services.file_storage import set_storage_settings
+
+    set_storage_settings(settings)
 
     # CORS
     from ppbase.middleware.cors import setup_cors
 
     setup_cors(app, settings.origins)
 
+    # Request logger
+    from ppbase.middleware.request_logger import RequestLoggerMiddleware
+    from ppbase.middleware.rate_limit import RateLimitMiddleware
+
+    app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(RequestLoggerMiddleware)
+
     # API routes
-    from ppbase.api.router import api_router, _records_router
+    from ppbase.api.router import (
+        api_router,
+        _records_router,
+        _record_auth_router,
+        _realtime_router,
+    )
 
     app.include_router(api_router, prefix="/api")
 
@@ -116,10 +262,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if _records_router is not None:
         app.include_router(_records_router, tags=["records"])
 
+    # The record auth router uses full paths like /api/collections/{...}/auth-*
+    # so it must also be included at the root level.
+    if _record_auth_router is not None:
+        app.include_router(_record_auth_router, tags=["record-auth"])
+
+    # The realtime router uses full paths like /api/realtime
+    # so it must also be included at the root level.
+    if _realtime_router is not None:
+        app.include_router(_realtime_router, tags=["realtime"])
+
+    if extensions is not None:
+        extensions.mount_routes(app)
+
     # Admin UI - serve static files from ppbase/admin/dist/
     import pathlib
 
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
     from fastapi.staticfiles import StaticFiles
 
     admin_dist = pathlib.Path(__file__).parent / "admin" / "dist"
@@ -147,6 +306,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             from fastapi.responses import RedirectResponse
 
             return RedirectResponse("/_/")
+
+    # Public directory (PocketBase-like): files are served at /
+    # without directory listing; "/" serves index.html when present.
+    public_dir = str(settings.public_dir or "").strip()
+    if public_dir:
+        public_root = pathlib.Path(public_dir).expanduser().resolve()
+
+        @app.get("/", include_in_schema=False)
+        async def _public_index() -> Response:
+            index = public_root / "index.html"
+            if index.is_file():
+                return FileResponse(str(index))
+            return Response(status_code=404)
+
+        @app.get("/{public_path:path}", include_in_schema=False)
+        async def _public_file(public_path: str) -> Response:
+            normalized = public_path.strip("/")
+            if not normalized:
+                return Response(status_code=404)
+            if (
+                normalized in {"api", "_"}
+                or normalized.startswith("api/")
+                or normalized.startswith("_/")
+            ):
+                raise HTTPException(status_code=404, detail="Not Found")
+
+            candidate = (public_root / normalized).resolve()
+            try:
+                candidate.relative_to(public_root)
+            except ValueError:
+                return Response(status_code=404)
+
+            if not candidate.is_file():
+                return Response(status_code=404)
+            return FileResponse(str(candidate))
 
     # Custom exception handler: PocketBase returns flat error objects, not
     # FastAPI's default {"detail": ...} wrapper.

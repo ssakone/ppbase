@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Event Hooks — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link active" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Extend with Go <span>›</span> Event Hooks</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="go-event-hooks">Go - Event Hooks</h1>
+<hr />
+<p>Event hooks</p>
+<p>The standard way to modify PocketBase is through <strong>event hooks</strong> in your Go code.</p>
+<p>All hooks have 3 main methods:</p>
+<ul>
+<li><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/hook#Hook.Bind"><code>Bind(handler)</code></a> adds a new handler to the specified event hook. A handler has 3 fields:<ul>
+<li><code>Id</code> <em>(optional)</em> - the name of the handler (could be used as argument for <code>Unbind</code>)</li>
+<li><code>Priority</code> <em>(optional)</em> - the execution order of the handler (if empty fallbacks to the order of registration in the code).</li>
+<li><code>Func</code> <em>(required)</em> - the handler function.</li>
+</ul>
+</li>
+<li><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/hook#Hook.BindFunc"><code>BindFunc(func)</code></a> is similar to <code>Bind</code> but registers a new handler from just the provided function.<br />
+    The registered handler is added with a default 0 priority and the id is autogenerated (the returned string value).</li>
+<li><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/hook#Hook.Trigger"><code>Trigger(event, oneOffHandlerFuncs...)</code></a> triggers the event hook.<br />
+<em>This method rarely has to be called manually by users.</em></li>
+</ul>
+<p>To remove an already registered hook handler, you can use the handler id and pass it to <code>Unbind(id)</code> or remove all handlers with <code>UnbindAll()</code> (<em>!including system handlers</em>).</p>
+<p>All hook handler functions share the same <code>func(e T) error</code> signature and expect the user to call <code>e.Next()</code> if they want to proceed with the execution chain.</p>
+<p>If you need to access the app instance from inside a hook handler, prefer using the <code>e.App</code> field instead of reusing a parent scope app variable because the hook could be part of a DB transaction and can cause deadlock.</p>
+<p>Also avoid using global mutex locks inside a hook handler because it could be invoked recursively (e.g. cascade delete) and can cause deadlock.</p>
+<p>You can explore all available hooks below:</p>
+<h3 id="app-hooks"><a href="#app-hooks">App hooks</a></h3>
+<p><strong><a href="#onbootstrap">OnBootstrap</a></strong></p>
+<p><code>OnBootstrap</code> hook is triggered when initializing the main application resources (db, app settings, etc).</p>
+<p>Note that attempting to access the database before the <code>e.Next()</code> call will result in an error.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error { if err := e.Next(); err != nil { return err } // e.App return nil }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onserve">OnServe</a></strong></p>
+<p><code>OnServe</code> hook is triggered when the app web server is started (after starting the TCP listener but before initializing the blocking serve task), allowing you to adjust its options and attach new routes or middlewares.</p>
+<p><code>package main import ( "log" "net/http" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/apis" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnServe().BindFunc(func(e *core.ServeEvent) error { // register new "GET /hello" route e.Router.GET("/hello", func(e *core.RequestEvent) error { return e.String(200, "Hello world!") }).Bind(apis.RequireAuth()) return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onsettingsreload">OnSettingsReload</a></strong></p>
+<p><code>OnSettingsReload</code> hook is triggered every time when the <code>App.Settings()</code> is being replaced with a new state.</p>
+<p>Calling <code>e.App.Settings()</code> after <code>e.Next()</code> returns the new state.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnSettingsReload().BindFunc(func(e *core.SettingsReloadEvent) error { if err := e.Next(); err != nil { return err } // e.App.Settings() return nil }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onbackupcreate">OnBackupCreate</a></strong></p>
+<p><code>OnBackupCreate</code> is triggered on each <code>App.CreateBackup</code> call.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnBackupCreate().BindFunc(func(e *core.BackupEvent) error { // e.App // e.Name - the name of the backup to create // e.Exclude - list of pb_data dir entries to exclude from the backup return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onbackuprestore">OnBackupRestore</a></strong></p>
+<p><code>OnBackupRestore</code> is triggered before app backup restore (aka. on <code>App.RestoreBackup</code> call).</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnBackupRestore().BindFunc(func(e *core.BackupEvent) error { // e.App // e.Name - the name of the backup to restore // e.Exclude - list of dir entries to exclude from the backup return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onterminate">OnTerminate</a></strong></p>
+<p><code>OnTerminate</code> hook is triggered when the app is in the process of being terminated (ex. on <code>SIGTERM</code> signal).<br />
+Note that the app could be terminated abruptly without awaiting the hook completion.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnTerminate().BindFunc(func(e *core.TerminateEvent) error { // e.App // e.IsRestart return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h3 id="mailer-hooks"><a href="#mailer-hooks">Mailer hooks</a></h3>
+<p><strong><a href="#onmailersend">OnMailerSend</a></strong></p>
+<p><code>OnMailerSend</code> hook is triggered every time when a new email is being sent using the <code>App.NewMailClient()</code> instance.</p>
+<p>It allows intercepting the email message or to use a custom mailer client.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnMailerSend().BindFunc(func(e *core.MailerEvent) error { // e.App // e.Mailer // e.Message // ex. change the mail subject e.Message.Subject = "new subject" return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmailerrecordauthalertsend">OnMailerRecordAuthAlertSend</a></strong></p>
+<p><code>OnMailerRecordAuthAlertSend</code> hook is triggered when sending a new device login auth alert email, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnMailerRecordAuthAlertSend().BindFunc(func(e *core.MailerRecordEvent) error { // e.App // e.Mailer // e.Message // e.Record // e.Meta["info"].(string) // ex. change the mail subject e.Message.Subject = "new subject" return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmailerrecordpasswordresetsend">OnMailerRecordPasswordResetSend</a></strong></p>
+<p><code>OnMailerRecordPasswordResetSend</code> hook is triggered when sending a password reset email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnMailerRecordPasswordResetSend().BindFunc(func(e *core.MailerRecordEvent) error { // e.App // e.Mailer // e.Message // e.Record // e.Meta["token"].(string) // ex. change the mail subject e.Message.Subject = "new subject" return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmailerrecordverificationsend">OnMailerRecordVerificationSend</a></strong></p>
+<p><code>OnMailerRecordVerificationSend</code> hook is triggered when sending a verification email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnMailerRecordVerificationSend().BindFunc(func(e *core.MailerRecordEvent) error { // e.App // e.Mailer // e.Message // e.Record // e.Meta["token"].(string) // ex. change the mail subject e.Message.Subject = "new subject" return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmailerrecordemailchangesend">OnMailerRecordEmailChangeSend</a></strong></p>
+<p><code>OnMailerRecordEmailChangeSend</code> hook is triggered when sending a confirmation new address email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnMailerRecordEmailChangeSend().BindFunc(func(e *core.MailerRecordEvent) error { // e.App // e.Mailer // e.Message // e.Record // e.Meta["token"].(string) // e.Meta["newEmail"].(string) // ex. change the mail subject e.Message.Subject = "new subject" return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmailerrecordotpsend">OnMailerRecordOTPSend</a></strong></p>
+<p><code>OnMailerRecordOTPSend</code> hook is triggered when sending an OTP email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnMailerRecordOTPSend().BindFunc(func(e *core.MailerRecordEvent) error { // e.App // e.Mailer // e.Message // e.Record // e.Meta["otpId"].(string) // e.Meta["password"].(string) // ex. change the mail subject e.Message.Subject = "new subject" return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h3 id="realtime-hooks"><a href="#realtime-hooks">Realtime hooks</a></h3>
+<p><strong><a href="#onrealtimeconnectrequest">OnRealtimeConnectRequest</a></strong></p>
+<p><code>OnRealtimeConnectRequest</code> hook is triggered when establishing the SSE client connection.</p>
+<p>Any execution after e.Next() of a hook handler happens after the client disconnects.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnRealtimeConnectRequest().BindFunc(func(e *core.RealtimeConnectRequestEvent) error { // e.App // e.Client // e.IdleTimeout // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrealtimesubscriberequest">OnRealtimeSubscribeRequest</a></strong></p>
+<p><code>OnRealtimeSubscribeRequest</code> hook is triggered when updating the client subscriptions, allowing you to further validate and modify the submitted change.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnRealtimeSubscribeRequest().BindFunc(func(e *core.RealtimeSubscribeRequestEvent) error { // e.App // e.Client // e.Subscriptions // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrealtimemessagesend">OnRealtimeMessageSend</a></strong></p>
+<p><code>OnRealtimeMessageSend</code> hook is triggered when sending an SSE message to a client.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnRealtimeMessageSend().BindFunc(func(e *core.RealtimeMessageEvent) error { // e.App // e.Client // e.Message // and all original connect RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h3 id="record-model-hooks"><a href="#record-model-hooks">Record model hooks</a></h3>
+<p>These are lower level Record model hooks and could be triggered from anywhere (custom console command, scheduled cron job, when calling <code>e.Save(record)</code>, etc.) and therefore they have no access to the request context!</p>
+<p>If you want to intercept the builtin Web APIs and to access their request body, query parameters, headers or the request auth state, then please use the designated <a href="#request-hooks">Record <code>*Request</code> hooks</a> .</p>
+<p><strong><a href="#onrecordenrich">OnRecordEnrich</a></strong></p>
+<p><code>OnRecordEnrich</code> is triggered every time when a record is enriched - as part of the builtin Record responses, during realtime message serialization, or when <code>apis.EnrichRecord</code> is invoked.</p>
+<p>It could be used for example to redact/hide or add computed temporary Record model props only for the specific request info.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnRecordEnrich("posts").BindFunc(func(e *core.RecordEnrichEvent) error { // hide one or more fields e.Record.Hide("role") // add new custom field for registered users if e.RequestInfo.Auth != nil &amp;&amp; e.RequestInfo.Auth.Collection().Name == "users" { e.Record.WithCustomData(true) // for security requires explicitly allowing it e.Record.Set("computedScore", e.Record.GetInt("score") * e.RequestInfo.Auth.GetInt("base")) } return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordvalidate">OnRecordValidate</a></strong></p>
+<p><code>OnRecordValidate</code> is a Record proxy model hook of <code>OnModelValidate</code>.</p>
+<p><code>OnRecordValidate</code> is called every time when a Record is being validated, e.g. triggered by <code>App.Validate()</code> or <code>App.Save()</code>.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordValidate().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordValidate("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="record-model-create-hooks"><a href="#record-model-create-hooks">Record model create hooks</a></h6>
+<p><strong><a href="#onrecordcreate">OnRecordCreate</a></strong></p>
+<p><code>OnRecordCreate</code> is a Record proxy model hook of <code>OnModelCreate</code>.</p>
+<p><code>OnRecordCreate</code> is triggered every time when a new Record is being created, e.g. triggered by <code>App.Save()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Record validation and the INSERT DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Record validation and the INSERT DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnRecordAfterCreateSuccess</code> or <code>OnRecordAfterCreateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordCreate().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordCreate("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordcreateexecute">OnRecordCreateExecute</a></strong></p>
+<p><code>OnRecordCreateExecute</code> is a Record proxy model hook of <code>OnModelCreateExecute</code>.</p>
+<p><code>OnRecordCreateExecute</code> is triggered after successful Record validation and right before the model INSERT DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Save()</code> in the following firing order:<br />
+<code>OnRecordCreate</code><br />
+ -&gt; <code>OnRecordValidate</code> (skipped with <code>App.SaveNoValidate()</code>)<br />
+ -&gt; <code>OnRecordCreateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnRecordAfterCreateSuccess</code> or <code>OnRecordAfterCreateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordCreateExecute().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordCreateExecute("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordaftercreatesuccess">OnRecordAfterCreateSuccess</a></strong></p>
+<p><code>OnRecordAfterCreateSuccess</code> is a Record proxy model hook of <code>OnModelAfterCreateSuccess</code>.</p>
+<p><code>OnRecordAfterCreateSuccess</code> is triggered after each successful Record DB create persistence.</p>
+<p>Note that when a Record is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordAfterCreateSuccess("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordaftercreateerror">OnRecordAfterCreateError</a></strong></p>
+<p><code>OnRecordAfterCreateError</code> is a Record proxy model hook of <code>OnModelAfterCreateError</code>.</p>
+<p><code>OnRecordAfterCreateError</code> is triggered after each failed Record DB create persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordAfterCreateError().BindFunc(func(e *core.RecordErrorEvent) error { // e.App // e.Record // e.Error return e.Next() }) // fires only for "users" and "articles" records app.OnRecordAfterCreateError("users", "articles").BindFunc(func(e *core.RecordErrorEvent) error { // e.App // e.Record // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="record-model-update-hooks"><a href="#record-model-update-hooks">Record model update hooks</a></h6>
+<p><strong><a href="#onrecordupdate">OnRecordUpdate</a></strong></p>
+<p><code>OnRecordUpdate</code> is a Record proxy model hook of <code>OnModelUpdate</code>.</p>
+<p><code>OnRecordUpdate</code> is triggered every time when a new Record is being updated, e.g. triggered by <code>App.Save()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Record validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Record validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnRecordAfterUpdateSuccess</code> or <code>OnRecordAfterUpdateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordUpdate().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordUpdate("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordupdateexecute">OnRecordUpdateExecute</a></strong></p>
+<p><code>OnRecordUpdateExecute</code> is a Record proxy model hook of <code>OnModelUpdateExecute</code>.</p>
+<p><code>OnRecordUpdateExecute</code> is triggered after successful Record validation and right before the model UPDATE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Save()</code> in the following firing order:<br />
+<code>OnRecordUpdate</code><br />
+ -&gt; <code>OnRecordValidate</code> (skipped with <code>App.SaveNoValidate()</code>)<br />
+ -&gt; <code>OnRecordUpdateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnRecordAfterUpdateSuccess</code> or <code>OnRecordAfterUpdateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordUpdateExecute().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordUpdateExecute("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordafterupdatesuccess">OnRecordAfterUpdateSuccess</a></strong></p>
+<p><code>OnRecordAfterUpdateSuccess</code> is a Record proxy model hook of <code>OnModelAfterUpdateSuccess</code>.</p>
+<p><code>OnRecordAfterUpdateSuccess</code> is triggered after each successful Record DB update persistence.</p>
+<p>Note that when a Record is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordAfterUpdateSuccess("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordafterupdateerror">OnRecordAfterUpdateError</a></strong></p>
+<p><code>OnRecordAfterUpdateError</code> is a Record proxy model hook of <code>OnModelAfterUpdateError</code>.</p>
+<p><code>OnRecordAfterUpdateError</code> is triggered after each failed Record DB update persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordAfterUpdateError().BindFunc(func(e *core.RecordErrorEvent) error { // e.App // e.Record // e.Error return e.Next() }) // fires only for "users" and "articles" records app.OnRecordAfterUpdateError("users", "articles").BindFunc(func(e *core.RecordErrorEvent) error { // e.App // e.Record // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="record-model-delete-hooks"><a href="#record-model-delete-hooks">Record model delete hooks</a></h6>
+<p><strong><a href="#onrecorddelete">OnRecordDelete</a></strong></p>
+<p><code>OnRecordDelete</code> is a Record proxy model hook of <code>OnModelDelete</code>.</p>
+<p><code>OnRecordDelete</code> is triggered every time when a new Record is being deleted, e.g. triggered by <code>App.Delete()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Record validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Record validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Record is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted deleted events, you can bind to <code>OnRecordAfterDeleteSuccess</code> or <code>OnRecordAfterDeleteError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordDelete().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordDelete("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecorddeleteexecute">OnRecordDeleteExecute</a></strong></p>
+<p><code>OnRecordDeleteExecute</code> is a Record proxy model hook of <code>OnModelDeleteExecute</code>.</p>
+<p><code>OnRecordDeleteExecute</code> is triggered after the internal delete checks and right before the Record the model DELETE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Delete()</code> in the following firing order:<br />
+<code>OnRecordDelete</code><br />
+ -&gt; internal delete checks<br />
+ -&gt; <code>OnRecordDeleteExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Record is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnRecordAfterDeleteSuccess</code> or <code>OnRecordAfterDeleteError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordDeleteExecute().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordDeleteExecute("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordafterdeletesuccess">OnRecordAfterDeleteSuccess</a></strong></p>
+<p><code>OnRecordAfterDeleteSuccess</code> is a Record proxy model hook of <code>OnModelAfterDeleteSuccess</code>.</p>
+<p><code>OnRecordAfterDeleteSuccess</code> is triggered after each successful Record DB delete persistence.</p>
+<p>Note that when a Record is deleted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordAfterDeleteSuccess().BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) // fires only for "users" and "articles" records app.OnRecordAfterDeleteSuccess("users", "articles").BindFunc(func(e *core.RecordEvent) error { // e.App // e.Record return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordafterdeleteerror">OnRecordAfterDeleteError</a></strong></p>
+<p><code>OnRecordAfterDeleteError</code> is a Record proxy model hook of <code>OnModelAfterDeleteError</code>.</p>
+<p><code>OnRecordAfterDeleteError</code> is triggered after each failed Record DB delete persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Delete()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every record app.OnRecordAfterDeleteError().BindFunc(func(e *core.RecordErrorEvent) error { // e.App // e.Record // e.Error return e.Next() }) // fires only for "users" and "articles" records app.OnRecordAfterDeleteError("users", "articles").BindFunc(func(e *core.RecordErrorEvent) error { // e.App // e.Record // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h3 id="collection-model-hooks"><a href="#collection-model-hooks">Collection model hooks</a></h3>
+<p>These are lower level Collection model hooks and could be triggered from anywhere (custom console command, scheduled cron job, when calling <code>e.Save(collection)</code>, etc.) and therefore they have no access to the request context!</p>
+<p>If you want to intercept the builtin Web APIs and to access their request body, query parameters, headers or the request auth state, then please use the designated <a href="#collection-request-hooks">Collection <code>*Request</code> hooks</a> .</p>
+<p><strong><a href="#oncollectionvalidate">OnCollectionValidate</a></strong></p>
+<p><code>OnCollectionValidate</code> is a Collection proxy model hook of <code>OnModelValidate</code>.</p>
+<p><code>OnCollectionValidate</code> is called every time when a Collection is being validated, e.g. triggered by <code>App.Validate()</code> or <code>App.Save()</code>.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionValidate().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionValidate("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="collection-mode-create-hooks"><a href="#collection-mode-create-hooks">Collection mode create hooks</a></h6>
+<p><strong><a href="#oncollectioncreate">OnCollectionCreate</a></strong></p>
+<p><code>OnCollectionCreate</code> is a Collection proxy model hook of <code>OnModelCreate</code>.</p>
+<p><code>OnCollectionCreate</code> is triggered every time when a new Collection is being created, e.g. triggered by <code>App.Save()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Collection validation and the INSERT DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Collection validation and the INSERT DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnCollectionAfterCreateSuccess</code> or <code>OnCollectionAfterCreateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionCreate().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionCreate("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectioncreateexecute">OnCollectionCreateExecute</a></strong></p>
+<p><code>OnCollectionCreateExecute</code> is a Collection proxy model hook of <code>OnModelCreateExecute</code>.</p>
+<p><code>OnCollectionCreateExecute</code> is triggered after successful Collection validation and right before the model INSERT DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Save()</code> in the following firing order:<br />
+<code>OnCollectionCreate</code><br />
+ -&gt; <code>OnCollectionValidate</code> (skipped with <code>App.SaveNoValidate()</code>)<br />
+ -&gt; <code>OnCollectionCreateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnCollectionAfterCreateSuccess</code> or <code>OnCollectionAfterCreateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionCreateExecute().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionCreateExecute("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionaftercreatesuccess">OnCollectionAfterCreateSuccess</a></strong></p>
+<p><code>OnCollectionAfterCreateSuccess</code> is a Collection proxy model hook of <code>OnModelAfterCreateSuccess</code>.</p>
+<p><code>OnCollectionAfterCreateSuccess</code> is triggered after each successful Collection DB create persistence.</p>
+<p>Note that when a Collection is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionAfterCreateSuccess().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionAfterCreateSuccess("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionaftercreateerror">OnCollectionAfterCreateError</a></strong></p>
+<p><code>OnCollectionAfterCreateError</code> is a Collection proxy model hook of <code>OnModelAfterCreateError</code>.</p>
+<p><code>OnCollectionAfterCreateError</code> is triggered after each failed Collection DB create persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionAfterCreateError().BindFunc(func(e *core.CollectionErrorEvent) error { // e.App // e.Collection // e.Error return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionAfterCreateError("users", "articles").BindFunc(func(e *core.CollectionErrorEvent) error { // e.App // e.Collection // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="collection-mode-update-hooks"><a href="#collection-mode-update-hooks">Collection mode update hooks</a></h6>
+<p><strong><a href="#oncollectionupdate">OnCollectionUpdate</a></strong></p>
+<p><code>OnCollectionUpdate</code> is a Collection proxy model hook of <code>OnModelUpdate</code>.</p>
+<p><code>OnCollectionUpdate</code> is triggered every time when a new Collection is being updated, e.g. triggered by <code>App.Save()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Collection validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Collection validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnCollectionAfterUpdateSuccess</code> or <code>OnCollectionAfterUpdateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionUpdate().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionUpdate("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionupdateexecute">OnCollectionUpdateExecute</a></strong></p>
+<p><code>OnCollectionUpdateExecute</code> is a Collection proxy model hook of <code>OnModelUpdateExecute</code>.</p>
+<p><code>OnCollectionUpdateExecute</code> is triggered after successful Collection validation and right before the model UPDATE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Save()</code> in the following firing order:<br />
+<code>OnCollectionUpdate</code><br />
+ -&gt; <code>OnCollectionValidate</code> (skipped with <code>App.SaveNoValidate()</code>)<br />
+ -&gt; <code>OnCollectionUpdateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnCollectionAfterUpdateSuccess</code> or <code>OnCollectionAfterUpdateError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionUpdateExecute().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionUpdateExecute("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionafterupdatesuccess">OnCollectionAfterUpdateSuccess</a></strong></p>
+<p><code>OnCollectionAfterUpdateSuccess</code> is a Collection proxy model hook of <code>OnModelAfterUpdateSuccess</code>.</p>
+<p><code>OnCollectionAfterUpdateSuccess</code> is triggered after each successful Collection DB update persistence.</p>
+<p>Note that when a Collection is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionAfterUpdateSuccess().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionAfterUpdateSuccess("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionafterupdateerror">OnCollectionAfterUpdateError</a></strong></p>
+<p><code>OnCollectionAfterUpdateError</code> is a Collection proxy model hook of <code>OnModelAfterUpdateError</code>.</p>
+<p><code>OnCollectionAfterUpdateError</code> is triggered after each failed Collection DB update persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionAfterUpdateError().BindFunc(func(e *core.CollectionErrorEvent) error { // e.App // e.Collection // e.Error return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionAfterUpdateError("users", "articles").BindFunc(func(e *core.CollectionErrorEvent) error { // e.App // e.Collection // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="collection-mode-delete-hooks"><a href="#collection-mode-delete-hooks">Collection mode delete hooks</a></h6>
+<p><strong><a href="#oncollectiondelete">OnCollectionDelete</a></strong></p>
+<p><code>OnCollectionDelete</code> is a Collection proxy model hook of <code>OnModelDelete</code>.</p>
+<p><code>OnCollectionDelete</code> is triggered every time when a new Collection is being deleted, e.g. triggered by <code>App.Delete()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Collection validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Collection validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Collection is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted deleted events, you can bind to <code>OnCollectionAfterDeleteSuccess</code> or <code>OnCollectionAfterDeleteError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionDelete().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionDelete("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectiondeleteexecute">OnCollectionDeleteExecute</a></strong></p>
+<p><code>OnCollectionDeleteExecute</code> is a Collection proxy model hook of <code>OnModelDeleteExecute</code>.</p>
+<p><code>OnCollectionDeleteExecute</code> is triggered after the internal delete checks and right before the Collection the model DELETE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Delete()</code> in the following firing order:<br />
+<code>OnCollectionDelete</code><br />
+ -&gt; internal delete checks<br />
+ -&gt; <code>OnCollectionDeleteExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Collection is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnCollectionAfterDeleteSuccess</code> or <code>OnCollectionAfterDeleteError</code> hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionDeleteExecute().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionDeleteExecute("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionafterdeletesuccess">OnCollectionAfterDeleteSuccess</a></strong></p>
+<p><code>OnCollectionAfterDeleteSuccess</code> is a Collection proxy model hook of <code>OnModelAfterDeleteSuccess</code>.</p>
+<p><code>OnCollectionAfterDeleteSuccess</code> is triggered after each successful Collection DB delete persistence.</p>
+<p>Note that when a Collection is deleted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionAfterDeleteSuccess().BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionAfterDeleteSuccess("users", "articles").BindFunc(func(e *core.CollectionEvent) error { // e.App // e.Collection return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionafterdeleteerror">OnCollectionAfterDeleteError</a></strong></p>
+<p><code>OnCollectionAfterDeleteError</code> is a Collection proxy model hook of <code>OnModelAfterDeleteError</code>.</p>
+<p><code>OnCollectionAfterDeleteError</code> is triggered after each failed Collection DB delete persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Delete()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnCollectionAfterDeleteError().BindFunc(func(e *core.CollectionErrorEvent) error { // e.App // e.Collection // e.Error return e.Next() }) // fires only for "users" and "articles" collections app.OnCollectionAfterDeleteError("users", "articles").BindFunc(func(e *core.CollectionErrorEvent) error { // e.App // e.Collection // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h3 id="request-hooks"><a href="#request-hooks">Request hooks</a></h3>
+<p>The request hooks are triggered only when the corresponding API request endpoint is accessed.</p>
+<h6 id="record-crud-request-hooks"><a href="#record-crud-request-hooks">Record CRUD request hooks</a></h6>
+<p><strong><a href="#onrecordslistrequest">OnRecordsListRequest</a></strong></p>
+<p><code>OnRecordsListRequest</code> hook is triggered on each API Records list request. Could be used to validate or modify the response before returning it to the client.</p>
+<p>Note that if you want to hide existing or add new computed Record fields prefer using the <a href="#onrecordenrich"><code>OnRecordEnrich</code></a> hook because it is less error-prone and it is triggered by all builtin Record responses (including when sending realtime Record events).</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnRecordsListRequest().BindFunc(func(e *core.RecordsListRequestEvent) error { // e.App // e.Collection // e.Records // e.Result // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "articles" collections app.OnRecordsListRequest("users", "articles").BindFunc(func(e *core.RecordsListRequestEvent) error { // e.App // e.Collection // e.Records // e.Result // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordviewrequest">OnRecordViewRequest</a></strong></p>
+<p><code>OnRecordViewRequest</code> hook is triggered on each API Record view request. Could be used to validate or modify the response before returning it to the client.</p>
+<p>Note that if you want to hide existing or add new computed Record fields prefer using the <a href="#onrecordenrich"><code>OnRecordEnrich</code></a> hook because it is less error-prone and it is triggered by all builtin Record responses (including when sending realtime Record events).</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnRecordViewRequest().BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "articles" collections app.OnRecordViewRequest("users", "articles").BindFunc(func(e *core.RecordRequestEvent) error { log.Println(e.HttpContext) log.Println(e.Record) return nil }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordcreaterequest">OnRecordCreateRequest</a></strong></p>
+<p><code>OnRecordCreateRequest</code> hook is triggered on each API Record create request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "articles" collections app.OnRecordCreateRequest("users", "articles").BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordupdaterequest">OnRecordUpdateRequest</a></strong></p>
+<p><code>OnRecordUpdateRequest</code> hook is triggered on each API Record update request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnRecordUpdateRequest().BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "articles" collections app.OnRecordUpdateRequest("users", "articles").BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecorddeleterequest">OnRecordDeleteRequest</a></strong></p>
+<p><code>OnRecordDeleteRequest</code> hook is triggered on each API Record delete request.<br />
+Could be used to additionally validate the request data or implement completely different delete behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every collection app.OnRecordDeleteRequest().BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "articles" collections app.OnRecordDeleteRequest("users", "articles").BindFunc(func(e *core.RecordRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="record-auth-request-hooks"><a href="#record-auth-request-hooks">Record auth request hooks</a></h6>
+<p><strong><a href="#onrecordauthrequest">OnRecordAuthRequest</a></strong></p>
+<p><code>OnRecordAuthRequest</code> hook is triggered on each successful API record authentication request (sign-in, token refresh, etc.). Could be used to additionally validate or modify the authenticated record data and token.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordAuthRequest().BindFunc(func(e *core.RecordAuthRequestEvent) error { // e.App // e.Record // e.Token // e.Meta // e.AuthMethod // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordAuthRequest("users", "managers").BindFunc(func(e *core.RecordAuthRequestEvent) error { // e.App // e.Record // e.Token // e.Meta // e.AuthMethod // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordauthrefreshrequest">OnRecordAuthRefreshRequest</a></strong></p>
+<p><code>OnRecordAuthRefreshRequest</code> hook is triggered on each Record auth refresh API request (right before generating a new auth token).</p>
+<p>Could be used to additionally validate the request data or implement completely different auth refresh behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordAuthRefreshRequest().BindFunc(func(e *core.RecordAuthWithOAuth2RequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordAuthRefreshRequest("users", "managers").BindFunc(func(e *core.RecordAuthWithOAuth2RequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordauthwithpasswordrequest">OnRecordAuthWithPasswordRequest</a></strong></p>
+<p><code>OnRecordAuthWithPasswordRequest</code> hook is triggered on each Record auth with password API request.</p>
+<p><code>e.Record</code> could be <code>nil</code> if no matching identity is found, allowing you to manually locate a different Record model (by reassigning <code>e.Record</code>).</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordAuthWithPasswordRequest().BindFunc(func(e *core.RecordAuthWithPasswordRequestEvent) error { // e.App // e.Collection // e.Record (could be nil) // e.Identity // e.IdentityField // e.Password // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordAuthWithPasswordRequest("users", "managers").BindFunc(func(e *core.RecordAuthWithPasswordRequestEvent) error { // e.App // e.Collection // e.Record (could be nil) // e.Identity // e.IdentityField // e.Password // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordauthwithoauth2request">OnRecordAuthWithOAuth2Request</a></strong></p>
+<p><code>OnRecordAuthWithOAuth2Request</code> hook is triggered on each Record OAuth2 sign-in/sign-up API request (after token exchange and before external provider linking).</p>
+<p>If <code>e.Record</code> is not set, then the OAuth2 request will try to create a new auth record.<br />
+To assign or link a different existing record model you can change the <code>e.Record</code> field.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordAuthWithOAuth2Request().BindFunc(func(e *core.RecordAuthWithOAuth2RequestEvent) error { // e.App // e.Collection // e.ProviderName // e.ProviderClient // e.Record (could be nil) // e.OAuth2User // e.CreateData // e.IsNewRecord // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordAuthWithOAuth2Request("users", "managers").BindFunc(func(e *core.RecordAuthWithOAuth2RequestEvent) error { // e.App // e.Collection // e.ProviderName // e.ProviderClient // e.Record (could be nil) // e.OAuth2User // e.CreateData // e.IsNewRecord // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordrequestpasswordresetrequest">OnRecordRequestPasswordResetRequest</a></strong></p>
+<p><code>OnRecordRequestPasswordResetRequest</code> hook is triggered on each Record request password reset API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different password reset behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordRequestPasswordResetRequest().BindFunc(func(e *core.RecordRequestPasswordResetRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordRequestPasswordResetRequest("users", "managers").BindFunc(func(e *core.RecordRequestPasswordResetRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordconfirmpasswordresetrequest">OnRecordConfirmPasswordResetRequest</a></strong></p>
+<p><code>OnRecordConfirmPasswordResetRequest</code> hook is triggered on each Record confirm password reset API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordConfirmPasswordResetRequest().BindFunc(func(e *core.RecordConfirmPasswordResetRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordConfirmPasswordResetRequest("users", "managers").BindFunc(func(e *core.RecordConfirmPasswordResetRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordrequestverificationrequest">OnRecordRequestVerificationRequest</a></strong></p>
+<p><code>OnRecordRequestVerificationRequest</code> hook is triggered on each Record request verification API request.</p>
+<p>Could be used to additionally validate the loaded request data or implement completely different verification behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordRequestVerificationRequest().BindFunc(func(e *core.RecordRequestVerificationRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordRequestVerificationRequest("users", "managers").BindFunc(func(e *core.RecordRequestVerificationRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordconfirmverificationrequest">OnRecordConfirmVerificationRequest</a></strong></p>
+<p><code>OnRecordConfirmVerificationRequest</code> hook is triggered on each Record confirm verification API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordConfirmVerificationRequest().BindFunc(func(e *core.RecordConfirmVerificationRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordConfirmVerificationRequest("users", "managers").BindFunc(func(e *core.RecordConfirmVerificationRequestEvent) error { // e.App // e.Collection // e.Record // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordrequestemailchangerequest">OnRecordRequestEmailChangeRequest</a></strong></p>
+<p><code>OnRecordRequestEmailChangeRequest</code> hook is triggered on each Record request email change API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different request email change behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordRequestEmailChangeRequest().BindFunc(func(e *core.RecordRequestEmailChangeRequestEvent) error { // e.App // e.Collection // e.Record // e.NewEmail // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordRequestEmailChangeRequest("users", "managers").BindFunc(func(e *core.RecordRequestEmailChangeRequestEvent) error { // e.App // e.Collection // e.Record // e.NewEmail // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordconfirmemailchangerequest">OnRecordConfirmEmailChangeRequest</a></strong></p>
+<p><code>OnRecordConfirmEmailChangeRequest</code> hook is triggered on each Record confirm email change API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordConfirmEmailChangeRequest().BindFunc(func(e *core.RecordConfirmEmailChangeRequestEvent) error { // e.App // e.Collection // e.Record // e.NewEmail // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordConfirmEmailChangeRequest("users", "managers").BindFunc(func(e *core.RecordConfirmEmailChangeRequestEvent) error { // e.App // e.Collection // e.Record // e.NewEmail // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordrequestotprequest">OnRecordRequestOTPRequest</a></strong></p>
+<p><code>OnRecordRequestOTPRequest</code> hook is triggered on each Record request OTP API request.</p>
+<p><code>e.Record</code> could be <code>nil</code> if no user with the requested email is found, allowing you to manually create a new Record or locate a different Record model (by reassigning <code>e.Record</code>).</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordRequestOTPRequest().BindFunc(func(e *core.RecordCreateOTPRequestEvent) error { // e.App // e.Collection // e.Record (could be nil) // e.Password // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordRequestOTPRequest("users", "managers").BindFunc(func(e *core.RecordCreateOTPRequestEvent) error { // e.App // e.Collection // e.Record (could be nil) // e.Password // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onrecordauthwithotprequest">OnRecordAuthWithOTPRequest</a></strong></p>
+<p><code>OnRecordAuthWithOTPRequest</code> hook is triggered on each Record auth with OTP API request.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth collection app.OnRecordAuthWithOTPRequest().BindFunc(func(e *core.RecordAuthWithOTPRequestEvent) error { // e.App // e.Collection // e.Record // e.OTP // and all RequestEvent fields... return e.Next() }) // fires only for "users" and "managers" auth collections app.OnRecordAuthWithOTPRequest("users", "managers").BindFunc(func(e *core.RecordAuthWithOTPRequestEvent) error { // e.App // e.Collection // e.Record // e.OTP // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="batch-request-hooks"><a href="#batch-request-hooks">Batch request hooks</a></h6>
+<p><strong><a href="#onbatchrequest">OnBatchRequest</a></strong></p>
+<p><code>OnBatchRequest</code> hook is triggered on each API batch request.</p>
+<p>Could be used to additionally validate or modify the submitted batch requests.</p>
+<p>This hook will also fire the corresponding <code>OnRecordCreateRequest</code>, <code>OnRecordUpdateRequest</code>, <code>OnRecordDeleteRequest</code> hooks, where <code>e.App</code> is the batch transactional app.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnBatchRequest().BindFunc(func(e *core.BatchRequestEvent) error { // e.App // e.Batch // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="file-request-hooks"><a href="#file-request-hooks">File request hooks</a></h6>
+<p><strong><a href="#onfiledownloadrequest">OnFileDownloadRequest</a></strong></p>
+<p><code>OnFileDownloadRequest</code> hook is triggered before each API File download request. Could be used to validate or modify the file response before returning it to the client.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnFileDownloadRequest().BindFunc(func(e *core.FileDownloadRequestEvent) error { // e.App // e.Collection // e.Record // e.FileField // e.ServedPath // e.ServedName // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onfiletokenrequest">OnFileTokenRequest</a></strong></p>
+<p><code>OnFileTokenRequest</code> hook is triggered on each auth file token API request.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every auth model app.OnFileTokenRequest().BindFunc(func(e *core.FileTokenRequestEvent) error { // e.App // e.Record // e.Token // and all RequestEvent fields... return e.Next(); }) // fires only for "users" app.OnFileTokenRequest("users").BindFunc(func(e *core.FileTokenRequestEvent) error { // e.App // e.Record // e.Token // and all RequestEvent fields... return e.Next(); }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="collection-request-hooks"><a href="#collection-request-hooks">Collection request hooks</a></h6>
+<p><strong><a href="#oncollectionslistrequest">OnCollectionsListRequest</a></strong></p>
+<p><code>OnCollectionsListRequest</code> hook is triggered on each API Collections list request. Could be used to validate or modify the response before returning it to the client.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnCollectionsListRequest().BindFunc(func(e *core.CollectionsListRequestEvent) error { // e.App // e.Collections // e.Result // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionviewrequest">OnCollectionViewRequest</a></strong></p>
+<p><code>OnCollectionViewRequest</code> hook is triggered on each API Collection view request. Could be used to validate or modify the response before returning it to the client.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnCollectionViewRequest().BindFunc(func(e *core.CollectionRequestEvent) error { // e.App // e.Collection // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectioncreaterequest">OnCollectionCreateRequest</a></strong></p>
+<p><code>OnCollectionCreateRequest</code> hook is triggered on each API Collection create request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnCollectionCreateRequest().BindFunc(func(e *core.CollectionRequestEvent) error { // e.App // e.Collection // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionupdaterequest">OnCollectionUpdateRequest</a></strong></p>
+<p><code>OnCollectionUpdateRequest</code> hook is triggered on each API Collection update request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnCollectionUpdateRequest().BindFunc(func(e *core.CollectionRequestEvent) error { // e.App // e.Collection // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectiondeleterequest">OnCollectionDeleteRequest</a></strong></p>
+<p><code>OnCollectionDeleteRequest</code> hook is triggered on each API Collection delete request.<br />
+Could be used to additionally validate the request data or implement completely different delete behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnCollectionDeleteRequest().BindFunc(func(e *core.CollectionRequestEvent) error { // e.App // e.Collection // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#oncollectionsimportrequest">OnCollectionsImportRequest</a></strong></p>
+<p><code>OnCollectionsImportRequest</code> hook is triggered on each API collections import request.<br />
+Could be used to additionally validate the imported collections or to implement completely different import behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnCollectionsImportRequest().BindFunc(func(e *core.CollectionsImportRequestEvent) error { // e.App // e.CollectionsData // e.DeleteMissing return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="settings-request-hooks"><a href="#settings-request-hooks">Settings request hooks</a></h6>
+<p><strong><a href="#onsettingslistrequest">OnSettingsListRequest</a></strong></p>
+<p><code>OnSettingsListRequest</code> hook is triggered on each API Settings list request.<br />
+Could be used to validate or modify the response before returning it to the client.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnSettingsListRequest().BindFunc(func(e *core.SettingsListRequestEvent) error { // e.App // e.Settings // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onsettingsupdaterequest">OnSettingsUpdateRequest</a></strong></p>
+<p><code>OnSettingsUpdateRequest</code> hook is triggered on each API Settings update request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() app.OnSettingsUpdateRequest().BindFunc(func(e *core.SettingsUpdateRequestEvent) error { // e.App // e.OldSettings // e.NewSettings // and all RequestEvent fields... return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h3 id="base-model-hooks"><a href="#base-model-hooks">Base model hooks</a></h3>
+<p>The Model hooks are fired for all PocketBase structs that implements the Model DB interface - Record, Collection, Log, etc.</p>
+<p>For convenience, if you want to listen to only the Record or Collection DB model events without doing manual type assertion, you can use the <a href="#record-model-hooks"><code>OnRecord*</code></a> and <a href="#collection-model-hooks"><code>OnCollection*</code></a> proxy hooks above.</p>
+<p><strong><a href="#onmodelvalidate">OnModelValidate</a></strong></p>
+<p><code>OnModelValidate</code> is called every time when a Model is being validated, e.g. triggered by <code>App.Validate()</code> or <code>App.Save()</code>.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelValidate().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelValidate("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="base-model-create-hooks"><a href="#base-model-create-hooks">Base model create hooks</a></h6>
+<p><strong><a href="#onmodelcreate">OnModelCreate</a></strong></p>
+<p><code>OnModelCreate</code> is triggered every time when a new Model is being created, e.g. triggered by <code>App.Save()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Model validation and the INSERT DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Model validation and the INSERT DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnModelAfterCreateSuccess</code> or <code>OnModelAfterCreateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelCreate().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelCreate("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelcreateexecute">OnModelCreateExecute</a></strong></p>
+<p><code>OnModelCreateExecute</code> is triggered after successful Model validation and right before the model INSERT DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Save()</code> in the following firing order:<br />
+<code>OnModelCreate</code><br />
+ -&gt; <code>OnModelValidate</code> (skipped with <code>App.SaveNoValidate()</code>)<br />
+ -&gt; <code>OnModelCreateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnModelAfterCreateSuccess</code> or <code>OnModelAfterCreateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelCreateExecute().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelCreateExecute("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelaftercreatesuccess">OnModelAfterCreateSuccess</a></strong></p>
+<p><code>OnModelAfterCreateSuccess</code> is triggered after each successful Model DB create persistence.</p>
+<p>Note that when a Model is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelAfterCreateSuccess().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelAfterCreateSuccess("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelaftercreateerror">OnModelAfterCreateError</a></strong></p>
+<p><code>OnModelAfterCreateError</code> is triggered after each failed Model DB create persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelAfterCreateError().BindFunc(func(e *core.ModelErrorEvent) error { // e.App // e.Model // e.Error return e.Next() }) // fires only for "users" and "articles" models app.OnModelAfterCreateError("users", "articles").BindFunc(func(e *core.ModelErrorEvent) error { // e.App // e.Model // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="base-model-update-hooks"><a href="#base-model-update-hooks">Base model update hooks</a></h6>
+<p><strong><a href="#onmodelupdate">OnModelUpdate</a></strong></p>
+<p><code>OnModelUpdate</code> is triggered every time when a new Model is being updated, e.g. triggered by <code>App.Save()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Model validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Model validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnModelAfterUpdateSuccess</code> or <code>OnModelAfterUpdateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelUpdate().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelUpdate("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelupdateexecute">OnModelUpdateExecute</a></strong></p>
+<p><code>OnModelUpdateExecute</code> is triggered after successful Model validation and right before the model UPDATE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Save()</code> in the following firing order:<br />
+<code>OnModelUpdate</code><br />
+ -&gt; <code>OnModelValidate</code> (skipped with <code>App.SaveNoValidate()</code>)<br />
+ -&gt; <code>OnModelUpdateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnModelAfterUpdateSuccess</code> or <code>OnModelAfterUpdateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelUpdateExecute().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelUpdateExecute("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelafterupdatesuccess">OnModelAfterUpdateSuccess</a></strong></p>
+<p><code>OnModelAfterUpdateSuccess</code> is triggered after each successful Model DB update persistence.</p>
+<p>Note that when a Model is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelAfterUpdateSuccess().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelAfterUpdateSuccess("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelafterupdateerror">OnModelAfterUpdateError</a></strong></p>
+<p><code>OnModelAfterUpdateError</code> is triggered after each failed Model DB update persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelAfterUpdateError().BindFunc(func(e *core.ModelErrorEvent) error { // e.App // e.Model // e.Error return e.Next() }) // fires only for "users" and "articles" models app.OnModelAfterUpdateError("users", "articles").BindFunc(func(e *core.ModelErrorEvent) error { // e.App // e.Model // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<h6 id="base-model-delete-hooks"><a href="#base-model-delete-hooks">Base model delete hooks</a></h6>
+<p><strong><a href="#onmodeldelete">OnModelDelete</a></strong></p>
+<p><code>OnModelDelete</code> is triggered every time when a new Model is being deleted, e.g. triggered by <code>App.Delete()</code>.</p>
+<p>Operations BEFORE the <code>e.Next()</code> execute before the Model validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.Next()</code> execute after the Model validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Model is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted deleted events, you can bind to <code>OnModelAfterDeleteSuccess</code> or <code>OnModelAfterDeleteError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelDelete().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelDelete("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodeldeleteexecute">OnModelDeleteExecute</a></strong></p>
+<p><code>OnModelDeleteExecute</code> is triggered after the internal delete checks and right before the Model the model DELETE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>App.Delete()</code> in the following firing order:<br />
+<code>OnModelDelete</code><br />
+ -&gt; internal delete checks<br />
+ -&gt; <code>OnModelDeleteExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Model is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>OnModelAfterDeleteSuccess</code> or <code>OnModelAfterDeleteError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelDeleteExecute().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelDeleteExecute("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelafterdeletesuccess">OnModelAfterDeleteSuccess</a></strong></p>
+<p><code>OnModelAfterDeleteSuccess</code> is triggered after each successful Model DB delete persistence.</p>
+<p>Note that when a Model is deleted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelAfterDeleteSuccess().BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) // fires only for "users" and "articles" models app.OnModelAfterDeleteSuccess("users", "articles").BindFunc(func(e *core.ModelEvent) error { // e.App // e.Model return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+<p><strong><a href="#onmodelafterdeleteerror">OnModelAfterDeleteError</a></strong></p>
+<p><code>OnModelAfterDeleteError</code> is triggered after each failed Model DB delete persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>App.Delete()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>OnRecord*</code> and <code>OnCollection*</code> proxy hooks.</p>
+<p><code>package main import ( "log" "github.com/pocketbase/pocketbase" "github.com/pocketbase/pocketbase/core" ) func main() { app := pocketbase.New() // fires for every model app.OnModelAfterDeleteError().BindFunc(func(e *core.ModelErrorEvent) error { // e.App // e.Model // e.Error return e.Next() }) // fires only for "users" and "articles" models app.OnModelAfterDeleteError("users", "articles").BindFunc(func(e *core.ModelErrorEvent) error { // e.App // e.Model // e.Error return e.Next() }) if err := app.Start(); err != nil { log.Fatal(err) } }</code></p>
+    <div id="page-nav">
+      <a href="../go/01_overview.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Vue d'ensemble</span>
+        </a>
+      <a href="../go/03_routing.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Routing</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

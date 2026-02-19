@@ -142,8 +142,80 @@ Detailed specs live in `project_docs/` (~10K lines):
 - `05_python_implementation_strategy.md` — tech stack rationale, DB schema DDL, Lark grammar
 - `07_comparison_report.md` — side-by-side PPBase vs PocketBase response comparison
 
-## Current status (v0.1.0 — Phase 1+)
+## Current status (v0.2.0 — Phase 2 Partial)
 
-**Working:** Admin CRUD+auth, Collection CRUD (dynamic DDL), Record CRUD, filter/sort/pagination, field validation (14 types), expand relations, PocketBase-compatible error format, admin UI with full collection/record management, CLI with server & DB management commands.
+**Working (Phase 1):** Admin CRUD+auth, Collection CRUD (dynamic DDL), Record CRUD, filter/sort/pagination, field validation (14 types), expand relations, PocketBase-compatible error format, admin UI with full collection/record management, CLI with server & DB management commands, per-collection auth with unique token secrets.
 
-**Not yet implemented (Phase 2):** Auth collection user registration/login, OAuth2, SSE realtime (LISTEN/NOTIFY), hooks, S3 storage, image thumbnails.
+**Working (Phase 2 - NEW):**
+- **OAuth2 Authentication:** Full PKCE flow with 5 providers (Google, GitHub, GitLab, Discord, Facebook), per-collection OAuth2 config, external auth linking in `_externalAuths`, configurable via env vars or collection options
+- **SSE Realtime:** Server-Sent Events with PostgreSQL LISTEN/NOTIFY, subscription management (collection-wide `*` or single-record subscriptions), automatic event broadcasting on create/update/delete
+
+**Not yet implemented:** Hooks, S3 storage, image thumbnails.
+
+## OAuth2 Configuration
+
+OAuth2 providers are configured via environment variables (global) or collection options (per-collection):
+
+```bash
+# Environment variables (global)
+export PPBASE_OAUTH2_GOOGLE_CLIENT_ID="..."
+export PPBASE_OAUTH2_GOOGLE_CLIENT_SECRET="..."
+export PPBASE_OAUTH2_GITHUB_CLIENT_ID="..."
+export PPBASE_OAUTH2_GITHUB_CLIENT_SECRET="..."
+# ... (gitlab, discord, facebook)
+```
+
+Collection options (per-collection, stored in `_collections.options`):
+```json
+{
+  "oauth2": {
+    "enabled": true,
+    "mappedFields": {
+      "id": "",
+      "name": "name",
+      "username": "username",
+      "avatarURL": "avatar"
+    },
+    "providers": [
+      {"name": "google", "clientId": "...", "clientSecret": "..."},
+      {"name": "github", "clientId": "...", "clientSecret": "..."}
+    ]
+  }
+}
+```
+
+### OAuth2 Endpoints
+
+- `GET /api/collections/{coll}/auth-methods` — returns OAuth2 providers with `authURL`, `state`, `codeVerifier`, `codeChallenge`
+- `POST /api/collections/{coll}/auth-with-oauth2` — exchange authorization code for JWT, creates/links user record
+
+## SSE Realtime
+
+Real-time updates use Server-Sent Events (SSE) with PostgreSQL LISTEN/NOTIFY for event broadcasting.
+
+### Realtime Endpoints
+
+- `GET /api/realtime` — establish SSE connection, receive `clientId` in `PB_CONNECT` event
+- `POST /api/realtime` — subscribe to topics (body: `{clientId, subscriptions: ["posts/*", "posts/abc123"]}`)
+
+### Subscription Format
+
+- Collection-wide: `collectionName/*` (e.g., `posts/*`)
+- Single-record: `collectionName/recordId` (e.g., `posts/abc123`)
+- Empty subscriptions array: unsubscribe from all
+
+### Event Format
+
+Events are sent with topic and data:
+```
+event: posts/abc123
+data: {"action": "create|update|delete", "record": {...}}
+```
+
+### Implementation Details
+
+- Subscription manager tracks client sessions and subscriptions in-memory
+- PostgreSQL NOTIFY channel: `record_changes`
+- Payload: `{"collection": "posts", "record_id": "abc123", "action": "create"}`
+- LISTEN task runs in background via app lifespan management
+- 5-minute idle timeout with keepalive pings

@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API — Records — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link active" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Référence Web API <span>›</span> API — Records</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="web-api-records">Web API - Records</h1>
+<hr />
+<p>API Records</p>
+<h3 id="crud-actions"><a href="#crud-actions">CRUD actions</a></h3>
+<p><strong><a href="#listsearch-records">List/Search records</a></strong></p>
+<p>Returns a paginated records list, supporting sorting and filtering.</p>
+<p>Depending on the collection's <code>listRule</code> value, the access to this action may or may not have been restricted.</p>
+<p><em>You could find individual generated records API documentation in the "Dashboard &gt; Collections &gt; API Preview".</em></p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // fetch a paginated records list const resultList = await pb.collection('posts').getList(1, 50, { filter: 'created &gt;= "2022-01-01 00:00:00" &amp;&amp; someField1 != someField2', }); // you can also fetch all records at once via getFullList const records = await pb.collection('posts').getFullList({ sort: '-created', }); // or fetch only the first record that matches the specified filter const record = await pb.collection('posts').getFirstListItem('someField="test"', { expand: 'relField1,relField2.subRelField', });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // fetch a paginated records list final resultList = await pb.collection('posts').getList( page: 1, perPage: 50, filter: 'created &gt;= "2022-01-01 00:00:00" &amp;&amp; someField1 != someField2', ); // you can also fetch all records at once via getFullList final records = await pb.collection('posts').getFullList(sort: '-created'); // or fetch only the first record that matches the specified filter final record = await pb.collection('posts').getFirstListItem( 'someField="test"', expand: 'relField1,relField2.subRelField', );</code></p>
+<h6 id="api-details">API details</h6>
+<p><strong>GET</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/records</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the records' collection.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>page</p>
+<p>Number</p>
+<p>The page (aka. offset) of the paginated list (<em>default to 1</em>).</p>
+<p>perPage</p>
+<p>Number</p>
+<p>The max returned records per page (<em>default to 30</em>).</p>
+<p>sort</p>
+<p>String</p>
+<p>Specify the <em>ORDER BY</em> fields.</p>
+<p>Add <code>-</code> / <code>+</code> (default) in front of the attribute for DESC / ASC order, eg.:</p>
+<p><code>// DESC by created and ASC by id ?sort=-created,id</code></p>
+<p><strong>Supported record sort fields:</strong><br />
+<code>@random</code>, <code>@rowid</code>, <code>id</code>, <strong>and any other collection field</strong>.</p>
+<p>filter</p>
+<p>String</p>
+<p>Filter expression to filter/search the returned records list (in addition to the collection's <code>listRule</code>), e.g.:</p>
+<p><code>?filter=(title~'abc' &amp;&amp; created&gt;'2022-01-01')</code></p>
+<p><strong>Supported record filter fields:</strong><br />
+<code>id</code>, <strong>+ any field from the collection schema</strong>.</p>
+<p>The syntax basically follows the format <code>OPERAND OPERATOR OPERAND</code>, where:</p>
+<ul>
+<li><code>OPERAND</code> - could be any field literal, string (single or double quoted), number, null, true, false</li>
+<li><code>OPERATOR</code> - is one of:<ul>
+<li><code>=</code> Equal</li>
+<li><code>!=</code> NOT equal</li>
+<li><code>&gt;</code> Greater than</li>
+<li><code>&gt;=</code> Greater than or equal</li>
+<li><code>&lt;</code> Less than</li>
+<li><code>&lt;=</code> Less than or equal</li>
+<li><code>~</code> Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+<li><code>!~</code> NOT Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+<li><code>?=</code> <em>Any/At least one of</em> Equal</li>
+<li><code>?!=</code> <em>Any/At least one of</em> NOT equal</li>
+<li><code>?&gt;</code> <em>Any/At least one of</em> Greater than</li>
+<li><code>?&gt;=</code> <em>Any/At least one of</em> Greater than or equal</li>
+<li><code>?&lt;</code> <em>Any/At least one of</em> Less than</li>
+<li><code>?&lt;=</code> <em>Any/At least one of</em> Less than or equal</li>
+<li><code>?~</code> <em>Any/At least one of</em> Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+<li><code>?!~</code> <em>Any/At least one of</em> NOT Like/Contains (if not specified auto wraps the right string OPERAND in a "%" for wildcard match)</li>
+</ul>
+</li>
+</ul>
+<p>To group and combine several expressions you can use parenthesis <code>(...)</code>, <code>&amp;&amp;</code> (AND) and <code>||</code> (OR) tokens.</p>
+<p>Single line comments are also supported: <code>// Example comment</code>.</p>
+<p>Field expressions with array-like value or nested fields that originate from a source with multiple records will apply a <strong>match-all</strong> constraint by default. If you want <strong>any/at-least-one-of</strong> type of constraint for such fields you'll have to prefix your operator with <code>?</code> (e.g. <code>multiRelation.title ?= "test"</code>).</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>skipTotal</p>
+<p>Boolean</p>
+<p>If it is set the total counts query will be skipped and the response fields <code>totalItems</code> and <code>totalPages</code> will have <code>-1</code> value.<br />
+This could drastically speed up the search queries when the total counters are not needed or cursor based pagination is used.<br />
+For optimization purposes, it is set by default for the <code>getFirstListItem()</code> and <code>getFullList()</code> SDKs methods.</p>
+<p>Responses</p>
+<p>200 400 403</p>
+<p><code>{ "page": 1, "perPage": 100, "totalItems": 2, "totalPages": 1, "items": [ { "id": "ae40239d2bc4477", "collectionId": "a98f514eb05f454", "collectionName": "posts", "updated": "2022-06-25 11:03:50.052", "created": "2022-06-25 11:03:35.163", "title": "test1" }, { "id": "d08dfc4f4d84419", "collectionId": "a98f514eb05f454", "collectionName": "posts", "updated": "2022-06-25 11:03:45.876", "created": "2022-06-25 11:03:45.876", "title": "test2" } ] }</code></p>
+<p><code>{ "status": 400, "message": "Something went wrong while processing your request. Invalid filter.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "Only superusers can filter by '@collection.*'", "data": {} }</code></p>
+<p><strong><a href="#view-record">View record</a></strong></p>
+<p>Returns a single collection record by its ID.</p>
+<p>Depending on the collection's <code>viewRule</code> value, the access to this action may or may not have been restricted.</p>
+<p><em>You could find individual generated records API documentation in the "Dashboard &gt; Collections &gt; API Preview".</em></p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const record1 = await pb.collection('posts').getOne('RECORD_ID', { expand: 'relField1,relField2.subRelField', });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final record1 = await pb.collection('posts').getOne('RECORD_ID', expand: 'relField1,relField2.subRelField', );</code></p>
+<h6 id="api-details_1">API details</h6>
+<p><strong>GET</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/records/<code>recordId</code></p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the record's collection.</p>
+<p>recordId</p>
+<p>String</p>
+<p>ID of the record to view.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 403 404</p>
+<p><code>{ "id": "ae40239d2bc4477", "collectionId": "a98f514eb05f454", "collectionName": "posts", "updated": "2022-06-25 11:03:50.052", "created": "2022-06-25 11:03:35.163", "title": "test1" }</code></p>
+<p><code>{ "status": 403, "message": "Only superusers can perform this action.", "data": {} }</code></p>
+<p><code>{ "status": 404, "message": "The requested resource wasn't found.", "data": {} }</code></p>
+<p><strong><a href="#create-record">Create record</a></strong></p>
+<p>Creates a new collection <em>Record</em>.</p>
+<p>Depending on the collection's <code>createRule</code> value, the access to this action may or may not have been restricted.</p>
+<p><em>You could find individual generated records API documentation from the Dashboard.</em></p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const record = await pb.collection('demo').create({ title: 'Lorem ipsum', });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final record = await pb.collection('demo').create(body: { 'title': 'Lorem ipsum', });</code></p>
+<h6 id="api-details_2">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/records</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the record's collection.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Optional id</p>
+<p>String</p>
+<p><strong>15 characters string</strong> to store as record ID.<br />
+If not set, it will be auto generated.</p>
+<p>Schema fields</p>
+<p><strong>Any field from the collection's schema.</strong></p>
+<p>Additional auth record fields</p>
+<p>Required password</p>
+<p>String</p>
+<p>Auth record password.</p>
+<p>Required passwordConfirm</p>
+<p>String</p>
+<p>Auth record password confirmation.</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.<br />
+File upload is supported only through <em>multipart/form-data</em>.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400 403 404</p>
+<p><code>{ "collectionId": "a98f514eb05f454", "collectionName": "demo", "id": "ae40239d2bc4477", "updated": "2022-06-25 11:03:50.052", "created": "2022-06-25 11:03:35.163", "title": "Lorem ipsum" }</code></p>
+<p><code>{ "status": 400, "message": "Failed to create record.", "data": { "title": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><code>{ "status": 403, "message": "Only superusers can perform this action.", "data": {} }</code></p>
+<p><code>{ "status": 404, "message": "The requested resource wasn't found. Missing collection context.", "data": {} }</code></p>
+<p><strong><a href="#update-record">Update record</a></strong></p>
+<p>Updates an existing collection <em>Record</em>.</p>
+<p>Depending on the collection's <code>updateRule</code> value, the access to this action may or may not have been restricted.</p>
+<p><em>You could find individual generated records API documentation from the Dashboard.</em></p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const record = await pb.collection('demo').update('YOUR_RECORD_ID', { title: 'Lorem ipsum', });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final record = await pb.collection('demo').update('YOUR_RECORD_ID', body: { 'title': 'Lorem ipsum', });</code></p>
+<h6 id="api-details_3">API details</h6>
+<p><strong>PATCH</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/records/<code>recordId</code></p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the record's collection.</p>
+<p>recordId</p>
+<p>String</p>
+<p>ID of the record to update.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Schema fields</p>
+<p><strong>Any field from the collection's schema.</strong></p>
+<p>Additional auth record fields</p>
+<p>Optional oldPassword</p>
+<p>String</p>
+<p>Old auth record password.<br />
+This field is required only when changing the record password. Superusers and auth records with "Manage" access can skip this field.</p>
+<p>Optional password</p>
+<p>String</p>
+<p>New auth record password.</p>
+<p>Optional passwordConfirm</p>
+<p>String</p>
+<p>New auth record password confirmation.</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.<br />
+File upload is supported only through <em>multipart/form-data</em>.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400 403 404</p>
+<p><code>{ "collectionId": "a98f514eb05f454", "collectionName": "demo", "id": "ae40239d2bc4477", "updated": "2022-06-25 11:03:50.052", "created": "2022-06-25 11:03:35.163", "title": "Lorem ipsum" }</code></p>
+<p><code>{ "status": 400, "message": "Failed to create record.", "data": { "title": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><code>{ "status": 403, "message": "Only superusers can perform this action.", "data": {} }</code></p>
+<p><code>{ "status": 404, "message": "The requested resource wasn't found. Missing collection context.", "data": {} }</code></p>
+<p><strong><a href="#delete-record">Delete record</a></strong></p>
+<p>Deletes a single collection <em>Record</em> by its ID.</p>
+<p>Depending on the collection's <code>deleteRule</code> value, the access to this action may or may not have been restricted.</p>
+<p><em>You could find individual generated records API documentation from the Dashboard.</em></p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection('demo').delete('YOUR_RECORD_ID');</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection('demo').delete('YOUR_RECORD_ID');</code></p>
+<h6 id="api-details_4">API details</h6>
+<p><strong>DELETE</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/records/<code>recordId</code></p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the record's collection.</p>
+<p>recordId</p>
+<p>String</p>
+<p>ID of the record to delete.</p>
+<p>Responses</p>
+<p>204 400 403 404</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "Failed to delete record. Make sure that the record is not part of a required relation reference.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "Only superusers can perform this action.", "data": {} }</code></p>
+<p><code>{ "status": 404, "message": "The requested resource wasn't found.", "data": {} }</code></p>
+<p><strong><a href="#batch-createupdateupsertdelete-records">Batch create/update/upsert/delete records</a></strong></p>
+<p>Batch and transactional create/update/upsert/delete of multiple records in a single request.</p>
+<p>The batch Web API need to be explicitly enabled and configured from the <em>Dashboard &gt; Settings &gt; Application</em>.</p>
+<p>Because this endpoint processes the requests in a single read&amp;write transaction, other queries may queue up and it could degrade the performance of your application if not used with proper care and configuration <em>(some recommendations: prefer using the smallest possible max processing time and body size limits; avoid large file uploads over slow S3 networks and custom hooks that communicate with slow external APIs)</em>.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const batch = pb.createBatch(); batch.collection('example1').create({ ... }); batch.collection('example2').update('RECORD_ID', { ... }); batch.collection('example3').delete('RECORD_ID'); batch.collection('example4').upsert({ ... }); const result = await batch.send();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final batch = pb.createBatch(); batch.collection('example1').create(body: { ... }); batch.collection('example2').update('RECORD_ID', body: { ... }); batch.collection('example3').delete('RECORD_ID'); batch.collection('example4').upsert(body: { ... }); final result = await batch.send();</code></p>
+<h6 id="api-details_5">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/batch</p>
+<p>Body Parameters</p>
+<p>Body parameters could be sent as <em>application/json</em> or <em>multipart/form-data</em>.<br />
+File upload is supported only via <em>multipart/form-data</em> (see below for more details).</p>
+<p>Param</p>
+<p>Description</p>
+<p>Required requests</p>
+<p>Array<Request> - List of the requests to process.</p>
+<p>The supported batch request actions are:</p>
+<ul>
+<li>record create - <code>POST /api/collections/{collection}/records</code></li>
+<li>record update - <code>PATCH /api/collections/{collection}/records/{id}</code></li>
+<li>record upsert - <code>PUT /api/collections/{collection}/records</code><br />
+    (the body must have <code>id</code> field)</li>
+<li>record delete - <code>DELETE /api/collections/{collection}/records/{id}</code></li>
+</ul>
+<p>Each batch Request element have the following properties:</p>
+<ul>
+<li><code>url path</code> <em>(could include query parameters)</em></li>
+<li><code>method</code> <em>(GET, POST, PUT, PATCH, DELETE)</em></li>
+<li><code>headers</code><br />
+<em>(custom per-request <code>Authorization</code> header is not supported at the moment, aka. all batch requests have the same auth state)</em></li>
+<li><code>body</code></li>
+</ul>
+<p><strong>NB!</strong> When the batch request is send as <code>multipart/form-data</code>, the regular batch action fields are expected to be submitted as serialized json under the <code>@jsonPayload</code> field and file keys need to follow the pattern <code>requests.N.fileField</code> or <code>requests[N].fileField</code> <em>(this is usually handled transparently by the SDKs when their specific object notation is used)</em> .<br />
+If you don't use the SDKs or prefer manually to construct the <code>FormData</code> body, then it could look something like:</p>
+<p><code>const formData = new FormData(); formData.append("@jsonPayload", JSON.stringify({ requests: [ { method: "POST", url: "/api/collections/example/records?expand=user", body: { title: "test1" }, }, { method: "PATCH", url: "/api/collections/example/records/RECORD_ID", body: { title: "test2" }, }, { method: "DELETE", url: "/api/collections/example/records/RECORD_ID", }, ] })) // file for the first request formData.append("requests.0.document", new File(...)) // file for the second request formData.append("requests.1.document", new File(...))</code></p>
+<p>Responses</p>
+<p>200 400 403</p>
+<p><code>[ { "status": 200, "body": { "collectionId": "a98f514eb05f454", "collectionName": "demo", "id": "ae40239d2bc4477", "updated": "2022-06-25 11:03:50.052", "created": "2022-06-25 11:03:35.163", "title": "test1", "document": "file_a98f51.txt" } }, { "status": 200, "body": { "collectionId": "a98f514eb05f454", "collectionName": "demo", "id": "31y1gc447bc9602", "updated": "2022-06-25 11:03:50.052", "created": "2022-06-25 11:03:35.163", "title": "test2", "document": "file_f514eb0.txt" } }, ]</code></p>
+<p><code>{ "status": 400, "message": "Batch transaction failed.", "data": { "requests": { "1": { "code": "batch_request_failed", "message": "Batch request failed.", "response": { "status": 400, "message": "Failed to create record.", "data": { "title": { "code": "validation_min_text_constraint", "message": "Must be at least 3 character(s).", "params": { "min": 3 } } } } } } } }</code></p>
+<p><code>{ "status": 403, "message": "Batch requests are not allowed.", "data": {} }</code></p>
+<h3 id="auth-record-actions"><a href="#auth-record-actions">Auth record actions</a></h3>
+<p><strong><a href="#list-auth-methods">List auth methods</a></strong></p>
+<p>Returns a public list with the allowed collection authentication methods.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const result = await pb.collection('users').listAuthMethods();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final result = await pb.collection('users').listAuthMethods();</code></p>
+<h6 id="api-details_6">API details</h6>
+<p><strong>GET</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/auth-methods</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200</p>
+<p><code>{ "password": { "enabled": true, "identityFields": ["email"] }, "oauth2": { "enabled": true, "providers": [ { "name": "github", "displayName": "GitHub", "state": "nT7SLxzXKAVMeRQJtxSYj9kvnJAvGk", "authURL": "https://github.com/login/oauth/authorize?client_id=test&amp;code_challenge=fcf8WAhNI6uCLJYgJubLyWXHvfs8xghoLe3zksBvxjE&amp;code_challenge_method=S256&amp;response_type=code&amp;scope=read%3Auser+user%3Aemail&amp;state=nT7SLxzXKAVMeRQJtxSYj9kvnJAvGk&amp;redirect_uri=", "codeVerifier": "PwBG5OKR2IyQ7siLrrcgWHFwLLLAeUrz7PS1nY4AneG", "codeChallenge": "fcf8WAhNI6uCLJYgJubLyWXHvfs8xghoLe3zksBvxjE", "codeChallengeMethod": "S256" } ] }, "mfa": { "enabled": false, "duration": 0 }, "otp": { "enabled": false, "duration": 0 } }</code></p>
+<p><strong><a href="#auth-with-password">Auth with password</a></strong></p>
+<p>Authenticate a single auth record by combination of a password and a unique identity field (e.g. email).</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const authData = await pb.collection('users').authWithPassword( 'YOUR_USERNAME_OR_EMAIL', 'YOUR_PASSWORD', ); // after the above you can also access the auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final authData = await pb.collection('users').authWithPassword( 'YOUR_USERNAME_OR_EMAIL', 'YOUR_PASSWORD', ); // after the above you can also access the auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<h6 id="api-details_7">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/auth-with-password</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required identity</p>
+<p>String</p>
+<p>Auth record username or email address.</p>
+<p>Required password</p>
+<p>String</p>
+<p>Auth record password.</p>
+<p>Optional identityField</p>
+<p>String</p>
+<p>A specific identity field to use (by default fallbacks to the first matching one).</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,record.expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,record.description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400</p>
+<p><code>{ "token": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoUmVjb3JkIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyMjA4OTg1MjYxfQ.UwD8JvkbQtXpymT09d7J6fdA0aP9g4FJ1GPh_ggEkzc", "record": { "id": "8171022dc95a4ed", "collectionId": "d2972397d45614e", "collectionName": "users", "created": "2022-06-24 06:24:18.434Z", "updated": "2022-06-24 06:24:18.889Z", "username": "test@example.com", "email": "test@example.com", "verified": false, "emailVisibility": true, "someCustomField": "example 123" } }</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while submitting the form.", "data": { "password": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong><a href="#auth-with-oauth2">Auth with OAuth2</a></strong></p>
+<p>Authenticate with an OAuth2 provider and returns a new auth token and record data.</p>
+<p>This action usually should be called right after the provider login page redirect.</p>
+<p>You could also check the <a href="/docs/authentication#web-oauth2-integration">OAuth2 web integration example</a>.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const authData = await pb.collection('users').authWithOAuth2Code( 'google', 'CODE', 'VERIFIER', 'REDIRECT_URL', // optional data that will be used for the new account on OAuth2 sign-up { 'name': 'test', }, ); // after the above you can also access the auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final authData = await pb.collection('users').authWithOAuth2Code( 'google', 'CODE', 'VERIFIER', 'REDIRECT_URL', // optional data that will be used for the new account on OAuth2 sign-up createData: { 'name': 'test', }, ); // after the above you can also access the auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<h6 id="api-details_8">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/auth-with-oauth2</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required provider</p>
+<p>String</p>
+<p>The name of the OAuth2 client provider (e.g. "google").</p>
+<p>Required code</p>
+<p>String</p>
+<p>The authorization code returned from the initial request.</p>
+<p>Required codeVerifier</p>
+<p>String</p>
+<p>The code verifier sent with the initial request as part of the code_challenge.</p>
+<p>Required redirectUrl</p>
+<p>String</p>
+<p>The redirect url sent with the initial request.</p>
+<p>Optional createData</p>
+<p>Object</p>
+<p>Optional data that will be used when creating the auth record on OAuth2 sign-up.</p>
+<p>The created auth record must comply with the same requirements and validations in the regular <strong>create</strong> action.<br />
+<em>The data can only be in <code>json</code>, aka. <code>multipart/form-data</code> and files upload currently are not supported during OAuth2 sign-ups.</em></p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,record.expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,record.description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400</p>
+<p><code>{ "token": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoUmVjb3JkIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyMjA4OTg1MjYxfQ.UwD8JvkbQtXpymT09d7J6fdA0aP9g4FJ1GPh_ggEkzc", "record": { "id": "8171022dc95a4ed", "collectionId": "d2972397d45614e", "collectionName": "users", "created": "2022-06-24 06:24:18.434Z", "updated": "2022-06-24 06:24:18.889Z", "username": "test@example.com", "email": "test@example.com", "verified": true, "emailVisibility": false, "someCustomField": "example 123" }, "meta": { "id": "abc123", "name": "John Doe", "username": "john.doe", "email": "test@example.com", "isNew": false, "avatarURL": "https://example.com/avatar.png", "rawUser": {...}, "accessToken": "...", "refreshToken": "...", "expiry": "..." } }</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while submitting the form.", "data": { "provider": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong><a href="#auth-with-otp">Auth with OTP</a></strong></p>
+<p>Authenticate a single auth record with an one-time password (OTP).</p>
+<p>Note that when requesting an OTP we return an <code>otpId</code> even if a user with the provided email doesn't exist as a very basic enumeration protection.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // send OTP email to the provided auth record const req = await pb.collection('users').requestOTP('test@example.com'); // ... show a screen/popup to enter the password from the email ... // authenticate with the requested OTP id and the email password const authData = await pb.collection('users').authWithOTP(req.otpId, "YOUR_OTP"); // after the above you can also access the auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id); // "logout" pb.authStore.clear();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // send OTP email to the provided auth record final req = await pb.collection('users').requestOTP('test@example.com'); // ... show a screen/popup to enter the password from the email ... // authenticate with the requested OTP id and the email password final authData = await pb.collection('users').authWithOTP(req.otpId, "YOUR_OTP"); // after the above you can also access the auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id); // "logout" pb.authStore.clear();</code></p>
+<h6 id="api-details_9">API details</h6>
+<p>OTP Request</p>
+<p>OTP Auth</p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/request-otp</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required email</p>
+<p>String</p>
+<p>The auth record email address to send the OTP request (if exists).</p>
+<p>Responses</p>
+<p>200 400 429</p>
+<p><code>{ "otpId": "cjoi5dtUwkIZp6D" }</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "email": { "code": "validation_is_email", "message": "Must be a valid email address." } } }</code></p>
+<p><code>{ "status": 429, "message": "You've send too many OTP requests, please try again later.", "data": {} }</code></p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/auth-with-otp</p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required otpId</p>
+<p>String</p>
+<p>The id of the OTP request.</p>
+<p>Required password</p>
+<p>String</p>
+<p>The one-time password.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,record.expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,record.description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400</p>
+<p><code>{ "token": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoUmVjb3JkIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyMjA4OTg1MjYxfQ.UwD8JvkbQtXpymT09d7J6fdA0aP9g4FJ1GPh_ggEkzc", "record": { "id": "8171022dc95a4ed", "collectionId": "d2972397d45614e", "collectionName": "users", "created": "2022-06-24 06:24:18.434Z", "updated": "2022-06-24 06:24:18.889Z", "username": "test@example.com", "email": "test@example.com", "verified": false, "emailVisibility": true, "someCustomField": "example 123" } }</code></p>
+<p><code>{ "status": 400, "message": "Failed to authenticate.", "data": { "otpId": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong><a href="#auth-refresh">Auth refresh</a></strong></p>
+<p>Returns a new auth response (token and user data) for already authenticated auth record.</p>
+<p><em>This method is usually called by users on page/screen reload to ensure that the previously stored data in <code>pb.authStore</code> is still valid and up-to-date.</em></p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const authData = await pb.collection('users').authRefresh(); // after the above you can also access the refreshed auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id);</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final authData = await pb.collection('users').authRefresh(); // after the above you can also access the refreshed auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id);</code></p>
+<h6 id="api-details_10">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/auth-refresh</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,record.expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,record.description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 401 403 404</p>
+<p><code>{ "token": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoUmVjb3JkIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyMjA4OTg1MjYxfQ.UwD8JvkbQtXpymT09d7J6fdA0aP9g4FJ1GPh_ggEkzc", "record": { "id": "8171022dc95a4ed", "collectionId": "d2972397d45614e", "collectionName": "users", "created": "2022-06-24 06:24:18.434Z", "updated": "2022-06-24 06:24:18.889Z", "username": "test@example.com", "email": "test@example.com", "verified": false, "emailVisibility": true, "someCustomField": "example 123" } }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token to be set.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "The authorized record model is not allowed to perform this action.", "data": {} }</code></p>
+<p><code>{ "status": 404, "message": "Missing auth record context.", "data": {} }</code></p>
+<p><strong><a href="#verification">Verification</a></strong></p>
+<p>Sends auth record email verification request.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection('users').requestVerification('test@example.com'); // --- // (optional) in your custom confirmation page: // --- await pb.collection('users').confirmVerification('VERIFICATION_TOKEN');</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection('users').requestVerification('test@example.com'); // --- // (optional) in your custom confirmation page: // --- await pb.collection('users').confirmVerification('VERIFICATION_TOKEN');</code></p>
+<h6 id="api-details_11">API details</h6>
+<p>Request verification</p>
+<p>Confirm verification</p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/request-verification</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required email</p>
+<p>String</p>
+<p>The auth record email address to send the verification request (if exists).</p>
+<p>Responses</p>
+<p>204 400</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "email": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/confirm-verification</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required token</p>
+<p>String</p>
+<p>The token from the verification request email.</p>
+<p>Responses</p>
+<p>204 400</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "token": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong><a href="#password-reset">Password reset</a></strong></p>
+<p>Sends auth record password reset email request.</p>
+<p>On successful password reset all previously issued auth tokens for the specific record will be automatically invalidated.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection('users').requestPasswordReset('test@example.com'); // --- // (optional) in your custom confirmation page: // --- // note: after this call all previously issued auth tokens are invalidated await pb.collection('users').confirmPasswordReset( 'RESET_TOKEN', 'NEW_PASSWORD', 'NEW_PASSWORD_CONFIRM', );</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection('users').requestPasswordReset('test@example.com'); // --- // (optional) in your custom confirmation page: // --- // note: after this call all previously issued auth tokens are invalidated await pb.collection('users').confirmPasswordReset( 'RESET_TOKEN', 'NEW_PASSWORD', 'NEW_PASSWORD_CONFIRM', );</code></p>
+<h6 id="api-details_12">API details</h6>
+<p>Request password reset</p>
+<p>Confirm password reset</p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/request-password-reset</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required email</p>
+<p>String</p>
+<p>The auth record email address to send the password reset request (if exists).</p>
+<p>Responses</p>
+<p>204 400</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "email": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/confirm-password-reset</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required token</p>
+<p>String</p>
+<p>The token from the password reset request email.</p>
+<p>Required password</p>
+<p>String</p>
+<p>The new password to set.</p>
+<p>Required passwordConfirm</p>
+<p>String</p>
+<p>The new password confirmation.</p>
+<p>Responses</p>
+<p>204 400</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "token": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong><a href="#email-change">Email change</a></strong></p>
+<p>Sends auth record email change request.</p>
+<p>On successful email change all previously issued auth tokens for the specific record will be automatically invalidated.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... await pb.collection('users').authWithPassword('test@example.com', '1234567890'); await pb.collection('users').requestEmailChange('new@example.com'); // --- // (optional) in your custom confirmation page: // --- // note: after this call all previously issued auth tokens are invalidated await pb.collection('users').confirmEmailChange('EMAIL_CHANGE_TOKEN', 'YOUR_PASSWORD');</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... await pb.collection('users').authWithPassword('test@example.com', '1234567890'); await pb.collection('users').requestEmailChange('new@example.com'); ... // --- // (optional) in your custom confirmation page: // --- // note: after this call all previously issued auth tokens are invalidated await pb.collection('users').confirmEmailChange('EMAIL_CHANGE_TOKEN', 'YOUR_PASSWORD');</code></p>
+<h6 id="api-details_13">API details</h6>
+<p>Request email change</p>
+<p>Confirm email change</p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/request-email-change</p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required newEmail</p>
+<p>String</p>
+<p>The new email address to send the change email request.</p>
+<p>Responses</p>
+<p>204 400 401 403</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "newEmail": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><code>{ "status": 401, "message": "The request requires valid record authorization token to be set.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "The authorized record model is not allowed to perform this action.", "data": {} }</code></p>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/confirm-email-change</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Required token</p>
+<p>String</p>
+<p>The token from the change email request email.</p>
+<p>Required password</p>
+<p>String</p>
+<p>The account password to confirm the email change.</p>
+<p>Responses</p>
+<p>204 400</p>
+<p><code>null</code></p>
+<p><code>{ "status": 400, "message": "An error occurred while validating the submitted data.", "data": { "token": { "code": "validation_required", "message": "Missing required value." } } }</code></p>
+<p><strong><a href="#impersonate">Impersonate</a></strong></p>
+<p>Impersonate allows you to authenticate as a different user by generating a <strong>nonrefreshable</strong> auth token.</p>
+<p>Only superusers can perform this action.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // authenticate as superuser await pb.collection("_superusers").authWithPassword("test@example.com", "1234567890"); // impersonate // (the custom token duration is optional and must be in seconds) const impersonateClient = pb.collection("users").impersonate("USER_RECORD_ID", 3600) // log the impersonate token and user data console.log(impersonateClient.authStore.token); console.log(impersonateClient.authStore.record); // send requests as the impersonated user impersonateClient.collection("example").getFullList();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // authenticate as superuser await pb.collection("_superusers").authWithPassword("test@example.com", "1234567890"); // impersonate // (the custom token duration is optional and must be in seconds) final impersonateClient = pb.collection("users").impersonate("USER_RECORD_ID", 3600) // log the impersonate token and user data print(impersonateClient.authStore.token); print(impersonateClient.authStore.record); // send requests as the impersonated user impersonateClient.collection("example").getFullList();</code></p>
+<h6 id="api-details_14">API details</h6>
+<p><strong>POST</strong></p>
+<p>/api/collections/<code>collectionIdOrName</code>/impersonate/<code>id</code></p>
+<p>Requires <code>Authorization:TOKEN</code></p>
+<p>Path parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>collectionIdOrName</p>
+<p>String</p>
+<p>ID or name of the auth collection.</p>
+<p>id</p>
+<p>String</p>
+<p>ID of the auth record to impersonate.</p>
+<p>Body Parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>Optional duration</p>
+<p>Number</p>
+<p>Optional custom JWT duration for the <code>exp</code> claim (in seconds).<br />
+If not set or 0, it fallbacks to the default collection auth token duration option.</p>
+<p>Body parameters could be sent as <em>JSON</em> or <em>multipart/form-data</em>.</p>
+<p>Query parameters</p>
+<p>Param</p>
+<p>Type</p>
+<p>Description</p>
+<p>expand</p>
+<p>String</p>
+<p>Auto expand record relations. Ex.:</p>
+<p><code>?expand=relField1,relField2.subRelField</code></p>
+<p>Supports up to 6-levels depth nested relations expansion.<br />
+The expanded relations will be appended to the record under the <code>expand</code> property (e.g. <code>"expand": {"relField1": {...}, ...}</code>).<br />
+Only the relations to which the request user has permissions to <strong>view</strong> will be expanded.</p>
+<p>fields</p>
+<p>String</p>
+<p>Comma separated string of the fields to return in the JSON response <em>(by default returns all fields)</em>. Ex.:</p>
+<p><code>?fields=*,record.expand.relField.name</code></p>
+<p><code>*</code> targets all keys from the specific depth level.</p>
+<p>In addition, the following field modifiers are also supported:</p>
+<ul>
+<li><code>:excerpt(maxLength, withEllipsis?)</code><br />
+    Returns a short plain text version of the field string value.<br />
+    Ex.: <code>?fields=*,record.description:excerpt(200,true)</code></li>
+</ul>
+<p>Responses</p>
+<p>200 400 401 403 404</p>
+<p><code>{ "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjb2xsZWN0aW9uSWQiOiJfcGJjX2MwcHdrZXNjcXMiLCJleHAiOjE3MzAzNjgxMTUsImlkIjoicXkwMmMxdDBueDBvanFuIiwicmVmcmVzaGFibGUiOmZhbHNlLCJ0eXBlIjoiYXV0aCJ9.1JOaE54TyPdDLf0mb0T6roIYeh8Y1HfJvDlYZADMN4U", "record": { "id": "8171022dc95a4ed", "collectionId": "d2972397d45614e", "collectionName": "users", "created": "2022-06-24 06:24:18.434Z", "updated": "2022-06-24 06:24:18.889Z", "username": "test@example.com", "email": "test@example.com", "verified": false, "emailVisibility": true, "someCustomField": "example 123" } }</code></p>
+<p><code>{ "status": 400, "message": "The request requires valid record authorization token to be set.", "data": { "duration": { "code": "validation_min_greater_equal_than_required", "message": "Must be no less than 0." } } }</code></p>
+<p><code>{ "status": 401, "message": "An error occurred while validating the submitted data.", "data": {} }</code></p>
+<p><code>{ "status": 403, "message": "The authorized record model is not allowed to perform this action.", "data": {} }</code></p>
+<p><code>{ "status": 404, "message": "The requested resource wasn't found.", "data": {} }</code></p>
+    <div id="page-nav">
+      <a href="../core/09_going-to-production.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Mise en production</span>
+        </a>
+      <a href="../api/02_api-collections.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">API — Collections</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

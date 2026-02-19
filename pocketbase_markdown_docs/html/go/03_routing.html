@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Routing — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link active" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Extend with Go <span>›</span> Routing</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="go-routing">Go - Routing</h1>
+<hr />
+<p>Routing</p>
+<p>PocketBase routing is built on top of the standard Go <a href="https://pkg.go.dev/net/http#ServeMux"><code>net/http.ServeMux</code></a>. The router can be accessed via the <code>app.OnServe()</code> hook allowing you to register custom endpoints and middlewares.</p>
+<h3 id="routes"><a href="#routes">Routes</a></h3>
+<h5 id="registering-new-routes"><a href="#registering-new-routes">Registering new routes</a></h5>
+<p>Every route has a path, handler function and eventually middlewares attached to it. For example:</p>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { // register "GET /hello/{name}" route (allowed for everyone) se.Router.GET("/hello/{name}", func(e *core.RequestEvent) error { name := e.Request.PathValue("name") return e.String(http.StatusOK, "Hello " + name) }) // register "POST /api/myapp/settings" route (allowed only for authenticated users) se.Router.POST("/api/myapp/settings", func(e *core.RequestEvent) error { // do something ... return e.JSON(http.StatusOK, map[string]bool{"success": true}) }).Bind(apis.RequireAuth()) return se.Next() })</code></p>
+<p>There are several routes registration methods available, but the most common ones are:</p>
+<p><code>se.Router.GET(path, action) se.Router.POST(path, action) se.Router.PUT(path, action) se.Router.PATCH(path, action) se.Router.DELETE(path, action) // If you want to handle any HTTP method define only a path (e.g. "/example") // OR if you want to specify a custom one add it as prefix to the path (e.g. "TRACE /example") se.Router.Any(pattern, action)</code></p>
+<p>The router also supports creating groups for routes that share the same base path and middlewares. For example:</p>
+<p><code>g := se.Router.Group("/api/myapp") // group middleware g.Bind(apis.RequireAuth()) // group routes g.GET("", action1) g.GET("/example/{id}", action2) g.PATCH("/example/{id}", action3).BindFunc( /* custom route specific middleware func */ ) // nested group sub := g.Group("/sub") sub.GET("/sub1", action4)</code></p>
+<p>The example registers the following endpoints<br />
+(all require authenticated user access):</p>
+<ul>
+<li>GET /api/myapp -&gt; action1</li>
+<li>GET /api/myapp/example/{id} -&gt; action2</li>
+<li>PATCH /api/myapp/example/{id} -&gt; action3</li>
+<li>GET /api/myapp/example/sub/sub1 -&gt; action4</li>
+</ul>
+<p>Each router group and route could define <a href="#middlewares">middlewares</a> in a similar manner to the regular app hooks via the <code>Bind/BindFunc</code> methods, allowing you to perform various BEFORE or AFTER action operations (e.g. inspecting request headers, custom access checks, etc.).</p>
+<h5 id="path-parameters-and-matching-rules"><a href="#path-parameters-and-matching-rules">Path parameters and matching rules</a></h5>
+<p>Because PocketBase routing is based on top of the Go standard router mux, we follow the same pattern matching rules. Below you could find a short overview but for more details please refer to <a href="https://pkg.go.dev/net/http#ServeMux"><code>net/http.ServeMux</code></a>.</p>
+<p>In general, a route pattern looks like <code>[METHOD ][HOST]/[PATH]</code> (<em>the METHOD prefix is added automatically when using the designated <code>GET()</code>, <code>POST()</code>, etc. methods)</em>).</p>
+<p>Route paths can include parameters in the format <code>{paramName}</code>.<br />
+You can also use <code>{paramName...}</code> format to specify a parameter that targets more than one path segment.</p>
+<p>A pattern ending with a trailing slash <code>/</code> acts as anonymous wildcard and matches any requests that begins with the defined route. If you want to have a trailing slash but to indicate the end of the URL then you need to end the path with the special <code>{$}</code> parameter.</p>
+<p>If your route path starts with <code>/api/</code> consider combining it with your unique app name like <code>/api/myapp/...</code> to avoid collisions with system routes.</p>
+<p>Here are some examples:</p>
+<p><code>// match "GET example.com/index.html" se.Router.GET("example.com/index.html") // match "GET /index.html" (for any host) se.Router.GET("/index.html") // match "GET /static/", "GET /static/a/b/c", etc. se.Router.GET("/static/") // match "GET /static/", "GET /static/a/b/c", etc. // (similar to the above but with a named wildcard parameter) se.Router.GET("/static/{path...}") // match only "GET /static/" (if no "/static" is registered, it is 301 redirected) se.Router.GET("/static/{$}") // match "GET /customers/john", "GET /customers/jane", etc. se.Router.GET("/customers/{name}")</code></p>
+<hr />
+<p>In the following examples <code>e</code> is usually <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/core#RequestEvent"><code>*core.RequestEvent</code></a> value.</p>
+<hr />
+<h5 id="reading-path-parameters"><a href="#reading-path-parameters">Reading path parameters</a></h5>
+<p><code>id := e.Request.PathValue("id")</code></p>
+<h5 id="retrieving-the-current-auth-state"><a href="#retrieving-the-current-auth-state">Retrieving the current auth state</a></h5>
+<p>The request auth state can be accessed (or set) via the <code>RequestEvent.Auth</code> field.</p>
+<p><code>authRecord := e.Auth isGuest := e.Auth == nil // the same as "e.Auth != nil &amp;&amp; e.Auth.IsSuperuser()" isSuperuser := e.HasSuperuserAuth()</code></p>
+<p>Alternatively you could also access the request data from the summarized request info instance <em>(usually used in hooks like the <code>OnRecordEnrich</code> where there is no direct access to the request)</em> .</p>
+<p><code>info, err := e.RequestInfo() authRecord := info.Auth isGuest := info.Auth == nil // the same as "info.Auth != nil &amp;&amp; info.Auth.IsSuperuser()" isSuperuser := info.HasSuperuserAuth()</code></p>
+<h5 id="reading-query-parameters"><a href="#reading-query-parameters">Reading query parameters</a></h5>
+<p><code>// retrieve the first value of the "search" query param search := e.Request.URL.Query().Get("search") // or via the parsed request info info, err := e.RequestInfo() search := info.Query["search"] // in case of array query params (e.g. search=123&amp;search=456) arr := e.Request.URL.Query()["search"] // []string{"123", "456"}</code></p>
+<h5 id="reading-request-headers"><a href="#reading-request-headers">Reading request headers</a></h5>
+<p><code>token := e.Request.Header.Get("Some-Header") // or via the parsed request info // (the header value is always normalized per the @request.headers.* API rules format) info, err := e.RequestInfo() token := info.Headers["some_header"]</code></p>
+<h5 id="writing-response-headers"><a href="#writing-response-headers">Writing response headers</a></h5>
+<p><code>e.Response.Header().Set("Some-Header", "123")</code></p>
+<h5 id="retrieving-uploaded-files"><a href="#retrieving-uploaded-files">Retrieving uploaded files</a></h5>
+<p><code>// retrieve the uploaded files and parse the found multipart data into a ready-to-use []*filesystem.File files, err := e.FindUploadedFiles("document") // or retrieve the raw single multipart/form-data file and header mf, mh, err := e.Request.FormFile("document")</code></p>
+<h5 id="reading-request-body"><a href="#reading-request-body">Reading request body</a></h5>
+<p>Body parameters can be read either via <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#Event.BindBody"><code>e.BindBody</code></a> OR through the parsed request info (<em>requires manual type assertions</em>).</p>
+<p>The <code>e.BindBody</code> argument must be a pointer to a struct or <code>map[string]any</code>.<br />
+The following struct tags are supported <em>(the specific binding rules and which one will be used depend on the request Content-Type)</em>:</p>
+<ul>
+<li><code>json</code> (json body)- uses the builtin Go JSON package for unmarshaling.</li>
+<li><code>xml</code> (xml body) - uses the builtin Go XML package for unmarshaling.</li>
+<li><code>form</code> (form data) - utilizes the custom <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#UnmarshalRequestData"><code>router.UnmarshalRequestData</code></a> method.</li>
+</ul>
+<p>NB! When binding structs make sure that they don't have public fields that shouldn't be bindable and it is advisable such fields to be unexported or define a separate struct with just the safe bindable fields.</p>
+<p><code>// read/scan the request body fields into a typed struct data := struct { // unexported to prevent binding somethingPrivate string Title string `json:"title" form:"title"` Description string `json:"description" form:"description"` Active bool `json:"active" form:"active"` }{} if err := e.BindBody(&amp;data); err != nil { return e.BadRequestError("Failed to read request data", err) } // alternatively, read the body via the parsed request info info, err := e.RequestInfo() title, ok := info.Body["title"].(string)</code></p>
+<h5 id="writing-response-body"><a href="#writing-response-body">Writing response body</a></h5>
+<p><em>For all supported methods, you can refer to <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#Event"><code>router.Event</code></a> .</em></p>
+<p><code>// send response with JSON body // (it also provides a generic response fields picker/filter if the "fields" query parameter is set) e.JSON(http.StatusOK, map[string]any{"name": "John"}) // send response with string body e.String(http.StatusOK, "Lorem ipsum...") // send response with HTML body // (check also the "Rendering templates" section) e.HTML(http.StatusOK, "&lt;h1&gt;Hello!&lt;/h1&gt;") // redirect e.Redirect(http.StatusTemporaryRedirect, "https://example.com") // send response with no body e.NoContent(http.StatusNoContent) // serve a single file e.FileFS(os.DirFS("..."), "example.txt") // stream the specified reader e.Stream(http.StatusOK, "application/octet-stream", reader) // send response with blob (bytes slice) body e.Blob(http.StatusOK, "application/octet-stream", []byte{ ... })</code></p>
+<h5 id="reading-the-client-ip"><a href="#reading-the-client-ip">Reading the client IP</a></h5>
+<p><code>// The IP of the last client connecting to your server. // The returned IP is safe and can be always trusted. // When behind a reverse proxy (e.g. nginx) this method returns the IP of the proxy. // https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#Event.RemoteIP ip := e.RemoteIP() // The "real" IP of the client based on the configured Settings.TrustedProxy header(s). // If such headers are not set, it fallbacks to e.RemoteIP(). // https://pkg.go.dev/github.com/pocketbase/pocketbase/core#RequestEvent.RealIP ip := e.RealIP()</code></p>
+<h5 id="request-store"><a href="#request-store">Request store</a></h5>
+<p>The <code>core.RequestEvent</code> comes with a local store that you can use to share custom data between <a href="#middlewares">middlewares</a> and the route action.</p>
+<p><code>// store for the duration of the request e.Set("someKey", 123) // retrieve later val := e.Get("someKey").(int) // 123</code></p>
+<h3 id="middlewares"><a href="#middlewares">Middlewares</a></h3>
+<h5 id="registering-middlewares"><a href="#registering-middlewares">Registering middlewares</a></h5>
+<p>Middlewares allow inspecting, intercepting and filtering route requests.</p>
+<p>All middleware functions share the same signature with the route actions (aka. <code>func(e *core.RequestEvent) error</code>) but expect the user to call <code>e.Next()</code> if they want to proceed with the execution chain.</p>
+<p>Middlewares can be registered <em>globally</em>, on <em>group</em> and on <em>route</em> level using the <code>Bind</code> and <code>BindFunc</code> methods.</p>
+<p>Here is a minimal example of what a global middleware looks like:</p>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { // register a global middleware se.Router.BindFunc(func(e *core.RequestEvent) error { if e.Request.Header.Get("Something") == "" { return e.BadRequestError("Something header value is missing!", nil) } return e.Next() }) return se.Next() })</code></p>
+<p><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#RouterGroup.Bind"><code>RouterGroup.Bind(middlewares...)</code></a> / <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#Route.Bind"><code>Route.Bind(middlewares...)</code></a> registers one or more middleware handlers.<br />
+Similar to the other app hooks, a middleware handler has 3 fields:</p>
+<ul>
+<li><code>Id</code> <em>(optional)</em> - the name of the middleware (could be used as argument for <code>Unbind</code>)</li>
+<li><code>Priority</code> <em>(optional)</em> - the execution order of the middleware (if empty fallbacks to the order of registration in the code)</li>
+<li><code>Func</code> <em>(required)</em> - the middleware handler function</li>
+</ul>
+<p>Often you don't need to specify the <code>Id</code> or <code>Priority</code> of the middleware and for convenience you can instead use directly <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#RouterGroup.BindFunc"><code>RouterGroup.BindFunc(funcs...)</code></a> / <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/tools/router#Route.BindFunc"><code>Route.BindFunc(funcs...)</code></a> .</p>
+<p>Below is a slightly more advanced example showing all options and the execution sequence (<em>2,0,1,3,4</em>):</p>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { // attach global middleware se.Router.BindFunc(func(e *core.RequestEvent) error { println(0) return e.Next() }) g := se.Router.Group("/sub") // attach group middleware g.BindFunc(func(e *core.RequestEvent) error { println(1) return e.Next() }) // attach group middleware with an id and custom priority g.Bind(&amp;hook.Handler[*core.RequestEvent]{ Id: "something", Func: func(e *core.RequestEvent) error { println(2) return e.Next() }, Priority: -1, }) // attach middleware to a single route // // "GET /sub/hello" should print the sequence: 2,0,1,3,4 g.GET("/hello", func(e *core.RequestEvent) error { println(4) return e.String(200, "Hello!") }).BindFunc(func(e *core.RequestEvent) error { println(3) return e.Next() }) return se.Next() })</code></p>
+<h5 id="removing-middlewares"><a href="#removing-middlewares">Removing middlewares</a></h5>
+<p>To remove a registered middleware from the execution chain for a specific group or route you can make use of the <code>Unbind(id)</code> method.</p>
+<p>Note that only middlewares that have a non-empty <code>Id</code> can be removed.</p>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { // global middleware se.Router.Bind(&amp;hook.Handler[*core.RequestEvent]{ Id: "test", Func: func(e *core.RequestEvent) error { // ... return e.Next() }, ) // "GET /A" invokes the "test" middleware se.Router.GET("/A", func(e *core.RequestEvent) error { return e.String(200, "A") }) // "GET /B" doesn't invoke the "test" middleware se.Router.GET("/B", func(e *core.RequestEvent) error { return e.String(200, "B") }).Unbind("test") return se.Next() })</code></p>
+<h5 id="builtin-middlewares"><a href="#builtin-middlewares">Builtin middlewares</a></h5>
+<p>The <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis"><code>apis</code></a> package exposes several middlewares that you can use as part of your application.</p>
+<p><code>// Require the request client to be unauthenticated (aka. guest). // Example: Route.Bind(apis.RequireGuestOnly()) apis.RequireGuestOnly() // Require the request client to be authenticated // (optionally specify a list of allowed auth collection names, default to any). // Example: Route.Bind(apis.RequireAuth()) apis.RequireAuth(optCollectionNames...) // Require the request client to be authenticated as superuser // (this is an alias for apis.RequireAuth(core.CollectionNameSuperusers)). // Example: Route.Bind(apis.RequireSuperuserAuth()) apis.RequireSuperuserAuth() // Require the request client to be authenticated as superuser OR // regular auth record with id matching the specified route parameter (default to "id"). // Example: Route.Bind(apis.RequireSuperuserOrOwnerAuth("")) apis.RequireSuperuserOrOwnerAuth(ownerIdParam) // Changes the global 32MB default request body size limit (set it to 0 for no limit). // Note that system record routes have dynamic body size limit based on their collection field types. // Example: Route.Bind(apis.BodyLimit(10 &lt;&lt; 20)) apis.BodyLimit(limitBytes) // Compresses the HTTP response using Gzip compression scheme. // Example: Route.Bind(apis.Gzip()) apis.Gzip() // Instructs the activity logger to log only requests that have failed/returned an error. // Example: Route.Bind(apis.SkipSuccessActivityLog()) apis.SkipSuccessActivityLog()</code></p>
+<h5 id="default-globally-registered-middlewares"><a href="#default-globally-registered-middlewares">Default globally registered middlewares</a></h5>
+<p>The below list is mostly useful for users that may want to plug their own custom middlewares before/after the priority of the default global ones, for example: registering a custom auth loader before the rate limiter with <code>apis.DefaultRateLimitMiddlewarePriority - 1</code> so that the rate limit can be applied properly based on the loaded auth state.</p>
+<p>All PocketBase applications have the below internal middlewares registered out of the box (<em>sorted by their priority</em>):</p>
+<ul>
+<li><strong>WWW redirect</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultWWWRedirectMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultWWWRedirectMiddlewarePriority</code></a><br />
+<em>Performs www -&gt; non-www redirect(s) if the request host matches with one of the values in certificate host policy.</em></li>
+<li><strong>CORS</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultCorsMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultCorsMiddlewarePriority</code></a><br />
+<em>By default all origins are allowed (PocketBase is stateless and doesn't rely on cookies) and can be configured with the <code>--origins</code> flag but for more advanced customization it can be also replaced entirely by binding with <code>apis.CORS(config)</code> middleware or registering your own custom one in its place.</em></li>
+<li><strong>Activity logger</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultActivityLoggerMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultActivityLoggerMiddlewarePriority</code></a><br />
+<em>Saves request information into the logs auxiliary database.</em></li>
+<li><strong>Auto panic recover</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultPanicRecoverMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultPanicRecoverMiddlewarePriority</code></a><br />
+<em>Default panic-recover handler.</em></li>
+<li><strong>Auth token loader</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultLoadAuthTokenMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultLoadAuthTokenMiddlewarePriority</code></a><br />
+<em>Loads the auth token from the <code>Authorization</code> header and populates the related auth record into the request event (aka. <code>e.Auth</code>).</em></li>
+<li><strong>Security response headers</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultSecurityHeadersMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultSecurityHeadersMiddlewarePriority</code></a><br />
+<em>Adds default common security headers (<code>X-XSS-Protection</code>, <code>X-Content-Type-Options</code>, <code>X-Frame-Options</code>) to the response (can be overwritten by other middlewares or from inside the route action).</em></li>
+<li><strong>Rate limit</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultRateLimitMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultRateLimitMiddlewarePriority</code></a><br />
+<em>Rate limits client requests based on the configured app settings (it does nothing if the rate limit option is not enabled).</em></li>
+<li><strong>Body limit</strong> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultBodyLimitMiddlewareId</code></a> <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#pkg-constants"><code>apis.DefaultBodyLimitMiddlewarePriority</code></a><br />
+<em>Applies a default max ~32MB request body limit for all custom routes ( system record routes have dynamic body size limit based on their collection field types). Can be overwritten on group/route level by simply rebinding the <code>apis.BodyLimit(limitBytes)</code> middleware.</em></li>
+</ul>
+<h3 id="error-response"><a href="#error-response">Error response</a></h3>
+<p>PocketBase has a global error handler and every returned error from a route or middleware will be safely converted by default to a generic <code>ApiError</code> to avoid accidentally leaking sensitive information (the original raw error message will be visible only in the <em>Dashboard &gt; Logs</em> or when in <code>--dev</code> mode).</p>
+<p>To make it easier returning formatted JSON error responses, the request event provides several <code>ApiError</code> methods.<br />
+Note that <code>ApiError.RawData()</code> will be returned in the response only if it is a map of <code>router.SafeErrorItem</code>/<code>validation.Error</code> items.</p>
+<p><code>import validation "github.com/go-ozzo/ozzo-validation/v4" se.Router.GET("/example", func(e *core.RequestEvent) error { ... // construct ApiError with custom status code and validation data error return e.Error(500, "something went wrong", map[string]validation.Error{ "title": validation.NewError("invalid_title", "Invalid or missing title"), }) // if message is empty string, a default one will be set return e.BadRequestError(optMessage, optData) // 400 ApiError return e.UnauthorizedError(optMessage, optData) // 401 ApiError return e.ForbiddenError(optMessage, optData) // 403 ApiError return e.NotFoundError(optMessage, optData) // 404 ApiError return e.TooManyRequestsError(optMessage, optData) // 429 ApiError return e.InternalServerError(optMessage, optData) // 500 ApiError })</code></p>
+<p>This is not very common but if you want to return <code>ApiError</code> outside of request related handlers, you can use the below <code>apis.*</code> factories:</p>
+<p><code>import ( validation "github.com/go-ozzo/ozzo-validation/v4" "github.com/pocketbase/pocketbase/apis" ) app.OnRecordCreate().BindFunc(func(e *core.RecordEvent) error { ... // construct ApiError with custom status code and validation data error return apis.NewApiError(500, "something went wrong", map[string]validation.Error{ "title": validation.NewError("invalid_title", "Invalid or missing title"), }) // if message is empty string, a default one will be set return apis.NewBadRequestError(optMessage, optData) // 400 ApiError return apis.NewUnauthorizedError(optMessage, optData) // 401 ApiError return apis.NewForbiddenError(optMessage, optData) // 403 ApiError return apis.NewNotFoundError(optMessage, optData) // 404 ApiError return apis.NewTooManyRequestsError(optMessage, optData) // 429 ApiError return apis.NewInternalServerError(optMessage, optData) // 500 ApiError })</code></p>
+<h3 id="helpers"><a href="#helpers">Helpers</a></h3>
+<h5 id="serving-static-directory"><a href="#serving-static-directory">Serving static directory</a></h5>
+<p><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#Static"><code>apis.Static()</code></a> serves static directory content from <code>fs.FS</code> instance.</p>
+<p>Expects the route to have a <code>{path...}</code> wildcard parameter.</p>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { // serves static files from the provided dir (if exists) se.Router.GET("/{path...}", apis.Static(os.DirFS("/path/to/public"), false)) return se.Next() })</code></p>
+<h5 id="auth-response"><a href="#auth-response">Auth response</a></h5>
+<p><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#RecordAuthResponse"><code>apis.RecordAuthResponse()</code></a> writes standardized JSON record auth response (aka. token + record data) into the specified request body. Could be used as a return result from a custom auth route.</p>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { se.Router.POST("/phone-login", func(e *core.RequestEvent) error { data := struct { Phone string `json:"phone" form:"phone"` Password string `json:"password" form:"password"` }{} if err := e.BindBody(&amp;data); err != nil { return e.BadRequestError("Failed to read request data", err) } record, err := e.App.FindFirstRecordByData("users", "phone", data.Phone) if err != nil || !record.ValidatePassword(data.Password) { // return generic 400 error as a basic enumeration protection return e.BadRequestError("Invalid credentials", err) } return apis.RecordAuthResponse(e, record, "phone", nil) }) return se.Next() })</code></p>
+<h5 id="enrich-records"><a href="#enrich-records">Enrich record(s)</a></h5>
+<p><a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#EnrichRecord"><code>apis.EnrichRecord()</code></a> and <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#EnrichRecords"><code>apis.EnrichRecords()</code></a> helpers parses the request context and enrich the provided record(s) by:</p>
+<ul>
+<li>expands relations (if <code>defaultExpands</code> and/or <code>?expand</code> query parameter is set)</li>
+<li>ensures that the emails of the auth record and its expanded auth relations are visible only for the current logged superuser, record owner or record with manage access</li>
+</ul>
+<p><code>app.OnServe().BindFunc(func(se *core.ServeEvent) error { se.Router.GET("/custom-article", func(e *core.RequestEvent) error { records, err := e.App.FindRecordsByFilter("article", "status = 'active'", "-created", 40, 0) if err != nil { return e.NotFoundError("No active articles", err) } // enrich the records with the "categories" relation as default expand err = apis.EnrichRecords(e, records, "categories") if err != nil { return err } return e.JSON(http.StatusOK, records) }) return se.Next() })</code></p>
+<h5 id="go-httphandler-wrappers"><a href="#go-http-handler-wrappers">Go http.Handler wrappers</a></h5>
+<p>If you want to register standard Go <code>http.Handler</code> function and middlewares, you can use <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#WrapStdHandler"><code>apis.WrapStdHandler(handler)</code></a> and <a href="https://pkg.go.dev/github.com/pocketbase/pocketbase/apis#WrapStdMiddleware"><code>apis.WrapStdMiddleware(func)</code></a> functions.</p>
+<h3 id="sending-request-to-custom-routes-using-the-sdks"><a href="#sending-request-to-custom-routes-using-the-sdks">Sending request to custom routes using the SDKs</a></h3>
+<p>The official PocketBase SDKs expose the internal <code>send()</code> method that could be used to send requests to your custom route(s).</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); await pb.send("/hello", { // for other options check // https://developer.mozilla.org/en-US/docs/Web/API/fetch#options query: { "abc": 123 }, });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); await pb.send("/hello", query: { "abc": 123 })</code></p>
+    <div id="page-nav">
+      <a href="../go/02_event-hooks.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Event Hooks</span>
+        </a>
+      <a href="../go/04_database.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Base de données</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

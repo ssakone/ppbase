@@ -8,6 +8,7 @@ __pycache__/
 /dist/
 build/
 *.whl
+tests/e2e/node_modules/
 
 # Virtual environment
 .venv/

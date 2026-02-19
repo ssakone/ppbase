@@ -44,12 +44,18 @@ _RESERVED_NAMES = frozenset({
     "created",
     "updated",
     "expand",
-    "collectionId",
-    "collectionName",
+    "collectionid",
+    "collectionname",
     "_collections",
     "_params",
     "_external_auths",
+    "_externalauths",
     "_superusers",
+    "_mfas",
+    "_otps",
+    "_authorigins",
+    "_migrations",
+    "users",
     "import",
 })
 
@@ -64,6 +70,17 @@ def _validate_collection_name(name: str) -> None:
         )
     if name.lower() in _RESERVED_NAMES:
         raise ValueError(f"Collection name '{name}' is reserved.")
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``override`` into ``base`` and return a new dict."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -187,14 +204,20 @@ async def list_collections(
     per_page: int = 30,
     sort: str = "",
     filter_str: str = "",
+    skip_total: bool = False,
 ) -> CollectionListResponse:
     """List collections with pagination and sorting."""
-    # Count total
-    count_stmt = select(func.count(CollectionRecord.id))
-    count_result = await session.execute(count_stmt)
-    total_items = count_result.scalar_one()
+    # Count total unless explicitly skipped
+    total_items = -1
+    if not skip_total:
+        count_stmt = select(func.count(CollectionRecord.id))
+        count_result = await session.execute(count_stmt)
+        total_items = count_result.scalar_one()
 
-    total_pages = max(1, math.ceil(total_items / per_page)) if per_page > 0 else 1
+    if total_items < 0:
+        total_pages = -1
+    else:
+        total_pages = max(1, math.ceil(total_items / per_page)) if per_page > 0 else 0
 
     # Query items
     stmt = select(CollectionRecord)
@@ -246,6 +269,17 @@ async def create_collection(
     if existing is not None:
         raise ValueError(f"Collection with name '{data.name}' already exists.")
 
+    # Auth collections need default auth options (per-collection token secrets)
+    # if the client didn't provide them.
+    options = data.options if isinstance(data.options, dict) else {}
+    if data.type == "auth":
+        from ppbase.services.auth_service import generate_default_auth_options
+
+        options = _deep_merge_dicts(
+            generate_default_auth_options(is_superusers=False),
+            options,
+        )
+
     now = datetime.now(timezone.utc)
     record = CollectionRecord(
         id=data.id or generate_id(),
@@ -259,7 +293,7 @@ async def create_collection(
         create_rule=data.create_rule,
         update_rule=data.update_rule,
         delete_rule=data.delete_rule,
-        options=data.options,
+        options=options,
         created=now,
         updated=now,
     )
@@ -318,18 +352,17 @@ async def update_collection(
     old_snapshot = _Snapshot(record)
 
     # Apply updates
-    if data.name is not None:
+    if data.name is not None and data.name.lower() != record.name.lower():
         _validate_collection_name(data.name)
-        if data.name.lower() != record.name.lower():
-            dup_stmt = select(CollectionRecord).where(
-                func.lower(CollectionRecord.name) == data.name.lower(),
-                CollectionRecord.id != record.id,
+        dup_stmt = select(CollectionRecord).where(
+            func.lower(CollectionRecord.name) == data.name.lower(),
+            CollectionRecord.id != record.id,
+        )
+        dup = (await session.execute(dup_stmt)).scalars().first()
+        if dup is not None:
+            raise ValueError(
+                f"Collection with name '{data.name}' already exists."
             )
-            dup = (await session.execute(dup_stmt)).scalars().first()
-            if dup is not None:
-                raise ValueError(
-                    f"Collection with name '{data.name}' already exists."
-                )
         record.name = data.name
 
     if data.type is not None:
@@ -355,7 +388,21 @@ async def update_collection(
         record.delete_rule = data.delete_rule
 
     if data.options is not None:
-        record.options = data.options
+        incoming_options = data.options if isinstance(data.options, dict) else {}
+        # Dashboard updates often send partial auth options (e.g. only oauth2).
+        # Preserve existing token/password settings and merge in provided keys.
+        if (record.type or "base") == "auth":
+            from ppbase.services.auth_service import generate_default_auth_options
+
+            existing_options = record.options if isinstance(record.options, dict) else {}
+            is_superusers = record.name == "_superusers"
+            merged = _deep_merge_dicts(
+                generate_default_auth_options(is_superusers=is_superusers),
+                existing_options,
+            )
+            record.options = _deep_merge_dicts(merged, incoming_options)
+        else:
+            record.options = incoming_options
 
     record.updated = datetime.now(timezone.utc)
 
@@ -548,10 +595,22 @@ async def import_collections(
             )
         else:
             # Create new
+            import_options = coll_data.get("options", {})
+            if not isinstance(import_options, dict):
+                import_options = {}
+            import_type = coll_data.get("type", "base")
+            # Auth collections need default auth options if not provided
+            if import_type == "auth":
+                from ppbase.services.auth_service import generate_default_auth_options
+                import_options = _deep_merge_dicts(
+                    generate_default_auth_options(is_superusers=False),
+                    import_options,
+                )
+
             create_data = CollectionCreate(
                 id=coll_data.get("id"),
                 name=name,
-                type=coll_data.get("type", "base"),
+                type=import_type,
                 system=coll_data.get("system", False),
                 schema=coll_data.get("schema", []),
                 indexes=coll_data.get("indexes", []),
@@ -560,7 +619,7 @@ async def import_collections(
                 createRule=coll_data.get("createRule"),
                 updateRule=coll_data.get("updateRule"),
                 deleteRule=coll_data.get("deleteRule"),
-                options=coll_data.get("options", {}),
+                options=import_options,
             )
             now = datetime.now(timezone.utc)
             record = CollectionRecord(

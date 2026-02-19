@@ -213,6 +213,12 @@ async def create_collection_table(
                 f'ON "{table_name}" ("{f.name}") WHERE "{f.name}" != \'\''
             )
 
+    # Custom indexes from collection definition
+    raw_indexes = getattr(collection, 'indexes', None) or []
+    for idx_sql in raw_indexes:
+        if isinstance(idx_sql, str) and idx_sql.strip():
+            index_stmts.append(idx_sql)
+
     async with engine.begin() as conn:
         await conn.execute(text(create_sql))
         for idx_sql in index_stmts:

@@ -20,6 +20,10 @@ from ppbase.models.record import build_record_response, format_datetime
 MAX_EXPAND_DEPTH = 6
 
 
+def _collection_type(collection: CollectionRecord) -> str:
+    return str(getattr(collection, "type", "base") or "base").strip().lower()
+
+
 def _parse_expand_string(expand_str: str) -> list[list[str]]:
     """Parse an expand string into a list of field-path lists.
 
@@ -107,6 +111,7 @@ async def expand_records(
     records: list[dict[str, Any]],
     expand_str: str,
     all_collections: list[CollectionRecord],
+    request_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Expand relation fields on a list of record response dicts.
 
@@ -133,7 +138,13 @@ async def expand_records(
     # Group paths by first segment for efficient batch loading
     for path in paths:
         await _expand_path(
-            engine, collection, records, path, all_collections, depth=0,
+            engine,
+            collection,
+            records,
+            path,
+            all_collections,
+            depth=0,
+            request_context=request_context,
         )
 
     return records
@@ -146,6 +157,7 @@ async def _expand_path(
     path: list[str],
     all_collections: list[CollectionRecord],
     depth: int,
+    request_context: dict[str, Any] | None = None,
 ) -> None:
     """Recursively expand a single dot-notation path on a set of records."""
     if depth >= MAX_EXPAND_DEPTH or not path:
@@ -193,6 +205,16 @@ async def _expand_path(
         if f.get("hidden", False) or f.get("type") == "password"
     }
 
+    _type = _collection_type(target_coll)
+    _is_auth = _type == "auth"
+    _is_view = _type == "view"
+    auth_payload = None
+    apply_email_visibility = False
+    if isinstance(request_context, dict):
+        apply_email_visibility = True
+        raw_auth = request_context.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_payload = raw_auth
     related_responses: dict[str, dict[str, Any]] = {}
     for rid, row in related_rows.items():
         related_responses[rid] = build_record_response(
@@ -201,6 +223,10 @@ async def _expand_path(
             target_coll.name,
             target_schema,
             hidden_fields=hidden_fields,
+            is_auth_collection=_is_auth,
+            is_view_collection=_is_view,
+            request_auth=auth_payload,
+            apply_email_visibility=apply_email_visibility,
         )
 
     # Attach expanded records to each parent record
@@ -241,6 +267,11 @@ async def _expand_path(
 
         if nested_records:
             await _expand_path(
-                engine, target_coll, nested_records, remaining,
-                all_collections, depth + 1,
+                engine,
+                target_coll,
+                nested_records,
+                remaining,
+                all_collections,
+                depth + 1,
+                request_context=request_context,
             )

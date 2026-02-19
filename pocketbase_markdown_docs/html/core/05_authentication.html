@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Authentification — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link active" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Documentation principale <span>›</span> Authentification</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="authentication">Authentication</h1>
+<hr />
+<p>Authentication</p>
+<h3 id="overview"><a href="#overview">Overview</a></h3>
+<p>A single client is considered authenticated as long as it sends valid <code>Authorization:YOUR_AUTH_TOKEN</code> header with the request.</p>
+<p>The PocketBase Web APIs are fully stateless and there are no sessions in the traditional sense (even the tokens are not stored in the database).</p>
+<p>Because there are no sessions and we don't store the tokens on the server there is also no logout endpoint. To "logout" a user you can simply disregard the token from your local state (aka. <code>pb.authStore.clear()</code> if you use the SDKs).</p>
+<p>The auth token could be generated either through the specific auth collection Web APIs or programmatically via Go/JS.</p>
+<p>All allowed auth collection methods can be configured individually from the specific auth collection options.</p>
+<p>Note that PocketBase admins (aka. <code>_superusers</code>) are similar to the regular auth collection records with 2 caveats:</p>
+<ul>
+<li>OAuth2 is not supported as auth method for the <code>_superusers</code> collection</li>
+<li>Superusers can access and modify anything (collection API rules are ignored)</li>
+</ul>
+<h3 id="authenticate-with-password"><a href="#authenticate-with-password">Authenticate with password</a></h3>
+<p>To authenticate with password you must enable the <em>Identity/Password</em> auth collection option <em>(see also <a href="/docs/api-records/#auth-with-password">Web API reference</a> )</em> .</p>
+<p>The default identity field is the <code>email</code> but you can configure any other unique field like "username" (it must have a UNIQUE index).</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const authData = await pb.collection("users").authWithPassword('test@example.com', '1234567890'); // after the above you can also access the auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final authData = await pb.collection("users").authWithPassword('test@example.com', '1234567890'); // after the above you can also access the auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<h3 id="authenticate-with-otp"><a href="#authenticate-with-otp">Authenticate with OTP</a></h3>
+<p>To authenticate with email code you must enable the <em>One-time password (OTP)</em> auth collection option <em>(see also <a href="/docs/api-records/#auth-with-otp">Web API reference</a> )</em> .</p>
+<p>The usual flow is the user typing manually the received password from their email but you can also adjust the default email template from the collection options and add a url containing the OTP and its id as query parameters <em>(you have access to <code>{OTP}</code> and <code>{OTP_ID}</code> placeholders)</em> .</p>
+<p>Note that when requesting an OTP we return an <code>otpId</code> even if a user with the provided email doesn't exist as a very rudimentary enumeration protection (it doesn't create or send anything).</p>
+<p>On successful OTP validation, by default the related user email will be automatically marked as "verified".</p>
+<p>Keep in mind that OTP as a standalone authentication method could be less secure compared to the other methods because the generated password is usually 0-9 digits and there is a risk of it being guessed or enumerated (especially when a longer duration time is configured).</p>
+<p>For security critical applications OTP is recommended to be used in combination with the other auth methods and the <a href="#multi-factor-authentication">Multi-factor authentication</a> option.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // send OTP email to the provided auth record const result = await pb.collection('users').requestOTP('test@example.com'); // ... show a screen/popup to enter the password from the email ... // authenticate with the requested OTP id and the email password const authData = await pb.collection('users').authWithOTP(result.otpId, "YOUR_OTP"); // after the above you can also access the auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id); // "logout" pb.authStore.clear();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // send OTP email to the provided auth record final result = await pb.collection('users').requestOTP('test@example.com'); // ... show a screen/popup to enter the password from the email ... // authenticate with the requested OTP id and the email password final authData = await pb.collection('users').authWithOTP(result.otpId, "YOUR_OTP"); // after the above you can also access the auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id); // "logout" pb.authStore.clear();</code></p>
+<h3 id="authenticate-with-oauth2"><a href="#authenticate-with-oauth2">Authenticate with OAuth2</a></h3>
+<p>You can also authenticate your users with an OAuth2 provider (Google, GitHub, Microsoft, etc.). See the section below for example integrations.</p>
+<p>Before starting, you'll need to create an OAuth2 app in the provider's dashboard in order to get a <strong>Client Id</strong> and <strong>Client Secret</strong>, and register a redirect URL .</p>
+<p>Once you have obtained the <strong>Client Id</strong> and <strong>Client Secret</strong>, you can enable and configure the provider from your PocketBase auth collection options (<em>PocketBase &gt; Collections &gt; {YOUR_COLLECTION} &gt; Edit collection (settings cogwheel) &gt; Options &gt; OAuth2</em>).</p>
+<p>All in one (<em>recommended</em>) Manual code exchange</p>
+<p>This method handles everything within a single call without having to define custom redirects, deeplinks or even page reload.</p>
+<p><strong>When creating your OAuth2 app, for a callback/redirect URL you have to use the <code>https://yourdomain.com/api/oauth2-redirect</code></strong> (<em>or when testing locally - <code>http://127.0.0.1:8090/api/oauth2-redirect</code></em> ).</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('https://pocketbase.io'); ... // This method initializes a one-off realtime subscription and will // open a popup window with the OAuth2 vendor page to authenticate. // // Once the external OAuth2 sign-in/sign-up flow is completed, the popup // window will be automatically closed and the OAuth2 data sent back // to the user through the previously established realtime connection. // // If the popup is being blocked on Safari, make sure that your click handler is not using async/await. pb.collection('users').authWithOAuth2({ provider: 'google' }).then((authData) =&gt; { console.log(authData) // after the above you can also access the auth data from the authStore console.log(pb.authStore.isValid); console.log(pb.authStore.token); console.log(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear(); });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; import 'package:url_launcher/url_launcher.dart'; final pb = PocketBase('https://pocketbase.io'); ... // This method initializes a one-off realtime subscription and will // call the provided urlCallback with the OAuth2 vendor url to authenticate. // // Once the external OAuth2 sign-in/sign-up flow is completed, the browser // window will be automatically closed and the OAuth2 data sent back // to the user through the previously established realtime connection. // // Note that it requires the app and realtime connection to remain active in the background! // For Android 15+ check the note in https://github.com/pocketbase/dart-sdk#oauth2-and-android-15. final authData = await pb.collection('users').authWithOAuth2('google', (url) async { // or use flutter_custom_tabs to make the transitions between native and web content more seamless await launchUrl(url); }); // after the above you can also access the auth data from the authStore print(pb.authStore.isValid); print(pb.authStore.token); print(pb.authStore.record.id); // "logout" the last authenticated record pb.authStore.clear();</code></p>
+<p>When authenticating manually with OAuth2 code you'll need 2 endpoints:</p>
+<ul>
+<li>somewhere to show the "Login with ..." links</li>
+<li>somewhere to handle the provider's redirect in order to exchange the auth code for token</li>
+</ul>
+<p>Here is a simple web example:</p>
+<ol>
+<li>
+<p><strong>Links page</strong> (e.g. https://127.0.0.1:8090 serving <code>pb_public/index.html</code>):</p>
+<p><code>&lt;!DOCTYPE html&gt; &lt;html&gt; &lt;head&gt; &lt;meta charset="utf-8" /&gt; &lt;meta name="viewport" content="width=device-width, initial-scale=1" /&gt; &lt;title&gt;OAuth2 links page&lt;/title&gt; &lt;script src="https://code.jquery.com/jquery-3.7.1.slim.min.js"&gt;&lt;/script&gt; &lt;/head&gt; &lt;body&gt; &lt;ul id="list"&gt; &lt;li&gt;Loading OAuth2 providers...&lt;/li&gt; &lt;/ul&gt; &lt;script type="module"&gt; import PocketBase from "https://cdn.jsdelivr.net/gh/pocketbase/js-sdk@master/dist/pocketbase.es.mjs" const pb = new PocketBase("http://127.0.0.1:8090"); const redirectURL = "http://127.0.0.1:8090/redirect.html"; const authMethods = await pb.collection("users").listAuthMethods(); const providers = authMethods.oauth2?.providers || []; const listItems = []; for (const provider of providers) { const $li = $(`&lt;li&gt;&lt;a&gt;Login with ${provider.name}&lt;/a&gt;&lt;/li&gt;`); $li.find("a") .attr("href", provider.authURL + redirectURL) .data("provider", provider) .click(function () { // store provider's data on click for verification in the redirect page localStorage.setItem("provider", JSON.stringify($(this).data("provider"))); }); listItems.push($li); } $("#list").html(listItems.length ? listItems : "&lt;li&gt;No OAuth2 providers.&lt;/li&gt;"); &lt;/script&gt; &lt;/body&gt; &lt;/html&gt;</code></p>
+</li>
+<li>
+<p><strong>Redirect handler page</strong> (e.g. https://127.0.0.1:8090/redirect.html serving <code>pb_public/redirect.html</code>):</p>
+<p><code>&lt;!DOCTYPE html&gt; &lt;html&gt; &lt;head&gt; &lt;meta charset="utf-8"&gt; &lt;title&gt;OAuth2 redirect page&lt;/title&gt; &lt;/head&gt; &lt;body&gt; &lt;pre id="content"&gt;Authenticating...&lt;/pre&gt; &lt;script type="module"&gt; import PocketBase from "https://cdn.jsdelivr.net/gh/pocketbase/js-sdk@master/dist/pocketbase.es.mjs" const pb = new PocketBase("http://127.0.0.1:8090"); const redirectURL = "http://127.0.0.1:8090/redirect.html"; const contentEl = document.getElementById("content"); // parse the query parameters from the redirected url const params = (new URL(window.location)).searchParams; // load the previously stored provider's data const provider = JSON.parse(localStorage.getItem("provider")) // compare the redirect's state param and the stored provider's one if (provider.state !== params.get("state")) { contentEl.innerText = "State parameters don't match."; } else { // authenticate pb.collection("users").authWithOAuth2Code( provider.name, params.get("code"), provider.codeVerifier, redirectURL, // pass any optional user create data { emailVisibility: false, } ).then((authData) =&gt; { contentEl.innerText = JSON.stringify(authData, null, 2); }).catch((err) =&gt; { contentEl.innerText = "Failed to exchange code.\n" + err; }); } &lt;/script&gt; &lt;/body&gt; &lt;/html&gt;</code></p>
+</li>
+</ol>
+<p>When using the "Manual code exchange" flow for sign-in with Apple your redirect handler must accept <code>POST</code> requests in order to receive the name and the email of the Apple user. If you just need the Apple user id, you can keep the redirect handler <code>GET</code> but you'll need to replace in the Apple authorization url <code>response_mode=form_post</code> with <code>response_mode=query</code>.</p>
+<h3 id="multi-factor-authentication"><a href="#multi-factor-authentication">Multi-factor authentication</a></h3>
+<p>PocketBase v0.23+ introduced optional Multi-factor authentication (MFA).</p>
+<p>If enabled, it requires the user to authenticate with any 2 different auth methods from above (the order doesn't matter).<br />
+The expected flow is:</p>
+<ol>
+<li>User authenticates with "Auth method A".</li>
+<li>On success, a 401 response is sent with <code>{"mfaId": "..."}</code> as JSON body (the MFA "session" is stored in the <code>_mfas</code> system collection).</li>
+<li>User authenticates with "Auth method B" as usual <strong>but adds the <code>mfaId</code> from the previous step as body or query parameter</strong>.</li>
+<li>On success, a regular auth response is returned, aka. token + auth record data.</li>
+</ol>
+<p>Below is an example for email/password + OTP authentication:</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... try { await pb.collection('users').authWithPassword('test@example.com', '1234567890'); } catch (err) { const mfaId = err.response?.mfaId; if (!mfaId) { throw err; // not mfa -&gt; rethrow } // the user needs to authenticate again with another auth method, for example OTP const result = await pb.collection('users').requestOTP('test@example.com'); // ... show a modal for users to check their email and to enter the received code ... await pb.collection('users').authWithOTP(result.otpId, 'EMAIL_CODE', { 'mfaId': mfaId }); }</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... try { await pb.collection('users').authWithPassword('test@example.com', '1234567890'); } on ClientException catch (e) { final mfaId = e.response['mfaId']; if (mfaId == null) { throw e; // not mfa -&gt; rethrow } // the user needs to authenticate again with another auth method, for example OTP final result = await pb.collection('users').requestOTP('test@example.com'); // ... show a modal for users to check their email and to enter the received code ... await pb.collection('users').authWithOTP(result.otpId, 'EMAIL_CODE', query: { 'mfaId': mfaId }); }</code></p>
+<h3 id="users-impersonation"><a href="#users-impersonation">Users impersonation</a></h3>
+<p>Superusers have the option to generate tokens and authenticate as anyone else via the <a href="/docs/api-records#impersonate">Impersonate endpoint</a> .</p>
+<p><strong>The generated impersonate auth tokens can have custom duration but are not renewable!</strong></p>
+<p>For convenience the official SDKs creates and returns a standalone client that keeps the token state in memory, aka. only for the duration of the impersonate client instance.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // authenticate as superuser await pb.collection("_superusers").authWithPassword("test@example.com", "1234567890"); // impersonate // (the custom token duration is in seconds and it is optional) const impersonateClient = await pb.collection("users").impersonate("USER_RECORD_ID", 3600) // log the impersonate token and user data console.log(impersonateClient.authStore.token); console.log(impersonateClient.authStore.record); // send requests as the impersonated user const items = await impersonateClient.collection("example").getFullList();</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // authenticate as superuser await pb.collection("_superusers").authWithPassword("test@example.com", "1234567890"); // impersonate // (the custom token duration is in seconds and it is optional) final impersonateClient = await pb.collection("users").impersonate("USER_RECORD_ID", 3600) // log the impersonate token and user data print(impersonateClient.authStore.token); print(impersonateClient.authStore.record); // send requests as the impersonated user final items = await impersonateClient.collection("example").getFullList();</code></p>
+<h3 id="api-keys"><a href="#api-keys">API keys</a></h3>
+<p>While PocketBase doesn't have "API keys" in the traditional sense, as a side effect of the support for users impersonation, for such cases you can use instead the generated nonrenewable <code>_superusers</code> impersonate auth token.<br />
+You can generate such token via the above impersonate API or from the <em>Dashboard &gt; Collections &gt; _superusers &gt; {select superuser} &gt; "Impersonate" dropdown option</em>:</p>
+<p><img alt="Screenshot of the _superusers impersonate popup" src="/images/screenshots/impersonate.png" /></p>
+<p>Because of the security implications (superusers can execute, access and modify anything), use the generated <code>_superusers</code> tokens with extreme care and only for internal <strong>server-to-server</strong> communication.</p>
+<p>To invalidate already issued tokens, you need to change the individual superuser account password (or if you want to reset the tokens for all superusers - change the shared auth token secret from the <code>_superusers</code> collection options).</p>
+<h3 id="auth-token-verification"><a href="#auth-token-verification">Auth token verification</a></h3>
+<p>PocketBase doesn't have a dedicated token verification endpoint, but if you want to verify an existing auth token from a 3rd party app you can send an <a href="/docs/api-records/#auth-refresh">Auth refresh</a> call, aka. <code>pb.collection("users").authRefresh()</code>.</p>
+<p>On valid token - it returns a new token with refreshed <code>exp</code> claim and the latest user data.</p>
+<p>Otherwise - returns an error response.</p>
+<p>Note that calling <code>authRefresh</code> doesn't invalidate previously issued tokens and you can safely disregard the new one if you don't need it (as mentioned in the beginning - PocketBase doesn't store the tokens on the server).</p>
+<p>Performance wise, the used <code>HS256</code> algorithm for generating the JWT has very little to no impact and it is essentially the same in terms of response time as calling <code>getOne("USER_ID")</code> <em>(see <a href="https://github.com/pocketbase/benchmarks/blob/master/results/hetzner_cax11.md#user-auth-refresh">benchmarks</a> )</em> .</p>
+    <div id="page-nav">
+      <a href="../core/04_api-rules-and-filters.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Règles API et filtres</span>
+        </a>
+      <a href="../core/06_files-handling.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Fichiers : upload & gestion</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

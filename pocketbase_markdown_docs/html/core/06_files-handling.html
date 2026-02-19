@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fichiers : upload & gestion — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link active" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Documentation principale <span>›</span> Fichiers : upload & gestion</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="files-upload-and-handling">Files Upload and Handling</h1>
+<hr />
+<p>Files upload and handling</p>
+<h3 id="uploading-files"><a href="#uploading-files">Uploading files</a></h3>
+<p>To upload files, you must first add a <code>file</code> field to your collection:</p>
+<p><img alt="File field screenshot" src="/images/screenshots/file-field.png" /></p>
+<p>Once added, you could create/update a Record and upload "documents" files by sending a <code>multipart/form-data</code> request using the <em>Records create/update APIs</em>.</p>
+<p>Each uploaded file will be stored with the original filename (sanitized) and suffixed with a random part (usually 10 characters). For example <code>test_52iwbgds7l.png</code>.</p>
+<p>All <code>file</code> fields by default has a max allowed file size up to <strong>~5MB</strong> <em>(you can adjust it from the collection field options but keep in mind that allowing to upload and serve large files could degrade the performance of your application)</em>.</p>
+<p>Here is an example how to create a new record and upload multiple files to the example "documents" <code>file</code> field using the SDKs:</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // create a new record and upload multiple files // (files must be Blob or File instances) const createdRecord = await pb.collection('example').create({ title: 'Hello world!', // regular text field 'documents': [ new File(['content 1...'], 'file1.txt'), new File(['content 2...'], 'file2.txt'), ] }); // ----------------------------------------------------------- // Alternative FormData + plain HTML file input example // &lt;input type="file" id="fileInput" /&gt; // ----------------------------------------------------------- const fileInput = document.getElementById('fileInput'); const formData = new FormData(); // set regular text field formData.append('title', 'Hello world!'); // listen to file input changes and add the selected files to the form data fileInput.addEventListener('change', function () { for (let file of fileInput.files) { formData.append('documents', file); } }); ... // upload and create new record const createdRecord = await pb.collection('example').create(formData);</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; import 'package:http/http.dart' as http; final pb = PocketBase('http://127.0.0.1:8090'); ... // create a new record and upload multiple files final record = await pb.collection('example').create( body: { 'title': 'Hello world!', // regular text field }, files: [ http.MultipartFile.fromString( 'documents', 'example content 1...', filename: 'file1.txt', ), http.MultipartFile.fromString( 'documents', 'example content 2...', filename: 'file2.txt', ), ], );</code></p>
+<p>If your <code>file</code> field supports uploading multiple files (aka. <strong>Max Files option is &gt;= 2</strong>) you can use the <code>+</code> prefix/suffix field name modifier to respectively prepend/append new files alongside the already uploaded ones. For example:</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const createdRecord = await pb.collection('example').update('RECORD_ID', { "documents+": new File(["content 3..."], "file3.txt") });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; import 'package:http/http.dart' as http; final pb = PocketBase('http://127.0.0.1:8090'); ... final record = await pb.collection('example').update( 'RECORD_ID', files: [ http.MultipartFile.fromString( 'documents+', 'example content 3...', filename: 'file3.txt', ), ], );</code></p>
+<h3 id="deleting-files"><a href="#deleting-files">Deleting files</a></h3>
+<p>To delete uploaded file(s), you could either edit the Record from the Dashboard, or use the API and set the file field to a zero-value<br />
+(empty string, <code>[]</code>).</p>
+<p>If you want to <strong>delete individual file(s) from a multiple file upload field</strong>, you could suffix the field name with <code>-</code> and specify the filename(s) you want to delete. Here are some examples using the SDKs:</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // delete all "documents" files await pb.collection('example').update('RECORD_ID', { 'documents': [], }); // delete individual files await pb.collection('example').update('RECORD_ID', { 'documents-': ["file1.pdf", "file2.txt"], });</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // delete all "documents" files await pb.collection('example').update('RECORD_ID', body: { 'documents': [], }); // delete individual files await pb.collection('example').update('RECORD_ID', body: { 'documents-': ["file1.pdf", "file2.txt"], });</code></p>
+<p>The above examples use the JSON object data format, but you could also use <code>FormData</code> instance for <em>multipart/form-data</em> requests. If using <code>FormData</code> set the file field to an empty string.</p>
+<h3 id="file-url"><a href="#file-url">File URL</a></h3>
+<p>Each uploaded file could be accessed by requesting its file url:<br />
+<code>http://127.0.0.1:8090/api/files/COLLECTION_ID_OR_NAME/RECORD_ID/FILENAME</code></p>
+<p>If your file field has the <strong>Thumb sizes</strong> option, you can get a thumb of the image file by adding the <code>thumb</code> query parameter to the url like this: <code>http://127.0.0.1:8090/api/files/COLLECTION_ID_OR_NAME/RECORD_ID/FILENAME**?thumb=100x300**</code><br />
+<em>Currently limited to jpg, png, gif (its first frame) and partially webp (stored as png).</em></p>
+<p>The following thumb formats are currently supported:</p>
+<ul>
+<li><strong>WxH</strong> (e.g. 100x300) - crop to WxH viewbox (from center)</li>
+<li><strong>WxHt</strong> (e.g. 100x300t) - crop to WxH viewbox (from top)</li>
+<li><strong>WxHb</strong> (e.g. 100x300b) - crop to WxH viewbox (from bottom)</li>
+<li><strong>WxHf</strong> (e.g. 100x300f) - fit inside a WxH viewbox (without cropping)</li>
+<li><strong>0xH</strong> (e.g. 0x300) - resize to H height preserving the aspect ratio</li>
+<li><strong>Wx0</strong> (e.g. 100x0) - resize to W width preserving the aspect ratio</li>
+</ul>
+<p>The original file would be returned, if the requested thumb size is not found or the file is not an image!</p>
+<p>If you already have a Record model instance, the SDKs provide a convenient method to generate a file url by its name.</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... const record = await pb.collection('example').getOne('RECORD_ID'); // get only the first filename from "documents" // // note: // "documents" is an array of filenames because // the "documents" field was created with "Max Files" option &gt; 1; // if "Max Files" was 1, then the result property would be just a string const firstFilename = record.documents[0]; // returns something like: // http://127.0.0.1:8090/api/files/example/kfzjt5oy8r34hvn/test_52iWbGinWd.png?thumb=100x250 const url = pb.files.getURL(record, firstFilename, {'thumb': '100x250'});</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... final record = await pb.collection('example').getOne('RECORD_ID'); // get only the first filename from "documents" // // note: // "documents" is an array of filenames because // the "documents" field was created with "Max Files" option &gt; 1; // if "Max Files" was 1, then the result property would be just a string final firstFilename = record.getListValue&lt;String&gt;('documents')[0]; // returns something like: // http://127.0.0.1:8090/api/files/example/kfzjt5oy8r34hvn/test_52iWbGinWd.png?thumb=100x250 final url = pb.files.getURL(record, firstFilename, thumb: '100x250');</code></p>
+<p>Additionally, to instruct the browser to always download the file instead of showing a preview when accessed directly, you can append the <code>?download=1</code> query parameter to the file url.</p>
+<h3 id="protected-files"><a href="#protected-files">Protected files</a></h3>
+<p>By default all files are publicly accessible if you know their full url.</p>
+<p>For most applications this is fine and reasonably safe because all files have a random part appended to their name, but in some cases you may want an extra security to prevent unauthorized access to sensitive files like ID card or Passport copies, contracts, etc.</p>
+<p>To do this you can mark the <code>file</code> field as <em>Protected</em> from its field options in the Dashboard and then request the file with a special <strong>short-lived file token</strong>.</p>
+<p>Only requests that satisfy the <strong>View API rule</strong> of the record collection will be able to access or download the protected file(s).</p>
+<p>JavaScript</p>
+<p>Dart</p>
+<p><code>import PocketBase from 'pocketbase'; const pb = new PocketBase('http://127.0.0.1:8090'); ... // authenticate await pb.collection('users').authWithPassword('test@example.com', '1234567890'); // generate a file token const fileToken = await pb.files.getToken(); // retrieve an example protected file url (will be valid ~2min) const record = await pb.collection('example').getOne('RECORD_ID'); const url = pb.files.getURL(record, record.myPrivateFile, {'token': fileToken});</code></p>
+<p><code>import 'package:pocketbase/pocketbase.dart'; final pb = PocketBase('http://127.0.0.1:8090'); ... // authenticate await pb.collection('users').authWithPassword('test@example.com', '1234567890'); // generate a file token final fileToken = await pb.files.getToken(); // retrieve an example protected file url (will be valid ~2min) final record = await pb.collection('example').getOne('RECORD_ID'); final url = pb.files.getURL(record, record.getStringValue('myPrivateFile'), token: fileToken);</code></p>
+<h3 id="storage-options"><a href="#storage-options">Storage options</a></h3>
+<p>By default PocketBase stores uploaded files in the <code>pb_data/storage</code> directory on the local file system. For the majority of cases this is usually the recommended storage option because it is very fast, easy to work with and backup.</p>
+<p>But if you have limited disk space you could switch to an external S3 compatible storage (AWS S3, MinIO, Wasabi, DigitalOcean Spaces, Vultr Object Storage, etc.). The easiest way to set up the connection settings is from the <em>Dashboard</em> &gt; <em>Settings</em> &gt; <em>Files storage</em>:</p>
+<p><img alt="Files storage settings screenshot" src="/images/screenshots/files-storage.png" /></p>
+    <div id="page-nav">
+      <a href="../core/05_authentication.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Authentification</span>
+        </a>
+      <a href="../core/07_working-with-relations.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Travailler avec les relations</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

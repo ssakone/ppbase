@@ -19,8 +19,8 @@ interface CollectionsTableProps {
 
 export function CollectionsTable({ collections, onRowClick }: CollectionsTableProps) {
   return (
-    <div className="rounded-xl border shadow-sm">
-      <Table>
+    <div className="rounded-xl border shadow-sm overflow-x-auto">
+      <Table className="min-w-[500px]">
         <TableHeader>
           <TableRow>
             <TableHead>Name</TableHead>

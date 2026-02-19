@@ -17,10 +17,20 @@ export function LoadingSpinner({ className, size = 'md', fullPage = false }: Loa
   if (fullPage) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className={cn('animate-spin text-muted-foreground', sizeClasses[size], className)} />
+        <Loader2
+          className={cn(
+            'animate-spin text-indigo-400',
+            sizeClasses[size],
+            className,
+          )}
+        />
       </div>
     )
   }
 
-  return <Loader2 className={cn('animate-spin', sizeClasses[size], className)} />
+  return (
+    <Loader2
+      className={cn('animate-spin', sizeClasses[size], className)}
+    />
+  )
 }

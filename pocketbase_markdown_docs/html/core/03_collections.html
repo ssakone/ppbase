@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Collections — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link active" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Documentation principale <span>›</span> Collections</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="collections">Collections</h1>
+<hr />
+<p>Collections</p>
+<h3 id="overview"><a href="#overview">Overview</a></h3>
+<p><strong>Collections</strong> represent your application data. Under the hood they are backed by plain SQLite tables that are generated automatically with the collection <strong>name</strong> and <strong>fields</strong> (columns).</p>
+<p>Single entry of a collection is called <strong>record</strong> (a single row in the SQL table).</p>
+<p>You can manage your <strong>collections</strong> from the Dashboard, with the Web APIs using the <a href="/docs/how-to-use/">client-side SDKs</a> (<em>superusers only</em>) or programmatically via the <a href="/docs/go-migrations/">Go</a>/<a href="/docs/js-migrations/">JavaScript</a> migrations.</p>
+<p>Similarly, you can manage your <strong>records</strong> from the Dashboard, with the Web APIs using the <a href="/docs/how-to-use/">client-side SDKs</a> or programmatically via the <a href="/docs/go-records/">Go</a>/<a href="/docs/js-records/">JavaScript</a> Record operations.</p>
+<p>Here is what a collection edit panel looks like in the Dashboard:</p>
+<p><img alt="Collection panel screenshot" src="/images/screenshots/collection-panel.png" /></p>
+<p>Currently there are 3 collection types: <strong>Base</strong>, <strong>View</strong> and <strong>Auth</strong>.</p>
+<h5 id="base-collection"><a href="#base-collection">Base collection</a></h5>
+<p><strong>Base collection</strong> is the default collection type and it could be used to store any application data (articles, products, posts, etc.).</p>
+<h5 id="view-collection"><a href="#view-collection">View collection</a></h5>
+<p><strong>View collection</strong> is a read-only collection type where the data is populated from a plain SQL <code>SELECT</code> statement, allowing users to perform aggregations or any other custom queries in general.<br />
+For example, the following query will create a read-only collection with 3 <em>posts</em> fields - <em>id</em>, <em>name</em> and <em>totalComments</em>:</p>
+<p><code>SELECT posts.id, posts.name, count(comments.id) as totalComments FROM posts LEFT JOIN comments on comments.postId = posts.id GROUP BY posts.id</code></p>
+<p>View collections don't receive realtime events because they don't have create/update/delete operations.</p>
+<h5 id="auth-collection"><a href="#auth-collection">Auth collection</a></h5>
+<p><strong>Auth collection</strong> has everything from the <strong>Base collection</strong> but with some additional special fields to help you manage your app users and also provide various authentication options.</p>
+<p>Each Auth collection has the following special system fields: <code>email</code>, <code>emailVisibility</code>, <code>verified</code>, <code>password</code> and <code>tokenKey</code>.<br />
+They cannot be renamed or deleted but can be configured using their specific field options. For example you can make the user email required or optional.</p>
+<p>You can have as many Auth collections as you want (users, managers, staffs, members, clients, etc.) each with their own set of fields, separate login and records managing endpoints.</p>
+<p>You can build all sort of different access controls:</p>
+<ul>
+<li><strong>Role (Group)</strong><br />
+<em>For example, you could attach a "role" <code>select</code> field to your Auth collection with the following options: "employee" and "staff". And then in some of your other collections you could define the following rule to allow only "staff":<br />
+<code>@request.auth.role = "staff"</code></em></li>
+<li><strong>Relation (Ownership)</strong><br />
+<em>Let's say that you have 2 collections - "posts" base collection and "users" auth collection. In your "posts" collection you can create "author" <code>relation</code> field pointing to the "users" collection. To allow access to only the "author" of the record(s), you could use a rule like: <code>@request.auth.id != "" &amp;&amp; author = @request.auth.id</code><br />
+    Nested relation fields look ups, including back-relations, are also supported, for example: <code>someRelField.anotherRelField.author = @request.auth.id</code></em></li>
+<li><strong>Managed</strong><br />
+<em>In addition to the default "List", "View", "Create", "Update", "Delete" API rules, Auth collections have also a special "Manage" API rule that could be used to allow one user (it could be even from a different collection) to be able to fully manage the data of another user (e.g. changing their email, password, etc.).</em></li>
+<li><strong>Mixed</strong><br />
+<em>You can build a mixed approach based on your unique use-case. Multiple rules can be grouped with parenthesis <code>()</code> and combined with <code>&amp;&amp;</code> (AND) and <code>||</code> (OR) operators:<br />
+<code>@request.auth.id != "" &amp;&amp; (@request.auth.role = "staff" || author = @request.auth.id)</code></em></li>
+</ul>
+<h3 id="fields"><a href="#fields">Fields</a></h3>
+<p>All collection fields <em>(with exception of the <code>JSONField</code>)</em> are <strong>non-nullable and use a zero-default</strong> for their respective type as fallback value when missing (empty string for <code>text</code>, 0 for <code>number</code>, etc.).</p>
+<p>All field specific modifiers are supported both in the Web APIs and via the record Get/Set methods.</p>
+<p><strong><a href="#boolfield">BoolField</a></strong></p>
+<p>BoolField defines <code>bool</code> type field to store a single <code>false</code> (default) or <code>true</code> value.</p>
+<p><strong><a href="#numberfield">NumberField</a></strong></p>
+<p>NumberField defines <code>number</code> type field for storing numeric/float64 value: <code>0</code> (default), <code>2</code>, <code>-1</code>, <code>1.5</code>.</p>
+<p>The following additional set modifiers are available:</p>
+<ul>
+<li><code>fieldName**+**</code> adds number to the already existing record value.</li>
+<li><code>fieldName**-**</code> subtracts number from the already existing record value.</li>
+</ul>
+<p><strong><a href="#textfield">TextField</a></strong></p>
+<p>TextField defines <code>text</code> type field for storing string values: <code>""</code> (default), <code>"example"</code>.</p>
+<p>The following additional set modifiers are available:</p>
+<ul>
+<li><code>fieldName**:autogenerate**</code> autogenerate a field value if the <code>AutogeneratePattern</code> field option is set.<br />
+    For example, submitting: <code>{"slug:autogenerate":"abc-"}</code> will result in <code>"abc-[random]"</code> <code>slug</code> field value.</li>
+</ul>
+<p><strong><a href="#emailfield">EmailField</a></strong></p>
+<p>EmailField defines <code>email</code> type field for storing a single email string address: <code>""</code> (default), <code>"john@example.com"</code>.</p>
+<p><strong><a href="#urlfield">URLField</a></strong></p>
+<p>URLField defines <code>url</code> type field for storing a single URL string value: <code>""</code> (default), <code>"https://example.com"</code>.</p>
+<p><strong><a href="#editorfield">EditorField</a></strong></p>
+<p>EditorField defines <code>editor</code> type field to store HTML formatted text: <code>""</code> (default), <code>&lt;p&gt;example&lt;/p&gt;</code>.</p>
+<p><strong><a href="#datefield">DateField</a></strong></p>
+<p>DateField defines <code>date</code> type field to store a single datetime string value: <code>""</code> (default), <code>"2022-01-01 00:00:00.000Z"</code>.</p>
+<p>All PocketBase dates at the moment follows the RFC3399 format <code>Y-m-d H:i:s.uZ</code> (e.g. <code>2024-11-10 18:45:27.123Z</code>).</p>
+<p>Dates are compared as strings, meaning that when using the filters with a date field you'll have to specify the full datetime string format. For example to target a single day (e.g. November 19, 2024) you can use something like: <code>created &gt;= '2024-11-19 00:00:00.000Z' &amp;&amp; created &lt;= '2024-11-19 23:59:59.999Z'</code></p>
+<p><strong><a href="#autodatefield">AutodateField</a></strong></p>
+<p>AutodateField defines an <code>autodate</code> type field and it is similar to the DateField but its value is auto set on record create/update.</p>
+<p>This field is usually used for defining timestamp fields like "created" and "updated".</p>
+<p><strong><a href="#selectfield">SelectField</a></strong></p>
+<p>SelectField defines <code>select</code> type field for storing single or multiple string values from a predefined list.</p>
+<p>It is usually intended for handling enums-like values such as <code>pending/public/private</code> statuses, simple <code>client/staff/manager/admin</code> roles, etc.</p>
+<p>For <strong>single</strong> <code>select</code> <em>(the <code>MaxSelect</code> option is &lt;= 1)</em> the field value is a string: <code>""</code>, <code>"optionA"</code>.</p>
+<p>For <strong>multiple</strong> <code>select</code> <em>(the <code>MaxSelect</code> option is &gt;= 2)</em> the field value is an array: <code>[]</code>, <code>["optionA", "optionB"]</code>.</p>
+<p>The following additional set modifiers are available:</p>
+<ul>
+<li><code>fieldName**+**</code> appends one or more values to the existing one.</li>
+<li><code>**+**fieldName</code> prepends one or more values to the existing one.</li>
+<li><code>fieldName**-**</code> subtracts/removes one or more values from the existing one.</li>
+</ul>
+<p>For example: <code>{"permissions+": "optionA", "roles-": ["staff", "editor"]}</code></p>
+<p><strong><a href="#filefield">FileField</a></strong></p>
+<p>FileField defines <code>file</code> type field for managing record file(s).</p>
+<p>PocketBase stores in the database only the file name. The file itself is stored either on the local disk or in S3, depending on your application storage settings.</p>
+<p>For <strong>single</strong> <code>file</code> <em>(the <code>MaxSelect</code> option is &lt;= 1)</em> the stored value is a string: <code>""</code>, <code>"file1_Ab24ZjL.png"</code>.</p>
+<p>For <strong>multiple</strong> <code>file</code> <em>(the <code>MaxSelect</code> option is &gt;= 2)</em> the stored value is an array: <code>[]</code>, <code>["file1_Ab24ZjL.png", "file2_Frq24ZjL.txt"]</code>.</p>
+<p>The following additional set modifiers are available:</p>
+<ul>
+<li><code>fieldName**+**</code> appends one or more files to the existing field value.</li>
+<li><code>**+**fieldName</code> prepends one or more files to the existing field value.</li>
+<li><code>fieldName**-**</code> deletes one or more files from the existing field value.</li>
+</ul>
+<p>For example: <code>{"documents+": new File(...), "documents-": ["file1_Ab24ZjL.txt", "file2_Frq24ZjL.txt"]}</code></p>
+<p>You can find more detailed information in the <a href="/docs/files-handling/">Files upload and handling</a> guide.</p>
+<p><strong><a href="#relationfield">RelationField</a></strong></p>
+<p>RelationField defines <code>relation</code> type field for storing single or multiple collection record references.</p>
+<p>For <strong>single</strong> <code>relation</code> <em>(the <code>MaxSelect</code> option is &lt;= 1)</em> the field value is a string: <code>""</code>, <code>"RECORD_ID"</code>.</p>
+<p>For <strong>multiple</strong> <code>relation</code> <em>(the <code>MaxSelect</code> option is &gt;= 2)</em> the field value is an array: <code>[]</code>, <code>["RECORD_ID1", "RECORD_ID2"]</code>.</p>
+<p>The following additional set modifiers are available:</p>
+<ul>
+<li><code>fieldName**+**</code> appends one or more ids to the existing one.</li>
+<li><code>**+**fieldName</code> prepends one or more ids to the existing one.</li>
+<li><code>fieldName**-**</code> subtracts/removes one or more ids from the existing one.</li>
+</ul>
+<p>For example: <code>{"users+": "USER_ID", "categories-": ["CAT_ID1", "CAT_ID2"]}</code></p>
+<p><strong><a href="#jsonfield">JSONField</a></strong></p>
+<p>JSONField defines <code>json</code> type field for storing any serialized JSON value, including <code>null</code> (default).</p>
+<p><strong><a href="#geopoint">GeoPoint</a></strong></p>
+<p>GeoPoint defines <code>geoPoint</code> type field for storing geographic coordinates (longitude, latitude) as a serialized json object. For example: <code>{"lon":12.34,"lat":56.78}</code>.</p>
+<p>The default/zero value of a <code>geoPoint</code> is the "Null Island", aka. <code>{"lon":0,"lat":0}</code>.</p>
+<p>When extending PocketBase with Go/JSVM, the <code>geoPoint</code> field value could be set as <code>types.GeoPoint</code> instance or a regular map with <code>lon</code> and <code>lat</code> keys:</p>
+<p>Go</p>
+<p>JavaScript</p>
+<p><code>// set types.GeoPoint record.Set("address", types.GeoPoint{Lon:12.34, Lat:45.67}) // set map[string]any record.Set("address", map[string]any{"lon":12.34, "lat":45.67}) // retrieve the field value as types.GeoPoint struct address := record.GetGeoPoint("address")</code></p>
+<p><code>record.set("address", {"lon":12.34, "lat":45.67}) const address = record.get("address")</code></p>
+    <div id="page-nav">
+      <a href="../core/02_how-to-use.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Comment utiliser PocketBase</span>
+        </a>
+      <a href="../core/04_api-rules-and-filters.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Règles API et filtres</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

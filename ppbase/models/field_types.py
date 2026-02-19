@@ -263,18 +263,20 @@ def _validate_url(field: FieldDefinition, value: Any) -> str:
     return val
 
 
-def _validate_date(field: FieldDefinition, value: Any) -> str:
+def _validate_date(field: FieldDefinition, value: Any) -> datetime | None:
     """Validate a date/datetime value.
 
     Accepts ISO-8601 / RFC-3339 strings or ``datetime`` objects and returns
-    a normalised string in ``YYYY-MM-DD HH:MM:SS.fffZ`` format.
+    a ``datetime`` object (or ``None`` for empty values).  The database column
+    is ``TIMESTAMPTZ``, so asyncpg needs a real ``datetime`` — not a string.
+    Response formatting (``build_record_response``) converts back to string.
     """
     if value is None or value == "":
         if field.required:
             raise FieldValidationError(
                 field.name, "validation_required", "Cannot be blank."
             )
-        return ""
+        return None
 
     if isinstance(value, datetime):
         dt = value
@@ -285,7 +287,7 @@ def _validate_date(field: FieldDefinition, value: Any) -> str:
                 raise FieldValidationError(
                     field.name, "validation_required", "Cannot be blank."
                 )
-            return ""
+            return None
         try:
             dt = datetime.fromisoformat(val_str.replace("Z", "+00:00"))
         except (ValueError, TypeError):
@@ -316,7 +318,7 @@ def _validate_date(field: FieldDefinition, value: Any) -> str:
                 f"Must be <= {max_date}.",
             )
 
-    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    return dt
 
 
 def _validate_autodate(field: FieldDefinition, value: Any) -> str:

@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Event Hooks — PocketBase Docs</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: #1a1a2e;
+    background: #f8f9fb;
+    display: flex;
+    min-height: 100vh;
+}
+
+/* Sidebar */
+#sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: #16213e;
+    color: #c8d6ef;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow-y: auto;
+    padding: 0 0 40px 0;
+    scrollbar-width: thin;
+    scrollbar-color: #0f3460 #16213e;
+}
+
+#sidebar-header {
+    padding: 20px 20px 16px;
+    background: #0f3460;
+    border-bottom: 1px solid #1a4a8a;
+}
+
+#sidebar-header a {
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+#sidebar-header .logo-text {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+}
+
+#sidebar-header .logo-sub {
+    font-size: 11px;
+    color: #7ba3d8;
+    font-weight: 400;
+    display: block;
+}
+
+#sidebar-version {
+    padding: 8px 20px;
+    font-size: 11px;
+    color: #5a7fa8;
+    border-bottom: 1px solid #1a3a6a;
+    background: #0f2a4a;
+}
+
+.sidebar-section { margin-top: 8px; }
+
+.sidebar-section-title {
+    padding: 10px 20px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #5a7fa8;
+}
+
+.sidebar-link {
+    display: block;
+    padding: 6px 20px 6px 28px;
+    color: #a8c4e0;
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sidebar-link:hover {
+    background: #1a3a6a;
+    color: #e0eeff;
+    border-left-color: #3a8fff;
+}
+
+.sidebar-link.active {
+    background: #0f3460;
+    color: #5bc0f8;
+    border-left-color: #5bc0f8;
+    font-weight: 500;
+}
+
+.sidebar-link.missing {
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* Main content */
+#main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+#topbar {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 12px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.breadcrumb {
+    font-size: 13px;
+    color: #718096;
+}
+
+.breadcrumb span { color: #a0aec0; margin: 0 6px; }
+
+#content-wrapper {
+    max-width: 860px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 40px 48px 60px;
+}
+
+/* Typography */
+h1 { font-size: 28px; font-weight: 700; color: #0f3460; margin: 0 0 8px; line-height: 1.3; }
+h2 { font-size: 20px; font-weight: 600; color: #1a2e4a; margin: 36px 0 12px; padding-top: 36px; border-top: 1px solid #e8edf5; }
+h3 { font-size: 16px; font-weight: 600; color: #2d3748; margin: 24px 0 10px; }
+h4 { font-size: 14px; font-weight: 600; color: #4a5568; margin: 20px 0 8px; }
+
+.page-meta {
+    color: #718096;
+    font-size: 13px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 2px solid #edf2f7;
+}
+
+p { margin: 0 0 16px; color: #2d3748; }
+
+/* Code */
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    font-size: 13px;
+    background: #eef2ff;
+    color: #3730a3;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid #e0e7ff;
+}
+
+pre {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    margin: 16px 0 20px;
+    border: 1px solid #1e2340;
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* Blockquotes / Notes */
+blockquote {
+    margin: 16px 0;
+    padding: 12px 20px;
+    background: #eff6ff;
+    border-left: 4px solid #3b82f6;
+    border-radius: 0 6px 6px 0;
+    color: #1e40af;
+    font-size: 14px;
+}
+
+blockquote p { color: inherit; margin: 0; }
+
+/* Lists */
+ul, ol { margin: 0 0 16px 24px; }
+li { margin-bottom: 6px; color: #2d3748; }
+li > ul, li > ol { margin-top: 6px; }
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 20px;
+    font-size: 14px;
+}
+
+th {
+    background: #f0f4ff;
+    color: #2d3748;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid #dde3f0;
+}
+
+td {
+    padding: 9px 14px;
+    border: 1px solid #e8ecf5;
+    color: #374151;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f8faff; }
+
+/* Links */
+a { color: #2563eb; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* HR */
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
+
+/* Strong / em */
+strong { font-weight: 600; color: #1a202c; }
+em { color: #4a5568; }
+
+/* Navigation footer */
+#page-nav {
+    display: flex;
+    gap: 16px;
+    margin-top: 48px;
+    padding-top: 28px;
+    border-top: 1px solid #e2e8f0;
+}
+
+.nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 20px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    text-decoration: none;
+    transition: all 0.15s;
+}
+
+.nav-btn:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+    text-decoration: none;
+}
+
+.nav-btn.prev { align-items: flex-start; }
+.nav-btn.next { align-items: flex-end; }
+
+.nav-direction {
+    font-size: 11px;
+    color: #718096;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.nav-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #2563eb;
+}
+
+/* Search */
+#search-box {
+    width: calc(100% - 40px);
+    margin: 12px 20px;
+    padding: 8px 12px;
+    background: #1a3a6a;
+    border: 1px solid #2a4a8a;
+    border-radius: 6px;
+    color: #c8d6ef;
+    font-size: 13px;
+    outline: none;
+}
+
+#search-box::placeholder { color: #4a6a8a; }
+#search-box:focus { border-color: #5bc0f8; }
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <a href="../index.html">
+      <div>
+        <span class="logo-text">🗃 PocketBase</span>
+        <span class="logo-sub">Documentation</span>
+      </div>
+    </a>
+  </div>
+  <div id="sidebar-version">v0.36.4 — Markdown + HTML</div>
+  <input id="search-box" placeholder="🔍 Rechercher..." onkeyup="filterNav(this.value)">
+  <div class="sidebar-section"><div class="sidebar-section-title">Documentation principale</div><a href="../core/01_introduction.html" class="sidebar-link" title="Introduction">Introduction</a><a href="../core/02_how-to-use.html" class="sidebar-link" title="Comment utiliser PocketBase">Comment utiliser PocketBase</a><a href="../core/03_collections.html" class="sidebar-link" title="Collections">Collections</a><a href="../core/04_api-rules-and-filters.html" class="sidebar-link" title="Règles API et filtres">Règles API et filtres</a><a href="../core/05_authentication.html" class="sidebar-link" title="Authentification">Authentification</a><a href="../core/06_files-handling.html" class="sidebar-link" title="Fichiers : upload & gestion">Fichiers : upload & gestion</a><a href="../core/07_working-with-relations.html" class="sidebar-link" title="Travailler avec les relations">Travailler avec les relations</a><a href="../core/08_use-as-framework.html" class="sidebar-link" title="Étendre PocketBase (framework)">Étendre PocketBase (framework)</a><a href="../core/09_going-to-production.html" class="sidebar-link" title="Mise en production">Mise en production</a></div><div class="sidebar-section"><div class="sidebar-section-title">Référence Web API</div><a href="../api/01_api-records.html" class="sidebar-link" title="API — Records">API — Records</a><a href="../api/02_api-collections.html" class="sidebar-link" title="API — Collections">API — Collections</a><a href="../api/03_api-files.html" class="sidebar-link" title="API — Fichiers">API — Fichiers</a><a href="../api/05_api-settings.html" class="sidebar-link" title="API — Paramètres">API — Paramètres</a><a href="../api/06_api-realtime.html" class="sidebar-link" title="API — Temps réel">API — Temps réel</a><a href="../api/07_api-health.html" class="sidebar-link" title="API — Santé">API — Santé</a><a href="../api/08_api-logs.html" class="sidebar-link" title="API — Logs">API — Logs</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with Go</div><a href="../go/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../go/02_event-hooks.html" class="sidebar-link" title="Event Hooks">Event Hooks</a><a href="../go/03_routing.html" class="sidebar-link" title="Routing">Routing</a><a href="../go/04_database.html" class="sidebar-link" title="Base de données">Base de données</a><a href="../go/05_record-operations.html" class="sidebar-link" title="Opérations Records">Opérations Records</a><a href="../go/06_collection-operations.html" class="sidebar-link" title="Opérations Collections">Opérations Collections</a><a href="../go/07_migrations.html" class="sidebar-link" title="Migrations">Migrations</a><a href="../go/08_jobs-scheduling.html" class="sidebar-link" title="Planification Jobs">Planification Jobs</a><a href="../go/09_sending-emails.html" class="sidebar-link" title="Envoi d'Emails">Envoi d'Emails</a><a href="../go/10_rendering-templates.html" class="sidebar-link" title="Templates">Templates</a><a href="../go/11_console-commands.html" class="sidebar-link" title="Commandes Console">Commandes Console</a><a href="../go/12_realtime.html" class="sidebar-link" title="Temps réel">Temps réel</a><a href="../go/13_filesystem.html" class="sidebar-link" title="Système de fichiers">Système de fichiers</a><a href="../go/14_logging.html" class="sidebar-link" title="Logging">Logging</a><a href="../go/15_testing.html" class="sidebar-link" title="Tests">Tests</a><a href="../go/16_miscellaneous.html" class="sidebar-link" title="Divers">Divers</a><a href="../go/17_record-proxy.html" class="sidebar-link" title="Record Proxy">Record Proxy</a></div><div class="sidebar-section"><div class="sidebar-section-title">Extend with JavaScript</div><a href="../js/01_overview.html" class="sidebar-link" title="Vue d'ensemble">Vue d'ensemble</a><a href="../js/02_event-hooks.html" class="sidebar-link active" title="Event Hooks">Event Hooks</a><a href="#" class="sidebar-link missing" title="Routing">Routing</a><a href="#" class="sidebar-link missing" title="Base de données">Base de données</a><a href="#" class="sidebar-link missing" title="Opérations Records">Opérations Records</a><a href="#" class="sidebar-link missing" title="Opérations Collections">Opérations Collections</a><a href="#" class="sidebar-link missing" title="Migrations">Migrations</a><a href="#" class="sidebar-link missing" title="Planification Jobs">Planification Jobs</a><a href="#" class="sidebar-link missing" title="Envoi d'Emails">Envoi d'Emails</a><a href="#" class="sidebar-link missing" title="Templates">Templates</a><a href="#" class="sidebar-link missing" title="Commandes Console">Commandes Console</a><a href="#" class="sidebar-link missing" title="Requêtes HTTP">Requêtes HTTP</a><a href="#" class="sidebar-link missing" title="Temps réel">Temps réel</a><a href="#" class="sidebar-link missing" title="Système de fichiers">Système de fichiers</a><a href="#" class="sidebar-link missing" title="Logging">Logging</a><a href="#" class="sidebar-link missing" title="Référence des Types">Référence des Types</a></div>
+</aside>
+
+<div id="main">
+  <div id="topbar">
+    <div class="breadcrumb">Extend with JavaScript <span>›</span> Event Hooks</div>
+    <div style="font-size:12px;color:#a0aec0;">PocketBase v0.36.4</div>
+  </div>
+  <div id="content-wrapper">
+    <div class="page-meta">Source : <a href="https://pocketbase.io/docs/" target="_blank">pocketbase.io/docs</a> &nbsp;|&nbsp; v0.36.4</div>
+<h1 id="js-event-hooks">JS - Event Hooks</h1>
+<hr />
+<p>Event hooks</p>
+<p>You can extend the default PocketBase behavior with custom server-side code using the exposed JavaScript app event hooks.</p>
+<p>Throwing an error or not calling <code>e.next()</code> inside a handler function stops the hook execution chain.</p>
+<p>All hook handler functions share the same <code>function(e){}</code> signature and expect the user to call <code>e.next()</code> if they want to proceed with the execution chain.</p>
+<h3 id="app-hooks"><a href="#app-hooks">App hooks</a></h3>
+<p><strong><a href="#onbootstrap">onBootstrap</a></strong></p>
+<p><code>onBootstrap</code> hook is triggered when initializing the main application resources (db, app settings, etc).</p>
+<p>Note that attempting to access the database before the <code>e.next()</code> call will result in an error.</p>
+<p><code>onBootstrap((e) =&gt; { e.next() // e.app })</code></p>
+<p><strong><a href="#onsettingsreload">onSettingsReload</a></strong></p>
+<p><code>onSettingsReload</code> hook is triggered every time when the <code>$app.settings()</code> is being replaced with a new state.</p>
+<p>Calling <code>e.app.settings()</code> after <code>e.next()</code> returns the new state.</p>
+<p><code>onSettingsReload((e) =&gt; { e.next() // e.app.settings() })</code></p>
+<p><strong><a href="#onbackupcreate">onBackupCreate</a></strong></p>
+<p><code>onBackupCreate</code> is triggered on each <code>$app.createBackup</code> call.</p>
+<p><code>onBackupCreate((e) =&gt; { // e.app // e.name - the name of the backup to create // e.exclude - list of pb_data dir entries to exclude from the backup })</code></p>
+<p><strong><a href="#onbackuprestore">onBackupRestore</a></strong></p>
+<p><code>onBackupRestore</code> is triggered before app backup restore (aka. on <code>$app.restoreBackup</code> call).</p>
+<p><code>onBackupRestore((e) =&gt; { // e.app // e.name - the name of the backup to restore // e.exclude - list of dir entries to exclude from the backup })</code></p>
+<p><strong><a href="#onterminate">onTerminate</a></strong></p>
+<p><code>onTerminate</code> hook is triggered when the app is in the process of being terminated (ex. on <code>SIGTERM</code> signal).<br />
+Note that the app could be terminated abruptly without awaiting the hook completion.</p>
+<p><code>onTerminate((e) =&gt; { // e.app // e.isRestart })</code></p>
+<h3 id="mailer-hooks"><a href="#mailer-hooks">Mailer hooks</a></h3>
+<p><strong><a href="#onmailersend">onMailerSend</a></strong></p>
+<p><code>onMailerSend</code> hook is triggered every time when a new email is being sent using the <code>$app.newMailClient()</code> instance.</p>
+<p>It allows intercepting the email message or to use a custom mailer client.</p>
+<p><code>onMailerSend((e) =&gt; { // e.app // e.mailer // e.message // ex. change the mail subject e.message.subject = "new subject" e.next() })</code></p>
+<p><strong><a href="#onmailerrecordauthalertsend">onMailerRecordAuthAlertSend</a></strong></p>
+<p><code>onMailerRecordAuthAlertSend</code> hook is triggered when sending a new device login auth alert email, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>onMailerRecordAuthAlertSend((e) =&gt; { // e.app // e.mailer // e.message // e.record // e.meta.info // ex. change the mail subject e.message.subject = "new subject" e.next() })</code></p>
+<p><strong><a href="#onmailerrecordpasswordresetsend">onMailerRecordPasswordResetSend</a></strong></p>
+<p><code>onMailerRecordPasswordResetSend</code> hook is triggered when sending a password reset email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>onMailerRecordPasswordResetSend((e) =&gt; { // e.app // e.mailer // e.message // e.record // e.meta.token // ex. change the mail subject e.message.subject = "new subject" e.next() })</code></p>
+<p><strong><a href="#onmailerrecordverificationsend">onMailerRecordVerificationSend</a></strong></p>
+<p><code>onMailerRecordVerificationSend</code> hook is triggered when sending a verification email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>onMailerRecordVerificationSend((e) =&gt; { // e.app // e.mailer // e.message // e.record // e.meta.token // ex. change the mail subject e.message.subject = "new subject" e.next() })</code></p>
+<p><strong><a href="#onmailerrecordemailchangesend">onMailerRecordEmailChangeSend</a></strong></p>
+<p><code>onMailerRecordEmailChangeSend</code> hook is triggered when sending a confirmation new address email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>onMailerRecordEmailChangeSend((e) =&gt; { // e.app // e.mailer // e.message // e.record // e.meta.token // e.meta.newEmail // ex. change the mail subject e.message.subject = "new subject" e.next() })</code></p>
+<p><strong><a href="#onmailerrecordotpsend">onMailerRecordOTPSend</a></strong></p>
+<p><code>onMailerRecordOTPSend</code> hook is triggered when sending an OTP email to an auth record, allowing you to intercept and customize the email message that is being sent.</p>
+<p><code>onMailerRecordOTPSend((e) =&gt; { // e.app // e.mailer // e.message // e.record // e.meta.otpId // e.meta.password // ex. change the mail subject e.message.subject = "new subject" e.next() })</code></p>
+<h3 id="realtime-hooks"><a href="#realtime-hooks">Realtime hooks</a></h3>
+<p><strong><a href="#onrealtimeconnectrequest">onRealtimeConnectRequest</a></strong></p>
+<p><code>onRealtimeConnectRequest</code> hook is triggered when establishing the SSE client connection.</p>
+<p>Any execution after e.next() of a hook handler happens after the client disconnects.</p>
+<p><code>onRealtimeConnectRequest((e) =&gt; { // e.app // e.client // e.idleTimeout // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#onrealtimesubscriberequest">onRealtimeSubscribeRequest</a></strong></p>
+<p><code>onRealtimeSubscribeRequest</code> hook is triggered when updating the client subscriptions, allowing you to further validate and modify the submitted change.</p>
+<p><code>onRealtimeSubscribeRequest((e) =&gt; { // e.app // e.client // e.subscriptions // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#onrealtimemessagesend">onRealtimeMessageSend</a></strong></p>
+<p><code>onRealtimeMessageSend</code> hook is triggered when sending an SSE message to a client.</p>
+<p><code>onRealtimeMessageSend((e) =&gt; { // e.app // e.client // e.message // and all original connect RequestEvent fields... e.next() })</code></p>
+<h3 id="record-model-hooks"><a href="#record-model-hooks">Record model hooks</a></h3>
+<p>These are lower level Record model hooks and could be triggered from anywhere (custom console command, scheduled cron job, when calling <code>e.save(record)</code>, etc.) and therefore they have no access to the request context!</p>
+<p>If you want to intercept the builtin Web APIs and to access their request body, query parameters, headers or the request auth state, then please use the designated <a href="#request-hooks">Record <code>*Request</code> hooks</a> .</p>
+<p><strong><a href="#onrecordenrich">onRecordEnrich</a></strong></p>
+<p><code>onRecordEnrich</code> is triggered every time when a record is enriched - as part of the builtin Record responses, during realtime message serialization, or when <code>apis.enrichRecord</code> is invoked.</p>
+<p>It could be used for example to redact/hide or add computed temporary Record model props only for the specific request info.</p>
+<p><code>onRecordEnrich((e) =&gt; { // hide one or more fields e.record.hide("role") // add new custom field for registered users if (e.requestInfo.auth?.collection()?.name == "users") { e.record.withCustomData(true) // for security custom props require to be enabled explicitly e.record.set("computedScore", e.record.get("score") * e.requestInfo.auth.get("base")) } e.next() }, "posts")</code></p>
+<p><strong><a href="#onrecordvalidate">onRecordValidate</a></strong></p>
+<p><code>onRecordValidate</code> is a Record proxy model hook of <code>onModelValidate</code>.</p>
+<p><code>onRecordValidate</code> is called every time when a Record is being validated, e.g. triggered by <code>$app.validate()</code> or <code>$app.save()</code>.</p>
+<p><code>// fires for every record onRecordValidate((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordValidate((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<h6 id="record-model-create-hooks"><a href="#record-model-create-hooks">Record model create hooks</a></h6>
+<p><strong><a href="#onrecordcreate">onRecordCreate</a></strong></p>
+<p><code>onRecordCreate</code> is a Record proxy model hook of <code>onModelCreate</code>.</p>
+<p><code>onRecordCreate</code> is triggered every time when a new Record is being created, e.g. triggered by <code>$app.save()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Record validation and the INSERT DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Record validation and the INSERT DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onRecordAfterCreateSuccess</code> or <code>onRecordAfterCreateError</code> hooks.</p>
+<p><code>// fires for every record onRecordCreate((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordCreate((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordcreateexecute">onRecordCreateExecute</a></strong></p>
+<p><code>onRecordCreateExecute</code> is a Record proxy model hook of <code>onModelCreateExecute</code>.</p>
+<p><code>onRecordCreateExecute</code> is triggered after successful Record validation and right before the model INSERT DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.save()</code> in the following firing order:<br />
+<code>onRecordCreate</code><br />
+ -&gt; <code>onRecordValidate</code> (skipped with <code>$app.saveNoValidate()</code>)<br />
+ -&gt; <code>onRecordCreateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onRecordAfterCreateSuccess</code> or <code>onRecordAfterCreateError</code> hooks.</p>
+<p><code>// fires for every record onRecordCreateExecute((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordCreateExecute((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordaftercreatesuccess">onRecordAfterCreateSuccess</a></strong></p>
+<p><code>onRecordAfterCreateSuccess</code> is a Record proxy model hook of <code>onModelAfterCreateSuccess</code>.</p>
+<p><code>onRecordAfterCreateSuccess</code> is triggered after each successful Record DB create persistence.</p>
+<p>Note that when a Record is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>// fires for every record onRecordAfterCreateSuccess((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordAfterCreateSuccess((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordaftercreateerror">onRecordAfterCreateError</a></strong></p>
+<p><code>onRecordAfterCreateError</code> is a Record proxy model hook of <code>onModelAfterCreateError</code>.</p>
+<p><code>onRecordAfterCreateError</code> is triggered after each failed Record DB create persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>// fires for every record onRecordAfterCreateError((e) =&gt; { // e.app // e.record // e.error e.next() }) // fires only for "users" and "articles" records onRecordAfterCreateError((e) =&gt; { // e.app // e.record // e.error e.next() }, "users", "articles")</code></p>
+<h6 id="record-model-update-hooks"><a href="#record-model-update-hooks">Record model update hooks</a></h6>
+<p><strong><a href="#onrecordupdate">onRecordUpdate</a></strong></p>
+<p><code>onRecordUpdate</code> is a Record proxy model hook of <code>onModelUpdate</code>.</p>
+<p><code>onRecordUpdate</code> is triggered every time when a new Record is being updated, e.g. triggered by <code>$app.save()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Record validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Record validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onRecordAfterUpdateSuccess</code> or <code>onRecordAfterUpdateError</code> hooks.</p>
+<p><code>// fires for every record onRecordUpdate((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordUpdate((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordupdateexecute">onRecordUpdateExecute</a></strong></p>
+<p><code>onRecordUpdateExecute</code> is a Record proxy model hook of <code>onModelUpdateExecute</code>.</p>
+<p><code>onRecordUpdateExecute</code> is triggered after successful Record validation and right before the model UPDATE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.save()</code> in the following firing order:<br />
+<code>onRecordUpdate</code><br />
+ -&gt; <code>onRecordValidate</code> (skipped with <code>$app.saveNoValidate()</code>)<br />
+ -&gt; <code>onRecordUpdateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Record is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onRecordAfterUpdateSuccess</code> or <code>onRecordAfterUpdateError</code> hooks.</p>
+<p><code>// fires for every record onRecordUpdateExecute((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordUpdateExecute((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordafterupdatesuccess">onRecordAfterUpdateSuccess</a></strong></p>
+<p><code>onRecordAfterUpdateSuccess</code> is a Record proxy model hook of <code>onModelAfterUpdateSuccess</code>.</p>
+<p><code>onRecordAfterUpdateSuccess</code> is triggered after each successful Record DB update persistence.</p>
+<p>Note that when a Record is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>// fires for every record onRecordAfterUpdateSuccess((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordAfterUpdateSuccess((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordafterupdateerror">onRecordAfterUpdateError</a></strong></p>
+<p><code>onRecordAfterUpdateError</code> is a Record proxy model hook of <code>onModelAfterUpdateError</code>.</p>
+<p><code>onRecordAfterUpdateError</code> is triggered after each failed Record DB update persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>// fires for every record onRecordAfterUpdateError((e) =&gt; { // e.app // e.record // e.error e.next() }) // fires only for "users" and "articles" records onRecordAfterUpdateError((e) =&gt; { // e.app // e.record // e.error e.next() }, "users", "articles")</code></p>
+<h6 id="record-model-delete-hooks"><a href="#record-model-delete-hooks">Record model delete hooks</a></h6>
+<p><strong><a href="#onrecorddelete">onRecordDelete</a></strong></p>
+<p><code>onRecordDelete</code> is a Record proxy model hook of <code>onModelDelete</code>.</p>
+<p><code>onRecordDelete</code> is triggered every time when a new Record is being deleted, e.g. triggered by <code>$app.delete()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Record validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Record validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Record is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted deleted events, you can bind to <code>onRecordAfterDeleteSuccess</code> or <code>onRecordAfterDeleteError</code> hooks.</p>
+<p><code>// fires for every record onRecordDelete((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordDelete((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecorddeleteexecute">onRecordDeleteExecute</a></strong></p>
+<p><code>onRecordDeleteExecute</code> is a Record proxy model hook of <code>onModelDeleteExecute</code>.</p>
+<p><code>onRecordDeleteExecute</code> is triggered after the internal delete checks and right before the Record the model DELETE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.delete()</code> in the following firing order:<br />
+<code>onRecordDelete</code><br />
+ -&gt; internal delete checks<br />
+ -&gt; <code>onRecordDeleteExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Record is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onRecordAfterDeleteSuccess</code> or <code>onRecordAfterDeleteError</code> hooks.</p>
+<p><code>// fires for every record onRecordDeleteExecute((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordDeleteExecute((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordafterdeletesuccess">onRecordAfterDeleteSuccess</a></strong></p>
+<p><code>onRecordAfterDeleteSuccess</code> is a Record proxy model hook of <code>onModelAfterDeleteSuccess</code>.</p>
+<p><code>onRecordAfterDeleteSuccess</code> is triggered after each successful Record DB delete persistence.</p>
+<p>Note that when a Record is deleted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>// fires for every record onRecordAfterDeleteSuccess((e) =&gt; { // e.app // e.record e.next() }) // fires only for "users" and "articles" records onRecordAfterDeleteSuccess((e) =&gt; { // e.app // e.record e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordafterdeleteerror">onRecordAfterDeleteError</a></strong></p>
+<p><code>onRecordAfterDeleteError</code> is a Record proxy model hook of <code>onModelAfterDeleteError</code>.</p>
+<p><code>onRecordAfterDeleteError</code> is triggered after each failed Record DB delete persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.delete()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>// fires for every record onRecordAfterDeleteError((e) =&gt; { // e.app // e.record // e.error e.next() }) // fires only for "users" and "articles" records onRecordAfterDeleteError((e) =&gt; { // e.app // e.record // e.error e.next() }, "users", "articles")</code></p>
+<h3 id="collection-model-hooks"><a href="#collection-model-hooks">Collection model hooks</a></h3>
+<p>These are lower level Collection model hooks and could be triggered from anywhere (custom console command, scheduled cron job, when calling <code>e.save(collection)</code>, etc.) and therefore they have no access to the request context!</p>
+<p>If you want to intercept the builtin Web APIs and to access their request body, query parameters, headers or the request auth state, then please use the designated <a href="#collection-request-hooks">Collection <code>*Request</code> hooks</a> .</p>
+<p><strong><a href="#oncollectionvalidate">onCollectionValidate</a></strong></p>
+<p><code>onCollectionValidate</code> is a Collection proxy model hook of <code>onModelValidate</code>.</p>
+<p><code>onCollectionValidate</code> is called every time when a Collection is being validated, e.g. triggered by <code>$app.validate()</code> or <code>$app.save()</code>.</p>
+<p><code>// fires for every collection onCollectionValidate((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionValidate((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<h6 id="collection-mode-create-hooks"><a href="#collection-mode-create-hooks">Collection mode create hooks</a></h6>
+<p><strong><a href="#oncollectioncreate">onCollectionCreate</a></strong></p>
+<p><code>onCollectionCreate</code> is a Collection proxy model hook of <code>onModelCreate</code>.</p>
+<p><code>onCollectionCreate</code> is triggered every time when a new Collection is being created, e.g. triggered by <code>$app.save()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Collection validation and the INSERT DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Collection validation and the INSERT DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onCollectionAfterCreateSuccess</code> or <code>onCollectionAfterCreateError</code> hooks.</p>
+<p><code>// fires for every collection onCollectionCreate((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionCreate((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectioncreateexecute">onCollectionCreateExecute</a></strong></p>
+<p><code>onCollectionCreateExecute</code> is a Collection proxy model hook of <code>onModelCreateExecute</code>.</p>
+<p><code>onCollectionCreateExecute</code> is triggered after successful Collection validation and right before the model INSERT DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.save()</code> in the following firing order:<br />
+<code>onCollectionCreate</code><br />
+ -&gt; <code>onCollectionValidate</code> (skipped with <code>$app.saveNoValidate()</code>)<br />
+ -&gt; <code>onCollectionCreateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onCollectionAfterCreateSuccess</code> or <code>onCollectionAfterCreateError</code> hooks.</p>
+<p><code>// fires for every collection onCollectionCreateExecute((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionCreateExecute((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionaftercreatesuccess">onCollectionAfterCreateSuccess</a></strong></p>
+<p><code>onCollectionAfterCreateSuccess</code> is a Collection proxy model hook of <code>onModelAfterCreateSuccess</code>.</p>
+<p><code>onCollectionAfterCreateSuccess</code> is triggered after each successful Collection DB create persistence.</p>
+<p>Note that when a Collection is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>// fires for every collection onCollectionAfterCreateSuccess((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionAfterCreateSuccess((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionaftercreateerror">onCollectionAfterCreateError</a></strong></p>
+<p><code>onCollectionAfterCreateError</code> is a Collection proxy model hook of <code>onModelAfterCreateError</code>.</p>
+<p><code>onCollectionAfterCreateError</code> is triggered after each failed Collection DB create persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>// fires for every collection onCollectionAfterCreateError((e) =&gt; { // e.app // e.collection // e.error e.next() }) // fires only for "users" and "articles" collections onCollectionAfterCreateError((e) =&gt; { // e.app // e.collection // e.error e.next() }, "users", "articles")</code></p>
+<h6 id="collection-mode-update-hooks"><a href="#collection-mode-update-hooks">Collection mode update hooks</a></h6>
+<p><strong><a href="#oncollectionupdate">onCollectionUpdate</a></strong></p>
+<p><code>onCollectionUpdate</code> is a Collection proxy model hook of <code>onModelUpdate</code>.</p>
+<p><code>onCollectionUpdate</code> is triggered every time when a new Collection is being updated, e.g. triggered by <code>$app.save()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Collection validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Collection validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onCollectionAfterUpdateSuccess</code> or <code>onCollectionAfterUpdateError</code> hooks.</p>
+<p><code>// fires for every collection onCollectionUpdate((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionUpdate((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionupdateexecute">onCollectionUpdateExecute</a></strong></p>
+<p><code>onCollectionUpdateExecute</code> is a Collection proxy model hook of <code>onModelUpdateExecute</code>.</p>
+<p><code>onCollectionUpdateExecute</code> is triggered after successful Collection validation and right before the model UPDATE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.save()</code> in the following firing order:<br />
+<code>onCollectionUpdate</code><br />
+ -&gt; <code>onCollectionValidate</code> (skipped with <code>$app.saveNoValidate()</code>)<br />
+ -&gt; <code>onCollectionUpdateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Collection is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onCollectionAfterUpdateSuccess</code> or <code>onCollectionAfterUpdateError</code> hooks.</p>
+<p><code>// fires for every collection onCollectionUpdateExecute((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionUpdateExecute((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionafterupdatesuccess">onCollectionAfterUpdateSuccess</a></strong></p>
+<p><code>onCollectionAfterUpdateSuccess</code> is a Collection proxy model hook of <code>onModelAfterUpdateSuccess</code>.</p>
+<p><code>onCollectionAfterUpdateSuccess</code> is triggered after each successful Collection DB update persistence.</p>
+<p>Note that when a Collection is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>// fires for every collection onCollectionAfterUpdateSuccess((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionAfterUpdateSuccess((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionafterupdateerror">onCollectionAfterUpdateError</a></strong></p>
+<p><code>onCollectionAfterUpdateError</code> is a Collection proxy model hook of <code>onModelAfterUpdateError</code>.</p>
+<p><code>onCollectionAfterUpdateError</code> is triggered after each failed Collection DB update persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>// fires for every collection onCollectionAfterUpdateError((e) =&gt; { // e.app // e.collection // e.error e.next() }) // fires only for "users" and "articles" collections onCollectionAfterUpdateError((e) =&gt; { // e.app // e.collection // e.error e.next() }, "users", "articles")</code></p>
+<h6 id="collection-mode-delete-hooks"><a href="#collection-mode-delete-hooks">Collection mode delete hooks</a></h6>
+<p><strong><a href="#oncollectiondelete">onCollectionDelete</a></strong></p>
+<p><code>onCollectionDelete</code> is a Collection proxy model hook of <code>onModelDelete</code>.</p>
+<p><code>onCollectionDelete</code> is triggered every time when a new Collection is being deleted, e.g. triggered by <code>$app.delete()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Collection validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Collection validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Collection is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted deleted events, you can bind to <code>onCollectionAfterDeleteSuccess</code> or <code>onCollectionAfterDeleteError</code> hooks.</p>
+<p><code>// fires for every collection onCollectionDelete((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionDelete((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectiondeleteexecute">onCollectionDeleteExecute</a></strong></p>
+<p><code>onCollectionDeleteExecute</code> is a Collection proxy model hook of <code>onModelDeleteExecute</code>.</p>
+<p><code>onCollectionDeleteExecute</code> is triggered after the internal delete checks and right before the Collection the model DELETE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.delete()</code> in the following firing order:<br />
+<code>onCollectionDelete</code><br />
+ -&gt; internal delete checks<br />
+ -&gt; <code>onCollectionDeleteExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Collection is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onCollectionAfterDeleteSuccess</code> or <code>onCollectionAfterDeleteError</code> hooks.</p>
+<p><code>// fires for every collection onCollectionDeleteExecute((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionDeleteExecute((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionafterdeletesuccess">onCollectionAfterDeleteSuccess</a></strong></p>
+<p><code>onCollectionAfterDeleteSuccess</code> is a Collection proxy model hook of <code>onModelAfterDeleteSuccess</code>.</p>
+<p><code>onCollectionAfterDeleteSuccess</code> is triggered after each successful Collection DB delete persistence.</p>
+<p>Note that when a Collection is deleted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p><code>// fires for every collection onCollectionAfterDeleteSuccess((e) =&gt; { // e.app // e.collection e.next() }) // fires only for "users" and "articles" collections onCollectionAfterDeleteSuccess((e) =&gt; { // e.app // e.collection e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#oncollectionafterdeleteerror">onCollectionAfterDeleteError</a></strong></p>
+<p><code>onCollectionAfterDeleteError</code> is a Collection proxy model hook of <code>onModelAfterDeleteError</code>.</p>
+<p><code>onCollectionAfterDeleteError</code> is triggered after each failed Collection DB delete persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.delete()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p><code>// fires for every collection onCollectionAfterDeleteError((e) =&gt; { // e.app // e.collection // e.error e.next() }) // fires only for "users" and "articles" collections onCollectionAfterDeleteError((e) =&gt; { // e.app // e.collection // e.error e.next() }, "users", "articles")</code></p>
+<h3 id="request-hooks"><a href="#request-hooks">Request hooks</a></h3>
+<p>The request hooks are triggered only when the corresponding API request endpoint is accessed.</p>
+<h6 id="record-crud-request-hooks"><a href="#record-crud-request-hooks">Record CRUD request hooks</a></h6>
+<p><strong><a href="#onrecordslistrequest">onRecordsListRequest</a></strong></p>
+<p><code>onRecordsListRequest</code> hook is triggered on each API Records list request. Could be used to validate or modify the response before returning it to the client.</p>
+<p>Note that if you want to hide existing or add new computed Record fields prefer using the <a href="#onrecordenrich"><code>onRecordEnrich</code></a> hook because it is less error-prone and it is triggered by all builtin Record responses (including when sending realtime Record events).</p>
+<p><code>// fires for every collection onRecordsListRequest((e) =&gt; { // e.app // e.collection // e.records // e.result // and all RequestEvent fields... e.next() }) // fires only for "users" and "articles" collections onRecordsListRequest((e) =&gt; { // e.app // e.collection // e.records // e.result // and all RequestEvent fields... e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordviewrequest">onRecordViewRequest</a></strong></p>
+<p><code>onRecordViewRequest</code> hook is triggered on each API Record view request. Could be used to validate or modify the response before returning it to the client.</p>
+<p>Note that if you want to hide existing or add new computed Record fields prefer using the <a href="#onrecordenrich"><code>onRecordEnrich</code></a> hook because it is less error-prone and it is triggered by all builtin Record responses (including when sending realtime Record events).</p>
+<p><code>// fires for every collection onRecordViewRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "articles" collections onRecordViewRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordcreaterequest">onRecordCreateRequest</a></strong></p>
+<p><code>onRecordCreateRequest</code> hook is triggered on each API Record create request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>// fires for every collection onRecordCreateRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "articles" collections onRecordCreateRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecordupdaterequest">onRecordUpdateRequest</a></strong></p>
+<p><code>onRecordUpdateRequest</code> hook is triggered on each API Record update request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>// fires for every collection onRecordUpdateRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "articles" collections onRecordUpdateRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onrecorddeleterequest">onRecordDeleteRequest</a></strong></p>
+<p><code>onRecordDeleteRequest</code> hook is triggered on each API Record delete request.<br />
+Could be used to additionally validate the request data or implement completely different delete behavior.</p>
+<p><code>// fires for every collection onRecordDeleteRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "articles" collections onRecordDeleteRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "articles")</code></p>
+<h6 id="record-auth-request-hooks"><a href="#record-auth-request-hooks">Record auth request hooks</a></h6>
+<p><strong><a href="#onrecordauthrequest">onRecordAuthRequest</a></strong></p>
+<p><code>onRecordAuthRequest</code> hook is triggered on each successful API record authentication request (sign-in, token refresh, etc.). Could be used to additionally validate or modify the authenticated record data and token.</p>
+<p><code>// fires for every auth collection onRecordAuthRequest((e) =&gt; { // e.app // e.record // e.token // e.meta // e.authMethod // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordAuthRequest((e) =&gt; { // e.app // e.record // e.token // e.meta // e.authMethod // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordauthrefreshrequest">onRecordAuthRefreshRequest</a></strong></p>
+<p><code>onRecordAuthRefreshRequest</code> hook is triggered on each Record auth refresh API request (right before generating a new auth token).</p>
+<p>Could be used to additionally validate the request data or implement completely different auth refresh behavior.</p>
+<p><code>// fires for every auth collection onRecordAuthRefreshRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordAuthRefreshRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordauthwithpasswordrequest">onRecordAuthWithPasswordRequest</a></strong></p>
+<p><code>onRecordAuthWithPasswordRequest</code> hook is triggered on each Record auth with password API request.</p>
+<p><code>e.record</code> could be <code>nil</code> if no matching identity is found, allowing you to manually locate a different Record model (by reassigning <code>e.record</code>).</p>
+<p><code>// fires for every auth collection onRecordAuthWithPasswordRequest((e) =&gt; { // e.app // e.collection // e.record (could be null) // e.identity // e.identityField // e.password // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordAuthWithPasswordRequest((e) =&gt; { // e.app // e.collection // e.record (could be null) // e.identity // e.identityField // e.password // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordauthwithoauth2request">onRecordAuthWithOAuth2Request</a></strong></p>
+<p><code>onRecordAuthWithOAuth2Request</code> hook is triggered on each Record OAuth2 sign-in/sign-up API request (after token exchange and before external provider linking).</p>
+<p>If <code>e.record</code> is not set, then the OAuth2 request will try to create a new auth record.<br />
+To assign or link a different existing record model you can change the <code>e.record</code> field.</p>
+<p><code>// fires for every auth collection onRecordAuthWithOAuth2Request((e) =&gt; { // e.app // e.collection // e.providerName // e.providerClient // e.record (could be null) // e.oauth2User // e.createData // e.isNewRecord // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordAuthWithOAuth2Request((e) =&gt; { // e.app // e.collection // e.providerName // e.providerClient // e.record (could be null) // e.oauth2User // e.createData // e.isNewRecord // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordrequestpasswordresetrequest">onRecordRequestPasswordResetRequest</a></strong></p>
+<p><code>onRecordRequestPasswordResetRequest</code> hook is triggered on each Record request password reset API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different password reset behavior.</p>
+<p><code>// fires for every auth collection onRecordRequestPasswordResetRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordRequestPasswordResetRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordconfirmpasswordresetrequest">onRecordConfirmPasswordResetRequest</a></strong></p>
+<p><code>onRecordConfirmPasswordResetRequest</code> hook is triggered on each Record confirm password reset API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>// fires for every auth collection onRecordConfirmPasswordResetRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordConfirmPasswordResetRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordrequestverificationrequest">onRecordRequestVerificationRequest</a></strong></p>
+<p><code>onRecordRequestVerificationRequest</code> hook is triggered on each Record request verification API request.</p>
+<p>Could be used to additionally validate the loaded request data or implement completely different verification behavior.</p>
+<p><code>// fires for every auth collection onRecordRequestVerificationRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordRequestVerificationRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordconfirmverificationrequest">onRecordConfirmVerificationRequest</a></strong></p>
+<p><code>onRecordConfirmVerificationRequest</code> hook is triggered on each Record confirm verification API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>// fires for every auth collection onRecordConfirmVerificationRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordConfirmVerificationRequest((e) =&gt; { // e.app // e.collection // e.record // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordrequestemailchangerequest">onRecordRequestEmailChangeRequest</a></strong></p>
+<p><code>onRecordRequestEmailChangeRequest</code> hook is triggered on each Record request email change API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different request email change behavior.</p>
+<p><code>// fires for every auth collection onRecordRequestEmailChangeRequest((e) =&gt; { // e.app // e.collection // e.record // e.newEmail // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordRequestEmailChangeRequest((e) =&gt; { // e.app // e.collection // e.record // e.newEmail // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordconfirmemailchangerequest">onRecordConfirmEmailChangeRequest</a></strong></p>
+<p><code>onRecordConfirmEmailChangeRequest</code> hook is triggered on each Record confirm email change API request.</p>
+<p>Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>// fires for every auth collection onRecordConfirmEmailChangeRequest((e) =&gt; { // e.app // e.collection // e.record // e.newEmail // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordConfirmEmailChangeRequest((e) =&gt; { // e.app // e.collection // e.record // e.newEmail // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordrequestotprequest">onRecordRequestOTPRequest</a></strong></p>
+<p><code>onRecordRequestOTPRequest</code> hook is triggered on each Record request OTP API request.</p>
+<p><code>e.record</code> could be <code>nil</code> if no user with the requested email is found, allowing you to manually create a new Record or locate a different Record model (by reassigning <code>e.record</code>).</p>
+<p><code>// fires for every auth collection onRecordRequestOTPRequest((e) =&gt; { // e.app // e.collection // e.record (could be null) // e.password // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordRequestOTPRequest((e) =&gt; { // e.app // e.collection // e.record (could be null) // e.password // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<p><strong><a href="#onrecordauthwithotprequest">onRecordAuthWithOTPRequest</a></strong></p>
+<p><code>onRecordAuthWithOTPRequest</code> hook is triggered on each Record auth with OTP API request.</p>
+<p><code>// fires for every auth collection onRecordAuthWithOTPRequest((e) =&gt; { // e.app // e.collection // e.record // e.otp // and all RequestEvent fields... e.next() }) // fires only for "users" and "managers" auth collections onRecordAuthWithOTPRequest((e) =&gt; { // e.app // e.collection // e.record // e.otp // and all RequestEvent fields... e.next() }, "users", "managers")</code></p>
+<h6 id="batch-request-hooks"><a href="#batch-request-hooks">Batch request hooks</a></h6>
+<p><strong><a href="#onbatchrequest">onBatchRequest</a></strong></p>
+<p><code>onBatchRequest</code> hook is triggered on each API batch request.</p>
+<p>Could be used to additionally validate or modify the submitted batch requests.</p>
+<p>This hook will also fire the corresponding <code>onRecordCreateRequest</code>, <code>onRecordUpdateRequest</code>, <code>onRecordDeleteRequest</code> hooks, where <code>e.app</code> is the batch transactional app.</p>
+<p><code>onBatchRequest((e) =&gt; { // e.app // e.batch // and all RequestEvent fields... e.next() })</code></p>
+<h6 id="file-request-hooks"><a href="#file-request-hooks">File request hooks</a></h6>
+<p><strong><a href="#onfiledownloadrequest">onFileDownloadRequest</a></strong></p>
+<p><code>onFileDownloadRequest</code> hook is triggered before each API File download request. Could be used to validate or modify the file response before returning it to the client.</p>
+<p><code>onFileDownloadRequest((e) =&gt; { // e.app // e.collection // e.record // e.fileField // e.servedPath // e.servedName // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#onfiletokenrequest">onFileTokenRequest</a></strong></p>
+<p><code>onFileTokenRequest</code> hook is triggered on each auth file token API request.</p>
+<p><code>// fires for every auth model onFileTokenRequest((e) =&gt; { // e.app // e.record // e.token // and all RequestEvent fields... e.next(); }) // fires only for "users" onFileTokenRequest((e) =&gt; { // e.app // e.record // e.token // and all RequestEvent fields... e.next(); }, "users")</code></p>
+<h6 id="collection-request-hooks"><a href="#collection-request-hooks">Collection request hooks</a></h6>
+<p><strong><a href="#oncollectionslistrequest">onCollectionsListRequest</a></strong></p>
+<p><code>onCollectionsListRequest</code> hook is triggered on each API Collections list request. Could be used to validate or modify the response before returning it to the client.</p>
+<p><code>onCollectionsListRequest((e) =&gt; { // e.app // e.collections // e.result // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#oncollectionviewrequest">onCollectionViewRequest</a></strong></p>
+<p><code>onCollectionViewRequest</code> hook is triggered on each API Collection view request. Could be used to validate or modify the response before returning it to the client.</p>
+<p><code>onCollectionViewRequest((e) =&gt; { // e.app // e.collection // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#oncollectioncreaterequest">onCollectionCreateRequest</a></strong></p>
+<p><code>onCollectionCreateRequest</code> hook is triggered on each API Collection create request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>onCollectionCreateRequest((e) =&gt; { // e.app // e.collection // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#oncollectionupdaterequest">onCollectionUpdateRequest</a></strong></p>
+<p><code>onCollectionUpdateRequest</code> hook is triggered on each API Collection update request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>onCollectionUpdateRequest((e) =&gt; { // e.app // e.collection // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#oncollectiondeleterequest">onCollectionDeleteRequest</a></strong></p>
+<p><code>onCollectionDeleteRequest</code> hook is triggered on each API Collection delete request.<br />
+Could be used to additionally validate the request data or implement completely different delete behavior.</p>
+<p><code>onCollectionDeleteRequest((e) =&gt; { // e.app // e.collection // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#oncollectionsimportrequest">onCollectionsImportRequest</a></strong></p>
+<p><code>onCollectionsImportRequest</code> hook is triggered on each API collections import request.<br />
+Could be used to additionally validate the imported collections or to implement completely different import behavior.</p>
+<p><code>onCollectionsImportRequest((e) =&gt; { // e.app // e.collectionsData // e.deleteMissing e.next() })</code></p>
+<h6 id="settings-request-hooks"><a href="#settings-request-hooks">Settings request hooks</a></h6>
+<p><strong><a href="#onsettingslistrequest">onSettingsListRequest</a></strong></p>
+<p><code>onSettingsListRequest</code> hook is triggered on each API Settings list request.<br />
+Could be used to validate or modify the response before returning it to the client.</p>
+<p><code>onSettingsListRequest((e) =&gt; { // e.app // e.settings // and all RequestEvent fields... e.next() })</code></p>
+<p><strong><a href="#onsettingsupdaterequest">onSettingsUpdateRequest</a></strong></p>
+<p><code>onSettingsUpdateRequest</code> hook is triggered on each API Settings update request.<br />
+Could be used to additionally validate the request data or implement completely different persistence behavior.</p>
+<p><code>onSettingsUpdateRequest((e) =&gt; { // e.app // e.oldSettings // e.newSettings // and all RequestEvent fields... e.next() })</code></p>
+<h3 id="base-model-hooks"><a href="#base-model-hooks">Base model hooks</a></h3>
+<p>The Model hooks are fired for all PocketBase structs that implements the Model DB interface - Record, Collection, Log, etc.</p>
+<p>For convenience, if you want to listen to only the Record or Collection DB model events without doing manual type assertion, you can use the <a href="#record-model-hooks"><code>onRecord*</code></a> and <a href="#collection-model-hooks"><code>onCollection*</code></a> proxy hooks above.</p>
+<p><strong><a href="#onmodelvalidate">onModelValidate</a></strong></p>
+<p><code>onModelValidate</code> is called every time when a Model is being validated, e.g. triggered by <code>$app.validate()</code> or <code>$app.save()</code>.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelValidate((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelValidate((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<h6 id="base-model-create-hooks"><a href="#base-model-create-hooks">Base model create hooks</a></h6>
+<p><strong><a href="#onmodelcreate">onModelCreate</a></strong></p>
+<p><code>onModelCreate</code> is triggered every time when a new Model is being created, e.g. triggered by <code>$app.save()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Model validation and the INSERT DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Model validation and the INSERT DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onModelAfterCreateSuccess</code> or <code>onModelAfterCreateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelCreate((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelCreate((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodelcreateexecute">onModelCreateExecute</a></strong></p>
+<p><code>onModelCreateExecute</code> is triggered after successful Model validation and right before the model INSERT DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.save()</code> in the following firing order:<br />
+<code>onModelCreate</code><br />
+ -&gt; <code>onModelValidate</code> (skipped with <code>$app.saveNoValidate()</code>)<br />
+ -&gt; <code>onModelCreateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onModelAfterCreateSuccess</code> or <code>onModelAfterCreateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelCreateExecute((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelCreateExecute((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodelaftercreatesuccess">onModelAfterCreateSuccess</a></strong></p>
+<p><code>onModelAfterCreateSuccess</code> is triggered after each successful Model DB create persistence.</p>
+<p>Note that when a Model is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelAfterCreateSuccess((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelAfterCreateSuccess((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodelaftercreateerror">onModelAfterCreateError</a></strong></p>
+<p><code>onModelAfterCreateError</code> is triggered after each failed Model DB create persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelAfterCreateError((e) =&gt; { // e.app // e.model // e.error e.next() }) // fires only for "users" and "articles" models onModelAfterCreateError((e) =&gt; { // e.app // e.model // e.error e.next() }, "users", "articles")</code></p>
+<h6 id="base-model-update-hooks"><a href="#base-model-update-hooks">Base model update hooks</a></h6>
+<p><strong><a href="#onmodelupdate">onModelUpdate</a></strong></p>
+<p><code>onModelUpdate</code> is triggered every time when a new Model is being updated, e.g. triggered by <code>$app.save()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Model validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Model validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onModelAfterUpdateSuccess</code> or <code>onModelAfterUpdateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelUpdate((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelUpdate((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodelupdateexecute">onModelUpdateExecute</a></strong></p>
+<p><code>onModelUpdateExecute</code> is triggered after successful Model validation and right before the model UPDATE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.save()</code> in the following firing order:<br />
+<code>onModelUpdate</code><br />
+ -&gt; <code>onModelValidate</code> (skipped with <code>$app.saveNoValidate()</code>)<br />
+ -&gt; <code>onModelUpdateExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Model is persisted in the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onModelAfterUpdateSuccess</code> or <code>onModelAfterUpdateError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelUpdateExecute((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelUpdateExecute((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodelafterupdatesuccess">onModelAfterUpdateSuccess</a></strong></p>
+<p><code>onModelAfterUpdateSuccess</code> is triggered after each successful Model DB update persistence.</p>
+<p>Note that when a Model is persisted as part of a transaction, this hook is delayed and executed only AFTER the transaction has been committed. This hook is NOT triggered in case the transaction fails/rollbacks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelAfterUpdateSuccess((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelAfterUpdateSuccess((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodelafterupdateerror">onModelAfterUpdateError</a></strong></p>
+<p><code>onModelAfterUpdateError</code> is triggered after each failed Model DB update persistence.</p>
+<p>Note that the execution of this hook is either immediate or delayed depending on the error:</p>
+<ul>
+<li><strong>immediate</strong> on <code>$app.save()</code> failure</li>
+<li><strong>delayed</strong> on transaction rollback</li>
+</ul>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelAfterUpdateError((e) =&gt; { // e.app // e.model // e.error e.next() }) // fires only for "users" and "articles" models onModelAfterUpdateError((e) =&gt; { // e.app // e.model // e.error e.next() }, "users", "articles")</code></p>
+<h6 id="base-model-delete-hooks"><a href="#base-model-delete-hooks">Base model delete hooks</a></h6>
+<p><strong><a href="#onmodeldelete">onModelDelete</a></strong></p>
+<p><code>onModelDelete</code> is triggered every time when a new Model is being deleted, e.g. triggered by <code>$app.delete()</code>.</p>
+<p>Operations BEFORE the <code>e.next()</code> execute before the Model validation and the UPDATE DB statement.</p>
+<p>Operations AFTER the <code>e.next()</code> execute after the Model validation and the UPDATE DB statement.</p>
+<p>Note that successful execution doesn't guarantee that the Model is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted deleted events, you can bind to <code>onModelAfterDeleteSuccess</code> or <code>onModelAfterDeleteError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+<p><code>// fires for every model onModelDelete((e) =&gt; { // e.app // e.model e.next() }) // fires only for "users" and "articles" models onModelDelete((e) =&gt; { // e.app // e.model e.next() }, "users", "articles")</code></p>
+<p><strong><a href="#onmodeldeleteexecute">onModelDeleteExecute</a></strong></p>
+<p><code>onModelDeleteExecute</code> is triggered after the internal delete checks and right before the Model the model DELETE DB statement execution.</p>
+<p>Usually it is triggered as part of the <code>$app.delete()</code> in the following firing order:<br />
+<code>onModelDelete</code><br />
+ -&gt; internal delete checks<br />
+ -&gt; <code>onModelDeleteExecute</code></p>
+<p>Note that successful execution doesn't guarantee that the Model is deleted from the database since its wrapping transaction may not have been committed yet. If you want to listen to only the actual persisted events, you can bind to <code>onModelAfterDeleteSuccess</code> or <code>onModelAfterDeleteError</code> hooks.</p>
+<p>For convenience, if you want to listen to only the Record or Collection models events without doing manual type assertion, you can use the equivalent <code>onRecord*</code> and <code>onCollection*</code> proxy hooks.</p>
+    <div id="page-nav">
+      <a href="../js/01_overview.html" class="nav-btn prev">
+          <span class="nav-direction">← Précédent</span>
+          <span class="nav-title">Vue d'ensemble</span>
+        </a>
+      <a href="../js/03_routing.html" class="nav-btn next">
+          <span class="nav-direction">Suivant →</span>
+          <span class="nav-title">Routing</span>
+        </a>
+    </div>
+  </div>
+</div>
+
+<script>
+function filterNav(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.sidebar-link').forEach(function(el) {
+    var show = !q || el.textContent.toLowerCase().includes(q);
+    el.style.display = show ? '' : 'none';
+  });
+  document.querySelectorAll('.sidebar-section-title').forEach(function(el) {
+    var section = el.nextElementSibling;
+    var visible = false;
+    while (section && section.classList.contains('sidebar-link')) {
+      if (section.style.display !== 'none') visible = true;
+      section = section.nextElementSibling;
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>
