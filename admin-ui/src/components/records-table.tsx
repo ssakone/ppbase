@@ -44,18 +44,33 @@ interface RecordsTableProps {
 // System columns that can be toggled
 const SYSTEM_COLUMNS = ['id', 'created', 'updated'] as const
 
+// Auth system fields are returned in records API payloads but are not part of
+// collection.schema/fields, so include them explicitly in the records table.
+const AUTH_SYSTEM_FIELDS: Field[] = [
+  { name: 'email', type: 'email' },
+  { name: 'emailVisibility', type: 'bool' },
+  { name: 'verified', type: 'bool' },
+]
+
 function getSchemaFields(collection: Collection, records: RecordModel[]): Field[] {
+  const attachAuthSystemFields = (base: Field[]): Field[] => {
+    if (collection.type !== 'auth') return base
+    const existing = new Set(base.map((f) => f.name))
+    const authFields = AUTH_SYSTEM_FIELDS.filter((f) => !existing.has(f.name))
+    return [...authFields, ...base]
+  }
+
   const fields = collection.fields ?? collection.schema ?? []
-  if (fields.length > 0) return fields
+  if (fields.length > 0) return attachAuthSystemFields(fields)
 
   // For view collections with empty schema, infer from first record
   if (records.length > 0) {
     const systemKeys = new Set(['id', 'collectionId', 'collectionName', 'created', 'updated'])
     const keys = Object.keys(records[0]).filter((k) => !systemKeys.has(k))
-    return keys.map((k) => ({ name: k, type: 'text' }))
+    return attachAuthSystemFields(keys.map((k) => ({ name: k, type: 'text' })))
   }
 
-  return []
+  return attachAuthSystemFields([])
 }
 
 const STORAGE_PREFIX = 'ppbase_columns_'

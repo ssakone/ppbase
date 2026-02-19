@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.db.system_tables import CollectionRecord, ExternalAuthRecord
@@ -469,63 +469,96 @@ async def link_or_create_oauth_user(
     Returns:
         Dict with keys: record, isNew, meta (OAuth2Meta)
     """
-    from ppbase.services.record_service import create_record, get_record_by_id
+    from ppbase.services.record_service import create_record, get_record
 
     async with engine.begin() as conn:
         # Check if external auth already exists
         result = await conn.execute(
-            select(ExternalAuthRecord).where(
+            select(ExternalAuthRecord.record_id).where(
                 ExternalAuthRecord.collection_id == collection.id,
                 ExternalAuthRecord.provider == provider_name,
                 ExternalAuthRecord.provider_id == provider_user_info["id"],
             )
         )
-        external_auth = result.scalar_one_or_none()
+        external_auth_record_id = result.scalar_one_or_none()
 
         is_new = False
         record = None
 
-        if external_auth:
+        if external_auth_record_id:
             # Existing OAuth2 link - get the user record
-            record = await get_record_by_id(
-                engine, collection.name, external_auth.record_id
-            )
+            record = await get_record(engine, collection, str(external_auth_record_id))
         else:
-            # New OAuth2 user - create record
-            is_new = True
+            # Try linking by existing auth email first.
+            existing_record_id: str | None = None
+            provider_email = str(provider_user_info.get("email") or "").strip()
+            if provider_email:
+                table = collection.name
+                email_result = await conn.execute(
+                    text(f'SELECT "id" FROM "{table}" WHERE "email" = :email LIMIT 1'),
+                    {"email": provider_email},
+                )
+                row = email_result.first()
+                if row:
+                    existing_record_id = str(row[0])
 
-            # Apply mapped fields from collection options
-            mapped_fields = (
-                collection.options.get("oauth2", {}).get("mappedFields", {})
-                if collection.options
-                else {}
-            )
-            oauth_data = {}
-            for provider_field, collection_field in mapped_fields.items():
-                if collection_field and provider_user_info.get(provider_field):
-                    oauth_data[collection_field] = provider_user_info[provider_field]
+            if existing_record_id:
+                record = await get_record(engine, collection, existing_record_id)
+                is_new = False
+            else:
+                # New OAuth2 user - create record
+                is_new = True
 
-            # Merge createData with OAuth data (createData takes precedence)
-            record_data = {**oauth_data, **create_data}
+                # Apply mapped fields from collection options
+                mapped_fields = (
+                    collection.options.get("oauth2", {}).get("mappedFields", {})
+                    if collection.options
+                    else {}
+                )
+                oauth_data = {}
+                for provider_field, collection_field in mapped_fields.items():
+                    if collection_field and provider_user_info.get(provider_field):
+                        oauth_data[collection_field] = provider_user_info[provider_field]
 
-            # Set verified=true for OAuth2 users
-            record_data["verified"] = True
-            if "emailVisibility" not in record_data:
-                record_data["emailVisibility"] = False
+                # Merge createData with OAuth data (createData takes precedence)
+                record_data = {**oauth_data, **create_data}
 
-            # Create user record
-            record = await create_record(engine, collection.name, record_data)
+                # OAuth providers usually return email; use it as fallback for auth collections.
+                if not record_data.get("email") and provider_user_info.get("email"):
+                    record_data["email"] = provider_user_info["email"]
 
-            # Create external auth link
-            external_auth_data = {
-                "collection_id": collection.id,
-                "record_id": record["id"],
-                "provider": provider_name,
-                "provider_id": provider_user_info["id"],
-            }
-            await conn.execute(
-                ExternalAuthRecord.__table__.insert().values(**external_auth_data)
-            )
+                # Auth collection creation requires password/passwordConfirm.
+                # Generate a random one for OAuth-only users when missing.
+                if not record_data.get("password"):
+                    generated_password = generate_token_key(30)
+                    record_data["password"] = generated_password
+                    record_data["passwordConfirm"] = generated_password
+
+                # Set verified=true for OAuth2 users
+                record_data["verified"] = True
+                if "emailVisibility" not in record_data:
+                    record_data["emailVisibility"] = False
+
+                # Create user record
+                record = await create_record(engine, collection, record_data)
+
+            # Create external auth link for newly linked/created records.
+            if record is not None:
+                from ppbase.core.id_generator import generate_id
+
+                external_auth_data = {
+                    "id": generate_id(),
+                    "collection_id": collection.id,
+                    "record_id": record["id"],
+                    "provider": provider_name,
+                    "provider_id": provider_user_info["id"],
+                }
+                await conn.execute(
+                    ExternalAuthRecord.__table__.insert().values(**external_auth_data)
+                )
+
+        if record is None:
+            raise ValueError("Failed to resolve OAuth2 auth record.")
 
     # Build OAuth2 meta
     expiry = None

@@ -31,8 +31,22 @@ interface RecordEditorProps {
   duplicateData?: Record<string, unknown> | null
 }
 
+const AUTH_SYSTEM_FIELDS: Field[] = [
+  { name: 'email', type: 'email' },
+  { name: 'emailVisibility', type: 'bool' },
+  { name: 'verified', type: 'bool' },
+]
+
 function getFields(collection: Collection): Field[] {
-  return collection.fields ?? collection.schema ?? []
+  const fields = collection.fields ?? collection.schema ?? []
+  const isAuthCollection = collection.type === 'auth' || collection.name === '_superusers'
+
+  if (!isAuthCollection) return fields
+
+  const existing = new Set(fields.map((field) => field.name))
+  const missingAuthFields = AUTH_SYSTEM_FIELDS.filter((field) => !existing.has(field.name))
+
+  return [...fields, ...missingAuthFields]
 }
 
 export function RecordEditor({
@@ -61,6 +75,7 @@ export function RecordEditor({
   // Auth collection detection — includes _superusers and any collection with type=auth
   const isSuperusersCollection = collection.name === '_superusers'
   const isAuthCollection = collection.type === 'auth' || isSuperusersCollection
+  const visibleFields = fields.filter((field) => !(isAuthCollection && !isEditing && field.name === 'email'))
   const [changePassword, setChangePassword] = useState(false)
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -280,7 +295,7 @@ export function RecordEditor({
                   </div>
                 )}
 
-                {fields.map((field) => (
+                {visibleFields.map((field) => (
                   <RecordFieldInput
                     key={field.name}
                     field={field}
@@ -291,7 +306,7 @@ export function RecordEditor({
                     collectionId={collection.id}
                   />
                 ))}
-                {fields.length === 0 && !isAuthCollection && (
+                {visibleFields.length === 0 && !isAuthCollection && (
                   <p className="text-sm text-muted-foreground py-4">
                     This collection has no editable fields.
                   </p>

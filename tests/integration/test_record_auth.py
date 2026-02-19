@@ -498,6 +498,309 @@ class TestAuthMethods:
         )
         assert resp.status_code == 404, resp.text
 
+    async def test_auth_methods_oauth_provider_uses_redirect_placeholder(
+        self,
+        app_client: AsyncClient,
+        admin_token: str,
+    ):
+        """OAuth2 provider URLs should expose a redirect_uri placeholder."""
+        patch_resp = await app_client.patch(
+            "/api/collections/users",
+            headers={"Authorization": admin_token},
+            json={
+                "options": {
+                    "oauth2": {
+                        "enabled": True,
+                        "providers": [
+                            {
+                                "name": "google",
+                                "clientId": "test-client-id",
+                                "clientSecret": "test-client-secret",
+                            }
+                        ],
+                    }
+                }
+            },
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+
+        try:
+            resp = await app_client.get("/api/collections/users/auth-methods")
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+
+            providers = data.get("oauth2", {}).get("providers", [])
+            assert providers
+
+            google = next((p for p in providers if p.get("name") == "google"), None)
+            assert google is not None
+
+            auth_url = str(google.get("authURL", ""))
+            assert auth_url
+            assert auth_url.endswith("redirect_uri=")
+            assert google.get("authUrl") == auth_url
+            assert "redirect_uri=http" not in auth_url
+        finally:
+            await app_client.patch(
+                "/api/collections/users",
+                headers={"Authorization": admin_token},
+                json={
+                    "options": {
+                        "oauth2": {
+                            "enabled": False,
+                            "providers": [],
+                        }
+                    }
+                },
+            )
+
+
+class TestOAuth2Auth:
+    """Tests for OAuth2 auth payload compatibility."""
+
+    async def test_auth_with_oauth2_accepts_redirect_url_alias(
+        self,
+        app_client: AsyncClient,
+    ):
+        """`redirectURL` alias should be accepted like `redirectUrl`."""
+        resp = await app_client.post(
+            "/api/collections/users/auth-with-oauth2",
+            json={
+                "provider": "google",
+                "code": "fake-code",
+                "codeVerifier": "fake-verifier",
+                "redirectURL": "https://example.com/api/oauth2-redirect",
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        data = resp.json()
+        assert "OAuth2 authentication is not enabled" in data.get("message", "")
+        assert "redirectUrl" not in data.get("data", {})
+
+    async def test_auth_with_oauth2_mocked_provider_creates_and_reuses_user(
+        self,
+        app_client: AsyncClient,
+        admin_token: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """OAuth2 login should create the auth user and reuse external auth link."""
+        import uuid
+
+        from ppbase.services import oauth2_service
+
+        unique_email = f"oauth_{uuid.uuid4().hex[:8]}@example.com"
+        unique_provider_id = f"google-provider-{uuid.uuid4().hex[:10]}"
+
+        patch_resp = await app_client.patch(
+            "/api/collections/users",
+            headers={"Authorization": admin_token},
+            json={
+                "options": {
+                    "oauth2": {
+                        "enabled": True,
+                        "providers": [
+                            {
+                                "name": "google",
+                                "clientId": "test-client-id",
+                                "clientSecret": "test-client-secret",
+                            }
+                        ],
+                    }
+                }
+            },
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+
+        class _FakeProvider:
+            def __init__(self, client_id: str, client_secret: str):
+                self.client_id = client_id
+                self.client_secret = client_secret
+
+            async def exchange_code(
+                self,
+                code: str,
+                redirect_url: str,
+                code_verifier: str,
+            ) -> dict:
+                return {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "expires_in": 3600,
+                }
+
+            async def get_user_info(self, access_token: str) -> dict:
+                return {
+                    "id": unique_provider_id,
+                    "email": unique_email,
+                    "name": "OAuth Test User",
+                    "username": "oauth_test_user",
+                    "avatarURL": "https://example.com/avatar.png",
+                }
+
+        monkeypatch.setattr(
+            oauth2_service,
+            "get_provider_credentials",
+            lambda provider_name, settings, opts: ("mock-client-id", "mock-client-secret"),
+        )
+        monkeypatch.setattr(
+            oauth2_service,
+            "get_provider_class",
+            lambda provider_name: _FakeProvider,
+        )
+
+        payload = {
+            "provider": "google",
+            "code": "mock-code",
+            "codeVerifier": "mock-code-verifier",
+            "redirectUrl": "https://ppshare.relais.dev/api/oauth2-redirect",
+        }
+
+        try:
+            first = await app_client.post(
+                "/api/collections/users/auth-with-oauth2",
+                json=payload,
+            )
+            assert first.status_code == 200, first.text
+            first_data = first.json()
+            assert first_data.get("token")
+            assert first_data.get("record", {}).get("email") == unique_email
+            assert first_data.get("meta", {}).get("isNew") is True
+
+            second = await app_client.post(
+                "/api/collections/users/auth-with-oauth2",
+                json=payload,
+            )
+            assert second.status_code == 200, second.text
+            second_data = second.json()
+            assert second_data.get("record", {}).get("id") == first_data["record"]["id"]
+            assert second_data.get("meta", {}).get("isNew") is False
+        finally:
+            await app_client.patch(
+                "/api/collections/users",
+                headers={"Authorization": admin_token},
+                json={
+                    "options": {
+                        "oauth2": {
+                            "enabled": False,
+                            "providers": [],
+                        }
+                    }
+                },
+            )
+
+    async def test_auth_with_oauth2_links_existing_user_by_email(
+        self,
+        app_client: AsyncClient,
+        admin_token: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """OAuth2 login should link to existing auth record with the same email."""
+        import uuid
+
+        from ppbase.services import oauth2_service
+
+        unique_email = f"oauth_link_{uuid.uuid4().hex[:8]}@example.com"
+        unique_provider_id = f"google-provider-{uuid.uuid4().hex[:10]}"
+
+        patch_resp = await app_client.patch(
+            "/api/collections/users",
+            headers={"Authorization": admin_token},
+            json={
+                "options": {
+                    "oauth2": {
+                        "enabled": True,
+                        "providers": [
+                            {
+                                "name": "google",
+                                "clientId": "test-client-id",
+                                "clientSecret": "test-client-secret",
+                            }
+                        ],
+                    }
+                }
+            },
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+
+        existing = await app_client.post(
+            "/api/collections/users/records",
+            json={
+                "email": unique_email,
+                "password": "securepass123",
+                "passwordConfirm": "securepass123",
+                "name": "Existing User",
+            },
+        )
+        assert existing.status_code == 200, existing.text
+        existing_id = existing.json()["id"]
+
+        class _FakeProvider:
+            def __init__(self, client_id: str, client_secret: str):
+                self.client_id = client_id
+                self.client_secret = client_secret
+
+            async def exchange_code(
+                self,
+                code: str,
+                redirect_url: str,
+                code_verifier: str,
+            ) -> dict:
+                return {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "expires_in": 3600,
+                }
+
+            async def get_user_info(self, access_token: str) -> dict:
+                return {
+                    "id": unique_provider_id,
+                    "email": unique_email,
+                    "name": "Existing User",
+                    "username": "existing_user",
+                    "avatarURL": "https://example.com/avatar.png",
+                }
+
+        monkeypatch.setattr(
+            oauth2_service,
+            "get_provider_credentials",
+            lambda provider_name, settings, opts: ("mock-client-id", "mock-client-secret"),
+        )
+        monkeypatch.setattr(
+            oauth2_service,
+            "get_provider_class",
+            lambda provider_name: _FakeProvider,
+        )
+
+        payload = {
+            "provider": "google",
+            "code": "mock-code",
+            "codeVerifier": "mock-code-verifier",
+            "redirectUrl": "https://ppshare.relais.dev/api/oauth2-redirect",
+        }
+
+        try:
+            oauth_resp = await app_client.post(
+                "/api/collections/users/auth-with-oauth2",
+                json=payload,
+            )
+            assert oauth_resp.status_code == 200, oauth_resp.text
+            oauth_data = oauth_resp.json()
+            assert oauth_data.get("record", {}).get("id") == existing_id
+            assert oauth_data.get("meta", {}).get("isNew") is False
+        finally:
+            await app_client.patch(
+                "/api/collections/users",
+                headers={"Authorization": admin_token},
+                json={
+                    "options": {
+                        "oauth2": {
+                            "enabled": False,
+                            "providers": [],
+                        }
+                    }
+                },
+            )
+
 
 # =========================================================================
 # Email Verification Tests

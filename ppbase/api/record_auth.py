@@ -18,7 +18,9 @@ Provides authentication endpoints for collections of type ``auth``:
 
 from __future__ import annotations
 
+import json
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -89,6 +91,207 @@ def _extract_auth_token(request: Request) -> str:
     if token.lower().startswith("bearer "):
         token = token[7:]
     return token.strip()
+
+
+def _normalize_oauth_base_url(base_url: str) -> str:
+    """Normalize callback base URL for OAuth2 providers.
+
+    Browsers and OAuth providers don't reliably accept ``0.0.0.0`` as a callback
+    host. When detected, rewrite it to ``127.0.0.1``.
+    """
+    parsed = urlsplit(base_url)
+    host = parsed.hostname or ""
+    if host not in {"0.0.0.0", "::"}:
+        return base_url
+
+    port = f":{parsed.port}" if parsed.port else ""
+    netloc = f"127.0.0.1{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _normalize_oauth_provider_auth_url(auth_url: str) -> str:
+    """Ensure provider auth URL ends with ``redirect_uri=`` placeholder.
+
+    PocketBase SDK concatenates the final callback URL to ``authUrl``.
+    Therefore, ``redirect_uri`` must be the last query parameter and have an empty value.
+    """
+    base, sep, query = auth_url.partition("?")
+    if not sep:
+        return auth_url
+
+    parsed = parse_qsl(query, keep_blank_values=True)
+    items: list[tuple[str, str]] = []
+    for key, value in parsed:
+        if key != "redirect_uri":
+            items.append((key, value))
+
+    items.append(("redirect_uri", ""))
+    normalized_query = urlencode(items, doseq=True)
+    return f"{base}?{normalized_query}"
+
+
+def _extract_first_header_value(value: str | None) -> str:
+    """Return first comma-separated header value."""
+    if not value:
+        return ""
+    return value.split(",")[0].strip()
+
+
+async def _resolve_public_base_url(request: Request, engine: Any) -> str:
+    """Resolve externally accessible app base URL.
+
+    Resolution order:
+    1) ``settings.meta.appURL`` from persisted settings
+    2) reverse-proxy headers (``X-Forwarded-*``)
+    3) request base URL fallback
+    """
+    configured_url = ""
+    try:
+        from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from ppbase.db.system_tables import ParamRecord
+
+        factory = async_sessionmaker(
+            bind=engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with factory() as session:
+            stmt = select(ParamRecord.value).where(ParamRecord.key == "settings")
+            raw_settings = (await session.execute(stmt)).scalar_one_or_none()
+
+        if isinstance(raw_settings, dict):
+            meta = raw_settings.get("meta")
+            if isinstance(meta, dict):
+                configured_url = str(meta.get("appURL", "") or "").strip().rstrip("/")
+    except Exception:
+        configured_url = ""
+
+    if configured_url:
+        parsed = urlsplit(configured_url)
+        if parsed.scheme and parsed.netloc:
+            normalized = urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
+            )
+            return _normalize_oauth_base_url(normalized.rstrip("/"))
+
+    scheme = _extract_first_header_value(request.headers.get("x-forwarded-proto"))
+    host = _extract_first_header_value(request.headers.get("x-forwarded-host"))
+    forwarded_port = _extract_first_header_value(request.headers.get("x-forwarded-port"))
+
+    if not scheme:
+        scheme = request.url.scheme
+    if not host:
+        host = request.headers.get("host", "").strip()
+
+    if host and forwarded_port and ":" not in host:
+        is_default_http = scheme == "http" and forwarded_port == "80"
+        is_default_https = scheme == "https" and forwarded_port == "443"
+        if not is_default_http and not is_default_https:
+            host = f"{host}:{forwarded_port}"
+
+    if host:
+        return _normalize_oauth_base_url(f"{scheme}://{host}".rstrip("/"))
+
+    return _normalize_oauth_base_url(str(request.base_url).rstrip("/"))
+
+
+async def _extract_oauth2_redirect_payload(request: Request) -> dict[str, str]:
+    """Extract OAuth2 callback payload from query/body."""
+    payload: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        payload[str(key)] = str(value)
+
+    if request.method.upper() != "POST":
+        return payload
+
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if value is None or key in payload:
+                    continue
+                payload[str(key)] = str(value)
+        return payload
+
+    try:
+        form = await request.form()
+    except Exception:
+        return payload
+
+    for key in form.keys():
+        if key in payload:
+            continue
+        value = form.get(key)
+        if value is not None:
+            payload[str(key)] = str(value)
+    return payload
+
+
+async def _dispatch_oauth2_realtime_payload(
+    subscription_manager: Any | None,
+    payload: dict[str, str],
+) -> bool:
+    """Push OAuth2 callback payload to the matching realtime client session."""
+    state = str(payload.get("state", "") or "").strip()
+    if not state or subscription_manager is None:
+        return False
+
+    get_session = getattr(subscription_manager, "get_session", None)
+    if not callable(get_session):
+        return False
+
+    session = get_session(state)
+    if session is None:
+        return False
+
+    await session.response_queue.put(
+        {"topic": "@oauth2", "data": dict(payload)}
+    )
+    return True
+
+
+def _oauth2_redirect_html(payload: dict[str, str]) -> str:
+    """Render popup relay HTML used by OAuth2 integrations."""
+    payload_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OAuth2 Redirect</title>
+  </head>
+  <body>
+    <script>
+      (function () {{
+        const payload = {payload_json};
+        const browserPayload = {{
+          query: window.location.search || '',
+          hash: window.location.hash || '',
+          href: window.location.href || '',
+        }};
+        const message = Object.assign({{}}, payload, browserPayload);
+
+        try {{
+          if (window.opener && typeof window.opener.postMessage === 'function') {{
+            window.opener.postMessage(message, window.location.origin);
+          }}
+        }} catch (_) {{
+          // Ignore postMessage delivery errors.
+        }}
+
+        try {{ window.close(); }} catch (_) {{}}
+      }})();
+    </script>
+    <noscript>OAuth2 redirect page</noscript>
+  </body>
+</html>
+"""
 
 
 async def _trigger_record_auth_request_hook(
@@ -210,41 +413,13 @@ async def _passes_auth_rule(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/api/oauth2-redirect")
-async def api_oauth2_redirect() -> HTMLResponse:
-    """Serve popup relay page used by PocketBase OAuth2 web integrations."""
-    html = """<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OAuth2 Redirect</title>
-  </head>
-  <body>
-    <script>
-      (function () {
-        const payload = {
-          query: window.location.search || '',
-          hash: window.location.hash || '',
-          href: window.location.href || '',
-        };
-
-        try {
-          if (window.opener && typeof window.opener.postMessage === 'function') {
-            window.opener.postMessage(payload, window.location.origin);
-          }
-        } catch (_) {
-          // Ignore postMessage delivery errors.
-        }
-
-        try { window.close(); } catch (_) {}
-      })();
-    </script>
-    <noscript>OAuth2 redirect page</noscript>
-  </body>
-</html>
-"""
-    return HTMLResponse(content=html, status_code=200)
+@router.api_route("/api/oauth2-redirect", methods=["GET", "POST"])
+async def api_oauth2_redirect(request: Request) -> HTMLResponse:
+    """Handle OAuth2 callback relay for realtime and popup integrations."""
+    payload = await _extract_oauth2_redirect_payload(request)
+    subscription_manager = getattr(request.app.state, "subscription_manager", None)
+    await _dispatch_oauth2_realtime_payload(subscription_manager, payload)
+    return HTMLResponse(content=_oauth2_redirect_html(payload), status_code=200)
 
 
 @router.get("/api/collections/{collectionIdOrName}/auth-methods")
@@ -314,12 +489,10 @@ async def api_auth_methods(collectionIdOrName: str, request: Request) -> JSONRes
                 code_verifier, code_challenge = generate_pkce_pair()
                 state = generate_state()
 
-                # Build redirect URL (base URL + collection-specific callback)
-                base_url = str(request.base_url).rstrip("/")
-                redirect_url = f"{base_url}/api/oauth2-redirect"
-
-                # Get auth URL
-                auth_url = provider.get_auth_url(state, code_challenge, redirect_url)
+                # Return auth URL with ``redirect_uri=`` placeholder.
+                # Clients (SDK/manual) append their callback URL.
+                auth_url = provider.get_auth_url(state, code_challenge, "")
+                auth_url = _normalize_oauth_provider_auth_url(auth_url)
 
                 oauth2_providers.append({
                     "name": provider_name,
@@ -329,6 +502,7 @@ async def api_auth_methods(collectionIdOrName: str, request: Request) -> JSONRes
                     "codeChallenge": code_challenge,
                     "codeChallengeMethod": "S256",
                     "authURL": auth_url,
+                    "authUrl": auth_url,
                 })
             except Exception:
                 # Skip providers that aren't configured
@@ -788,7 +962,12 @@ async def api_auth_with_oauth2(
         provider = str(payload.get("provider", "")).strip()
         code = str(payload.get("code", "")).strip()
         code_verifier = str(payload.get("codeVerifier", "")).strip()
-        redirect_url = str(payload.get("redirectUrl", "")).strip()
+        redirect_url_raw = payload.get("redirectUrl")
+        if redirect_url_raw in (None, ""):
+            redirect_url_raw = payload.get("redirectURL")
+        if redirect_url_raw in (None, ""):
+            redirect_url_raw = payload.get("redirect_url")
+        redirect_url = str(redirect_url_raw or "").strip()
         create_data = payload.get("createData", {})
 
         if not provider:
@@ -1156,7 +1335,7 @@ async def api_request_verification(
         )
 
     settings = request.app.state.settings
-    base_url = str(request.base_url).rstrip("/")
+    base_url = await _resolve_public_base_url(request, engine)
 
     from ppbase.services.record_auth_service import request_verification as _req_verif
 
@@ -1248,7 +1427,7 @@ async def api_request_password_reset(
         )
 
     settings = request.app.state.settings
-    base_url = str(request.base_url).rstrip("/")
+    base_url = await _resolve_public_base_url(request, engine)
 
     from ppbase.services.record_auth_service import request_password_reset as _req_reset
 
@@ -1387,7 +1566,7 @@ async def api_request_email_change(
             {"newEmail": {"code": "validation_required", "message": "Cannot be blank."}},
         )
 
-    base_url = str(request.base_url).rstrip("/")
+    base_url = await _resolve_public_base_url(request, engine)
     ok, errors = await _request_email_change(
         engine,
         collection,

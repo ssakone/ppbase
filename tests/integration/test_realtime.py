@@ -12,6 +12,7 @@ from ppbase.db.engine import get_engine
 from ppbase.services.realtime_service import (
     SubscriptionManager,
     broadcast_record_change,
+    parse_realtime_topic,
 )
 from ppbase.services.record_service import resolve_collection
 
@@ -42,6 +43,15 @@ async def test_subscription_manager_add_subscription():
     assert session is not None
     assert len(session.subscriptions) == 1
     assert session.subscriptions[0].topic == "posts/*"
+
+
+@pytest.mark.asyncio
+async def test_parse_realtime_topic_supports_internal_oauth2_channel():
+    """Internal @oauth2 topic should be accepted."""
+    parsed = parse_realtime_topic("@oauth2")
+    assert parsed.base_topic == "@oauth2"
+    assert parsed.collection_name == ""
+    assert parsed.resource == "@oauth2"
 
 
 @pytest.mark.asyncio

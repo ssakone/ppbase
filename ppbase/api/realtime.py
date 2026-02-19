@@ -206,18 +206,19 @@ async def realtime_subscribe(
                 logger.warning("Invalid realtime topic '%s': %s", raw_topic, exc)
                 continue
 
-            try:
-                collection = await resolve_collection(engine, parsed_topic.collection_name)
-                if collection is None:
-                    logger.warning("Collection not found: %s", parsed_topic.collection_name)
+            if parsed_topic.collection_name:
+                try:
+                    collection = await resolve_collection(engine, parsed_topic.collection_name)
+                    if collection is None:
+                        logger.warning("Collection not found: %s", parsed_topic.collection_name)
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to resolve collection %s: %s",
+                        parsed_topic.collection_name,
+                        exc,
+                    )
                     continue
-            except Exception as exc:
-                logger.warning(
-                    "Failed to resolve collection %s: %s",
-                    parsed_topic.collection_name,
-                    exc,
-                )
-                continue
 
             parsed_subscriptions.append(
                 RealtimeSubscription(

@@ -61,12 +61,19 @@ def parse_realtime_topic(topic: str) -> ParsedRealtimeTopic:
         raise ValueError("Empty topic.")
 
     base_topic, _, query_string = raw_topic.partition("?")
-    parts = base_topic.split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError(f"Invalid topic format: {raw_topic}")
-
-    collection_name = parts[0]
-    resource = parts[1]
+    # Internal channels (eg. PB_CONNECT, @oauth2) don't follow collection/resource.
+    if "/" not in base_topic:
+        if base_topic == "PB_CONNECT" or base_topic.startswith("@"):
+            collection_name = ""
+            resource = base_topic
+        else:
+            raise ValueError(f"Invalid topic format: {raw_topic}")
+    else:
+        parts = base_topic.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(f"Invalid topic format: {raw_topic}")
+        collection_name = parts[0]
+        resource = parts[1]
 
     options_query: dict[str, Any] = {}
     options_headers: dict[str, Any] = {}
