@@ -352,18 +352,17 @@ async def update_collection(
     old_snapshot = _Snapshot(record)
 
     # Apply updates
-    if data.name is not None:
+    if data.name is not None and data.name.lower() != record.name.lower():
         _validate_collection_name(data.name)
-        if data.name.lower() != record.name.lower():
-            dup_stmt = select(CollectionRecord).where(
-                func.lower(CollectionRecord.name) == data.name.lower(),
-                CollectionRecord.id != record.id,
+        dup_stmt = select(CollectionRecord).where(
+            func.lower(CollectionRecord.name) == data.name.lower(),
+            CollectionRecord.id != record.id,
+        )
+        dup = (await session.execute(dup_stmt)).scalars().first()
+        if dup is not None:
+            raise ValueError(
+                f"Collection with name '{data.name}' already exists."
             )
-            dup = (await session.execute(dup_stmt)).scalars().first()
-            if dup is not None:
-                raise ValueError(
-                    f"Collection with name '{data.name}' already exists."
-                )
         record.name = data.name
 
     if data.type is not None:

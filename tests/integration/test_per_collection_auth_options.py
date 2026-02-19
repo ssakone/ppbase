@@ -43,6 +43,45 @@ class TestAuthOptionsPopulated:
         # Users should have 7 days (604800s) auth token duration
         assert opts["authToken"]["duration"] == 604800
 
+    async def test_users_oauth2_update_with_same_reserved_name(self, app_client: AsyncClient, admin_token: str):
+        """Updating users OAuth2 settings should not fail on reserved-name validation."""
+        resp = await app_client.patch(
+            "/api/collections/users",
+            headers={"Authorization": admin_token},
+            json={
+                "name": "users",
+                "type": "auth",
+                "options": {
+                    "oauth2": {
+                        "enabled": True,
+                        "providers": [
+                            {
+                                "name": "google",
+                                "clientId": "test-client-id",
+                                "clientSecret": "test-client-secret",
+                            }
+                        ],
+                        "mappedFields": {
+                            "username": "name",
+                            "avatarURL": "avatar",
+                            "name": "Google",
+                        },
+                    }
+                },
+                "listRule": "id = @request.auth.id",
+                "viewRule": "id = @request.auth.id",
+                "createRule": "",
+                "updateRule": "id = @request.auth.id",
+                "deleteRule": "id = @request.auth.id",
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        oauth2 = data["options"]["oauth2"]
+        assert oauth2["enabled"] is True
+        assert oauth2["providers"][0]["name"] == "google"
+
     async def test_new_auth_collection_gets_created(self, app_client: AsyncClient, admin_token: str):
         """Creating a new auth collection should succeed."""
         coll_name = f"members_{uuid.uuid4().hex[:8]}"
