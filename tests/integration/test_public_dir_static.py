@@ -35,6 +35,9 @@ async def test_public_dir_returns_404_without_directory_index(tmp_path) -> None:
     nested_dir = public_dir / "nested"
     nested_dir.mkdir(parents=True, exist_ok=True)
     (nested_dir / "hello.txt").write_text("hello")
+    with_index_dir = public_dir / "with-index"
+    with_index_dir.mkdir(parents=True, exist_ok=True)
+    (with_index_dir / "index.html").write_text("<html><body>Nested Index</body></html>")
 
     app = create_app(Settings(public_dir=str(public_dir)))
     transport = ASGITransport(app=app)
@@ -43,6 +46,7 @@ async def test_public_dir_returns_404_without_directory_index(tmp_path) -> None:
         root_response = await client.get("/")
         directory_response = await client.get("/nested/")
         file_response = await client.get("/nested/hello.txt")
+        directory_index_response = await client.get("/with-index/")
 
     assert root_response.status_code == 404
     assert root_response.text == ""
@@ -52,6 +56,9 @@ async def test_public_dir_returns_404_without_directory_index(tmp_path) -> None:
 
     assert file_response.status_code == 200
     assert file_response.text == "hello"
+
+    assert directory_index_response.status_code == 200
+    assert "Nested Index" in directory_index_response.text
 
 
 @pytest.mark.asyncio

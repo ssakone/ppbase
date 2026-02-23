@@ -338,9 +338,16 @@ def create_app(
             except ValueError:
                 return Response(status_code=404)
 
-            if not candidate.is_file():
-                return Response(status_code=404)
-            return FileResponse(str(candidate))
+            if candidate.is_file():
+                return FileResponse(str(candidate))
+
+            # Resolve directory requests like /dashboard/ to /dashboard/index.html
+            if candidate.is_dir():
+                index = candidate / "index.html"
+                if index.is_file():
+                    return FileResponse(str(index))
+
+            return Response(status_code=404)
 
     # Custom exception handler: PocketBase returns flat error objects, not
     # FastAPI's default {"detail": ...} wrapper.
