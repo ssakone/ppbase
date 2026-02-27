@@ -2,6 +2,7 @@ import { lazy, Suspense, type ReactElement } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Toaster } from 'sonner'
+import { CheckCircle2, CircleAlert } from 'lucide-react'
 import { AuthProvider } from '@/context/auth-context'
 import { CommandPaletteProvider } from '@/context/command-palette-context'
 import { SidebarProvider } from '@/context/sidebar-context'
@@ -74,7 +75,30 @@ export default function App() {
         <BrowserRouter basename="/_">
           <CommandPaletteProvider>
             <SidebarProvider>
-              <Toaster position="bottom-right" richColors closeButton />
+              <Toaster
+                position="bottom-center"
+                closeButton
+                toastOptions={{
+                  classNames: {
+                    toast:
+                      'w-[min(560px,calc(100vw-2rem))] rounded-xl border border-slate-200 bg-white text-slate-900 shadow-lg',
+                    icon: 'order-1 shrink-0',
+                    content: 'order-2 min-w-0 flex-1',
+                    title: 'text-sm font-medium',
+                    description: 'text-xs text-slate-600',
+                    closeButton:
+                      '!static !top-auto !left-auto !right-auto !translate-x-0 !translate-y-0 order-3 ml-auto shrink-0 border border-slate-200 bg-white text-slate-500 hover:bg-slate-100 hover:text-slate-700',
+                    success:
+                      '!border-emerald-200 !bg-emerald-50/90 [&_[data-icon]]:text-emerald-600',
+                    error:
+                      '!border-red-200 !bg-red-50/90 [&_[data-icon]]:text-red-600',
+                  },
+                }}
+                icons={{
+                  success: <CheckCircle2 className="h-4 w-4" />,
+                  error: <CircleAlert className="h-4 w-4" />,
+                }}
+              />
               <Routes>
                 <Route path="/login" element={withSuspense(<LoginPage />)} />
                 <Route path="/setup" element={withSuspense(<SetupPage />)} />

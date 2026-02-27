@@ -114,18 +114,34 @@ export function CollectionEditor({ open, onClose, onDelete, mode, collectionId }
       return false
     }
     if (type !== 'view') {
-      for (const field of fields) {
+      const seenFieldNames = new Set<string>()
+
+      for (const [index, field] of fields.entries()) {
+        const fieldName = field.name?.trim() ?? ''
+
+        if (!fieldName) {
+          toast.error(`Field #${index + 1} must have a name.`)
+          return false
+        }
+
+        const fieldNameKey = fieldName.toLowerCase()
+        if (seenFieldNames.has(fieldNameKey)) {
+          toast.error(`Field "${fieldName}" is duplicated. Field names must be unique.`)
+          return false
+        }
+        seenFieldNames.add(fieldNameKey)
+
         if (field.type === 'select') {
           const vals = field.values || field.options?.values || []
           if (vals.length === 0) {
-            toast.error(`Select field "${field.name}" must have at least one value.`)
+            toast.error(`Select field "${fieldName}" must have at least one value.`)
             return false
           }
         }
         if (field.type === 'relation') {
           const cid = field.collectionId || field.options?.collectionId
           if (!cid) {
-            toast.error(`Relation field "${field.name}" must have a target collection.`)
+            toast.error(`Relation field "${fieldName}" must have a target collection.`)
             return false
           }
         }

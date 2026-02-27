@@ -42,6 +42,21 @@ async def _table_exists(engine: AsyncEngine, table_name: str) -> bool:
         return result.first() is not None
 
 
+async def _column_exists(engine: AsyncEngine, table_name: str, column_name: str) -> bool:
+    """Check whether a column exists in the public schema."""
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' "
+                "AND table_name = :table_name "
+                "AND column_name = :column_name"
+            ),
+            {"table_name": table_name, "column_name": column_name},
+        )
+        return result.first() is not None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -60,6 +75,30 @@ async def bootstrap_system_collections(
     await ensure_otps_collection(session, engine)
     await ensure_auth_origins_collection(session, engine)
     await ensure_users_collection(session, engine)
+    await ensure_request_logs_columns(engine)
+
+
+# ---------------------------------------------------------------------------
+# _requests schema backfill
+# ---------------------------------------------------------------------------
+
+async def ensure_request_logs_columns(engine: AsyncEngine) -> None:
+    """Backfill optional payload columns for the ``_requests`` table."""
+    if not await _table_exists(engine, "_requests"):
+        return
+
+    async with engine.begin() as conn:
+        if not await _column_exists(engine, "_requests", "request_body"):
+            await conn.execute(
+                text('ALTER TABLE "_requests" ADD COLUMN "request_body" JSONB NULL')
+            )
+            logger.info("Added _requests.request_body column")
+
+        if not await _column_exists(engine, "_requests", "response_body"):
+            await conn.execute(
+                text('ALTER TABLE "_requests" ADD COLUMN "response_body" JSONB NULL')
+            )
+            logger.info("Added _requests.response_body column")
 
 
 # ---------------------------------------------------------------------------
