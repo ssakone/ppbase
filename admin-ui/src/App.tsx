@@ -71,7 +71,7 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
-        <BrowserRouter basename="/_/">
+        <BrowserRouter basename="/_">
           <CommandPaletteProvider>
             <SidebarProvider>
               <Toaster position="bottom-right" richColors closeButton />
