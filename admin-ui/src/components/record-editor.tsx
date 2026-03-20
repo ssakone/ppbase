@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { MoreVertical } from 'lucide-react'
@@ -58,7 +58,7 @@ export function RecordEditor({
 }: RecordEditorProps) {
   const navigate = useNavigate()
   const isEditing = !!recordId
-  const fields = getFields(collection)
+  const fields = useMemo(() => getFields(collection), [collection.id, collection.type, collection.name, collection.fields, collection.schema])
   const { data: collections } = useCollections()
   const { data: existingRecord, isLoading: isRecordLoading } = useRecord(
     collection.id,
@@ -87,6 +87,8 @@ export function RecordEditor({
 
   // Initialize form data
   useEffect(() => {
+    if (!open) return
+
     if (duplicateData) {
       setFormData({ ...duplicateData })
     } else if (isEditing && existingRecord) {
@@ -106,7 +108,7 @@ export function RecordEditor({
       }
       setFormData(data)
     }
-  }, [existingRecord, duplicateData, isEditing, fields])
+  }, [open, existingRecord, duplicateData, isEditing, fields])
 
   const handleFieldChange = (fieldName: string, value: unknown) => {
     console.log('[RecordEditor] handleFieldChange:', fieldName, value)

@@ -220,6 +220,8 @@ class RequestLogRecord(Base):
     remote_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     referer: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_body: Mapped[dict | str | None] = mapped_column(JSONB, nullable=True)
+    response_body: Mapped[dict | str | None] = mapped_column(JSONB, nullable=True)
     meta: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
