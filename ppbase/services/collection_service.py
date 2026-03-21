@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from ppbase.core.id_generator import generate_id
 from ppbase.db.schema_manager import (
@@ -370,9 +371,13 @@ async def update_collection(
     if data.system is not None:
         record.system = data.system
     if data.schema is not None:
-        record.schema = data.schema
+        import copy
+        record.schema = copy.deepcopy(data.schema)
+        flag_modified(record, "schema")
     if data.indexes is not None:
-        record.indexes = data.indexes
+        import copy
+        record.indexes = copy.deepcopy(data.indexes)
+        flag_modified(record, "indexes")
 
     # Rules: only update if explicitly provided (must use model_fields_set)
     update_payload = data.model_dump(exclude_unset=True, by_alias=False)
@@ -403,6 +408,7 @@ async def update_collection(
             record.options = _deep_merge_dicts(merged, incoming_options)
         else:
             record.options = incoming_options
+        flag_modified(record, "options")
 
     record.updated = datetime.now(timezone.utc)
 

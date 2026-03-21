@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from ppbase.core.id_generator import generate_id
 from ppbase.db.schema_manager import (
@@ -104,9 +105,13 @@ class MigrationApp:
         if "system" in changes:
             record.system = changes["system"]
         if "schema" in changes:
-            record.schema = changes["schema"]
+            import copy
+            record.schema = copy.deepcopy(changes["schema"])
+            flag_modified(record, "schema")
         if "indexes" in changes:
-            record.indexes = changes["indexes"]
+            import copy
+            record.indexes = copy.deepcopy(changes["indexes"])
+            flag_modified(record, "indexes")
         if "listRule" in changes:
             record.list_rule = changes["listRule"]
         if "viewRule" in changes:
@@ -118,7 +123,9 @@ class MigrationApp:
         if "deleteRule" in changes:
             record.delete_rule = changes["deleteRule"]
         if "options" in changes:
-            record.options = changes["options"]
+            import copy
+            record.options = copy.deepcopy(changes["options"])
+            flag_modified(record, "options")
 
         record.updated = datetime.now(timezone.utc)
         await self.session.flush()
