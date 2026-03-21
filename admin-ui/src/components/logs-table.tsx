@@ -159,6 +159,30 @@ function LogDetailSheet({ logId, onClose }: LogDetailSheetProps) {
                 mono
               />
 
+              {/* Request payload */}
+              {log.requestBody != null && (
+                <div className="mt-5">
+                  <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-400 mb-2">
+                    Request body
+                  </p>
+                  <pre className="rounded-xl bg-slate-950 text-cyan-300 p-4 text-[12px] font-mono overflow-auto leading-relaxed">
+                    {JSON.stringify(log.requestBody, null, 2)}
+                  </pre>
+                </div>
+              )}
+
+              {/* Response payload */}
+              {log.responseBody != null && (
+                <div className="mt-5">
+                  <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-400 mb-2">
+                    Response body
+                  </p>
+                  <pre className="rounded-xl bg-slate-950 text-indigo-300 p-4 text-[12px] font-mono overflow-auto leading-relaxed">
+                    {JSON.stringify(log.responseBody, null, 2)}
+                  </pre>
+                </div>
+              )}
+
               {/* Meta section */}
               {log.meta && Object.keys(log.meta).length > 0 && (
                 <div className="mt-5">

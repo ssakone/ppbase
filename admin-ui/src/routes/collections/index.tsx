@@ -14,25 +14,31 @@ export function CollectionsPage() {
   const { data: collections = [], isLoading } = useCollections()
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
-  const editId = searchParams.get('edit')
-  const [editorOpen, setEditorOpen] = useState(searchParams.get('new') === '1' || !!editId)
-  const [editingCollectionId, setEditingCollectionId] = useState<string | null>(editId)
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [editingCollectionId, setEditingCollectionId] = useState<string | null>(null)
 
   useEffect(() => {
     const id = searchParams.get('edit')
+    const isCreate = searchParams.get('new') === '1'
+
     if (id) {
       setEditingCollectionId(id)
       setEditorOpen(true)
-    } else if (searchParams.get('new') === '1') {
+      return
+    }
+
+    if (isCreate) {
       setEditingCollectionId(null)
       setEditorOpen(true)
+      return
     }
+
+    setEditingCollectionId(null)
+    setEditorOpen(false)
   }, [searchParams])
 
   const handleNewCollection = useCallback(() => {
-    setEditingCollectionId(null)
-    setEditorOpen(true)
-    setSearchParams({})
+    setSearchParams({ new: '1' })
   }, [setSearchParams])
 
   const handleEditorClose = useCallback(() => {

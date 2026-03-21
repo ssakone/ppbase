@@ -113,6 +113,8 @@ export interface LogRecord {
   remoteIp: string
   referer?: string
   userAgent?: string
+  requestBody?: Record<string, unknown> | string | null
+  responseBody?: Record<string, unknown> | string | null
   meta?: Record<string, unknown>
   created: string
   updated: string

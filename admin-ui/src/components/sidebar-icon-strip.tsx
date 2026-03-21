@@ -20,9 +20,11 @@ export function SidebarIconStrip() {
   const { logout } = useAuth()
   const { openPalette } = useCommandPalette()
 
+  const isSuperusersPage = location.pathname === '/collections/_superusers'
+
   const isActive = (section: string) => {
     if (section === 'dashboard') return location.pathname === '/dashboard'
-    if (section === 'collections') return location.pathname.startsWith('/collections')
+    if (section === 'collections') return location.pathname.startsWith('/collections') && !isSuperusersPage
     if (section === 'migrations') return location.pathname === '/migrations'
     if (section === 'logs') return location.pathname === '/logs'
     if (section === 'settings') return location.pathname === '/settings'
@@ -112,7 +114,7 @@ export function SidebarIconStrip() {
         <Tooltip>
           <TooltipTrigger asChild>
             <button
-              className={cn(btnClass, location.pathname === '/collections/_superusers' && activeClass)}
+              className={cn(btnClass, isSuperusersPage && activeClass)}
               onClick={() => handleNav('/collections/_superusers', 'collections')}
               onMouseEnter={() => prefetchRoute('records')}
               onFocus={() => prefetchRoute('records')}

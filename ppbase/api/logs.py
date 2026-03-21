@@ -32,6 +32,8 @@ def _serialize(row: RequestLogRecord) -> dict[str, Any]:
         "remoteIp": row.remote_ip or "",
         "referer": row.referer or "",
         "userAgent": row.user_agent or "",
+        "requestBody": row.request_body,
+        "responseBody": row.response_body,
         "meta": row.meta or {},
         "created": row.created.isoformat() if row.created else "",
         "updated": row.updated.isoformat() if row.updated else "",

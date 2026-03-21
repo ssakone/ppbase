@@ -46,3 +46,4 @@ htmlcov/
 # Admin UI (React build)
 admin-ui/node_modules/
 admin-ui/dist/
+ppbase/admin/dist/

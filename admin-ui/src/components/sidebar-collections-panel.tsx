@@ -53,8 +53,12 @@ export function SidebarCollectionsPanel() {
   const showPanel = location.pathname.startsWith('/collections')
   if (!showPanel) return null
 
+  const activeCollectionRef = location.pathname.startsWith('/collections/')
+    ? decodeURIComponent(location.pathname.slice('/collections/'.length))
+    : null
+
   const renderCollectionItem = (col: Collection) => {
-    const isActive = location.pathname === `/collections/${col.id}`
+    const isActive = activeCollectionRef === col.id || activeCollectionRef === col.name
     return (
       <button
         key={col.id}
