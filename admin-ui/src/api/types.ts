@@ -59,6 +59,7 @@ export interface RecordModel {
   collectionName?: string
   created: string
   updated: string
+  expand?: Record<string, unknown>
   [key: string]: unknown
 }
 

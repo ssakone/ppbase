@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useState, useCallback, useEffect, useMemo } from 'react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { Settings, RefreshCw, Plus, Code, Database, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useCollection } from '@/hooks/use-collections'
@@ -16,14 +16,27 @@ import { LoadingSpinner } from '@/components/loading-spinner'
 import { EmptyState } from '@/components/empty-state'
 import { Button } from '@/components/ui/button'
 
+function getRelationExpandFields(collectionFields: Array<{ name: string; type: string }>): string | undefined {
+  const relationNames = collectionFields
+    .filter((field) => field.type === 'relation')
+    .map((field) => field.name)
+
+  if (relationNames.length === 0) return undefined
+  return relationNames.join(',')
+}
+
 export function RecordsPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const { data: collection, isLoading: isCollectionLoading } = useCollection(id)
   const [page, setPage] = useState(1)
   const [perPage] = useState(30)
   const [filter, setFilter] = useState('')
+
+  const fields = useMemo(() => collection?.fields ?? collection?.schema ?? [], [collection])
+  const relationExpand = useMemo(() => getRelationExpandFields(fields), [fields])
 
   const {
     data: records,
@@ -31,7 +44,7 @@ export function RecordsPage() {
     isError: isRecordsError,
     error: recordsError,
     refetch,
-  } = useRecords(id, { page, perPage, filter: filter || undefined })
+  } = useRecords(id, { page, perPage, filter: filter || undefined, expand: relationExpand })
 
   // Reset filter and page when switching collections
   useEffect(() => {
@@ -51,13 +64,35 @@ export function RecordsPage() {
 
   const isView = collection?.type === 'view'
 
+  useEffect(() => {
+    if (!collection) return
+    const targetRecordId = searchParams.get('record')
+    if (!targetRecordId) return
+
+    setEditingRecordId(targetRecordId)
+    setDuplicateData(null)
+    setIsEditorOpen(true)
+
+    const next = new URLSearchParams(searchParams)
+    next.delete('record')
+    setSearchParams(next, { replace: true })
+  }, [collection, searchParams, setSearchParams])
+
   // Listen for duplicate events from record editor
   useEffect(() => {
     const handler = (e: Event) => {
-      const data = (e as CustomEvent).detail as Record<string, unknown>
-      setDuplicateData(data)
-      setEditingRecordId(null)
-      setIsEditorOpen(true)
+      const { data, closeCurrent } = (e as CustomEvent).detail as { data: Record<string, unknown>, closeCurrent?: boolean }
+      // Close current modal first if requested
+      if (closeCurrent) {
+        setIsEditorOpen(false)
+        setEditingRecordId(null)
+        setDuplicateData(null)
+      }
+      // Then open new modal with duplicate data after a short delay
+      setTimeout(() => {
+        setDuplicateData({ ...data })
+        setIsEditorOpen(true)
+      }, 100)
     }
     window.addEventListener('ppbase:duplicate-record', handler)
     return () => window.removeEventListener('ppbase:duplicate-record', handler)

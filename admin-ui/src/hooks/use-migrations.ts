@@ -5,12 +5,16 @@ import {
   applyMigrations,
   revertMigration,
   generateSnapshot,
+  type MigrationsListParams,
 } from '@/api/endpoints/migrations'
 
-export function useMigrations() {
+export function useMigrations(params: MigrationsListParams = {}) {
+  const page = params.page ?? 1
+  const perPage = params.perPage ?? 30
+
   return useQuery({
-    queryKey: ['migrations'],
-    queryFn: listMigrations,
+    queryKey: ['migrations', page, perPage],
+    queryFn: () => listMigrations({ page, perPage }),
   })
 }
 

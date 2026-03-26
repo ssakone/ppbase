@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Search, ChevronLeft, ChevronRight, Plus, MoreHorizontal } from 'lucide-react'
+import { Search, ChevronLeft, ChevronRight, Plus, MoreHorizontal, ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -20,7 +20,11 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import type { Collection, Field, RecordModel, PaginatedResult } from '@/api/types'
-import { formatCellValue } from '@/lib/format-cell'
+import {
+  formatCellValue,
+  getRelationDisplayValues,
+  getRelationRecordIds,
+} from '@/lib/format-cell'
 import { formatDate, truncateId } from '@/lib/utils'
 import { ImagePreview } from '@/components/ui/image-preview'
 import { FieldTypeBadge } from '@/components/field-type-badge'
@@ -71,6 +75,10 @@ function getSchemaFields(collection: Collection, records: RecordModel[]): Field[
   }
 
   return attachAuthSystemFields([])
+}
+
+function getRelationCollectionId(field: Field): string | undefined {
+  return field.collectionId ?? field.options?.collectionId
 }
 
 const STORAGE_PREFIX = 'ppbase_columns_'
@@ -152,12 +160,6 @@ export function RecordsTable({
   const showCreated = !hiddenColumns.has('created')
   const showUpdated = !hiddenColumns.has('updated')
 
-  // All toggleable column names
-  const allColumnNames = useMemo(
-    () => [...SYSTEM_COLUMNS, ...fields.map((f) => f.name)],
-    [fields],
-  )
-
   const hiddenCount = hiddenColumns.size
 
   // Searchable fields for plain-text → filter conversion (PocketBase-style)
@@ -170,6 +172,54 @@ export function RecordsTable({
     const normalized = normalizeSearchFilter(searchInput, searchableFields)
     onFilterChange(normalized)
   }, [searchInput, onFilterChange, searchableFields])
+
+  const openRelatedRecord = useCallback((e: React.MouseEvent, targetCollectionId: string, targetRecordId: string) => {
+    e.stopPropagation()
+    const targetUrl = `${window.location.origin}/_/collections/${encodeURIComponent(targetCollectionId)}?record=${encodeURIComponent(targetRecordId)}`
+    window.open(targetUrl, '_blank', 'noopener,noreferrer')
+  }, [])
+
+  const renderRelationCell = useCallback((record: RecordModel, field: Field) => {
+    const targetCollectionId = getRelationCollectionId(field)
+    if (!targetCollectionId) {
+      return formatCellValue(record[field.name], field)
+    }
+
+    const labels = getRelationDisplayValues(record, field.name)
+    const relationIds = getRelationRecordIds(record, field.name)
+
+    if (labels.length === 0 || relationIds.length === 0) {
+      return formatCellValue(record[field.name], field)
+    }
+
+    return (
+      <div className="flex flex-wrap items-center gap-1.5" title="Open related record in new tab">
+        {labels.map((label, idx) => {
+          const recordId = relationIds[idx]
+          if (!recordId) {
+            return (
+              <span key={`${field.name}-${idx}`} className="text-xs text-muted-foreground">
+                {label}
+              </span>
+            )
+          }
+
+          return (
+            <button
+              key={`${field.name}-${recordId}-${idx}`}
+              type="button"
+              className="inline-flex max-w-full items-center gap-1 rounded-md border border-slate-200 px-2 py-0.5 text-xs text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+              onClick={(e) => openRelatedRecord(e, targetCollectionId, recordId)}
+              title={`Open related record ${recordId}`}
+            >
+              <span className="truncate">{label}</span>
+              <ExternalLink className="h-3 w-3 shrink-0" />
+            </button>
+          )
+        })}
+      </div>
+    )
+  }, [openRelatedRecord])
 
   // +1 for the column-toggle header at the end
   const visibleColCount =
@@ -357,13 +407,15 @@ export function RecordsTable({
                     </TableCell>
                   )}
                   {visibleFields.map((f) => (
-                    <TableCell key={f.name} className="max-w-[200px] truncate">
+                    <TableCell key={f.name} className={`max-w-[260px] ${f.type === 'relation' ? 'align-top' : 'truncate'}`}>
                       {f.type === 'file' ? (
                         <ImagePreview
                           collectionId={collection.id}
                           recordId={record.id}
                           files={record[f.name] as string | string[]}
                         />
+                      ) : f.type === 'relation' ? (
+                        renderRelationCell(record, f)
                       ) : (
                         formatCellValue(record[f.name], f)
                       )}

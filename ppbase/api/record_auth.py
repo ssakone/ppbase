@@ -545,18 +545,14 @@ async def api_auth_with_password(
     collectionIdOrName: str,
     request: Request,
 ) -> JSONResponse:
-    """Authenticate a user with identity + password."""
+    """Authenticate a user with identity + password.
+
+    Supports all auth collections including _superusers.
+    """
     engine = get_engine()
     collection = await resolve_collection(engine, collectionIdOrName)
     if collection is None:
         return _error_response(404, "Missing collection context.")
-
-    # Block _superusers — they use the admin auth API
-    if collection.name == "_superusers":
-        return _error_response(
-            404,
-            "Use the admin auth endpoints for _superusers.",
-        )
 
     err = _require_auth_collection(collection)
     if err:
@@ -687,13 +683,6 @@ async def api_request_otp(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
-    # Block _superusers — they use the admin auth API
-    if collection.name == "_superusers":
-        return _error_response(
-            404,
-            "Use the admin auth endpoints for _superusers.",
-        )
-
     err = _require_auth_collection(collection)
     if err:
         return err
@@ -788,13 +777,6 @@ async def api_auth_with_otp(
     collection = await resolve_collection(engine, collectionIdOrName)
     if collection is None:
         return _error_response(404, "Missing collection context.")
-
-    # Block _superusers — they use the admin auth API
-    if collection.name == "_superusers":
-        return _error_response(
-            404,
-            "Use the admin auth endpoints for _superusers.",
-        )
 
     err = _require_auth_collection(collection)
     if err:
@@ -925,13 +907,6 @@ async def api_auth_with_oauth2(
     collection = await resolve_collection(engine, collectionIdOrName)
     if collection is None:
         return _error_response(404, "Missing collection context.")
-
-    # Block _superusers
-    if collection.name == "_superusers":
-        return _error_response(
-            404,
-            "Use the admin auth endpoints for _superusers.",
-        )
 
     err = _require_auth_collection(collection)
     if err:
