@@ -51,7 +51,7 @@ export function MigrationsTable({ migrations }: MigrationsTableProps) {
       <TableFooter>
         <TableRow>
           <TableCell colSpan={3} className="text-muted-foreground">
-            {migrations.length} migration{migrations.length !== 1 ? 's' : ''} total
+            Showing {migrations.length} migration{migrations.length !== 1 ? 's' : ''} on this page
           </TableCell>
         </TableRow>
       </TableFooter>

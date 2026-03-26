@@ -9,10 +9,11 @@ export async function listRecords(collection: string, params?: string): Promise<
   )
 }
 
-export async function getRecord(collection: string, id: string): Promise<RecordModel> {
+export async function getRecord(collection: string, id: string, params?: string): Promise<RecordModel> {
+  const query = params ? '?' + params : ''
   return apiClient.request<RecordModel>(
     'GET',
-    '/api/collections/' + encodeURIComponent(collection) + '/records/' + encodeURIComponent(id),
+    '/api/collections/' + encodeURIComponent(collection) + '/records/' + encodeURIComponent(id) + query,
   )
 }
 
@@ -65,15 +66,11 @@ export async function updateRecord(
 ): Promise<RecordModel> {
   const path = '/api/collections/' + encodeURIComponent(collection) + '/records/' + encodeURIComponent(id)
 
-  console.log('[records.ts] updateRecord:', { collection, id, hasFiles: hasFiles(data), data })
-
   if (hasFiles(data)) {
     const formData = buildFormData(data)
-    console.log('[records.ts] Sending FormData, entries:', [...formData.entries()])
     return apiClient.requestFormData<RecordModel>('PATCH', path, formData)
   }
 
-  console.log('[records.ts] Sending JSON:', data)
   return apiClient.request<RecordModel>('PATCH', path, data)
 }
 

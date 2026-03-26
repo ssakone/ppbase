@@ -18,6 +18,7 @@ export interface FieldInputProps {
   collections?: Collection[]
   recordId?: string
   collectionId?: string
+  recordExpand?: Record<string, unknown>
 }
 
 const FIELD_COMPONENTS: Record<string, React.FC<FieldInputProps>> = {

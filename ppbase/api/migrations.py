@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -60,6 +60,8 @@ def _dep_engine() -> AsyncEngine:
 @router.get("")
 async def list_migrations(
     request: Request,
+    page: int = Query(default=1, ge=1),
+    perPage: int = Query(default=30, ge=1, le=200, alias="perPage"),
     session: AsyncSession = Depends(get_session),
     _admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -98,9 +100,17 @@ async def list_migrations(
 
     items.sort(key=lambda x: x["file"])
 
+    total_items = len(items)
+    total_pages = max(1, (total_items + perPage - 1) // perPage)
+    start = (page - 1) * perPage
+    end = start + perPage
+
     return {
-        "items": items,
-        "totalItems": len(items),
+        "page": page,
+        "perPage": perPage,
+        "totalItems": total_items,
+        "totalPages": total_pages,
+        "items": items[start:end],
     }
 
 

@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { useMigrations, useMigrationStatus } from '@/hooks/use-migrations'
 import { ContentHeader } from '@/components/content-header'
 import { Breadcrumb } from '@/components/breadcrumb'
@@ -10,9 +11,19 @@ import { Button } from '@/components/ui/button'
 import { FileText, AlertCircle } from 'lucide-react'
 
 export function MigrationsPage() {
-  const { data: migrationsData, isLoading, isError, refetch } = useMigrations()
+  const [page, setPage] = useState(1)
+  const [perPage] = useState(30)
+  const { data: migrationsData, isLoading, isError, refetch } = useMigrations({ page, perPage })
   const migrations = migrationsData?.items ?? []
+  const totalPages = migrationsData?.totalPages ?? 1
+  const totalItems = migrationsData?.totalItems ?? 0
   const { data: status } = useMigrationStatus()
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [page, totalPages])
 
   return (
     <>
@@ -37,14 +48,40 @@ export function MigrationsPage() {
         ) : (
           <div className="space-y-6">
             <MigrationStatusCards status={status} />
-            {migrations.length === 0 ? (
+            {totalItems === 0 ? (
               <EmptyState
                 icon={<FileText className="h-6 w-6" />}
                 title="No migrations"
                 description="No migration files found. Generate a snapshot to create your first migration."
               />
             ) : (
-              <MigrationsTable migrations={migrations} />
+              <>
+                <MigrationsTable migrations={migrations} />
+
+                <div className="flex items-center justify-between text-sm text-muted-foreground">
+                  <span>
+                    Page {page} of {totalPages} — {totalItems} total migrations
+                  </span>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page <= 1}
+                      onClick={() => setPage((prev) => prev - 1)}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page >= totalPages}
+                      onClick={() => setPage((prev) => prev + 1)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              </>
             )}
           </div>
         )}

@@ -153,10 +153,12 @@ async def require_admin(
 ) -> dict[str, Any]:
     """Require that the request has a valid admin token.
 
+    Also accepts authRecord tokens from the _superusers collection.
+
     Raises:
         HTTPException(401): If no admin auth is present.
     """
-    if auth is None or auth.get("type") != "admin":
+    if auth is None:
         raise HTTPException(
             status_code=401,
             detail={
@@ -165,7 +167,27 @@ async def require_admin(
                 "data": {},
             },
         )
-    return auth
+
+    token_type = auth.get("type")
+
+    # Admin tokens
+    if token_type == "admin":
+        return auth
+
+    # Auth record tokens from _superusers collection are also admin-level
+    if token_type == "authRecord":
+        collection_name = auth.get("collectionName", "")
+        if collection_name == "_superusers":
+            return auth
+
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "status": 401,
+            "message": "The request requires admin authorization token to be set.",
+            "data": {},
+        },
+    )
 
 
 async def require_auth(

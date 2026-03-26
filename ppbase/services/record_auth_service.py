@@ -162,6 +162,9 @@ async def auth_with_password(
 ) -> dict[str, Any] | None:
     """Authenticate a user by identity + password.
 
+    For _superusers collection, returns an admin token (type: "admin").
+    For other auth collections, returns a record token (type: "authRecord").
+
     Returns ``{"token": ..., "record": ...}`` on success, or ``None`` on
     bad credentials.
     """
@@ -189,7 +192,21 @@ async def auth_with_password(
     if not pw_hash or not verify_password(password, pw_hash):
         return None
 
-    token = create_record_auth_token(row, collection, settings)
+    # _superusers collection uses admin tokens
+    if collection.name == "_superusers":
+        from ppbase.services.auth_service import create_admin_token
+        from ppbase.db.system_tables import SuperuserRecord
+
+        # Build a mock admin record object
+        class MockAdminRecord:
+            def __init__(self, row_dict):
+                self.id = row_dict.get("id", "")
+                self.token_key = row_dict.get("token_key", "")
+
+        mock_admin = MockAdminRecord(row)
+        token = create_admin_token(mock_admin, settings, superusers_collection=collection)
+    else:
+        token = create_record_auth_token(row, collection, settings)
 
     record = build_record_response(
         row,
@@ -392,6 +409,9 @@ async def auth_refresh(
 ) -> dict[str, Any] | None:
     """Refresh an auth token.
 
+    For _superusers collection, returns an admin token.
+    For other auth collections, returns a record token.
+
     ``token_payload`` is the decoded JWT.  We re-fetch the record to verify
     it still exists and issue a fresh token.
 
@@ -411,7 +431,20 @@ async def auth_refresh(
     if row is None:
         return None
 
-    token = create_record_auth_token(row, collection, settings)
+    # _superusers collection uses admin tokens
+    if collection.name == "_superusers":
+        from ppbase.services.auth_service import create_admin_token
+        from ppbase.db.system_tables import SuperuserRecord
+
+        class MockAdminRecord:
+            def __init__(self, row_dict):
+                self.id = row_dict.get("id", "")
+                self.token_key = row_dict.get("token_key", "")
+
+        mock_admin = MockAdminRecord(row)
+        token = create_admin_token(mock_admin, settings, superusers_collection=collection)
+    else:
+        token = create_record_auth_token(row, collection, settings)
 
     record = build_record_response(
         row,
@@ -432,20 +465,52 @@ async def impersonate_auth_record(
     *,
     duration: int | None = None,
 ) -> dict[str, Any] | None:
-    """Generate a non-refreshable auth token for an existing auth record."""
+    """Generate a non-refreshable auth token for an existing auth record.
+
+    For _superusers collection, returns an admin token.
+    """
     from ppbase.models.record import build_record_response
 
     row = await _get_raw_record_by_id(engine, collection, record_id)
     if row is None:
         return None
 
-    token = create_record_auth_token(
-        row,
-        collection,
-        settings,
-        refreshable=False,
-        duration_seconds=duration,
-    )
+    # _superusers collection uses admin tokens
+    if collection.name == "_superusers":
+        from ppbase.services.auth_service import create_admin_token
+
+        class MockAdminRecord:
+            def __init__(self, row_dict):
+                self.id = row_dict.get("id", "")
+                self.token_key = row_dict.get("token_key", "")
+
+        mock_admin = MockAdminRecord(row)
+        token = create_admin_token(
+            mock_admin,
+            settings,
+            superusers_collection=collection,
+        )
+        # Admin tokens don't support refreshable flag in the same way
+        # but we can still make it non-refreshable by setting it in payload
+        import jwt as _jwt
+        unverified = _jwt.decode(token, options={"verify_signature": False})
+        unverified["refreshable"] = False
+        # Re-sign with same secret
+        secret = mock_admin.token_key
+        from ppbase.services.auth_service import get_collection_token_config
+        auth_secret, _ = get_collection_token_config(collection, 'authToken')
+        secret += auth_secret
+        from ppbase.services.auth_service import create_token
+        token = create_token(unverified, secret, duration if duration else 1209600)
+    else:
+        token = create_record_auth_token(
+            row,
+            collection,
+            settings,
+            refreshable=False,
+            duration_seconds=duration,
+        )
+
     record = build_record_response(
         row,
         collection.id,
@@ -469,6 +534,8 @@ async def verify_record_auth_token(
 ) -> dict[str, Any] | None:
     """Fully verify a record auth JWT.
 
+    For _superusers collection, also accepts admin tokens (type: "admin").
+
     Returns the decoded payload on success, or ``None`` on failure.
     """
     import jwt as _jwt
@@ -480,8 +547,17 @@ async def verify_record_auth_token(
     except _jwt.InvalidTokenError:
         return None
 
-    if unverified.get("type") != "authRecord":
-        return None
+    token_type = unverified.get("type")
+
+    # For _superusers, accept both admin and authRecord tokens
+    if collection.name == "_superusers":
+        if token_type not in ("admin", "authRecord"):
+            return None
+    else:
+        # For other collections, only accept authRecord tokens
+        if token_type != "authRecord":
+            return None
+
     if unverified.get("collectionId") != collection.id:
         return None
 

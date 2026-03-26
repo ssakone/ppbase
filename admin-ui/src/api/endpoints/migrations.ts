@@ -1,8 +1,55 @@
 import { apiClient } from '../client'
-import type { Migration, MigrationStatus } from '../types'
+import type { Migration, PaginatedResult, MigrationStatus } from '../types'
 
-export async function listMigrations(): Promise<{ items: Migration[]; totalItems: number }> {
-  return apiClient.request<{ items: Migration[]; totalItems: number }>('GET', '/api/migrations')
+export interface MigrationsListParams {
+  page?: number
+  perPage?: number
+}
+
+type LegacyMigrationsResponse = {
+  items: Migration[]
+  totalItems: number
+}
+
+type PaginatedMigrationsResponse = PaginatedResult<Migration>
+
+function isPaginatedMigrationsResponse(
+  data: LegacyMigrationsResponse | PaginatedMigrationsResponse,
+): data is PaginatedMigrationsResponse {
+  return (
+    typeof (data as PaginatedMigrationsResponse).page === 'number'
+    && typeof (data as PaginatedMigrationsResponse).perPage === 'number'
+    && typeof (data as PaginatedMigrationsResponse).totalPages === 'number'
+  )
+}
+
+export async function listMigrations(params: MigrationsListParams = {}): Promise<PaginatedResult<Migration>> {
+  const { page = 1, perPage = 30 } = params
+  const qs = new URLSearchParams()
+  qs.set('page', String(page))
+  qs.set('perPage', String(perPage))
+
+  const data = await apiClient.request<LegacyMigrationsResponse | PaginatedMigrationsResponse>(
+    'GET',
+    `/api/migrations?${qs}`,
+  )
+
+  if (isPaginatedMigrationsResponse(data)) {
+    return data
+  }
+
+  const totalItems = data.totalItems ?? data.items.length
+  const totalPages = Math.max(1, Math.ceil(totalItems / perPage))
+  const start = (page - 1) * perPage
+  const end = start + perPage
+
+  return {
+    page,
+    perPage,
+    totalItems,
+    totalPages,
+    items: data.items.slice(start, end),
+  }
 }
 
 export async function getMigrationStatus(): Promise<MigrationStatus> {

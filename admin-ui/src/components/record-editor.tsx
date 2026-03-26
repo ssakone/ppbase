@@ -49,6 +49,12 @@ function getFields(collection: Collection): Field[] {
   return [...fields, ...missingAuthFields]
 }
 
+function getRelationExpand(fields: Field[]): string | undefined {
+  const relationNames = fields.filter((field) => field.type === 'relation').map((field) => field.name)
+  if (relationNames.length === 0) return undefined
+  return relationNames.join(',')
+}
+
 export function RecordEditor({
   open,
   onClose,
@@ -59,10 +65,12 @@ export function RecordEditor({
   const navigate = useNavigate()
   const isEditing = !!recordId
   const fields = useMemo(() => getFields(collection), [collection.id, collection.type, collection.name, collection.fields, collection.schema])
+  const relationExpand = useMemo(() => getRelationExpand(fields), [fields])
   const { data: collections } = useCollections()
   const { data: existingRecord, isLoading: isRecordLoading } = useRecord(
     collection.id,
     recordId ?? undefined,
+    { expand: relationExpand },
   )
 
   const createMutation = useCreateRecord(collection.id)
@@ -89,8 +97,14 @@ export function RecordEditor({
   useEffect(() => {
     if (!open) return
 
+    // Priority: duplicateData > existingRecord (edit) > empty (create)
     if (duplicateData) {
-      setFormData({ ...duplicateData })
+      // For duplicate, ensure all fields are present
+      const data: Record<string, unknown> = {}
+      for (const field of fields) {
+        data[field.name] = duplicateData[field.name] ?? null
+      }
+      setFormData(data)
     } else if (isEditing && existingRecord) {
       const data: Record<string, unknown> = {}
       for (const field of fields) {
@@ -209,13 +223,12 @@ export function RecordEditor({
     for (const field of fields) {
       data[field.name] = existingRecord[field.name] ?? null
     }
-    onClose()
-    // Signal parent to open with duplicate data
-    setTimeout(() => {
-      window.dispatchEvent(
-        new CustomEvent('ppbase:duplicate-record', { detail: data }),
-      )
-    }, 200)
+    // Signal parent to handle duplicate - parent will close current and open new
+    window.dispatchEvent(
+      new CustomEvent('ppbase:duplicate-record', {
+        detail: { data, closeCurrent: true }
+      }),
+    )
   }
 
   const isSaving = createMutation.isPending || updateMutation.isPending
@@ -226,10 +239,10 @@ export function RecordEditor({
   return (
     <>
       <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
-        <SheetContent className="sm:max-w-[700px] flex flex-col overflow-hidden">
+        <SheetContent className="sm:max-w-[700px] flex flex-col overflow-hidden" showCloseButton={false}>
           <SheetHeader className="shrink-0 px-6 pt-6 pb-4">
-            <div className="flex items-center justify-between pr-8">
-              <SheetTitle>{title}</SheetTitle>
+            <div className="flex items-center justify-end gap-3">
+              <SheetTitle className="flex-1">{title}</SheetTitle>
               {isEditing && existingRecord && (
                 <RecordActionsMenu
                   record={existingRecord}
@@ -306,6 +319,7 @@ export function RecordEditor({
                     collections={collections}
                     recordId={existingRecord?.id}
                     collectionId={collection.id}
+                    recordExpand={existingRecord?.expand}
                   />
                 ))}
                 {visibleFields.length === 0 && !isAuthCollection && (

@@ -12,6 +12,7 @@ interface UseRecordsParams {
   perPage?: number
   filter?: string
   sort?: string
+  expand?: string
 }
 
 function serializeParams(params?: UseRecordsParams): string | undefined {
@@ -21,21 +22,32 @@ function serializeParams(params?: UseRecordsParams): string | undefined {
   if (params.perPage) parts.push(`perPage=${params.perPage}`)
   if (params.filter) parts.push(`filter=${encodeURIComponent(params.filter)}`)
   if (params.sort) parts.push(`sort=${encodeURIComponent(params.sort)}`)
+  if (params.expand) parts.push(`expand=${encodeURIComponent(params.expand)}`)
   return parts.length > 0 ? parts.join('&') : undefined
 }
 
 export function useRecords(collectionIdOrName: string | undefined, params?: UseRecordsParams) {
+  const query = serializeParams(params)
   return useQuery({
-    queryKey: ['records', collectionIdOrName, params],
-    queryFn: () => listRecords(collectionIdOrName!, serializeParams(params)),
+    queryKey: ['records', collectionIdOrName, query],
+    queryFn: () => listRecords(collectionIdOrName!, query),
     enabled: !!collectionIdOrName,
   })
 }
 
-export function useRecord(collectionIdOrName: string | undefined, id: string | undefined) {
+interface UseRecordParams {
+  expand?: string
+}
+
+export function useRecord(
+  collectionIdOrName: string | undefined,
+  id: string | undefined,
+  params?: UseRecordParams,
+) {
+  const query = serializeParams(params)
   return useQuery({
-    queryKey: ['records', collectionIdOrName, id],
-    queryFn: () => getRecord(collectionIdOrName!, id!),
+    queryKey: ['records', collectionIdOrName, id, query],
+    queryFn: () => getRecord(collectionIdOrName!, id!, query),
     enabled: !!collectionIdOrName && !!id,
   })
 }
