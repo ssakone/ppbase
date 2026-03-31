@@ -18,10 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from ppbase.core.id_generator import generate_id
 from ppbase.db.system_tables import CollectionRecord
 from ppbase.models.field_types import (
+    _EMAIL_RE,
     FieldDefinition,
     FieldType,
     FieldValidationError,
-    _EMAIL_RE,
     validate_field_value,
 )
 from ppbase.models.record import (
@@ -31,15 +31,23 @@ from ppbase.models.record import (
 )
 from ppbase.services.filter_parser import parse_filter, parse_sort
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-_FIELD_CORE_KEYS = frozenset({
-    "id", "name", "type", "required", "system", "hidden", "presentable", "options",
-})
+_FIELD_CORE_KEYS = frozenset(
+    {
+        "id",
+        "name",
+        "type",
+        "required",
+        "system",
+        "hidden",
+        "presentable",
+        "options",
+    }
+)
 
 
 def _normalize_field(f: dict[str, Any]) -> dict[str, Any]:
@@ -148,9 +156,13 @@ def _collection_type(collection: CollectionRecord) -> str:
 
 
 # Columns from the _superusers table that must never be exposed through the API
-_SUPERUSERS_HIDDEN_COLUMNS = frozenset({
-    "password_hash", "token_key", "last_reset_sent_at",
-})
+_SUPERUSERS_HIDDEN_COLUMNS = frozenset(
+    {
+        "password_hash",
+        "token_key",
+        "last_reset_sent_at",
+    }
+)
 
 
 async def _build_relation_resolver(
@@ -252,7 +264,11 @@ async def list_records(
             for col_expr, _dir in sort_parts:
                 # col_expr is quoted like '"fieldname"' or a function like 'RANDOM()'
                 col_name = col_expr.strip('"')
-                if col_name not in valid_fields and not col_expr.endswith("()") and col_name != "ctid":
+                if (
+                    col_name not in valid_fields
+                    and not col_expr.endswith("()")
+                    and col_name != "ctid"
+                ):
                     raise ValueError(
                         f"Invalid sort field: {col_name}. "
                         f"Available fields: {', '.join(sorted(valid_fields))}."
@@ -301,7 +317,10 @@ async def list_records(
 
     # Strip sensitive columns for _superusers (backed by _admins table)
     if collection.name == "_superusers":
-        rows = [{k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS} for row in rows]
+        rows = [
+            {k: v for k, v in row.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
+            for row in rows
+        ]
 
     _type = _collection_type(collection)
     _is_auth = _type == "auth"
@@ -315,8 +334,12 @@ async def list_records(
             auth_payload = raw_auth
     items = [
         build_record_response(
-            row, collection.id, collection.name, collection.schema or [],
-            fields_filter=ff, hidden_fields=hidden,
+            row,
+            collection.id,
+            collection.name,
+            collection.schema or [],
+            fields_filter=ff,
+            hidden_fields=hidden,
             is_auth_collection=_is_auth,
             is_view_collection=_is_view,
             request_auth=auth_payload,
@@ -360,7 +383,9 @@ async def get_record(
 
     # Strip sensitive columns for _superusers (backed by _admins table)
     if collection.name == "_superusers":
-        row_dict = {k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS}
+        row_dict = {
+            k: v for k, v in row_dict.items() if k not in _SUPERUSERS_HIDDEN_COLUMNS
+        }
 
     _type = _collection_type(collection)
     _is_auth = _type == "auth"
@@ -373,8 +398,12 @@ async def get_record(
         if isinstance(raw_auth, dict):
             auth_payload = raw_auth
     return build_record_response(
-        row_dict, collection.id, collection.name, collection.schema or [],
-        fields_filter=ff, hidden_fields=hidden,
+        row_dict,
+        collection.id,
+        collection.name,
+        collection.schema or [],
+        fields_filter=ff,
+        hidden_fields=hidden,
         is_auth_collection=_is_auth,
         is_view_collection=_is_view,
         request_auth=auth_payload,
@@ -427,7 +456,7 @@ async def create_record(
     # --- Auth collection: password & system columns ---
     col_type = _collection_type(collection)
     if col_type == "auth":
-        from ppbase.services.auth_service import hash_password, generate_token_key
+        from ppbase.services.auth_service import generate_token_key, hash_password
 
         # Reject client-supplied internal columns
         data.pop("password_hash", None)
@@ -459,11 +488,17 @@ async def create_record(
         # Auth system column: email (required for auth, from data)
         email_val = data.pop("email", None)
         if email_val is None or (isinstance(email_val, str) and not email_val.strip()):
-            errors["email"] = {"code": "validation_required", "message": "Cannot be blank."}
+            errors["email"] = {
+                "code": "validation_required",
+                "message": "Cannot be blank.",
+            }
         else:
             email_str = str(email_val).strip()
             if not _EMAIL_RE.match(email_str):
-                errors["email"] = {"code": "validation_invalid_email", "message": "Must be a valid email address."}
+                errors["email"] = {
+                    "code": "validation_invalid_email",
+                    "message": "Must be a valid email address.",
+                }
             else:
                 columns["email"] = email_str
 
@@ -531,11 +566,18 @@ async def create_record(
     if col_type == "auth" and "email" in columns:
         dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email LIMIT 1'
         async with engine.connect() as conn:
-            dup = (await conn.execute(text(dup_sql), {"email": columns["email"]})).first()
+            dup = (
+                await conn.execute(text(dup_sql), {"email": columns["email"]})
+            ).first()
         if dup:
-            raise _ValidationErrors({
-                "email": {"code": "validation_not_unique", "message": "The email is already in use."}
-            })
+            raise _ValidationErrors(
+                {
+                    "email": {
+                        "code": "validation_not_unique",
+                        "message": "The email is already in use.",
+                    }
+                }
+            )
 
     # Build INSERT
     col_names = ", ".join(f'"{c}"' for c in columns)
@@ -546,11 +588,13 @@ async def create_record(
         await conn.execute(text(insert_sql), columns)
 
         # Send PostgreSQL NOTIFY for realtime updates
-        notify_payload = _json.dumps({
-            "collection": collection.name,
-            "record_id": record_id,
-            "action": "create",
-        })
+        notify_payload = _json.dumps(
+            {
+                "collection": collection.name,
+                "record_id": record_id,
+                "action": "create",
+            }
+        )
         # NOTIFY requires string literal, escape single quotes
         escaped_payload = notify_payload.replace("'", "''")
         await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
@@ -610,7 +654,7 @@ async def update_record(
     # --- Auth collection: password update handling ---
     col_type = _collection_type(collection)
     if col_type == "auth":
-        from ppbase.services.auth_service import hash_password, generate_token_key
+        from ppbase.services.auth_service import generate_token_key, hash_password
 
         # Strip internal columns from client data
         data.pop("password_hash", None)
@@ -637,12 +681,20 @@ async def update_record(
         # Handle email update with format validation
         if "email" in data:
             email_val = data.pop("email")
-            if email_val is None or (isinstance(email_val, str) and not email_val.strip()):
-                errors["email"] = {"code": "validation_required", "message": "Cannot be blank."}
+            if email_val is None or (
+                isinstance(email_val, str) and not email_val.strip()
+            ):
+                errors["email"] = {
+                    "code": "validation_required",
+                    "message": "Cannot be blank.",
+                }
             else:
                 email_str = str(email_val).strip()
                 if not _EMAIL_RE.match(email_str):
-                    errors["email"] = {"code": "validation_invalid_email", "message": "Must be a valid email address."}
+                    errors["email"] = {
+                        "code": "validation_invalid_email",
+                        "message": "Must be a valid email address.",
+                    }
                 else:
                     updates["email"] = email_str
 
@@ -656,12 +708,78 @@ async def update_record(
 
     field_map = {f.name: f for f in schema_fields}
 
-    # Process uploaded files
+    # Track file fields that need cleanup after update
+    files_to_delete: list[str] = []
+
+    def _parse_modifier_key(key: str) -> tuple[str, str | None]:
+        field_name = key
+        modifier: str | None = None
+        if key.startswith("+"):
+            modifier = "prepend"
+            field_name = key[1:]
+        elif key.endswith("+"):
+            modifier = "+"
+            field_name = key[:-1]
+        elif key.endswith("-"):
+            modifier = "-"
+            field_name = key[:-1]
+        return field_name, modifier
+
+    def _raw_file_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(v) for v in value if v]
+        if value:
+            return [str(value)]
+        return []
+
+    def _coerce_file_value(
+        field_def: FieldDefinition, values: list[str]
+    ) -> str | list[str]:
+        max_select = field_def.options.get("maxSelect", 1) or 1
+        if max_select > 1:
+            return values
+        return values[-1] if values else ""
+
+    # Build a mutable field state from the current DB row so mixed multipart
+    # operations like images + images- are applied against a single source of
+    # truth and DB/storage stay in sync.
+    field_state: dict[str, Any] = {}
+    for field_name, field_def in field_map.items():
+        if field_def.type == FieldType.AUTODATE:
+            continue
+        field_state[field_name] = raw_row.get(field_name)
+
+    # Apply plain/modifier body values first.
+    for key, value in data.items():
+        if key == "id":
+            continue
+
+        field_name, modifier = _parse_modifier_key(key)
+        field_def = field_map.get(field_name)
+        if field_def is None:
+            continue
+        if field_def.type == FieldType.AUTODATE:
+            continue
+
+        current = field_state.get(field_name)
+
+        if modifier == "+":
+            field_state[field_name] = _apply_append(current, value, field_def)
+        elif modifier == "prepend":
+            field_state[field_name] = _apply_prepend(current, value, field_def)
+        elif modifier == "-":
+            field_state[field_name] = _apply_remove(current, value, field_def)
+        else:
+            field_state[field_name] = value
+
+    # Apply uploaded files using the same modifier semantics as body fields.
     if files:
-        for field_name, file_list in files.items():
+        for raw_key, file_list in files.items():
+            field_name, modifier = _parse_modifier_key(raw_key)
             field_def = field_map.get(field_name)
             if field_def is None or field_def.type != FieldType.FILE:
                 continue
+
             upload_has_error = False
             for uploaded_name, uploaded_content in file_list:
                 try:
@@ -678,118 +796,72 @@ async def update_record(
                     upload_has_error = True
             if upload_has_error:
                 continue
+
             max_select = field_def.options.get("maxSelect", 1) or 1
             saved_names = save_files(
                 collection.id, record_id, field_name, file_list, max_select
             )
-            if max_select == 1:
-                data[field_name] = saved_names[0] if saved_names else ""
+
+            current = field_state.get(field_name)
+            if modifier == "+":
+                field_state[field_name] = _apply_append(current, saved_names, field_def)
+            elif modifier == "prepend":
+                field_state[field_name] = _apply_prepend(
+                    current, saved_names, field_def
+                )
             else:
-                # Append to existing files for multi-file
-                current = raw_row.get(field_name)
-                if isinstance(current, list):
-                    data[field_name] = current + saved_names
-                else:
-                    data[field_name] = saved_names
+                field_state[field_name] = _coerce_file_value(field_def, saved_names)
 
-    # Track file fields that need cleanup after update
-    files_to_delete: list[str] = []
-
-    # Process +/- modifiers and plain field updates
+    # Validate final field state and derive removed physical files from the
+    # final DB value instead of from intermediate mutations.
     processed_fields: set[str] = set()
-    for key, value in data.items():
-        if key == "id":
-            continue
-
-        modifier = None
-        field_name = key
-        if key.startswith("+"):
-            modifier = "prepend"
-            field_name = key[1:]
-        elif key.endswith("+"):
-            modifier = "+"
-            field_name = key[:-1]
-        elif key.endswith("-"):
-            modifier = "-"
-            field_name = key[:-1]
-
+    for field_name, value in field_state.items():
         field_def = field_map.get(field_name)
         if field_def is None:
             continue
         if field_def.type == FieldType.AUTODATE:
             continue
 
+        raw_current = raw_row.get(field_name)
+        if value == raw_current:
+            continue
+
         processed_fields.add(field_name)
 
-        if modifier == "+":
-            current = raw_row.get(field_name)
-            merged = _apply_append(current, value, field_def)
-            try:
-                validated = validate_field_value(field_def, merged)
-                updates[field_name] = _serialize_for_pg(validated, field_def)
-            except FieldValidationError as exc:
-                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+        if field_def.type == FieldType.FILE:
+            old_files = set(_raw_file_list(raw_current))
+            new_files = set(_raw_file_list(value))
+            files_to_delete.extend(old_files - new_files)
 
-        elif modifier == "prepend":
-            current = raw_row.get(field_name)
-            merged = _apply_prepend(current, value, field_def)
-            try:
-                validated = validate_field_value(field_def, merged)
-                updates[field_name] = _serialize_for_pg(validated, field_def)
-            except FieldValidationError as exc:
-                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
-
-        elif modifier == "-":
-            current = raw_row.get(field_name)
-            reduced = _apply_remove(current, value, field_def)
-            # For file fields, track the removed filenames for disk cleanup
-            if field_def.type == FieldType.FILE:
-                cur_set = set(str(v) for v in (current if isinstance(current, list) else [current]) if v)
-                new_set = set(str(v) for v in (reduced if isinstance(reduced, list) else [reduced]) if v)
-                files_to_delete.extend(cur_set - new_set)
-            try:
-                validated = validate_field_value(field_def, reduced)
-                updates[field_name] = _serialize_for_pg(validated, field_def)
-            except FieldValidationError as exc:
-                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
-
-        else:
-            # For file fields, detect removed files
-            if field_def.type == FieldType.FILE:
-                old_val = raw_row.get(field_name)
-                old_files: set[str] = set()
-                if isinstance(old_val, list):
-                    old_files = {str(v) for v in old_val if v}
-                elif old_val:
-                    old_files = {str(old_val)}
-
-                new_files: set[str] = set()
-                if isinstance(value, list):
-                    new_files = {str(v) for v in value if v}
-                elif value:
-                    new_files = {str(value)}
-
-                removed = old_files - new_files
-                files_to_delete.extend(removed)
-
-            try:
-                validated = validate_field_value(field_def, value)
-                updates[field_name] = _serialize_for_pg(validated, field_def)
-            except FieldValidationError as exc:
-                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+        try:
+            validated = validate_field_value(field_def, value)
+            updates[field_name] = _serialize_for_pg(validated, field_def)
+        except FieldValidationError as exc:
+            errors[exc.field_name] = {"code": exc.code, "message": exc.message}
 
     if errors:
         raise _ValidationErrors(errors)
 
     # Email uniqueness check for auth collections on update
     if col_type == "auth" and "email" in updates and updates["email"]:
-        dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email AND "id" != :rid LIMIT 1'
+        dup_sql = (
+            f'SELECT 1 FROM "{table}" WHERE "email" = :email AND "id" != :rid LIMIT 1'
+        )
         async with engine.connect() as conn:
-            dup = (await conn.execute(text(dup_sql), {"email": updates["email"], "rid": record_id})).first()
+            dup = (
+                await conn.execute(
+                    text(dup_sql), {"email": updates["email"], "rid": record_id}
+                )
+            ).first()
         if dup:
-            raise _ValidationErrors({
-                "email": {"code": "validation_not_unique", "message": "The email is already in use."}
-            })
+            raise _ValidationErrors(
+                {
+                    "email": {
+                        "code": "validation_not_unique",
+                        "message": "The email is already in use.",
+                    }
+                }
+            )
 
     if len(updates) <= 1:
         # Only "updated" timestamp -- nothing else changed
@@ -804,11 +876,13 @@ async def update_record(
         await conn.execute(text(update_sql), params)
 
         # Send PostgreSQL NOTIFY for realtime updates
-        notify_payload = _json.dumps({
-            "collection": collection.name,
-            "record_id": record_id,
-            "action": "update",
-        })
+        notify_payload = _json.dumps(
+            {
+                "collection": collection.name,
+                "record_id": record_id,
+                "action": "update",
+            }
+        )
         # NOTIFY requires string literal, escape single quotes
         escaped_payload = notify_payload.replace("'", "''")
         await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
@@ -925,11 +999,13 @@ async def delete_record(
         await conn.execute(text(delete_sql), {"id": record_id})
 
         # Send PostgreSQL NOTIFY for realtime updates
-        notify_payload = _json.dumps({
-            "collection": collection.name,
-            "record_id": record_id,
-            "action": "delete",
-        })
+        notify_payload = _json.dumps(
+            {
+                "collection": collection.name,
+                "record_id": record_id,
+                "action": "delete",
+            }
+        )
         # NOTIFY requires string literal, escape single quotes
         escaped_payload = notify_payload.replace("'", "''")
         await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
@@ -969,14 +1045,12 @@ async def _cascade_delete(
             if max_select > 1:
                 # Array column: find records where array contains this ID
                 find_sql = (
-                    f'SELECT "id" FROM "{other_table}" '
-                    f'WHERE :rid = ANY("{field_name}")'
+                    f'SELECT "id" FROM "{other_table}" WHERE :rid = ANY("{field_name}")'
                 )
             else:
                 # Scalar column
                 find_sql = (
-                    f'SELECT "id" FROM "{other_table}" '
-                    f'WHERE "{field_name}" = :rid'
+                    f'SELECT "id" FROM "{other_table}" WHERE "{field_name}" = :rid'
                 )
 
             async with engine.connect() as conn:
@@ -985,7 +1059,9 @@ async def _cascade_delete(
 
             for related_id in related_ids:
                 await delete_record(
-                    engine, other_coll, related_id,
+                    engine,
+                    other_coll,
+                    related_id,
                     all_collections=all_collections,
                 )
 
@@ -1017,8 +1093,7 @@ async def check_record_rule(
         relation_resolver = await _build_relation_resolver(engine, collection)
     where_sql, params = parse_filter(rule_filter, request_context, relation_resolver)
     sql = (
-        f'SELECT 1 FROM "{table}" '
-        f'WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'
+        f'SELECT 1 FROM "{table}" WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'
     )
     params["_rule_rec_id"] = record_id
     async with engine.connect() as conn:
@@ -1036,10 +1111,7 @@ async def resolve_collection(
     id_or_name: str,
 ) -> CollectionRecord | None:
     """Resolve a collection by ID or name from the _collections table."""
-    sql = text(
-        'SELECT * FROM "_collections" '
-        "WHERE id = :val OR name = :val LIMIT 1"
-    )
+    sql = text('SELECT * FROM "_collections" WHERE id = :val OR name = :val LIMIT 1')
     async with engine.connect() as conn:
         result = await conn.execute(sql, {"val": id_or_name})
         row = result.mappings().first()
