@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from ppbase import __version__
 from ppbase.config import Settings
 
 if TYPE_CHECKING:
@@ -220,7 +221,7 @@ def create_app(
 
     app = FastAPI(
         title="PPBase",
-        version="0.1.0",
+        version=__version__,
         docs_url="/api/docs" if settings.dev else None,
         redoc_url=None,
         lifespan=_lifespan,

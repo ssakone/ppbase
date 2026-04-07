@@ -131,7 +131,10 @@ export interface LogStats {
 export interface HealthStatus {
   code: number
   message: string
-  data: Record<string, unknown>
+  data: {
+    version?: string
+    [key: string]: unknown
+  }
 }
 
 export interface OAuth2ProviderConfig {

@@ -5,6 +5,7 @@ import { useCommandPalette } from '@/context/command-palette-context'
 import { cn } from '@/lib/utils'
 import { prefetchRoute } from '@/lib/route-prefetch'
 import { navigateWithTransition } from '@/lib/navigation'
+import { useHealth } from '@/hooks/use-health'
 import { LayoutGrid, GitBranch, Settings, LogOut, Activity, Users2, Home, Command } from 'lucide-react'
 import {
   Tooltip,
@@ -19,8 +20,10 @@ export function SidebarIconStrip() {
   const { setActiveSection, setSidebarOpen } = useSidebar()
   const { logout } = useAuth()
   const { openPalette } = useCommandPalette()
+  const { data: health } = useHealth()
 
   const isSuperusersPage = location.pathname === '/collections/_superusers'
+  const version = typeof health?.data?.version === 'string' ? health.data.version.trim() : ''
 
   const isActive = (section: string) => {
     if (section === 'dashboard') return location.pathname === '/dashboard'
@@ -63,6 +66,14 @@ export function SidebarIconStrip() {
             <path d="M10 22h8a4 4 0 010 8h-8v-8zm2 2v4h6a2 2 0 000-4h-6z" fill="#fff" opacity="0.6" />
           </svg>
         </button>
+        {version && (
+          <span
+            className="mb-3 text-[10px] font-medium leading-none text-slate-400"
+            title={`PPBase v${version}`}
+          >
+            v{version}
+          </span>
+        )}
 
         {/* Dashboard */}
         <Tooltip>
