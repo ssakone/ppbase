@@ -2,13 +2,34 @@
 
 Extension middleware intercepts requests to **custom routes** (routes registered via `pb.get()`, `pb.group()`, etc.). It does **not** intercept built-in PocketBase API calls — use record hooks for those.
 
+`@pb.http_middleware(...)` is a new **global FastAPI middleware** and runs on all incoming requests before route handling.
+
 ## Three levels of middleware
 
 | Level | Registration | Scope |
 |-------|-------------|-------|
+| HTTP | `@pb.http_middleware(priority=N)` | All HTTP requests (`host`-based logic, rewrite, short-circuit, maintenance mode) |
 | Global | `@pb.middleware(priority=N)` | All extension routes |
 | Group | `@group.middleware(priority=N)` | Routes in that group |
 | Route | `@pb.get("/path", middlewares=[fn])` | That route only |
+
+## HTTP middleware
+
+Use this API when you need logic before route matching (`host`-based routing, global auth, rewrites, etc.).
+
+```python
+@pb.http_middleware(priority=100)
+async def custom_domain_router(request, call_next):
+    if request.headers.get("host", "").startswith("teste.relais.dev"):
+        request.state.site = "supershop"
+        # rewrite root path to a tenant route without duplicating endpoints
+        if request.url.path == "/":
+            request.scope["path"] = "/s/supershop"
+            request.scope["raw_path"] = b"/s/supershop"
+    return await call_next()
+```
+
+`call_next()` must be awaited to continue the chain. If you return a response directly, the chain stops there.
 
 Middleware handlers receive a `RouteRequestEvent` and **must** call `await event.next()` to pass control to the next handler.
 

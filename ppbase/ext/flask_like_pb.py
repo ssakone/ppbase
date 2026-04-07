@@ -648,6 +648,40 @@ class FlaskLikePB:
     def head(self, path: str, **fastapi_kwargs: Any):
         return self.route(path, methods=["HEAD"], **fastapi_kwargs)
 
+    def _build_http_middleware_predicate(
+        self,
+        *,
+        path: str | None = None,
+        paths: Sequence[str] | None = None,
+        methods: Sequence[str] | None = None,
+        predicate: Callable[[Any], bool] | None = None,
+    ) -> Callable[[Any], bool] | None:
+        normalized_methods = _normalize_methods(methods)
+        path_patterns = _normalize_patterns(path=path, paths=paths)
+
+        if not normalized_methods and not path_patterns and predicate is None:
+            return None
+
+        def _predicate(request: Any) -> bool:
+            if normalized_methods:
+                request_method = str(getattr(request, "method", "") or "").upper()
+                if request_method not in normalized_methods:
+                    return False
+
+            if path_patterns:
+                request_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+                if not request_path.startswith("/"):
+                    request_path = f"/{request_path}"
+                if not any(_path_matches(request_path, pattern) for pattern in path_patterns):
+                    return False
+
+            if predicate is not None and not predicate(request):
+                return False
+
+            return True
+
+        return _predicate
+
     @staticmethod
     def _build_route_middleware_predicate(
         *,
@@ -747,9 +781,79 @@ class FlaskLikePB:
         )
         return func
 
+    def http_middleware(
+        self,
+        *,
+        id: str | None = None,
+        priority: int = 0,
+        path: str | None = None,
+        paths: Sequence[str] | None = None,
+        methods: Sequence[str] | None = None,
+        predicate: Callable[[Any], bool] | None = None,
+    ):
+        """Register a global HTTP middleware (fastapi-layer)."""
+        merged_predicate = self._build_http_middleware_predicate(
+            path=path,
+            paths=paths,
+            methods=methods,
+            predicate=predicate,
+        )
+
+        def decorator(func: MiddlewareHandler) -> MiddlewareHandler:
+            self._extensions.register_http_middleware(
+                func,
+                id=id,
+                priority=priority,
+                predicate=merged_predicate,
+            )
+            return func
+
+        return decorator
+
+    def http_use(
+        self,
+        func: MiddlewareHandler | None = None,
+        *,
+        id: str | None = None,
+        priority: int = 0,
+        path: str | None = None,
+        paths: Sequence[str] | None = None,
+        methods: Sequence[str] | None = None,
+        predicate: Callable[[Any], bool] | None = None,
+    ):
+        """Programmatic alias for ``@pb.http_middleware(...)`` registration."""
+        if func is None:
+            return self.http_middleware(
+                id=id,
+                priority=priority,
+                path=path,
+                paths=paths,
+                methods=methods,
+                predicate=predicate,
+            )
+
+        merged_predicate = self._build_http_middleware_predicate(
+            path=path,
+            paths=paths,
+            methods=methods,
+            predicate=predicate,
+        )
+        self._extensions.register_http_middleware(
+            func,
+            id=id,
+            priority=priority,
+            predicate=merged_predicate,
+        )
+        return func
+
     def unbind_middleware(self, id: str) -> FlaskLikePB:
         """Remove a previously registered global middleware by ID."""
         self._extensions.remove_global_middleware(id)
+        return self
+
+    def unbind_http_middleware(self, id: str) -> "FlaskLikePB":
+        """Remove a previously registered global HTTP middleware by ID."""
+        self._extensions.remove_http_middleware(id)
         return self
 
     def group(self, prefix: str) -> RouteGroup:

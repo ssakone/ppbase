@@ -231,6 +231,41 @@ def create_app(
     app.state.extension_registry = extensions
     app.state.rate_limit_settings_version = 0
 
+    if extensions is not None:
+        http_middlewares = tuple(extensions.get_http_middlewares())
+    else:
+        http_middlewares = ()
+
+    if http_middlewares:
+        import inspect
+
+        async def _invoke_handler(
+            handler: Any,
+            request: Request,
+            call_next: Any,
+        ) -> Response:
+            result = handler(request, call_next)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        @app.middleware("http")
+        async def _ppbase_http_middleware(request: Request, call_next):
+            async def _run_http(index: int) -> Response:
+                if index >= len(http_middlewares):
+                    return await call_next(request)
+
+                binding = http_middlewares[index]
+                if not binding.matches(request):
+                    return await _run_http(index + 1)
+
+                async def _next() -> Response:
+                    return await _run_http(index + 1)
+
+                return await _invoke_handler(binding.handler, request, _next)
+
+            return await _run_http(0)
+
     from ppbase.services.file_storage import set_storage_settings
 
     set_storage_settings(settings)

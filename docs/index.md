@@ -138,9 +138,12 @@ Route kwargs: `middlewares=[...]`, `unbind=["id"]`, plus any FastAPI kwargs (tag
 
 | Method | Description |
 |--------|-------------|
+| `@pb.http_middleware(priority, path, paths, methods, id, predicate)` | Global HTTP middleware (before route matching) |
 | `@pb.middleware(priority, path, paths, methods, id, predicate)` | Global extension middleware |
 | `pb.use(fn, priority, path, methods, id, predicate)` | Programmatic alias |
+| `pb.http_use(fn, priority, path, methods, id, predicate)` | Programmatic alias for `@pb.http_middleware(...)` |
 | `pb.unbind_middleware(id)` | Remove global middleware by ID |
+| `pb.unbind_http_middleware(id)` | Remove global HTTP middleware by ID |
 | `pb.request_store()` | `Depends` — access request-local store in handlers |
 
 ### Auth dependencies (FastAPI `Depends`)

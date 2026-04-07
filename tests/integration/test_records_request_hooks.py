@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from ppbase import PPBase
 from ppbase.api import records as records_api
 from ppbase.ext.registry import ExtensionRegistry, HOOK_RECORD_CREATE_REQUEST
 
@@ -126,3 +127,103 @@ async def test_record_create_hook_exception_rolls_back(monkeypatch) -> None:
 
     assert writes == 1
     assert fake_engine.last_exc_type is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_record_create_hook_can_apply_builtin_auth_middleware(monkeypatch) -> None:
+    app_pb = PPBase()
+    fake_engine = _FakeEngine()
+    called = False
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="templates_id",
+            name="templates",
+            type="base",
+            create_rule="",
+            options={},
+        )
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        return {
+            "id": "rec_auth",
+            "collectionId": "templates_id",
+            "collectionName": "templates",
+            "title": payload.get("title"),
+        }
+
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+
+    @app_pb.on_record_create_request(
+        "templates",
+        middleware=app_pb.apis.require_auth(),
+    )
+    async def _hook(event):
+        nonlocal called
+        called = True
+        return await event.next()
+
+    app = _build_records_app(app_pb._extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/api/collections/templates/records", json={"title": "blocked"})
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["message"] == "The request requires authentication."
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_record_create_hook_supports_multiple_middlewares(monkeypatch) -> None:
+    app_pb = PPBase()
+    fake_engine = _FakeEngine()
+    calls: list[str] = []
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="templates_id",
+            name="templates",
+            type="base",
+            create_rule="",
+            options={},
+        )
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        calls.append("default")
+        return {
+            "id": "rec_multi",
+            "collectionId": "templates_id",
+            "collectionName": "templates",
+            "title": payload.get("title"),
+        }
+
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+
+    async def first(event):
+        calls.append("mw:first")
+        return await event.next()
+
+    async def second(event):
+        calls.append("mw:second")
+        return await event.next()
+
+    @app_pb.on_record_create_request(
+        "templates",
+        middleware=[first, second],
+    )
+    async def _hook(event):
+        calls.append("hook")
+        return await event.next()
+
+    app = _build_records_app(app_pb._extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/api/collections/templates/records", json={"title": "ok"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "ok"
+    assert calls == ["mw:first", "mw:second", "hook", "default"]
