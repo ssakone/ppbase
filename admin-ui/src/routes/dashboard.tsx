@@ -123,7 +123,6 @@ export function DashboardPage() {
   const appName = String(settings?.meta?.appName || 'PPBase')
   const migrationFilesCount = migrationsData?.totalItems ?? 0
   const errorRatePercent = logStats?.total ? (logStats.errors / logStats.total) * 100 : 0
-  const highErrorRate = (logStats?.total ?? 0) >= 20 && errorRatePercent >= 5
   const hasPendingMigrations = (migrationStatus?.pending ?? 0) > 0
   const healthy = !healthError && health?.code === 200
 
@@ -145,14 +144,6 @@ export function DashboardPage() {
         tone: 'warn',
       })
     }
-    if (highErrorRate) {
-      values.push({
-        title: `High error rate (${errorRatePercent.toFixed(1)}%)`,
-        detail: 'Review failing requests and inspect logs.',
-        href: '/logs',
-        tone: 'danger',
-      })
-    }
     if (authCollections === 0) {
       values.push({
         title: 'No auth collection configured',
@@ -162,7 +153,7 @@ export function DashboardPage() {
       })
     }
     return values
-  }, [healthy, hasPendingMigrations, migrationStatus?.pending, highErrorRate, errorRatePercent, authCollections])
+  }, [healthy, hasPendingMigrations, migrationStatus?.pending, authCollections])
 
   const handleRefresh = async () => {
     setIsRefreshing(true)

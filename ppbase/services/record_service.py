@@ -147,51 +147,87 @@ def _collection_type(collection: CollectionRecord) -> str:
     return str(getattr(collection, "type", "base") or "base").strip().lower()
 
 
+async def _notify_record_change(
+    conn: Any,
+    collection_name: str,
+    record_id: str,
+    action: str,
+) -> None:
+    """Publish a realtime notification using a bound payload parameter."""
+    payload = _json.dumps({
+        "collection": collection_name,
+        "record_id": record_id,
+        "action": action,
+    }, separators=(",", ":"))
+    await conn.execute(
+        text("SELECT pg_notify('record_changes', :payload)"),
+        {"payload": payload},
+    )
+
+
 # Columns from the _superusers table that must never be exposed through the API
 _SUPERUSERS_HIDDEN_COLUMNS = frozenset({
     "password_hash", "token_key", "last_reset_sent_at",
 })
 
+RelationResolver = dict[str, dict[str, Any]]
+
 
 async def _build_relation_resolver(
     engine: AsyncEngine,
     collection: CollectionRecord,
-) -> dict[str, tuple[str, int]]:
-    """Map relation field names to ``(target_table_name, max_select)``.
+) -> RelationResolver:
+    """Map relation field names to recursive resolver metadata.
 
     This allows the filter parser to translate dotted paths like
-    ``author.name`` into proper ``EXISTS`` subqueries against the related
-    collection's table.
+    ``author.company.name`` into proper nested ``EXISTS`` subqueries against
+    the related collections' tables.
     """
-    schema: list[dict[str, Any]] = collection.schema or []
-    # Collect (field_name, target_collection_id, max_select)
-    targets: list[tuple[str, str, int]] = []
-    for raw in schema:
-        f = _normalize_field(raw)
-        if f.get("type") != "relation":
-            continue
-        opts = f.get("options") or {}
-        coll_id = opts.get("collectionId")
-        max_select = opts.get("maxSelect", 1) or 1
-        if coll_id:
-            targets.append((f["name"], coll_id, max_select))
+    cache: dict[str, RelationResolver] = {}
 
-    if not targets:
-        return {}
+    async def _build(
+        current: CollectionRecord,
+        active_path: set[str],
+    ) -> RelationResolver:
+        cache_key = str(current.id)
+        if cache_key in cache:
+            return cache[cache_key]
 
-    # Resolve unique collection IDs to table names in one pass
-    unique_ids = {cid for _, cid, _ in targets}
-    id_to_name: dict[str, str] = {}
-    for cid in unique_ids:
-        target = await resolve_collection(engine, cid)
-        if target is not None:
-            id_to_name[cid] = _table_name(target)
+        schema: list[dict[str, Any]] = current.schema or []
+        targets: list[tuple[str, str, int]] = []
+        for raw in schema:
+            f = _normalize_field(raw)
+            if f.get("type") != "relation":
+                continue
+            opts = f.get("options") or {}
+            coll_id = opts.get("collectionId")
+            max_select = opts.get("maxSelect", 1) or 1
+            field_name = str(f.get("name") or "")
+            if coll_id and field_name:
+                targets.append((field_name, coll_id, max_select))
 
-    resolver: dict[str, tuple[str, int]] = {}
-    for field_name, coll_id, max_select in targets:
-        if coll_id in id_to_name:
-            resolver[field_name] = (id_to_name[coll_id], max_select)
-    return resolver
+        resolver: RelationResolver = {}
+        cache[cache_key] = resolver
+
+        for field_name, coll_id, max_select in targets:
+            target = await resolve_collection(engine, coll_id)
+            if target is None:
+                continue
+
+            target_key = str(target.id)
+            nested_relations: RelationResolver = {}
+            if target_key not in active_path:
+                nested_relations = await _build(target, active_path | {target_key})
+
+            resolver[field_name] = {
+                "table": _table_name(target),
+                "max_select": max_select,
+                "relations": nested_relations,
+            }
+
+        return resolver
+
+    return await _build(collection, {str(collection.id)})
 
 
 # ---------------------------------------------------------------------------
@@ -546,14 +582,7 @@ async def create_record(
         await conn.execute(text(insert_sql), columns)
 
         # Send PostgreSQL NOTIFY for realtime updates
-        notify_payload = _json.dumps({
-            "collection": collection.name,
-            "record_id": record_id,
-            "action": "create",
-        })
-        # NOTIFY requires string literal, escape single quotes
-        escaped_payload = notify_payload.replace("'", "''")
-        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+        await _notify_record_change(conn, collection.name, record_id, "create")
 
     # Fetch and return the created record
     return (await get_record(engine, collection, record_id)) or {
@@ -804,14 +833,7 @@ async def update_record(
         await conn.execute(text(update_sql), params)
 
         # Send PostgreSQL NOTIFY for realtime updates
-        notify_payload = _json.dumps({
-            "collection": collection.name,
-            "record_id": record_id,
-            "action": "update",
-        })
-        # NOTIFY requires string literal, escape single quotes
-        escaped_payload = notify_payload.replace("'", "''")
-        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+        await _notify_record_change(conn, collection.name, record_id, "update")
 
     # Delete removed files from disk
     if files_to_delete:
@@ -925,14 +947,7 @@ async def delete_record(
         await conn.execute(text(delete_sql), {"id": record_id})
 
         # Send PostgreSQL NOTIFY for realtime updates
-        notify_payload = _json.dumps({
-            "collection": collection.name,
-            "record_id": record_id,
-            "action": "delete",
-        })
-        # NOTIFY requires string literal, escape single quotes
-        escaped_payload = notify_payload.replace("'", "''")
-        await conn.execute(text(f"NOTIFY record_changes, '{escaped_payload}'"))
+        await _notify_record_change(conn, collection.name, record_id, "delete")
 
     # Delete all associated files from disk
     delete_all_files(collection.id, record_id)

@@ -59,6 +59,8 @@ HOOK_NAMES = (
 RouteMiddlewareHandler = Callable[[RouteRequestEvent], Any]
 RouteMiddlewareInput = RouteMiddlewareHandler | HookBinding
 RouteMiddlewarePredicate = Callable[[RouteRequestEvent], bool]
+HttpMiddlewareHandler = Callable[[Any, Callable[[], Any]], Any]
+HttpMiddlewarePredicate = Callable[[Any], bool]
 
 
 @dataclass
@@ -129,6 +131,9 @@ class ExtensionRegistry:
         self._global_middlewares: dict[str, HookBinding] = {}
         self._middleware_order = 0
         self._middleware_id = 0
+        self._http_middlewares: dict[str, HookBinding] = {}
+        self._http_middleware_order = 0
+        self._http_middleware_id = 0
         self._routes: list[RouteDef] = []
         self._route_order = 0
         self._frozen = False
@@ -151,6 +156,10 @@ class ExtensionRegistry:
         self._middleware_id += 1
         return f"route_middleware:{self._middleware_id}"
 
+    def _next_http_middleware_id(self) -> str:
+        self._http_middleware_id += 1
+        return f"http_middleware:{self._http_middleware_id}"
+
     def _new_middleware_binding(
         self,
         handler: RouteMiddlewareHandler,
@@ -169,6 +178,24 @@ class ExtensionRegistry:
         self._middleware_order += 1
         return binding
 
+    def _new_http_middleware_binding(
+        self,
+        handler: HttpMiddlewareHandler,
+        *,
+        id: str | None = None,
+        priority: int = 0,
+        predicate: HttpMiddlewarePredicate | None = None,
+    ) -> HookBinding:
+        binding = HookBinding(
+            id=id or self._next_http_middleware_id(),
+            handler=handler,
+            priority=priority,
+            predicate=predicate,
+        )
+        binding.order = self._http_middleware_order
+        self._http_middleware_order += 1
+        return binding
+
     def register_middleware(
         self,
         handler: RouteMiddlewareHandler,
@@ -184,6 +211,24 @@ class ExtensionRegistry:
             priority=priority,
             predicate=predicate,
         )
+
+    def register_http_middleware(
+        self,
+        handler: HttpMiddlewareHandler,
+        *,
+        id: str | None = None,
+        priority: int = 0,
+        predicate: HttpMiddlewarePredicate | None = None,
+    ) -> str:
+        self.ensure_mutable()
+        binding = self._new_http_middleware_binding(
+            handler,
+            id=id,
+            priority=priority,
+            predicate=predicate,
+        )
+        self._http_middlewares[binding.id] = binding
+        return binding.id
 
     def add_global_middleware(
         self,
@@ -207,6 +252,10 @@ class ExtensionRegistry:
         self.ensure_mutable()
         self._global_middlewares.pop(id, None)
 
+    def remove_http_middleware(self, id: str) -> None:
+        self.ensure_mutable()
+        self._http_middlewares.pop(id, None)
+
     @staticmethod
     def _sort_middlewares(bindings: Sequence[HookBinding]) -> tuple[HookBinding, ...]:
         return tuple(sorted(bindings, key=lambda item: (-item.priority, item.order)))
@@ -227,6 +276,10 @@ class ExtensionRegistry:
                 raise TypeError("Route middleware must be callable.")
             normalized.append(self._new_middleware_binding(item))
         return tuple(normalized)
+
+    def get_http_middlewares(self) -> tuple[HookBinding, ...]:
+        """Return registered HTTP middlewares sorted by priority."""
+        return self._sort_middlewares(self._http_middlewares.values())
 
     def add_route(
         self,

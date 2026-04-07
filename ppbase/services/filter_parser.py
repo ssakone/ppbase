@@ -188,13 +188,13 @@ class _FilterTransformer(Transformer):
     def __init__(
         self,
         request_context: dict[str, Any] | None = None,
-        relation_resolver: dict[str, tuple[str, int]] | None = None,
+        relation_resolver: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         super().__init__()
         self._param_counter = 0
         self._params: dict[str, Any] = {}
         self._request_context = request_context or {}
-        # Maps relation field name → (target_table_name, max_select)
+        # Maps relation field name → recursive relation metadata.
         self._relation_resolver = relation_resolver or {}
 
     def _next_param(self, value: Any) -> str:
@@ -274,18 +274,33 @@ class _FilterTransformer(Transformer):
             parts[-1] = base_last
             modifier = maybe_modifier
 
-        # Detect relation field traversal (e.g. author.name)
+        # Detect relation field traversal (e.g. author.name, author.company.name)
         if len(parts) >= 2 and self._relation_resolver:
-            first = parts[0]
-            if first in self._relation_resolver:
-                if len(parts) > 2:
-                    raise ValueError(
-                        f"Multi-level relation traversal not yet supported: "
-                        f"{'.'.join(parts)}. Use {first}.fieldName format."
+            relation_steps: list[tuple[str, str, int]] = []
+            current_resolver = self._relation_resolver
+
+            for part in parts[:-1]:
+                info = current_resolver.get(part)
+                if not isinstance(info, dict):
+                    break
+                relation_steps.append(
+                    (
+                        _sanitize_ident(part),
+                        _sanitize_ident(str(info["table"])),
+                        int(info.get("max_select", 1) or 1),
                     )
-                traversed = _sanitize_ident(parts[1])
-                target_table, max_select = self._relation_resolver[first]
-                return ("relation_ref", first, traversed, target_table, max_select)
+                )
+                nested = info.get("relations")
+                current_resolver = nested if isinstance(nested, dict) else {}
+
+            if relation_steps:
+                leaf_parts = parts[len(relation_steps):]
+                if len(leaf_parts) != 1:
+                    raise ValueError(
+                        f"Invalid relation traversal: {'.'.join(parts)}. "
+                        "Only relation segments may be chained before the final field name."
+                    )
+                return ("relation_ref", relation_steps, _sanitize_ident(leaf_parts[0]))
 
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
@@ -305,12 +320,12 @@ class _FilterTransformer(Transformer):
         # ── Relation field traversal → generate _RelationCondition ─────
         left_is_rel = (
             isinstance(left, tuple)
-            and len(left) == 5
+            and len(left) == 3
             and left[0] == "relation_ref"
         )
         right_is_rel = (
             isinstance(right, tuple)
-            and len(right) == 5
+            and len(right) == 3
             and right[0] == "relation_ref"
         )
         if left_is_rel or right_is_rel:
@@ -511,12 +526,45 @@ class _FilterTransformer(Transformer):
     ) -> _RelationCondition | str:
         """Handle comparisons where at least one side is a relation traversal."""
 
+        def _relation_leaf_sql(steps: list[tuple[str, str, int]], leaf_field: str) -> str:
+            return f'"{steps[-1][1]}"."{leaf_field}"'
+
+        def _wrap_nested_relation_exists(
+            steps: list[tuple[str, str, int]],
+            leaf_condition: str,
+        ) -> str:
+            wrapped = leaf_condition
+            for idx in range(len(steps) - 1, -1, -1):
+                field_name, target_table, max_select = steps[idx]
+                if idx == 0:
+                    source_expr = f'"{field_name}"'
+                else:
+                    parent_table = steps[idx - 1][1]
+                    source_expr = f'"{parent_table}"."{field_name}"'
+                join_cond = (
+                    f'"{target_table}"."id" = ANY({source_expr})'
+                    if max_select > 1
+                    else f'"{target_table}"."id" = {source_expr}'
+                )
+                wrapped = (
+                    f'EXISTS (SELECT 1 FROM "{target_table}" '
+                    f'WHERE {join_cond} AND {wrapped})'
+                )
+            return wrapped
+
         # Both sides are relation refs (rare) --------------------------------
         if left_is_rel and right_is_rel:
-            l_field, l_trav, l_tbl, l_max = left[1], left[2], left[3], left[4]
-            r_field, r_trav, r_tbl, r_max = right[1], right[2], right[3], right[4]
-            l_col = f'"{l_tbl}"."{l_trav}"'
-            r_col = f'"{r_tbl}"."{r_trav}"'
+            l_steps, l_leaf = left[1], left[2]
+            r_steps, r_leaf = right[1], right[2]
+            if len(l_steps) > 1 or len(r_steps) > 1:
+                raise ValueError(
+                    "Comparisons between two nested relation traversals are not supported."
+                )
+
+            l_field, l_tbl, l_max = l_steps[0]
+            r_field, r_tbl, r_max = r_steps[0]
+            l_col = f'"{l_tbl}"."{l_leaf}"'
+            r_col = f'"{r_tbl}"."{r_leaf}"'
             l_join = (
                 f'"{l_tbl}"."id" = ANY("{l_field}")'
                 if l_max > 1
@@ -535,23 +583,27 @@ class _FilterTransformer(Transformer):
 
         # One side is a relation ref -----------------------------------------
         if left_is_rel:
-            rel_field, traversed, target, max_sel = left[1], left[2], left[3], left[4]
+            rel_steps, traversed = left[1], left[2]
             other = right
             rel_is_left = True
         else:
-            rel_field, traversed, target, max_sel = right[1], right[2], right[3], right[4]
+            rel_steps, traversed = right[1], right[2]
             other = left
             rel_is_left = False
 
-        rel_col = f'"{target}"."{traversed}"'
+        rel_col = _relation_leaf_sql(rel_steps, traversed)
         other_sql = self._operand_to_sql(other)
 
-        # JOIN condition (scalar vs array relation)
-        join_cond = (
-            f'"{target}"."id" = ANY("{rel_field}")'
-            if max_sel > 1
-            else f'"{target}"."id" = "{rel_field}"'
-        )
+        # Single-level paths keep grouped EXISTS behavior for AND clauses.
+        if len(rel_steps) == 1:
+            rel_field, target, max_sel = rel_steps[0]
+            join_cond = (
+                f'"{target}"."id" = ANY("{rel_field}")'
+                if max_sel > 1
+                else f'"{target}"."id" = "{rel_field}"'
+            )
+        else:
+            join_cond = ""
 
         # WHERE condition — mirrors operator handling of _collection_comparison
         where_cond: str
@@ -569,7 +621,9 @@ class _FilterTransformer(Transformer):
                 where_cond = f"{rel_col} {sql_op} {other_sql}"
             else:
                 where_cond = f"{other_sql} {sql_op} {rel_col}"
-            return _RelationCondition(rel_field, target, join_cond, where_cond)
+            if len(rel_steps) == 1:
+                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
+            return _wrap_nested_relation_exists(rel_steps, where_cond)
 
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
@@ -581,7 +635,9 @@ class _FilterTransformer(Transformer):
                 where_cond = f"{rel_col} {sql_op} {other_sql}"
             else:
                 where_cond = f"{other_sql} {sql_op} {rel_col}"
-            return _RelationCondition(rel_field, target, join_cond, where_cond)
+            if len(rel_steps) == 1:
+                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
+            return _wrap_nested_relation_exists(rel_steps, where_cond)
 
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
@@ -589,7 +645,9 @@ class _FilterTransformer(Transformer):
                 where_cond = f"{other_sql} {sql_op} ANY({rel_col})"
             else:
                 where_cond = f"{rel_col} {sql_op} ANY({other_sql})"
-            return _RelationCondition(rel_field, target, join_cond, where_cond)
+            if len(rel_steps) == 1:
+                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
+            return _wrap_nested_relation_exists(rel_steps, where_cond)
 
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
@@ -610,14 +668,18 @@ class _FilterTransformer(Transformer):
                     f"EXISTS (SELECT 1 FROM unnest({other_sql}) AS _elem "
                     f"WHERE _elem {sql_op} {rel_col})"
                 )
-            return _RelationCondition(rel_field, target, join_cond, where_cond)
+            if len(rel_steps) == 1:
+                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
+            return _wrap_nested_relation_exists(rel_steps, where_cond)
 
         # Fallback
         if rel_is_left:
             where_cond = f"{rel_col} = {other_sql}"
         else:
             where_cond = f"{other_sql} = {rel_col}"
-        return _RelationCondition(rel_field, target, join_cond, where_cond)
+        if len(rel_steps) == 1:
+            return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
+        return _wrap_nested_relation_exists(rel_steps, where_cond)
 
     # -- :each modifier helpers ---------------------------------------------
 
@@ -1029,7 +1091,7 @@ class _FilterTransformer(Transformer):
 def parse_filter(
     filter_str: str,
     request_context: dict[str, Any] | None = None,
-    relation_resolver: dict[str, tuple[str, int]] | None = None,
+    relation_resolver: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Parse a PocketBase filter expression into a SQL WHERE clause.
 
@@ -1038,10 +1100,10 @@ def parse_filter(
         request_context: Optional dict with ``context``, ``method``,
             ``headers``, ``auth``, ``data``, ``query`` keys
             for resolving ``@request.*`` macros.
-        relation_resolver: Optional mapping of relation field names to
-            ``(target_table_name, max_select)`` tuples.  When provided,
-            dotted field paths like ``author.name`` are resolved as relation
-            traversals and generate ``EXISTS`` subqueries.
+        relation_resolver: Optional recursive mapping of relation field names.
+            When provided, dotted field paths like ``author.company.name`` are
+            resolved as nested relation traversals and generate ``EXISTS``
+            subqueries.
 
     Returns:
         A tuple of ``(where_sql, params)`` where ``where_sql`` is a SQL
