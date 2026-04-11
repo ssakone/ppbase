@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 import { prefetchRoute } from '@/lib/route-prefetch'
 import { navigateWithTransition } from '@/lib/navigation'
 import { useHealth } from '@/hooks/use-health'
-import { LayoutGrid, GitBranch, Settings, LogOut, Activity, Users2, Home, Command } from 'lucide-react'
+import { LayoutGrid, GitBranch, Settings, LogOut, Activity, Users2, Home, Command, Zap } from 'lucide-react'
 import {
   Tooltip,
   TooltipContent,
@@ -29,6 +29,7 @@ export function SidebarIconStrip() {
     if (section === 'dashboard') return location.pathname === '/dashboard'
     if (section === 'collections') return location.pathname.startsWith('/collections') && !isSuperusersPage
     if (section === 'migrations') return location.pathname === '/migrations'
+    if (section === 'hooks') return location.pathname === '/hooks'
     if (section === 'logs') return location.pathname === '/logs'
     if (section === 'settings') return location.pathname === '/settings'
     return false
@@ -36,7 +37,7 @@ export function SidebarIconStrip() {
 
   const handleNav = (
     path: string,
-    section?: 'dashboard' | 'collections' | 'migrations' | 'logs' | 'settings',
+    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'settings',
   ) => {
     if (section) setActiveSection(section)
     setSidebarOpen(false)
@@ -149,6 +150,21 @@ export function SidebarIconStrip() {
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" className="text-sm">Migrations</TooltipContent>
+        </Tooltip>
+
+        {/* Hooks */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className={cn(btnClass, isActive('hooks') && activeClass)}
+              onClick={() => handleNav('/hooks', 'hooks')}
+              onMouseEnter={() => prefetchRoute('hooks')}
+              onFocus={() => prefetchRoute('hooks')}
+            >
+              <Zap className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-sm">Hooks</TooltipContent>
         </Tooltip>
 
         {/* Logs */}

@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     auto_migrate: bool = True
     migrations_dir: str = "./pb_migrations"
 
+    # ---- Hooks ----
+    hooks_dir: str = "./pb_hooks"
+
     # ---- Misc ----
     log_level: str = "INFO"
     max_request_body_size: int = 5_242_880  # 5 MB

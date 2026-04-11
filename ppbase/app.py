@@ -17,6 +17,7 @@ from ppbase.config import Settings
 
 if TYPE_CHECKING:
     from ppbase.ext.registry import ExtensionRegistry
+    from ppbase.services.hook_manager import HookManager
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ async def _lifespan(app: FastAPI):
     from ppbase.db.system_tables import create_system_tables
     from ppbase.ext.events import BootstrapEvent, ServeEvent, TerminateEvent
     from ppbase.ext.registry import HOOK_BOOTSTRAP, HOOK_SERVE, HOOK_TERMINATE
+    from ppbase.services.process_control import schedule_process_restart
     from ppbase.services.realtime_service import SubscriptionManager, listen_for_db_events
 
     settings: Settings = app.state.settings
@@ -179,10 +181,48 @@ async def _lifespan(app: FastAPI):
         except Exception:
             pass
 
+    # Load persisted disabled hooks state and apply to hook manager
+    hook_manager = getattr(app.state, "hook_manager", None)
+    if hook_manager is not None:
+        _hooks_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
+        async with _hooks_factory() as _hooks_session:
+            from sqlalchemy import select as _hsel
+            stmt = _hsel(ParamRecord.value).where(ParamRecord.key == "hooks_runtime")
+            hooks_runtime = (await _hooks_session.execute(stmt)).scalar_one_or_none()
+            if isinstance(hooks_runtime, dict):
+                disabled = set(hooks_runtime.get("disabled", []))
+                hook_manager.set_auto_restart_on_change(
+                    bool(hooks_runtime.get("autoRestartOnChange", False))
+                )
+                if disabled:
+                    for hook_id in disabled:
+                        hook_manager.disable_hook(hook_id)
+                    logger.info("Restored %d disabled hook(s) from settings", len(disabled))
+
     if extensions is not None:
         await extensions.hooks.get(HOOK_SERVE).trigger(
             ServeEvent(app=app, settings=settings),
         )
+
+    # Start hooks directory watcher task (polls every 2 seconds)
+    hooks_watcher_task = None
+    if hook_manager is not None:
+        async def _hooks_watcher() -> None:
+            while True:
+                await asyncio.sleep(2)
+                try:
+                    reloaded = hook_manager.rescan()
+                    if reloaded:
+                        logger.info("Hot-reloaded hook file(s): %s", ", ".join(reloaded))
+                        if hook_manager.get_auto_restart_on_change():
+                            schedule_process_restart(
+                                f"Detected hook file changes: {', '.join(reloaded)}"
+                            )
+                except Exception as exc:
+                    logger.error("Hook watcher error: %s", exc)
+
+        hooks_watcher_task = asyncio.create_task(_hooks_watcher())
+        logger.info("Started pb_hooks/ watcher task (polling every 2s)")
 
     yield
 
@@ -191,7 +231,14 @@ async def _lifespan(app: FastAPI):
             TerminateEvent(app=app, settings=settings),
         )
 
-    # Shutdown: cancel LISTEN task and dispose of the connection pool
+    # Shutdown: cancel watcher and LISTEN tasks, dispose of the connection pool
+    if hooks_watcher_task is not None:
+        hooks_watcher_task.cancel()
+        try:
+            await hooks_watcher_task
+        except asyncio.CancelledError:
+            pass
+
     logger.info("Shutting down PostgreSQL LISTEN task")
     listen_task.cancel()
     try:
@@ -206,6 +253,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     extensions: "ExtensionRegistry | None" = None,
+    hook_manager: "HookManager | None" = None,
 ) -> FastAPI:
     """Build and return the FastAPI application.
 
@@ -230,6 +278,7 @@ def create_app(
     # Attach settings to app state so dependencies can access them
     app.state.settings = settings
     app.state.extension_registry = extensions
+    app.state.hook_manager = hook_manager
     app.state.rate_limit_settings_version = 0
 
     if extensions is not None:

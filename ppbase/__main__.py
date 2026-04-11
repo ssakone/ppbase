@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import os
 import signal
 import shutil
@@ -93,6 +94,7 @@ def _start_daemon(
     data_dir: str | None = None,
     public_dir: str | None = None,
     migrations_dir: str | None = None,
+    hooks_dir: str | None = None,
     hooks: list[str] | None = None,
     automigrate: bool | None = None,
 ) -> None:
@@ -110,6 +112,8 @@ def _start_daemon(
         cmd += ["--publicDir", public_dir]
     if migrations_dir:
         cmd += ["--migrationsDir", migrations_dir]
+    if hooks_dir:
+        cmd += ["--hooksDir", hooks_dir]
     for target in hooks or []:
         cmd += ["--hooks", target]
     if automigrate is True:
@@ -150,6 +154,10 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     """Start the PPBase server (foreground or daemon)."""
     from ppbase import pb
 
+    os.environ["PPBASE_RESTART_CMD"] = json.dumps(
+        [sys.executable, "-m", "ppbase", *sys.argv[1:]]
+    )
+
     overrides: dict = {}
     if args.db:
         overrides["database_url"] = args.db
@@ -159,6 +167,8 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         overrides["public_dir"] = args.public_dir
     if args.migrations_dir:
         overrides["migrations_dir"] = args.migrations_dir
+    if getattr(args, "hooks_dir", None):
+        overrides["hooks_dir"] = args.hooks_dir
     if args.automigrate is not None:
         overrides["auto_migrate"] = args.automigrate
 
@@ -178,6 +188,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
             data_dir=args.data_dir,
             public_dir=args.public_dir,
             migrations_dir=args.migrations_dir,
+            hooks_dir=getattr(args, "hooks_dir", None),
             hooks=args.hooks,
             automigrate=args.automigrate,
         )
@@ -639,6 +650,14 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable/disable auto-migration (default: from settings)",
+    )
+    serve_parser.add_argument(
+        "--hooksDir",
+        "--hooks-dir",
+        dest="hooks_dir",
+        type=str,
+        default=None,
+        help="Directory for file-based hooks (default: ./pb_hooks).",
     )
     serve_parser.add_argument(
         "--hooks",

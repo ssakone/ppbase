@@ -3,6 +3,7 @@ export type PrefetchKey =
   | 'collections'
   | 'records'
   | 'migrations'
+  | 'hooks'
   | 'logs'
   | 'settings'
 
@@ -11,6 +12,7 @@ const prefetchLoaders: Record<PrefetchKey, () => Promise<unknown>> = {
   collections: () => import('@/routes/collections/index'),
   records: () => import('@/routes/collections/[id]'),
   migrations: () => import('@/routes/migrations'),
+  hooks: () => import('@/routes/hooks'),
   logs: () => import('@/routes/logs'),
   settings: () => import('@/routes/settings'),
 }

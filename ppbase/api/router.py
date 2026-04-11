@@ -45,6 +45,14 @@ api_router.include_router(settings_router, prefix="/settings", tags=["settings"]
 api_router.include_router(files_router, prefix="/files", tags=["files"])
 api_router.include_router(logs_router, tags=["logs"])
 
+# Hooks management router -- import gracefully.
+try:
+    from ppbase.api.hooks import router as hooks_router
+
+    api_router.include_router(hooks_router, tags=["hooks"])
+except (ImportError, AttributeError):
+    pass
+
 # Collections router -- built by another agent; import gracefully.
 # NOTE: The collections router already defines prefix="/collections" internally.
 try:

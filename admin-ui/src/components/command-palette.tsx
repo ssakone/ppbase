@@ -12,6 +12,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  Zap,
 } from 'lucide-react'
 import { useCommandPalette } from '@/context/command-palette-context'
 import { useAuth } from '@/context/auth-context'
@@ -88,6 +89,16 @@ export function CommandPalette() {
         icon: GitBranch,
         prefetch: 'migrations',
         run: go('/migrations'),
+      },
+      {
+        id: 'go-hooks',
+        label: 'Go to Hooks',
+        hint: 'Navigation',
+        group: 'Navigation',
+        keywords: ['hooks', 'plugins', 'extensions', 'pb_hooks'],
+        icon: Zap,
+        prefetch: 'hooks',
+        run: go('/hooks'),
       },
       {
         id: 'go-logs',

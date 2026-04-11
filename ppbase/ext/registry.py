@@ -319,7 +319,6 @@ class ExtensionRegistry:
         self._route_order += 1
 
     def get_hook(self, name: str) -> Hook:
-        self.ensure_mutable()
         return self.hooks.get(name)
 
     def mount_routes(self, app: FastAPI) -> None:

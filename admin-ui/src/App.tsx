@@ -49,6 +49,11 @@ const SettingsPage = lazy(async () => {
   return { default: module.SettingsPage }
 })
 
+const HooksPage = lazy(async () => {
+  const module = await import('@/routes/hooks')
+  return { default: module.HooksPage }
+})
+
 const LogsPage = lazy(async () => {
   const module = await import('@/routes/logs')
   return { default: module.LogsPage }
@@ -108,6 +113,7 @@ export default function App() {
                   <Route path="/collections" element={withSuspense(<CollectionsPage />)} />
                   <Route path="/collections/:id" element={withSuspense(<RecordsPage />)} />
                   <Route path="/migrations" element={withSuspense(<MigrationsPage />)} />
+                  <Route path="/hooks" element={withSuspense(<HooksPage />)} />
                   <Route path="/logs" element={withSuspense(<LogsPage />)} />
                   <Route path="/settings" element={withSuspense(<SettingsPage />)} />
                 </Route>

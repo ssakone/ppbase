@@ -570,9 +570,19 @@ class FlaskLikePB:
         """Build and return the FastAPI app instance."""
         if self._app is None:
             from ppbase.app import create_app
+            from ppbase.services.hook_manager import HookManager
+
+            hooks_dir = self.settings.hooks_dir
+            hook_manager = HookManager(hooks_dir, self._extensions, self)
+            hook_manager.initial_load()
+            self._hook_manager = hook_manager
 
             self._extensions.freeze()
-            self._app = create_app(self.settings, extensions=self._extensions)
+            self._app = create_app(
+                self.settings,
+                extensions=self._extensions,
+                hook_manager=hook_manager,
+            )
         return self._app
 
     def start(self, host: str | None = None, port: int | None = None) -> None:

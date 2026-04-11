@@ -153,3 +153,44 @@ export interface CollectionOAuth2Options {
   }
   providers: OAuth2ProviderConfig[]
 }
+
+export interface HookFunction {
+  hookType: string
+  bindingId: string
+  handlerName: string
+}
+
+export interface HookState {
+  id: string
+  filename: string
+  filepath: string
+  name: string
+  description: string
+  status: 'loaded' | 'error' | 'disabled' | 'unsupported_for_hot_reload'
+  enabled: boolean
+  functions: HookFunction[]
+  error: string | null
+  errorTraceback: string | null
+  lastLoaded: string | null
+  hasRoutes: boolean
+  hasHttpMiddleware: boolean
+  restartRequired: boolean
+}
+
+export interface HooksListResult {
+  items: HookState[]
+  hooksDir: string
+  runtime: HooksRuntime
+}
+
+export interface HooksRescanResult {
+  reloaded: string[]
+  items: HookState[]
+}
+
+export interface HooksRuntime {
+  disabled: string[]
+  autoRestartOnChange: boolean
+  canRestart: boolean
+  restartPending: boolean
+}
