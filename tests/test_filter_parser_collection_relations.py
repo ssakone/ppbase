@@ -95,3 +95,111 @@ def test_collection_relation_field_generates_target_exists() -> None:
     assert 'EXISTS (SELECT 1 FROM "business" WHERE "business"."id" = "business_access"."business"' in sql
     assert '"business"."owner"' in sql
     assert "ANY(" not in sql
+
+
+def test_back_relation_generates_reverse_exists() -> None:
+    sql, params = parse_filter(
+        "business_access_via_business.user ?= @request.auth.id",
+        {"auth": {"id": "user_1"}},
+        {
+            "__fields__": {"id": {"type": "text"}},
+            "business_access_via_business": {
+                "kind": "back",
+                "table": "business_access",
+                "back_field": "business",
+                "max_select": 1,
+                "relations": {
+                    "__fields__": {
+                        "user": {"type": "relation"},
+                    },
+                },
+            },
+        },
+        current_table="business",
+    )
+
+    assert params == {"_fp1": "user_1"}
+    assert 'EXISTS (SELECT 1 FROM "business_access"' in sql
+    assert '"business_access"."business" = "business"."id"' in sql
+    assert '"business_access"."user"' in sql
+    assert "ANY(" not in sql
+
+
+def test_back_relation_after_forward_relation_is_nested() -> None:
+    sql, params = parse_filter(
+        "account.business_access_via_business.user ?= @request.auth.id",
+        {"auth": {"id": "user_1"}},
+        {
+            "__fields__": {"account": {"type": "relation"}},
+            "account": {
+                "kind": "forward",
+                "field": "account",
+                "table": "business",
+                "max_select": 1,
+                "relations": {
+                    "__fields__": {"id": {"type": "text"}},
+                    "business_access_via_business": {
+                        "kind": "back",
+                        "table": "business_access",
+                        "back_field": "business",
+                        "max_select": 1,
+                        "relations": {
+                            "__fields__": {
+                                "user": {"type": "relation"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        current_table="sessions",
+    )
+
+    assert params == {"_fp1": "user_1"}
+    assert 'EXISTS (SELECT 1 FROM "business" WHERE "business"."id" = "sessions"."account"' in sql
+    assert 'EXISTS (SELECT 1 FROM "business_access" WHERE "business_access"."business" = "business"."id"' in sql
+    assert '"business_access"."user"' in sql
+
+
+def test_back_relation_can_continue_through_relation_to_json_path() -> None:
+    sql, params = parse_filter(
+        (
+            "business_access_via_business.user ?= @request.auth.id && "
+            "business_access_via_business.role.permissions.wallet.read ?= true"
+        ),
+        {"auth": {"id": "user_1"}},
+        {
+            "__fields__": {"id": {"type": "text"}},
+            "business_access_via_business": {
+                "kind": "back",
+                "table": "business_access",
+                "back_field": "business",
+                "max_select": 1,
+                "relations": {
+                    "__fields__": {
+                        "user": {"type": "relation"},
+                        "role": {"type": "relation"},
+                    },
+                    "role": {
+                        "kind": "forward",
+                        "field": "role",
+                        "table": "business_roles",
+                        "max_select": 1,
+                        "relations": {
+                            "__fields__": {
+                                "permissions": {"type": "json"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        current_table="business",
+    )
+
+    assert params == {"_fp1": "user_1"}
+    assert sql.count('EXISTS (SELECT 1 FROM "business_access"') == 1
+    assert '"business_access"."business" = "business"."id"' in sql
+    assert '"business_access"."user"' in sql
+    assert 'EXISTS (SELECT 1 FROM "business_roles" WHERE "business_roles"."id" = "business_access"."role"' in sql
+    assert 'jsonb_extract_path("business_roles"."permissions", \'wallet\', \'read\')' in sql

@@ -183,125 +183,149 @@ _SUPERUSERS_HIDDEN_COLUMNS = frozenset(
 )
 
 RelationResolver = dict[str, dict[str, Any]]
+RelationIndex = dict[str, Any]
+_RELATION_INDEX_CACHE: dict[int, tuple[tuple[tuple[str, str, str, str], ...], RelationIndex]] = {}
+
+
+def _collection_field_metadata(collection: CollectionRecord) -> dict[str, dict[str, Any]]:
+    fields: dict[str, dict[str, Any]] = {
+        "id": {"type": "text"},
+        "created": {"type": "date"},
+        "updated": {"type": "date"},
+    }
+    schema: list[dict[str, Any]] = collection.schema or []
+    for raw in schema:
+        field = _normalize_field(raw)
+        name = str(field.get("name") or "")
+        if not name:
+            continue
+        fields[name] = {
+            "type": str(field.get("type") or ""),
+            "options": field.get("options") or {},
+        }
+    return fields
+
+
+def _relation_targets(
+    collection: CollectionRecord,
+    by_id: dict[str, CollectionRecord],
+    by_name: dict[str, CollectionRecord],
+) -> list[tuple[str, CollectionRecord, int]]:
+    targets: list[tuple[str, CollectionRecord, int]] = []
+    schema: list[dict[str, Any]] = collection.schema or []
+    for raw in schema:
+        field = _normalize_field(raw)
+        if field.get("type") != "relation":
+            continue
+        field_name = str(field.get("name") or "")
+        opts = field.get("options") or {}
+        target_ref = opts.get("collectionId")
+        target = by_id.get(str(target_ref)) or by_name.get(str(target_ref))
+        if not field_name or target is None:
+            continue
+        targets.append((field_name, target, int(opts.get("maxSelect", 1) or 1)))
+    return targets
+
+
+def _relation_index_signature(
+    collections: list[CollectionRecord],
+) -> tuple[tuple[str, str, str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                str(coll.id),
+                str(coll.name),
+                str(coll.updated),
+                str(len(coll.schema or [])),
+            )
+            for coll in collections
+        )
+    )
+
+
+def _build_relation_index_from_collections(
+    collections: list[CollectionRecord],
+) -> RelationIndex:
+    """Build a flat PocketBase-style relation index.
+
+    The filter parser resolves only the path segments it actually sees.  This
+    keeps large schemas cheap: building the index is O(collections + relation
+    fields), with no recursive expansion of forward/back-relation combinations.
+    """
+    by_id = {str(coll.id): coll for coll in collections}
+    by_name = {str(coll.name): coll for coll in collections}
+
+    result: RelationIndex = {
+        "__flat__": True,
+        "collections": {},
+        "back_relations": {},
+    }
+    collections_meta: dict[str, dict[str, Any]] = result["collections"]
+    back_relations: dict[str, dict[str, dict[str, Any]]] = result["back_relations"]
+
+    for coll in collections:
+        table = _table_name(coll)
+        fields = _collection_field_metadata(coll)
+        relations: dict[str, dict[str, Any]] = {}
+        collections_meta[table] = {
+            "id": str(coll.id),
+            "table": table,
+            "fields": fields,
+            "relations": relations,
+        }
+
+    for coll in collections:
+        table = _table_name(coll)
+        relations = collections_meta[table]["relations"]
+        for field_name, target, max_select in _relation_targets(coll, by_id, by_name):
+            target_table = _table_name(target)
+            relations[field_name] = {
+                "kind": "forward",
+                "field": field_name,
+                "table": target_table,
+                "max_select": max_select,
+            }
+
+            back_key = f"{table}_via_{field_name}"
+            back_relations.setdefault(target_table, {})[back_key] = {
+                "kind": "back",
+                "table": table,
+                "back_field": field_name,
+                "max_select": max_select,
+            }
+
+    return result
+
+
+async def _build_relation_index(engine: AsyncEngine) -> RelationIndex:
+    collections = await get_all_collections(engine)
+    signature = _relation_index_signature(collections)
+    cache_key = id(engine)
+    cached = _RELATION_INDEX_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return cached[1]
+
+    index = _build_relation_index_from_collections(collections)
+    _RELATION_INDEX_CACHE[cache_key] = (signature, index)
+    return index
 
 
 async def _build_relation_resolver(
     engine: AsyncEngine,
     collection: CollectionRecord,
-) -> RelationResolver:
-    """Map relation field names to recursive resolver metadata.
-
-    This allows the filter parser to translate dotted paths like
-    ``author.company.name`` into proper nested ``EXISTS`` subqueries against
-    the related collections' tables.
-    """
-    cache: dict[str, RelationResolver] = {}
-
-    async def _build(
-        current: CollectionRecord,
-        active_path: set[str],
-    ) -> RelationResolver:
-        cache_key = str(current.id)
-        if cache_key in cache:
-            return cache[cache_key]
-
-        schema: list[dict[str, Any]] = current.schema or []
-        targets: list[tuple[str, str, int]] = []
-        for raw in schema:
-            f = _normalize_field(raw)
-            if f.get("type") != "relation":
-                continue
-            opts = f.get("options") or {}
-            coll_id = opts.get("collectionId")
-            max_select = opts.get("maxSelect", 1) or 1
-            field_name = str(f.get("name") or "")
-            if coll_id and field_name:
-                targets.append((field_name, coll_id, max_select))
-
-        resolver: RelationResolver = {}
-        cache[cache_key] = resolver
-
-        for field_name, coll_id, max_select in targets:
-            target = await resolve_collection(engine, coll_id)
-            if target is None:
-                continue
-
-            target_key = str(target.id)
-            nested_relations: RelationResolver = {}
-            if target_key not in active_path:
-                nested_relations = await _build(target, active_path | {target_key})
-
-            resolver[field_name] = {
-                "table": _table_name(target),
-                "max_select": max_select,
-                "relations": nested_relations,
-            }
-
-        return resolver
-
-    return await _build(collection, {str(collection.id)})
+) -> RelationIndex:
+    """Return the flat relation index used for lazy path resolution."""
+    return await _build_relation_index(engine)
 
 
-async def _build_collection_resolver(engine: AsyncEngine) -> dict[str, dict[str, Any]]:
+async def _build_collection_resolver(engine: AsyncEngine) -> RelationIndex:
     """Build relation metadata for ``@collection.collection.relation.field``.
 
     The filter parser is intentionally DB-agnostic, so record_service supplies
     the collection schema graph it needs to resolve relation paths inside
     ``@collection`` references.
     """
-    collections = await get_all_collections(engine)
-    by_id = {str(coll.id): coll for coll in collections}
-    by_name = {str(coll.name): coll for coll in collections}
-    cache: dict[str, RelationResolver] = {}
-
-    def _target_collection(collection_ref: Any) -> CollectionRecord | None:
-        if collection_ref is None:
-            return None
-        key = str(collection_ref)
-        return by_id.get(key) or by_name.get(key)
-
-    def _build(
-        current: CollectionRecord,
-        active_path: set[str],
-    ) -> RelationResolver:
-        cache_key = str(current.id)
-        if cache_key in cache:
-            return cache[cache_key]
-
-        resolver: RelationResolver = {}
-        cache[cache_key] = resolver
-
-        schema: list[dict[str, Any]] = current.schema or []
-        for raw in schema:
-            field = _normalize_field(raw)
-            if field.get("type") != "relation":
-                continue
-            field_name = str(field.get("name") or "")
-            opts = field.get("options") or {}
-            target = _target_collection(opts.get("collectionId"))
-            if not field_name or target is None:
-                continue
-
-            nested: RelationResolver = {}
-            target_key = str(target.id)
-            if target_key not in active_path:
-                nested = _build(target, active_path | {target_key})
-
-            resolver[field_name] = {
-                "table": _table_name(target),
-                "max_select": int(opts.get("maxSelect", 1) or 1),
-                "relations": nested,
-            }
-
-        return resolver
-
-    result: dict[str, dict[str, Any]] = {}
-    for coll in collections:
-        result[_table_name(coll)] = {
-            "table": _table_name(coll),
-            "relations": _build(coll, {str(coll.id)}),
-        }
-    return result
+    return await _build_relation_index(engine)
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +361,13 @@ async def list_records(
         # Only resolve relations when the filter contains a dotted path
         relation_resolver = None
         collection_resolver = None
+        relation_index = None
+        if "." in filter_str or "@collection." in filter_str:
+            relation_index = await _build_relation_index(engine)
         if "." in filter_str:
-            relation_resolver = await _build_relation_resolver(engine, collection)
+            relation_resolver = relation_index
         if "@collection." in filter_str:
-            collection_resolver = await _build_collection_resolver(engine)
+            collection_resolver = relation_index
         where_sql, params = parse_filter(
             filter_str,
             request_context,
@@ -1170,10 +1197,13 @@ async def check_record_rule(
     # Resolve relation fields for dotted paths in the rule
     relation_resolver = None
     collection_resolver = None
+    relation_index = None
+    if "." in rule_filter or "@collection." in rule_filter:
+        relation_index = await _build_relation_index(engine)
     if "." in rule_filter:
-        relation_resolver = await _build_relation_resolver(engine, collection)
+        relation_resolver = relation_index
     if "@collection." in rule_filter:
-        collection_resolver = await _build_collection_resolver(engine)
+        collection_resolver = relation_index
     where_sql, params = parse_filter(
         rule_filter,
         request_context,
