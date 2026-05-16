@@ -131,7 +131,7 @@ def _validate_editor(field: FieldDefinition, value: Any) -> str:
     if not val:
         return val
 
-    if max_size is not None and len(val.encode()) > int(max_size):
+    if max_size not in (None, "", 0) and len(val.encode()) > int(max_size):
         raise FieldValidationError(
             field.name,
             "validation_max_size_constraint",
@@ -478,7 +478,7 @@ def _validate_json(field: FieldDefinition, value: Any) -> Any:
 
     opts = field.options
     max_size = opts.get("maxSize")
-    if max_size is not None:
+    if max_size not in (None, "", 0):
         encoded = _json.dumps(value, separators=(",", ":"))
         if len(encoded.encode()) > int(max_size):
             raise FieldValidationError(
