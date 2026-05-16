@@ -242,6 +242,68 @@ async def _build_relation_resolver(
     return await _build(collection, {str(collection.id)})
 
 
+async def _build_collection_resolver(engine: AsyncEngine) -> dict[str, dict[str, Any]]:
+    """Build relation metadata for ``@collection.collection.relation.field``.
+
+    The filter parser is intentionally DB-agnostic, so record_service supplies
+    the collection schema graph it needs to resolve relation paths inside
+    ``@collection`` references.
+    """
+    collections = await get_all_collections(engine)
+    by_id = {str(coll.id): coll for coll in collections}
+    by_name = {str(coll.name): coll for coll in collections}
+    cache: dict[str, RelationResolver] = {}
+
+    def _target_collection(collection_ref: Any) -> CollectionRecord | None:
+        if collection_ref is None:
+            return None
+        key = str(collection_ref)
+        return by_id.get(key) or by_name.get(key)
+
+    def _build(
+        current: CollectionRecord,
+        active_path: set[str],
+    ) -> RelationResolver:
+        cache_key = str(current.id)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        resolver: RelationResolver = {}
+        cache[cache_key] = resolver
+
+        schema: list[dict[str, Any]] = current.schema or []
+        for raw in schema:
+            field = _normalize_field(raw)
+            if field.get("type") != "relation":
+                continue
+            field_name = str(field.get("name") or "")
+            opts = field.get("options") or {}
+            target = _target_collection(opts.get("collectionId"))
+            if not field_name or target is None:
+                continue
+
+            nested: RelationResolver = {}
+            target_key = str(target.id)
+            if target_key not in active_path:
+                nested = _build(target, active_path | {target_key})
+
+            resolver[field_name] = {
+                "table": _table_name(target),
+                "max_select": int(opts.get("maxSelect", 1) or 1),
+                "relations": nested,
+            }
+
+        return resolver
+
+    result: dict[str, dict[str, Any]] = {}
+    for coll in collections:
+        result[_table_name(coll)] = {
+            "table": _table_name(coll),
+            "relations": _build(coll, {str(coll.id)}),
+        }
+    return result
+
+
 # ---------------------------------------------------------------------------
 # List records
 # ---------------------------------------------------------------------------
@@ -274,9 +336,18 @@ async def list_records(
     if filter_str:
         # Only resolve relations when the filter contains a dotted path
         relation_resolver = None
+        collection_resolver = None
         if "." in filter_str:
             relation_resolver = await _build_relation_resolver(engine, collection)
-        where_sql, params = parse_filter(filter_str, request_context, relation_resolver)
+        if "@collection." in filter_str:
+            collection_resolver = await _build_collection_resolver(engine)
+        where_sql, params = parse_filter(
+            filter_str,
+            request_context,
+            relation_resolver,
+            collection_resolver,
+            table,
+        )
 
     # Build ORDER BY clause
     # View collections may lack "created" — fall back to no explicit order
@@ -1098,9 +1169,18 @@ async def check_record_rule(
     table = _table_name(collection)
     # Resolve relation fields for dotted paths in the rule
     relation_resolver = None
+    collection_resolver = None
     if "." in rule_filter:
         relation_resolver = await _build_relation_resolver(engine, collection)
-    where_sql, params = parse_filter(rule_filter, request_context, relation_resolver)
+    if "@collection." in rule_filter:
+        collection_resolver = await _build_collection_resolver(engine)
+    where_sql, params = parse_filter(
+        rule_filter,
+        request_context,
+        relation_resolver,
+        collection_resolver,
+        table,
+    )
     sql = (
         f'SELECT 1 FROM "{table}" WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'
     )
