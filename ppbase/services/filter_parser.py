@@ -10,6 +10,7 @@ SQL strings -- to prevent SQL injection.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from lark import Lark, Transformer, v_args
@@ -105,6 +106,13 @@ _ANY_LIKE_OPS = {
     "?!~": "NOT ILIKE",
 }
 
+_DATETIME_FIELD_TYPES = {"date", "autodate"}
+_SYSTEM_FIELD_TYPES = {
+    "id": "text",
+    "created": "autodate",
+    "updated": "autodate",
+}
+
 
 # ---------------------------------------------------------------------------
 # @collection condition — grouped into EXISTS subqueries
@@ -147,6 +155,7 @@ class _ResolvedPath:
     steps: list[_TraversalStep]
     sql: str
     is_json: bool = False
+    field_type: str = ""
 
 
 class _CollectionRef:
@@ -159,6 +168,7 @@ class _CollectionRef:
         "relation_steps",
         "leaf_sql",
         "leaf_is_json",
+        "leaf_type",
     )
 
     def __init__(
@@ -170,6 +180,7 @@ class _CollectionRef:
         relation_steps: list[_TraversalStep] | None = None,
         leaf_sql: str | None = None,
         leaf_is_json: bool = False,
+        leaf_type: str = "",
     ) -> None:
         self.table_name = table_name
         self.group_key = group_key
@@ -177,6 +188,7 @@ class _CollectionRef:
         self.relation_steps = relation_steps or []
         self.leaf_sql = leaf_sql
         self.leaf_is_json = leaf_is_json
+        self.leaf_type = leaf_type
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +388,106 @@ class _FilterTransformer(Transformer):
                     return info
         return None
 
+    def _field_type_for_table(self, table_name: str | None, field_name: str) -> str:
+        safe_field = _sanitize_ident(str(field_name))
+        if safe_field in _SYSTEM_FIELD_TYPES:
+            return _SYSTEM_FIELD_TYPES[safe_field]
+
+        safe_table = _sanitize_ident(str(table_name)) if table_name else ""
+        if safe_table and self._is_flat_resolver(self._relation_resolver):
+            field_info = self._flat_fields(self._relation_resolver, safe_table).get(
+                safe_field,
+            )
+            if isinstance(field_info, dict):
+                return str(field_info.get("type") or "")
+
+        fields = self._resolver_fields(self._relation_resolver)
+        field_info = fields.get(safe_field) if isinstance(fields, dict) else None
+        if isinstance(field_info, dict):
+            return str(field_info.get("type") or "")
+        return ""
+
+    def _field_type_for_collection_resolver(
+        self,
+        table_name: str,
+        field_name: str,
+    ) -> str:
+        safe_field = _sanitize_ident(str(field_name))
+        if safe_field in _SYSTEM_FIELD_TYPES:
+            return _SYSTEM_FIELD_TYPES[safe_field]
+        safe_table = _sanitize_ident(str(table_name))
+        if self._is_flat_resolver(self._collection_resolver):
+            field_info = self._flat_fields(self._collection_resolver, safe_table).get(
+                safe_field,
+            )
+        else:
+            coll_info = self._collection_resolver.get(safe_table)
+            fields = coll_info.get("fields", {}) if isinstance(coll_info, dict) else {}
+            field_info = fields.get(safe_field) if isinstance(fields, dict) else None
+        if isinstance(field_info, dict):
+            return str(field_info.get("type") or "")
+        return ""
+
+    def _literal_for_field_type(
+        self,
+        node: tuple[str, Any],
+        field_type: str,
+    ) -> tuple[str, Any]:
+        if (
+            field_type not in _DATETIME_FIELD_TYPES
+            or not isinstance(node, tuple)
+            or len(node) < 2
+            or node[0] != "literal"
+            or not isinstance(node[1], str)
+        ):
+            return node
+
+        value = node[1].strip()
+        if not value:
+            return node
+
+        normalized = value.replace("Z", "+00:00")
+        if " " in normalized and "T" not in normalized:
+            normalized = normalized.replace(" ", "T", 1)
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return node
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        else:
+            parsed = parsed.astimezone(UTC)
+        return ("literal", parsed)
+
+    def _operand_field_type(self, node: tuple[str, Any]) -> str:
+        if not isinstance(node, tuple) or len(node) < 2:
+            return ""
+        kind = node[0]
+        if kind == "field":
+            if len(node) >= 3 and node[2]:
+                return str(node[2])
+            if "." in str(node[1]):
+                return ""
+            return self._field_type_for_table(self._current_table, str(node[1]))
+        if kind == "relation_ref" and len(node) >= 5:
+            return str(node[4] or "")
+        if kind == "sql_ref" and len(node) >= 4:
+            return str(node[3] or "")
+        return ""
+
+    def _coerce_comparison_literals(
+        self,
+        left: tuple[str, Any],
+        right: tuple[str, Any],
+    ) -> tuple[tuple[str, Any], tuple[str, Any]]:
+        left_type = self._operand_field_type(left)
+        right_type = self._operand_field_type(right)
+        if left_type in _DATETIME_FIELD_TYPES:
+            right = self._literal_for_field_type(right, left_type)
+        if right_type in _DATETIME_FIELD_TYPES:
+            left = self._literal_for_field_type(left, right_type)
+        return left, right
+
     def _step_from_info(self, segment: str, info: dict[str, Any]) -> _TraversalStep:
         kind = str(info.get("kind", "forward") or "forward")
         target_table = _sanitize_ident(str(info["table"]))
@@ -427,7 +539,11 @@ class _FilterTransformer(Transformer):
 
         current_table = _sanitize_ident(start_table) if start_table else ""
         flat_resolver = relations if self._is_flat_resolver(relations) else None
-        current_relations = {} if flat_resolver else (relations if isinstance(relations, dict) else {})
+        current_relations = (
+            {}
+            if flat_resolver
+            else relations if isinstance(relations, dict) else {}
+        )
         current_fields = (
             self._flat_fields(flat_resolver, current_table)
             if flat_resolver
@@ -440,9 +556,20 @@ class _FilterTransformer(Transformer):
             part = safe_parts[idx]
 
             if idx == len(safe_parts) - 1:
+                field_info = (
+                    current_fields.get(part)
+                    if isinstance(current_fields, dict)
+                    else None
+                )
+                field_type = (
+                    str(field_info.get("type") or "")
+                    if isinstance(field_info, dict)
+                    else _SYSTEM_FIELD_TYPES.get(part, "")
+                )
                 return _ResolvedPath(
                     steps,
                     self._column_expr_for_table(current_table, part),
+                    field_type=field_type,
                 )
 
             field_info = current_fields.get(part) if isinstance(current_fields, dict) else None
@@ -455,6 +582,7 @@ class _FilterTransformer(Transformer):
                         safe_parts[idx + 1:],
                     ),
                     is_json=True,
+                    field_type="",
                 )
 
             info = (
@@ -480,6 +608,7 @@ class _FilterTransformer(Transformer):
                             current_table,
                             step.source_field or part,
                         ),
+                        field_type="relation",
                     )
 
                 steps.append(step)
@@ -534,13 +663,25 @@ class _FilterTransformer(Transformer):
                 optimize_relation_id=False,
             )
             if resolved is not None and resolved.steps:
-                return ("relation_ref", resolved.steps, resolved.sql, resolved.is_json)
+                return (
+                    "relation_ref",
+                    resolved.steps,
+                    resolved.sql,
+                    resolved.is_json,
+                    resolved.field_type,
+                )
             if resolved is not None and resolved.is_json:
-                return ("sql_ref", resolved.sql, resolved.is_json)
+                return ("sql_ref", resolved.sql, resolved.is_json, resolved.field_type)
 
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
-        return ("field", ".".join(parts))
+        field_name = ".".join(parts)
+        field_type = (
+            self._field_type_for_table(self._current_table, field_name)
+            if len(parts) == 1
+            else ""
+        )
+        return ("field", field_name, field_type)
 
     # -- Comparisons ---------------------------------------------------------
 
@@ -552,6 +693,8 @@ class _FilterTransformer(Transformer):
         right: tuple[str, Any],
     ) -> str | _CollectionCondition | _RelationCondition:
         op = str(op_token).strip()
+        if op in _STANDARD_OPS:
+            left, right = self._coerce_comparison_literals(left, right)
 
         # ── Relation field traversal → generate _RelationCondition ─────
         left_is_rel = (
@@ -703,10 +846,15 @@ class _FilterTransformer(Transformer):
         group_key = str(node[3])
 
         if len(field_path) == 1:
+            field_type = self._field_type_for_collection_resolver(
+                coll_name,
+                field_path[0],
+            )
             return _CollectionRef(
                 coll_name,
                 group_key,
                 column_sql=self._qualified_column(coll_name, field_path[0]),
+                leaf_type=field_type,
             )
 
         if self._is_flat_resolver(self._collection_resolver):
@@ -736,6 +884,7 @@ class _FilterTransformer(Transformer):
                 coll_name,
                 group_key,
                 column_sql=resolved.sql,
+                leaf_type=resolved.field_type,
             )
 
         return _CollectionRef(
@@ -744,6 +893,7 @@ class _FilterTransformer(Transformer):
             relation_steps=resolved.steps,
             leaf_sql=resolved.sql,
             leaf_is_json=resolved.is_json,
+            leaf_type=resolved.field_type,
         )
 
     def _collection_relation_leaf_sql(self, ref: _CollectionRef) -> str:
@@ -802,6 +952,8 @@ class _FilterTransformer(Transformer):
             if ref.column_sql is not None
             else self._collection_relation_leaf_sql(ref)
         )
+        if ref.leaf_type in _DATETIME_FIELD_TYPES:
+            other = self._literal_for_field_type(other, ref.leaf_type)
         other_sql = self._operand_to_sql(other)
 
         if op in _STANDARD_OPS:
@@ -1360,15 +1512,24 @@ class _FilterTransformer(Transformer):
         if name == "todayStart":
             return "(date_trunc('day', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
         if name == "todayEnd":
-            return "((date_trunc('day', TIMEZONE('UTC', NOW())) + INTERVAL '1 day' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            return (
+                "((date_trunc('day', TIMEZONE('UTC', NOW())) + INTERVAL '1 day' "
+                "- INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            )
         if name == "monthStart":
             return "(date_trunc('month', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
         if name == "monthEnd":
-            return "((date_trunc('month', TIMEZONE('UTC', NOW())) + INTERVAL '1 month' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            return (
+                "((date_trunc('month', TIMEZONE('UTC', NOW())) + INTERVAL '1 month' "
+                "- INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            )
         if name == "yearStart":
             return "(date_trunc('year', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
         if name == "yearEnd":
-            return "((date_trunc('year', TIMEZONE('UTC', NOW())) + INTERVAL '1 year' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            return (
+                "((date_trunc('year', TIMEZONE('UTC', NOW())) + INTERVAL '1 year' "
+                "- INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            )
         if name == "request.context":
             context = self._request_context.get("context", "")
             pname = self._next_param(context)
