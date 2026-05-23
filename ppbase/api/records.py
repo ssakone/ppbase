@@ -303,6 +303,78 @@ def _coerce_positive_float(value: Any, default: float) -> float:
         return default
 
 
+async def _parse_record_request_body(
+    request: Request,
+) -> tuple[
+    dict[str, Any] | None,
+    dict[str, list[tuple[str, bytes]]],
+    JSONResponse | None,
+]:
+    """Parse a record create/update body from JSON or multipart form data.
+
+    PocketBase clients send regular fields as a serialized JSON object under
+    ``@jsonPayload`` when the request also contains uploaded files.
+    """
+    content_type = request.headers.get("content-type", "")
+    data: dict[str, Any] = {}
+    files: dict[str, list[tuple[str, bytes]]] = {}
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        json_payloads: list[str] = []
+
+        for key in form.keys():
+            values = form.getlist(key)
+            if key == "@jsonPayload":
+                json_payloads.extend(
+                    str(value) for value in values if not hasattr(value, "read")
+                )
+                continue
+
+            file_values: list[tuple[str, bytes]] = []
+            str_values: list[str] = []
+            for value in values:
+                if hasattr(value, "read"):  # UploadFile
+                    content = await value.read()
+                    file_values.append((value.filename or "file", content))
+                else:
+                    str_values.append(str(value))
+
+            if file_values:
+                files[key] = file_values
+            if len(str_values) == 1:
+                data[key] = str_values[0]
+            elif str_values:
+                data[key] = str_values
+
+        for raw_payload in json_payloads:
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                return None, files, _error_response(400, "Invalid JSON body.")
+            if not isinstance(payload, dict):
+                return None, files, _error_response(
+                    400,
+                    "Request body must be a JSON object.",
+                )
+            data.update(payload)
+
+        return data, files, None
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return None, files, _error_response(400, "Invalid JSON body.")
+
+    if not isinstance(payload, dict):
+        return None, files, _error_response(
+            400,
+            "Request body must be a JSON object.",
+        )
+
+    return payload, files, None
+
+
 async def _get_batch_settings(engine: Any) -> tuple[bool, int, int, float]:
     """Return ``(enabled, max_requests, max_body_size, timeout_seconds)`` from app settings."""
     enabled = _DEFAULT_BATCH_ENABLED
@@ -990,36 +1062,10 @@ async def api_create_record(
             "Use the admin auth endpoints instead.",
         )
 
-    # Parse body - support both JSON and multipart/form-data
-    content_type = request.headers.get("content-type", "")
-    data: dict[str, Any] = {}
-    files: dict[str, list[tuple[str, bytes]]] = {}
-
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        for key in form.keys():
-            values = form.getlist(key)
-            file_values: list[tuple[str, bytes]] = []
-            str_values: list[str] = []
-            for v in values:
-                if hasattr(v, "read"):  # UploadFile
-                    content = await v.read()
-                    file_values.append((v.filename or "file", content))
-                else:
-                    str_values.append(str(v))
-            if file_values:
-                files[key] = file_values
-            elif len(str_values) == 1:
-                data[key] = str_values[0]
-            elif str_values:
-                data[key] = str_values
-    else:
-        try:
-            data = await request.json()
-        except Exception:
-            return _error_response(400, "Invalid JSON body.")
-
-    if not isinstance(data, dict):
+    data, files, parse_error = await _parse_record_request_body(request)
+    if parse_error is not None:
+        return parse_error
+    if data is None:
         return _error_response(400, "Request body must be a JSON object.")
 
     event = RecordRequestEvent(
@@ -1248,36 +1294,10 @@ async def api_update_record(
             "Use the admin auth endpoints instead.",
         )
 
-    # Parse body - support both JSON and multipart/form-data
-    content_type = request.headers.get("content-type", "")
-    data: dict[str, Any] = {}
-    files: dict[str, list[tuple[str, bytes]]] = {}
-
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        for key in form.keys():
-            values = form.getlist(key)
-            file_values: list[tuple[str, bytes]] = []
-            str_values: list[str] = []
-            for v in values:
-                if hasattr(v, "read"):  # UploadFile
-                    content = await v.read()
-                    file_values.append((v.filename or "file", content))
-                else:
-                    str_values.append(str(v))
-            if file_values:
-                files[key] = file_values
-            elif len(str_values) == 1:
-                data[key] = str_values[0]
-            elif str_values:
-                data[key] = str_values
-    else:
-        try:
-            data = await request.json()
-        except Exception:
-            return _error_response(400, "Invalid JSON body.")
-
-    if not isinstance(data, dict):
+    data, files, parse_error = await _parse_record_request_body(request)
+    if parse_error is not None:
+        return parse_error
+    if data is None:
         return _error_response(400, "Request body must be a JSON object.")
 
     event = RecordRequestEvent(

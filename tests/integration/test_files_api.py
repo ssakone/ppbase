@@ -103,6 +103,107 @@ async def test_serve_file_download_query_param_controls_content_disposition(
         )
 
 
+async def test_serve_view_file_uses_original_record_storage(
+    app_client: AsyncClient,
+    admin_token: str,
+) -> None:
+    source_collection_name = f"files_source_{uuid.uuid4().hex[:8]}"
+    view_collection_name = f"files_view_{uuid.uuid4().hex[:8]}"
+    view_collection: dict[str, object] | None = None
+
+    create_source_response = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": source_collection_name,
+            "type": "base",
+            "schema": [
+                {
+                    "name": "images",
+                    "type": "file",
+                    "required": False,
+                    "options": {"maxSelect": 5},
+                }
+            ],
+            "listRule": "",
+            "viewRule": "",
+            "createRule": "",
+            "updateRule": "",
+            "deleteRule": "",
+        },
+    )
+    assert create_source_response.status_code == 200, create_source_response.text
+    source_collection = create_source_response.json()
+
+    try:
+        create_record_response = await app_client.post(
+            f"/api/collections/{source_collection_name}/records",
+            headers={"Authorization": admin_token},
+            data={},
+            files=[("images", ("view-source.png", b"view-file-body", "image/png"))],
+        )
+        assert create_record_response.status_code == 200, create_record_response.text
+        record = create_record_response.json()
+        filenames = record.get("images")
+        assert isinstance(filenames, list)
+        stored_filename = str(filenames[0])
+
+        create_view_response = await app_client.post(
+            "/api/collections",
+            headers={"Authorization": admin_token},
+            json={
+                "name": view_collection_name,
+                "type": "view",
+                "schema": [
+                    {
+                        "name": "id",
+                        "type": "text",
+                        "required": True,
+                    },
+                    {
+                        "name": "projected_images",
+                        "type": "file",
+                        "required": False,
+                        "options": {"maxSelect": 5},
+                    },
+                ],
+                "options": {
+                    "query": (
+                        f'SELECT src.id, src.images AS projected_images '
+                        f'FROM "{source_collection_name}" src'
+                    ),
+                },
+                "listRule": "",
+                "viewRule": "",
+            },
+        )
+        assert create_view_response.status_code == 200, create_view_response.text
+        view_collection = create_view_response.json()
+
+        source_path = (
+            get_storage_path(source_collection["id"], record["id"]) / stored_filename
+        )
+        view_path = get_storage_path(view_collection["id"], record["id"]) / stored_filename
+        assert source_path.is_file()
+        assert not view_path.exists()
+
+        file_response = await app_client.get(
+            f"/api/files/{view_collection['id']}/{record['id']}/{stored_filename}"
+        )
+        assert file_response.status_code == 200, file_response.text
+        assert file_response.content == b"view-file-body"
+    finally:
+        if view_collection is not None:
+            await app_client.delete(
+                f"/api/collections/{view_collection['id']}",
+                headers={"Authorization": admin_token},
+            )
+        await app_client.delete(
+            f"/api/collections/{source_collection['id']}",
+            headers={"Authorization": admin_token},
+        )
+
+
 async def test_protected_files_require_valid_file_token(
     app_client: AsyncClient,
     admin_token: str,
