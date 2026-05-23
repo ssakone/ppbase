@@ -141,12 +141,15 @@ def _validate_editor(field: FieldDefinition, value: Any) -> str:
 
 
 def _validate_number(field: FieldDefinition, value: Any) -> int | float:
-    try:
-        val = float(value) if value is not None else 0.0
-    except (TypeError, ValueError):
-        raise FieldValidationError(
-            field.name, "validation_not_a_number", "Must be a valid number."
-        )
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        val = 0.0
+    else:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            raise FieldValidationError(
+                field.name, "validation_not_a_number", "Must be a valid number."
+            )
     if math.isnan(val) or math.isinf(val):
         raise FieldValidationError(
             field.name, "validation_not_a_number", "NaN and Inf are not allowed."
@@ -475,6 +478,20 @@ def _validate_json(field: FieldDefinition, value: Any) -> Any:
 
     if value is None:
         return None
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        first = stripped[:1]
+        may_be_json = bool(stripped) and (
+            first in ('"', "{", "[", "t", "f", "n")
+            or first.isdigit()
+            or first == "-"
+        )
+        if may_be_json:
+            try:
+                value = _json.loads(stripped)
+            except (TypeError, ValueError):
+                pass
 
     opts = field.options
     max_size = opts.get("maxSize")
