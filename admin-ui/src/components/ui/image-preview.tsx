@@ -8,7 +8,35 @@ import {
     DialogDescription,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { apiClient } from '@/api/client'
 import { cn } from '@/lib/utils'
+
+let cachedFileToken = ''
+let cachedFileTokenExpiresAt = 0
+let pendingFileToken: Promise<string> | null = null
+
+async function getFileToken(): Promise<string> {
+    const now = Date.now()
+    if (cachedFileToken && cachedFileTokenExpiresAt > now) {
+        return cachedFileToken
+    }
+    if (pendingFileToken) {
+        return pendingFileToken
+    }
+
+    pendingFileToken = apiClient
+        .request<{ token: string }>('POST', '/api/files/token')
+        .then((response) => {
+            cachedFileToken = response.token || ''
+            cachedFileTokenExpiresAt = Date.now() + 120_000
+            return cachedFileToken
+        })
+        .finally(() => {
+            pendingFileToken = null
+        })
+
+    return pendingFileToken
+}
 
 interface ImagePreviewProps {
     collectionId: string
@@ -26,13 +54,41 @@ export function ImagePreview({
     size = 'sm',
 }: ImagePreviewProps) {
     const [selectedFile, setSelectedFile] = useState<string | null>(null)
+    const [fileToken, setFileToken] = useState<string | null>(null)
 
     const fileList = Array.isArray(files) ? files : [files]
     // Filter out empty strings
     const validFiles = fileList.filter(f => !!f)
 
-    const getUrl = (filename: string) =>
-        `/api/files/${collectionId}/${recordId}/${filename}`
+    useEffect(() => {
+        let cancelled = false
+
+        getFileToken()
+            .then((token) => {
+                if (!cancelled) {
+                    setFileToken(token)
+                }
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setFileToken('')
+                }
+            })
+
+        return () => {
+            cancelled = true
+        }
+    }, [])
+
+    const getUrl = (filename: string) => {
+        const path = [
+            '/api/files',
+            encodeURIComponent(collectionId),
+            encodeURIComponent(recordId),
+            encodeURIComponent(filename),
+        ].join('/')
+        return fileToken ? `${path}?token=${encodeURIComponent(fileToken)}` : path
+    }
 
     const isImage = (filename: string) =>
         /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(filename)
@@ -89,7 +145,11 @@ export function ImagePreview({
                             setSelectedFile(file)
                         }}
                     >
-                        {isImage(file) ? (
+                        {isImage(file) && fileToken === null ? (
+                            <div className="flex h-full w-full items-center justify-center bg-secondary">
+                                <ImageIcon className="h-4 w-4 text-muted-foreground" />
+                            </div>
+                        ) : isImage(file) ? (
                             <img
                                 src={getUrl(file)}
                                 alt={file}
@@ -122,7 +182,11 @@ export function ImagePreview({
 
                             {/* Image Area - Centered */}
                             <div className="flex-1 flex items-center justify-center min-h-[200px] overflow-hidden relative group">
-                                {isImage(selectedFile) ? (
+                                {isImage(selectedFile) && fileToken === null ? (
+                                    <div className="w-[600px] h-[400px] max-w-full flex items-center justify-center bg-white rounded-t-lg shadow-2xl">
+                                        <ImageIcon className="h-16 w-16 text-slate-300" />
+                                    </div>
+                                ) : isImage(selectedFile) ? (
                                     <img
                                         src={getUrl(selectedFile)}
                                         alt={selectedFile}
@@ -133,7 +197,7 @@ export function ImagePreview({
                                         <FileIcon className="h-24 w-24 text-slate-300" />
                                         <p className="text-xl font-medium text-center break-all max-w-[80%]">{selectedFile}</p>
                                         <Button asChild size="lg">
-                                            <a href={getUrl(selectedFile)} download target="_blank" rel="noreferrer">
+                                            <a href={fileToken === null ? undefined : getUrl(selectedFile)} download target="_blank" rel="noreferrer">
                                                 <Download className="mr-2 h-5 w-5" />
                                                 Download
                                             </a>
@@ -171,7 +235,7 @@ export function ImagePreview({
                                         {selectedFile}
                                     </span>
                                     <a
-                                        href={getUrl(selectedFile)}
+                                        href={fileToken === null ? undefined : getUrl(selectedFile)}
                                         target="_blank"
                                         rel="noreferrer"
                                         className="text-slate-400 hover:text-blue-600 transition-colors shrink-0"
