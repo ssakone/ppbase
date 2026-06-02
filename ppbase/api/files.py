@@ -41,6 +41,27 @@ from ppbase.services.rule_engine import check_rule
 router = APIRouter()
 _THUMB_OPTION_PATTERN = re.compile(r"^(\d+)x(\d+)([tbf]?)$")
 _SUPPORTED_THUMB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+_QUERY_SOURCE_RE = re.compile(
+    r'\b(?:FROM|JOIN)\s+("(?P<qtable>[^"]+)"|(?P<table>[A-Za-z_][A-Za-z0-9_]*))'
+    r'(?:\s+(?:AS\s+)?("(?P<qalias>[^"]+)"|(?P<alias>[A-Za-z_][A-Za-z0-9_]*)))?',
+    re.IGNORECASE,
+)
+_SQL_KEYWORDS = {
+    "and",
+    "cross",
+    "full",
+    "group",
+    "having",
+    "inner",
+    "join",
+    "left",
+    "limit",
+    "on",
+    "order",
+    "right",
+    "union",
+    "where",
+}
 
 
 def _not_found_error() -> HTTPException:
@@ -241,6 +262,180 @@ def _normalize_file_options(field_def: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _collection_type(collection: CollectionRecord) -> str:
+    return str(getattr(collection, "type", "base") or "base").strip().lower()
+
+
+def _quote_ident(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _get_view_query(collection: CollectionRecord) -> str:
+    options = getattr(collection, "options", None) or {}
+    if not isinstance(options, dict):
+        return ""
+    return str(options.get("query") or options.get("viewQuery") or "").strip()
+
+
+def _strip_sql_comments(query: str) -> str:
+    without_block = re.sub(r"/\*.*?\*/", " ", query, flags=re.DOTALL)
+    return re.sub(r"--[^\n\r]*", " ", without_block)
+
+
+def _extract_query_sources(query: str) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    clean_query = _strip_sql_comments(query)
+
+    for match in _QUERY_SOURCE_RE.finditer(clean_query):
+        table = match.group("qtable") or match.group("table") or ""
+        alias = match.group("qalias") or match.group("alias") or table
+        if alias.lower() in _SQL_KEYWORDS:
+            alias = table
+        if table:
+            sources[table] = table
+        if alias:
+            sources[alias] = table
+
+    return sources
+
+
+def _find_top_level_from_index(query: str) -> int:
+    depth = 0
+    quote: str | None = None
+    index = 0
+    upper_query = query.upper()
+
+    while index < len(query):
+        char = query[index]
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        elif depth == 0 and upper_query.startswith("FROM", index):
+            before = query[index - 1] if index > 0 else " "
+            after_index = index + len("FROM")
+            after = query[after_index] if after_index < len(query) else " "
+            if (
+                not (before.isalnum() or before == "_")
+                and not (after.isalnum() or after == "_")
+            ):
+                return index
+        index += 1
+
+    return -1
+
+
+def _get_view_select_clause(query: str) -> str:
+    stripped = query.strip()
+    if not stripped.upper().startswith("SELECT"):
+        return ""
+    from_index = _find_top_level_from_index(stripped)
+    if from_index < 0:
+        return ""
+    return stripped[len("SELECT") : from_index]
+
+
+def _split_select_expressions(select_sql: str) -> list[str]:
+    expressions: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+
+    for index, char in enumerate(select_sql):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "(":
+            depth += 1
+            continue
+        if char == ")" and depth > 0:
+            depth -= 1
+            continue
+        if char == "," and depth == 0:
+            expressions.append(select_sql[start:index].strip())
+            start = index + 1
+
+    tail = select_sql[start:].strip()
+    if tail:
+        expressions.append(tail)
+    return expressions
+
+
+def _unquote_ident(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1].replace('""', '"')
+    return value
+
+
+def _parse_simple_column_reference(expression: str) -> tuple[str | None, str | None]:
+    expr = expression.strip()
+    match = re.match(
+        r'^(?:(?P<alias>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\.)?'
+        r'(?P<field>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)$',
+        expr,
+    )
+    if match is None:
+        return None, None
+    alias = match.group("alias")
+    field = match.group("field")
+    return (_unquote_ident(alias) if alias else None, _unquote_ident(field))
+
+
+def _view_file_source_hint(
+    collection: CollectionRecord,
+    file_field_name: str,
+) -> tuple[str | None, str]:
+    query = _get_view_query(collection)
+    if not query:
+        return None, file_field_name
+
+    clean_query = _strip_sql_comments(query)
+    select_sql = _get_view_select_clause(clean_query)
+    if not select_sql:
+        return None, file_field_name
+
+    sources = _extract_query_sources(clean_query)
+
+    for expression in _split_select_expressions(select_sql):
+        alias_match = re.search(
+            r'\s+AS\s+("(?P<qas>[^"]+)"|(?P<as>[A-Za-z_][A-Za-z0-9_]*))\s*$',
+            expression,
+            flags=re.IGNORECASE,
+        )
+        if alias_match:
+            output_name = alias_match.group("qas") or alias_match.group("as") or ""
+            source_expr = expression[: alias_match.start()].strip()
+        else:
+            source_expr = expression.strip()
+            _source_alias, source_field = _parse_simple_column_reference(source_expr)
+            output_name = source_field or ""
+
+        if output_name != file_field_name:
+            continue
+
+        source_alias, source_field = _parse_simple_column_reference(source_expr)
+        if not source_field:
+            continue
+        source_table = sources.get(source_alias or "")
+        return source_table, source_field
+
+    return None, file_field_name
+
+
 def _field_contains_filename(field_value: Any, filename: str) -> bool:
     target = str(filename)
     if isinstance(field_value, list):
@@ -265,6 +460,62 @@ def _find_file_field_for_filename(
             continue
         options = _normalize_file_options(field_def)
         return field_def, bool(options.get("protected", False))
+    return None
+
+
+async def _resolve_view_file_storage_context(
+    session: AsyncSession,
+    collection: CollectionRecord,
+    file_field_name: str,
+    filename: str,
+) -> tuple[str, str] | None:
+    """Return ``(collection_id, record_id)`` for files projected by a view."""
+    if _collection_type(collection) != "view":
+        return None
+
+    source_table, source_field_name = _view_file_source_hint(collection, file_field_name)
+    query_sources = set(_extract_query_sources(_get_view_query(collection)).values())
+
+    stmt = select(CollectionRecord).where(CollectionRecord.type != "view")
+    if source_table:
+        stmt = stmt.where(CollectionRecord.name == source_table)
+    elif query_sources:
+        stmt = stmt.where(CollectionRecord.name.in_(query_sources))
+
+    candidates = (await session.execute(stmt)).scalars().all()
+    for candidate in candidates:
+        for field_def in candidate.schema or []:
+            if not isinstance(field_def, dict):
+                continue
+            if field_def.get("type") != "file":
+                continue
+            field_name = str(field_def.get("name", "") or "")
+            if field_name != source_field_name:
+                continue
+
+            options = _normalize_file_options(field_def)
+            max_select = options.get("maxSelect", 1) or 1
+            table_name = _quote_ident(candidate.name)
+            column_name = _quote_ident(field_name)
+            if max_select > 1:
+                query = text(
+                    f"SELECT id FROM {table_name} "
+                    f"WHERE :filename = ANY({column_name}) LIMIT 1"
+                )
+            else:
+                query = text(
+                    f"SELECT id FROM {table_name} "
+                    f"WHERE {column_name} = :filename LIMIT 1"
+                )
+
+            try:
+                result = await session.execute(query, {"filename": filename})
+            except Exception:
+                continue
+            row = result.mappings().first()
+            if row is not None:
+                return candidate.id, str(row.get("id") or "")
+
     return None
 
 
@@ -616,19 +867,37 @@ async def serve_file(
 
     thumb_option = _parse_thumb_option(request)
     storage_backend = get_storage_backend()
+    storage_collection_id = collection.id
+    storage_record_id = record_id
 
-    source_path = get_storage_path(collection.id, record_id) / filename
+    view_storage_context = await _resolve_view_file_storage_context(
+        session,
+        collection,
+        str(field_def.get("name", "") or ""),
+        filename,
+    )
+    if view_storage_context is not None:
+        storage_collection_id, storage_record_id = view_storage_context
+
+    source_path = (
+        get_storage_path(storage_collection_id, storage_record_id) / filename
+    )
     served_file_path: Path | None = None
     if storage_backend != "s3":
         if not source_path.is_file():
             raise _not_found_error()
         served_file_path = (
-            _resolve_thumb_path(source_path, filename, field_def, thumb_option) or source_path
+            _resolve_thumb_path(source_path, filename, field_def, thumb_option)
+            or source_path
         )
 
     source_bytes: bytes | None = None
     if served_file_path is None:
-        source_bytes = read_file_bytes(collection.id, record_id, filename)
+        source_bytes = read_file_bytes(
+            storage_collection_id,
+            storage_record_id,
+            filename,
+        )
         if source_bytes is None:
             raise _not_found_error()
 
@@ -673,7 +942,11 @@ async def serve_file(
 
     effective_filename = str(event.filename or filename).strip() or filename
     if source_bytes is None:
-        source_bytes = read_file_bytes(collection.id, record_id, effective_filename)
+        source_bytes = read_file_bytes(
+            storage_collection_id,
+            storage_record_id,
+            effective_filename,
+        )
     if source_bytes is None:
         raise _not_found_error()
 

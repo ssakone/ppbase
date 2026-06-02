@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,11 @@ from httpx import ASGITransport, AsyncClient
 
 from ppbase import PPBase
 from ppbase.api import records as records_api
-from ppbase.ext.registry import ExtensionRegistry, HOOK_RECORD_CREATE_REQUEST
+from ppbase.ext.registry import (
+    ExtensionRegistry,
+    HOOK_RECORD_CREATE_REQUEST,
+    HOOK_RECORD_UPDATE_REQUEST,
+)
 
 
 class _FakeBeginContext:
@@ -80,6 +85,120 @@ async def test_record_create_hook_can_mutate_payload(monkeypatch) -> None:
     assert response.status_code == 200, response.text
     assert response.json()["title"] == "set-by-hook"
     assert created_payloads and created_payloads[0]["title"] == "set-by-hook"
+
+
+@pytest.mark.asyncio
+async def test_record_create_route_decodes_multipart_json_payload(monkeypatch) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    created_payloads: list[dict[str, object]] = []
+    created_files: list[dict[str, list[tuple[str, bytes]]]] = []
+    hook_payloads: list[dict[str, object]] = []
+
+    async def _capture_hook(e):
+        hook_payloads.append(dict(e.data))
+        return await e.next()
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            create_rule="",
+            options={},
+        )
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        created_payloads.append(dict(payload))
+        created_files.append(dict(files or {}))
+        return {
+            "id": "rec_multipart",
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+            "count": payload.get("count"),
+        }
+
+    extensions.hooks.get(HOOK_RECORD_CREATE_REQUEST).bind_func(_capture_hook)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    payload = json.dumps({"title": "json-title", "count": 2})
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/collections/posts/records",
+            files={
+                "title": (None, "form-title"),
+                "@jsonPayload": (None, payload),
+                "attachment": ("hello.txt", b"hello", "text/plain"),
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert hook_payloads == [{"title": "json-title", "count": 2}]
+    assert created_payloads == [{"title": "json-title", "count": 2}]
+    assert "@jsonPayload" not in created_payloads[0]
+    assert created_files == [{"attachment": [("hello.txt", b"hello")]}]
+
+
+@pytest.mark.asyncio
+async def test_record_update_route_decodes_multipart_json_payload(monkeypatch) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    updated_payloads: list[dict[str, object]] = []
+    updated_files: list[dict[str, list[tuple[str, bytes]]]] = []
+    hook_payloads: list[dict[str, object]] = []
+
+    async def _capture_hook(e):
+        hook_payloads.append(dict(e.data))
+        return await e.next()
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            update_rule="",
+            options={},
+        )
+
+    async def _fake_update_record(_engine, _collection, record_id, payload, files=None):
+        updated_payloads.append(dict(payload))
+        updated_files.append(dict(files or {}))
+        return {
+            "id": record_id,
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+            "enabled": payload.get("enabled"),
+        }
+
+    extensions.hooks.get(HOOK_RECORD_UPDATE_REQUEST).bind_func(_capture_hook)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "update_record", _fake_update_record)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    payload = json.dumps({"title": "json-title", "enabled": True})
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.patch(
+            "/api/collections/posts/records/rec1",
+            files={
+                "title": (None, "form-title"),
+                "@jsonPayload": (None, payload),
+                "attachment": ("hello.txt", b"hello", "text/plain"),
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert hook_payloads == [{"title": "json-title", "enabled": True}]
+    assert updated_payloads == [{"title": "json-title", "enabled": True}]
+    assert "@jsonPayload" not in updated_payloads[0]
+    assert updated_files == [{"attachment": [("hello.txt", b"hello")]}]
 
 
 @pytest.mark.asyncio
