@@ -9,6 +9,8 @@ SQL strings -- to prevent SQL injection.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from lark import Lark, Transformer, v_args
@@ -104,6 +106,13 @@ _ANY_LIKE_OPS = {
     "?!~": "NOT ILIKE",
 }
 
+_DATETIME_FIELD_TYPES = {"date", "autodate"}
+_SYSTEM_FIELD_TYPES = {
+    "id": "text",
+    "created": "autodate",
+    "updated": "autodate",
+}
+
 
 # ---------------------------------------------------------------------------
 # @collection condition — grouped into EXISTS subqueries
@@ -125,6 +134,61 @@ class _CollectionCondition:
         self.table_name = table_name
         self.group_key = group_key
         self.inner_sql = inner_sql
+
+
+@dataclass(frozen=True)
+class _TraversalStep:
+    """One relation or back-relation hop in a dotted filter path."""
+
+    relation_key: str
+    target_table: str
+    max_select: int
+    kind: str = "forward"
+    source_field: str | None = None
+    back_field: str | None = None
+
+
+@dataclass(frozen=True)
+class _ResolvedPath:
+    """Resolved SQL expression and traversal hops for a dotted field path."""
+
+    steps: list[_TraversalStep]
+    sql: str
+    is_json: bool = False
+    field_type: str = ""
+
+
+class _CollectionRef:
+    """Resolved ``@collection.X.path`` operand metadata."""
+
+    __slots__ = (
+        "table_name",
+        "group_key",
+        "column_sql",
+        "relation_steps",
+        "leaf_sql",
+        "leaf_is_json",
+        "leaf_type",
+    )
+
+    def __init__(
+        self,
+        table_name: str,
+        group_key: str,
+        *,
+        column_sql: str | None = None,
+        relation_steps: list[_TraversalStep] | None = None,
+        leaf_sql: str | None = None,
+        leaf_is_json: bool = False,
+        leaf_type: str = "",
+    ) -> None:
+        self.table_name = table_name
+        self.group_key = group_key
+        self.column_sql = column_sql
+        self.relation_steps = relation_steps or []
+        self.leaf_sql = leaf_sql
+        self.leaf_is_json = leaf_is_json
+        self.leaf_type = leaf_type
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +253,8 @@ class _FilterTransformer(Transformer):
         self,
         request_context: dict[str, Any] | None = None,
         relation_resolver: dict[str, dict[str, Any]] | None = None,
+        collection_resolver: dict[str, dict[str, Any]] | None = None,
+        current_table: str | None = None,
     ) -> None:
         super().__init__()
         self._param_counter = 0
@@ -196,6 +262,9 @@ class _FilterTransformer(Transformer):
         self._request_context = request_context or {}
         # Maps relation field name → recursive relation metadata.
         self._relation_resolver = relation_resolver or {}
+        # Maps collection name → {"table": name, "relations": RelationResolver}.
+        self._collection_resolver = collection_resolver or {}
+        self._current_table = _sanitize_ident(current_table) if current_table else None
 
     def _next_param(self, value: Any) -> str:
         self._param_counter += 1
@@ -244,11 +313,6 @@ class _FilterTransformer(Transformer):
                     f"Invalid @collection reference: @{stripped}. "
                     "Expected format: @collection.collectionName.fieldName"
                 )
-            if len(parts) > 3:
-                raise ValueError(
-                    f"Relation traversal in @collection not yet supported: @{stripped}. "
-                    "Use @collection.collectionName.fieldName format."
-                )
             coll_ref = parts[1]
             alias_key = ""
             if ":" in coll_ref:
@@ -259,10 +323,324 @@ class _FilterTransformer(Transformer):
             else:
                 coll_name = _sanitize_ident(coll_ref)
                 group_key = coll_name
-            field_name = _sanitize_ident(parts[2])
-            return ("collection_ref", coll_name, field_name, group_key)
+            field_path = tuple(_sanitize_ident(part) for part in parts[2:] if part)
+            if not field_path:
+                raise ValueError(
+                    f"Invalid @collection reference: @{stripped}. "
+                    "Expected format: @collection.collectionName.fieldName"
+                )
+            return ("collection_ref", coll_name, field_path, group_key)
 
         return ("macro", name)
+
+    def _resolver_fields(
+        self,
+        resolver: dict[str, dict[str, Any]] | None,
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(resolver, dict):
+            return {}
+        fields = resolver.get("__fields__")
+        return fields if isinstance(fields, dict) else {}
+
+    def _is_flat_resolver(self, resolver: dict[str, Any] | None) -> bool:
+        return isinstance(resolver, dict) and resolver.get("__flat__") is True
+
+    def _flat_collection(
+        self,
+        resolver: dict[str, Any] | None,
+        table_name: str,
+    ) -> dict[str, Any]:
+        if not self._is_flat_resolver(resolver):
+            return {}
+        collections = resolver.get("collections")
+        if not isinstance(collections, dict):
+            return {}
+        coll = collections.get(table_name)
+        return coll if isinstance(coll, dict) else {}
+
+    def _flat_fields(
+        self,
+        resolver: dict[str, Any] | None,
+        table_name: str,
+    ) -> dict[str, dict[str, Any]]:
+        fields = self._flat_collection(resolver, table_name).get("fields")
+        return fields if isinstance(fields, dict) else {}
+
+    def _flat_relation_info(
+        self,
+        resolver: dict[str, Any] | None,
+        table_name: str,
+        segment: str,
+    ) -> dict[str, Any] | None:
+        coll = self._flat_collection(resolver, table_name)
+        relations = coll.get("relations")
+        if isinstance(relations, dict):
+            info = relations.get(segment)
+            if isinstance(info, dict):
+                return info
+
+        back_relations = resolver.get("back_relations") if isinstance(resolver, dict) else None
+        if isinstance(back_relations, dict):
+            by_collection = back_relations.get(table_name)
+            if isinstance(by_collection, dict):
+                info = by_collection.get(segment)
+                if isinstance(info, dict):
+                    return info
+        return None
+
+    def _field_type_for_table(self, table_name: str | None, field_name: str) -> str:
+        safe_field = _sanitize_ident(str(field_name))
+        if safe_field in _SYSTEM_FIELD_TYPES:
+            return _SYSTEM_FIELD_TYPES[safe_field]
+
+        safe_table = _sanitize_ident(str(table_name)) if table_name else ""
+        if safe_table and self._is_flat_resolver(self._relation_resolver):
+            field_info = self._flat_fields(self._relation_resolver, safe_table).get(
+                safe_field,
+            )
+            if isinstance(field_info, dict):
+                return str(field_info.get("type") or "")
+
+        fields = self._resolver_fields(self._relation_resolver)
+        field_info = fields.get(safe_field) if isinstance(fields, dict) else None
+        if isinstance(field_info, dict):
+            return str(field_info.get("type") or "")
+        return ""
+
+    def _field_type_for_collection_resolver(
+        self,
+        table_name: str,
+        field_name: str,
+    ) -> str:
+        safe_field = _sanitize_ident(str(field_name))
+        if safe_field in _SYSTEM_FIELD_TYPES:
+            return _SYSTEM_FIELD_TYPES[safe_field]
+        safe_table = _sanitize_ident(str(table_name))
+        if self._is_flat_resolver(self._collection_resolver):
+            field_info = self._flat_fields(self._collection_resolver, safe_table).get(
+                safe_field,
+            )
+        else:
+            coll_info = self._collection_resolver.get(safe_table)
+            fields = coll_info.get("fields", {}) if isinstance(coll_info, dict) else {}
+            field_info = fields.get(safe_field) if isinstance(fields, dict) else None
+        if isinstance(field_info, dict):
+            return str(field_info.get("type") or "")
+        return ""
+
+    def _literal_for_field_type(
+        self,
+        node: tuple[str, Any],
+        field_type: str,
+    ) -> tuple[str, Any]:
+        if (
+            field_type not in _DATETIME_FIELD_TYPES
+            or not isinstance(node, tuple)
+            or len(node) < 2
+            or node[0] != "literal"
+            or not isinstance(node[1], str)
+        ):
+            return node
+
+        value = node[1].strip()
+        if not value:
+            return node
+
+        normalized = value.replace("Z", "+00:00")
+        if " " in normalized and "T" not in normalized:
+            normalized = normalized.replace(" ", "T", 1)
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return node
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        else:
+            parsed = parsed.astimezone(UTC)
+        return ("literal", parsed)
+
+    def _operand_field_type(self, node: tuple[str, Any]) -> str:
+        if not isinstance(node, tuple) or len(node) < 2:
+            return ""
+        kind = node[0]
+        if kind == "field":
+            if len(node) >= 3 and node[2]:
+                return str(node[2])
+            if "." in str(node[1]):
+                return ""
+            return self._field_type_for_table(self._current_table, str(node[1]))
+        if kind == "relation_ref" and len(node) >= 5:
+            return str(node[4] or "")
+        if kind == "sql_ref" and len(node) >= 4:
+            return str(node[3] or "")
+        return ""
+
+    def _coerce_comparison_literals(
+        self,
+        left: tuple[str, Any],
+        right: tuple[str, Any],
+    ) -> tuple[tuple[str, Any], tuple[str, Any]]:
+        left_type = self._operand_field_type(left)
+        right_type = self._operand_field_type(right)
+        if left_type in _DATETIME_FIELD_TYPES:
+            right = self._literal_for_field_type(right, left_type)
+        if right_type in _DATETIME_FIELD_TYPES:
+            left = self._literal_for_field_type(left, right_type)
+        return left, right
+
+    def _step_from_info(self, segment: str, info: dict[str, Any]) -> _TraversalStep:
+        kind = str(info.get("kind", "forward") or "forward")
+        target_table = _sanitize_ident(str(info["table"]))
+        max_select = int(info.get("max_select", 1) or 1)
+        source_field = _sanitize_ident(str(info.get("field") or segment))
+        back_field_raw = info.get("back_field")
+        back_field = (
+            _sanitize_ident(str(back_field_raw))
+            if back_field_raw is not None
+            else None
+        )
+        if kind == "back" and not back_field:
+            raise ValueError(f"Invalid back-relation metadata for {segment}.")
+        return _TraversalStep(
+            relation_key=_sanitize_ident(segment),
+            target_table=target_table,
+            max_select=max_select,
+            kind=kind,
+            source_field=source_field,
+            back_field=back_field,
+        )
+
+    def _json_extract_sql(self, column_sql: str, path_parts: list[str] | tuple[str, ...]) -> str:
+        if not path_parts:
+            return column_sql
+        args = ", ".join(f"'{_sanitize_ident(str(part))}'" for part in path_parts)
+        return f"jsonb_extract_path({column_sql}, {args})"
+
+    def _resolve_dotted_path(
+        self,
+        parts: list[str] | tuple[str, ...],
+        *,
+        start_table: str,
+        relations: dict[str, dict[str, Any]] | None,
+        fields: dict[str, dict[str, Any]] | None = None,
+        allow_unresolved: bool = True,
+        optimize_relation_id: bool = False,
+        context: str = "field path",
+    ) -> _ResolvedPath | None:
+        """Resolve a PocketBase dotted path into SQL and traversal steps.
+
+        This mirrors PocketBase's segment-by-segment resolver: each segment can
+        be a direct relation, a synthetic back-relation, or a JSON field that
+        consumes the remaining segments as a JSON path.
+        """
+        safe_parts = [_sanitize_ident(str(part)) for part in parts]
+        if not safe_parts:
+            return None
+
+        current_table = _sanitize_ident(start_table) if start_table else ""
+        flat_resolver = relations if self._is_flat_resolver(relations) else None
+        current_relations = (
+            {}
+            if flat_resolver
+            else relations if isinstance(relations, dict) else {}
+        )
+        current_fields = (
+            self._flat_fields(flat_resolver, current_table)
+            if flat_resolver
+            else fields if isinstance(fields, dict) else self._resolver_fields(current_relations)
+        )
+        steps: list[_TraversalStep] = []
+        idx = 0
+
+        while idx < len(safe_parts):
+            part = safe_parts[idx]
+
+            if idx == len(safe_parts) - 1:
+                field_info = (
+                    current_fields.get(part)
+                    if isinstance(current_fields, dict)
+                    else None
+                )
+                field_type = (
+                    str(field_info.get("type") or "")
+                    if isinstance(field_info, dict)
+                    else _SYSTEM_FIELD_TYPES.get(part, "")
+                )
+                return _ResolvedPath(
+                    steps,
+                    self._column_expr_for_table(current_table, part),
+                    field_type=field_type,
+                )
+
+            field_info = current_fields.get(part) if isinstance(current_fields, dict) else None
+            field_type = str(field_info.get("type", "")) if isinstance(field_info, dict) else ""
+            if field_type in {"json", "geoPoint"}:
+                return _ResolvedPath(
+                    steps,
+                    self._json_extract_sql(
+                        self._column_expr_for_table(current_table, part),
+                        safe_parts[idx + 1:],
+                    ),
+                    is_json=True,
+                    field_type="",
+                )
+
+            info = (
+                self._flat_relation_info(flat_resolver, current_table, part)
+                if flat_resolver
+                else current_relations.get(part) if isinstance(current_relations, dict) else None
+            )
+            if isinstance(info, dict) and "table" in info:
+                step = self._step_from_info(part, info)
+
+                # PocketBase optimizes single relation `.id` lookups by using
+                # the stored relation id column instead of joining the target.
+                if (
+                    optimize_relation_id
+                    and step.kind == "forward"
+                    and step.max_select <= 1
+                    and idx == len(safe_parts) - 2
+                    and safe_parts[idx + 1] == "id"
+                ):
+                    return _ResolvedPath(
+                        steps,
+                        self._column_expr_for_table(
+                            current_table,
+                            step.source_field or part,
+                        ),
+                        field_type="relation",
+                    )
+
+                steps.append(step)
+                current_table = step.target_table
+                if flat_resolver:
+                    current_fields = self._flat_fields(flat_resolver, current_table)
+                else:
+                    nested = info.get("relations")
+                    current_relations = nested if isinstance(nested, dict) else {}
+                    nested_fields = info.get("fields")
+                    current_fields = (
+                        nested_fields
+                        if isinstance(nested_fields, dict) and nested_fields
+                        else self._resolver_fields(current_relations)
+                    )
+                idx += 1
+                continue
+
+            if steps:
+                raise ValueError(
+                    f"Invalid relation traversal: {'.'.join(safe_parts)}. "
+                    "Only relation, back-relation, or JSON segments may be chained "
+                    "before the final field name."
+                )
+            if not allow_unresolved:
+                raise ValueError(
+                    f"Invalid {context}: {'.'.join(safe_parts)}. "
+                    "Missing relation metadata for the referenced collection."
+                )
+            return None
+
+        return None
 
     def field_path(self, items: list) -> tuple:
         parts = [str(t) for t in items]
@@ -276,35 +654,34 @@ class _FilterTransformer(Transformer):
 
         # Detect relation field traversal (e.g. author.name, author.company.name)
         if len(parts) >= 2 and self._relation_resolver:
-            relation_steps: list[tuple[str, str, int]] = []
-            current_resolver = self._relation_resolver
-
-            for part in parts[:-1]:
-                info = current_resolver.get(part)
-                if not isinstance(info, dict):
-                    break
-                relation_steps.append(
-                    (
-                        _sanitize_ident(part),
-                        _sanitize_ident(str(info["table"])),
-                        int(info.get("max_select", 1) or 1),
-                    )
+            resolved = self._resolve_dotted_path(
+                parts,
+                start_table=self._current_table or "",
+                relations=self._relation_resolver,
+                fields=self._resolver_fields(self._relation_resolver),
+                allow_unresolved=True,
+                optimize_relation_id=False,
+            )
+            if resolved is not None and resolved.steps:
+                return (
+                    "relation_ref",
+                    resolved.steps,
+                    resolved.sql,
+                    resolved.is_json,
+                    resolved.field_type,
                 )
-                nested = info.get("relations")
-                current_resolver = nested if isinstance(nested, dict) else {}
-
-            if relation_steps:
-                leaf_parts = parts[len(relation_steps):]
-                if len(leaf_parts) != 1:
-                    raise ValueError(
-                        f"Invalid relation traversal: {'.'.join(parts)}. "
-                        "Only relation segments may be chained before the final field name."
-                    )
-                return ("relation_ref", relation_steps, _sanitize_ident(leaf_parts[0]))
+            if resolved is not None and resolved.is_json:
+                return ("sql_ref", resolved.sql, resolved.is_json, resolved.field_type)
 
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
-        return ("field", ".".join(parts))
+        field_name = ".".join(parts)
+        field_type = (
+            self._field_type_for_table(self._current_table, field_name)
+            if len(parts) == 1
+            else ""
+        )
+        return ("field", field_name, field_type)
 
     # -- Comparisons ---------------------------------------------------------
 
@@ -316,16 +693,18 @@ class _FilterTransformer(Transformer):
         right: tuple[str, Any],
     ) -> str | _CollectionCondition | _RelationCondition:
         op = str(op_token).strip()
+        if op in _STANDARD_OPS:
+            left, right = self._coerce_comparison_literals(left, right)
 
         # ── Relation field traversal → generate _RelationCondition ─────
         left_is_rel = (
             isinstance(left, tuple)
-            and len(left) == 3
+            and len(left) >= 3
             and left[0] == "relation_ref"
         )
         right_is_rel = (
             isinstance(right, tuple)
-            and len(right) == 3
+            and len(right) >= 3
             and right[0] == "relation_ref"
         )
         if left_is_rel or right_is_rel:
@@ -390,7 +769,7 @@ class _FilterTransformer(Transformer):
         # ANY standard operators (for array columns)
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
-            return f"{right_sql} {sql_op} ANY({left_sql})"
+            return self._scalar_or_array_any_sql(left_sql, right_sql, sql_op)
 
         # ANY LIKE operators
         if op in _ANY_LIKE_OPS:
@@ -398,12 +777,234 @@ class _FilterTransformer(Transformer):
             if right[0] == "literal" and isinstance(right[1], str):
                 wrapped = f"%{right[1]}%"
                 pname = self._next_param(wrapped)
-                return f"EXISTS (SELECT 1 FROM unnest({left_sql}) AS _elem WHERE _elem {sql_op} :{pname})"
-            return f"EXISTS (SELECT 1 FROM unnest({left_sql}) AS _elem WHERE _elem {sql_op} {right_sql})"
+                return self._scalar_or_array_like_sql(left_sql, f":{pname}", sql_op)
+            return self._scalar_or_array_like_sql(left_sql, right_sql, sql_op)
 
         return f"{left_sql} = {right_sql}"
 
     # -- @collection comparison helpers --------------------------------------
+
+    def _qualified_column(self, table_name: str, field_name: str) -> str:
+        return f'"{_sanitize_ident(table_name)}"."{_sanitize_ident(field_name)}"'
+
+    def _column_expr_for_table(self, table_name: str | None, field_name: str) -> str:
+        if table_name:
+            return self._qualified_column(table_name, field_name)
+        return self._field_expr(field_name)
+
+    def _text_cast_sql(self, sql_expr: str) -> str:
+        if sql_expr.startswith(":"):
+            return f"CAST({sql_expr} AS text)"
+        return f"{sql_expr}::text"
+
+    def _scalar_or_array_any_sql(
+        self,
+        container_sql: str,
+        value_sql: str,
+        sql_op: str,
+    ) -> str:
+        """Build scalar-safe ``?=``/``?!=`` SQL.
+
+        PocketBase applies ``?=`` to both multi-value fields and scalar relation
+        fields. PostgreSQL ``ANY(varchar)`` is invalid, so equality-style
+        operators use a JSONB shape check that works for scalar and array
+        columns.
+        """
+        if sql_op not in {"=", "!="}:
+            return f"{value_sql} {sql_op} ANY({container_sql})"
+
+        container_text = self._text_cast_sql(container_sql)
+        value_text = self._text_cast_sql(value_sql)
+        return (
+            "(CASE "
+            f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(to_jsonb({container_sql})) "
+            f"AS _elem(value) WHERE {value_text} {sql_op} _elem.value) "
+            f"ELSE {value_text} {sql_op} {container_text} "
+            "END)"
+        )
+
+    def _scalar_or_array_like_sql(
+        self,
+        container_sql: str,
+        pattern_sql: str,
+        sql_op: str,
+    ) -> str:
+        """Build scalar-safe ``?~``/``?!~`` SQL."""
+        return (
+            "(CASE "
+            f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
+            f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(to_jsonb({container_sql})) "
+            f"AS _elem(value) WHERE _elem.value {sql_op} {pattern_sql}) "
+            f"ELSE {container_sql}::text {sql_op} {pattern_sql} "
+            "END)"
+        )
+
+    def _resolve_collection_ref(self, node: tuple) -> _CollectionRef:
+        coll_name = _sanitize_ident(str(node[1]))
+        field_path = tuple(_sanitize_ident(str(part)) for part in node[2])
+        group_key = str(node[3])
+
+        if len(field_path) == 1:
+            field_type = self._field_type_for_collection_resolver(
+                coll_name,
+                field_path[0],
+            )
+            return _CollectionRef(
+                coll_name,
+                group_key,
+                column_sql=self._qualified_column(coll_name, field_path[0]),
+                leaf_type=field_type,
+            )
+
+        if self._is_flat_resolver(self._collection_resolver):
+            relations = self._collection_resolver
+            fields = self._flat_fields(self._collection_resolver, coll_name)
+        else:
+            coll_info = self._collection_resolver.get(coll_name)
+            relations = coll_info.get("relations", {}) if isinstance(coll_info, dict) else {}
+            fields = coll_info.get("fields", {}) if isinstance(coll_info, dict) else {}
+        resolved = self._resolve_dotted_path(
+            field_path,
+            start_table=coll_name,
+            relations=relations,
+            fields=fields if isinstance(fields, dict) else {},
+            allow_unresolved=False,
+            optimize_relation_id=True,
+            context="@collection relation traversal",
+        )
+        if resolved is None:
+            raise ValueError(
+                f"Invalid @collection relation traversal: "
+                f"@collection.{coll_name}.{'.'.join(field_path)}."
+            )
+
+        if not resolved.steps:
+            return _CollectionRef(
+                coll_name,
+                group_key,
+                column_sql=resolved.sql,
+                leaf_type=resolved.field_type,
+            )
+
+        return _CollectionRef(
+            coll_name,
+            group_key,
+            relation_steps=resolved.steps,
+            leaf_sql=resolved.sql,
+            leaf_is_json=resolved.is_json,
+            leaf_type=resolved.field_type,
+        )
+
+    def _collection_relation_leaf_sql(self, ref: _CollectionRef) -> str:
+        if not ref.relation_steps or not ref.leaf_sql:
+            if ref.column_sql:
+                return ref.column_sql
+            raise ValueError("Invalid @collection relation reference.")
+        return ref.leaf_sql
+
+    def _join_condition_for_step(
+        self,
+        step: _TraversalStep,
+        parent_table: str | None,
+    ) -> str:
+        if step.kind == "back":
+            back_field = step.back_field or ""
+            target_expr = self._qualified_column(step.target_table, back_field)
+            parent_id = self._column_expr_for_table(parent_table, "id")
+            if step.max_select > 1:
+                return self._scalar_or_array_any_sql(target_expr, parent_id, "=")
+            return f"{target_expr} = {parent_id}"
+
+        source_field = step.source_field or step.relation_key
+        source_expr = self._column_expr_for_table(parent_table, source_field)
+        target_id = self._qualified_column(step.target_table, "id")
+        if step.max_select > 1:
+            return self._scalar_or_array_any_sql(source_expr, target_id, "=")
+        return f"{target_id} = {source_expr}"
+
+    def _wrap_collection_relation_exists(
+        self,
+        ref: _CollectionRef,
+        leaf_condition: str,
+    ) -> str:
+        wrapped = leaf_condition
+        for idx in range(len(ref.relation_steps) - 1, -1, -1):
+            step = ref.relation_steps[idx]
+            parent_table = ref.table_name if idx == 0 else ref.relation_steps[idx - 1].target_table
+            join_cond = self._join_condition_for_step(step, parent_table)
+            wrapped = (
+                f'EXISTS (SELECT 1 FROM "{step.target_table}" '
+                f'WHERE {join_cond} AND {wrapped})'
+            )
+        return wrapped
+
+    def _collection_ref_condition(
+        self,
+        ref: _CollectionRef,
+        op: str,
+        other: tuple,
+        *,
+        ref_is_left: bool,
+    ) -> str:
+        ref_sql = (
+            ref.column_sql
+            if ref.column_sql is not None
+            else self._collection_relation_leaf_sql(ref)
+        )
+        if ref.leaf_type in _DATETIME_FIELD_TYPES:
+            other = self._literal_for_field_type(other, ref.leaf_type)
+        other_sql = self._operand_to_sql(other)
+
+        if op in _STANDARD_OPS:
+            sql_op = _STANDARD_OPS[op]
+            if other[0] == "null":
+                if sql_op == "=":
+                    condition = f"{ref_sql} IS NULL"
+                elif sql_op == "!=":
+                    condition = f"{ref_sql} IS NOT NULL"
+                else:
+                    condition = f"{ref_sql} {sql_op} NULL"
+            elif ref_is_left:
+                condition = f"{ref_sql} {sql_op} {other_sql}"
+            else:
+                condition = f"{other_sql} {sql_op} {ref_sql}"
+        elif op in _LIKE_OPS:
+            sql_op = _LIKE_OPS[op]
+            if other[0] == "literal" and isinstance(other[1], str):
+                wrapped = f"%{other[1]}%"
+                pname = self._next_param(wrapped)
+                other_sql = f":{pname}"
+            if ref_is_left:
+                condition = f"{ref_sql} {sql_op} {other_sql}"
+            else:
+                condition = f"{other_sql} {sql_op} {ref_sql}"
+        elif op in _ANY_STANDARD_OPS:
+            sql_op = _ANY_STANDARD_OPS[op]
+            if ref_is_left:
+                condition = self._scalar_or_array_any_sql(ref_sql, other_sql, sql_op)
+            else:
+                condition = self._scalar_or_array_any_sql(other_sql, ref_sql, sql_op)
+        elif op in _ANY_LIKE_OPS:
+            sql_op = _ANY_LIKE_OPS[op]
+            if other[0] == "literal" and isinstance(other[1], str):
+                wrapped = f"%{other[1]}%"
+                pname = self._next_param(wrapped)
+                other_sql = f":{pname}"
+            if ref_is_left:
+                condition = self._scalar_or_array_like_sql(ref_sql, other_sql, sql_op)
+            else:
+                condition = self._scalar_or_array_like_sql(other_sql, ref_sql, sql_op)
+        else:
+            condition = (
+                f"{ref_sql} = {other_sql}"
+                if ref_is_left
+                else f"{other_sql} = {ref_sql}"
+            )
+
+        if ref.column_sql is not None:
+            return condition
+        return self._wrap_collection_relation_exists(ref, condition)
 
     def _collection_comparison(
         self,
@@ -417,102 +1018,49 @@ class _FilterTransformer(Transformer):
 
         # Both sides reference @collection -----------------------------------
         if left_is_coll and right_is_coll:
-            l_coll, l_field, l_group = left[1], left[2], left[3]
-            r_coll, r_field, r_group = right[1], right[2], right[3]
-            l_col = f'"{l_coll}"."{l_field}"'
-            r_col = f'"{r_coll}"."{r_field}"'
+            l_ref = self._resolve_collection_ref(left)
+            r_ref = self._resolve_collection_ref(right)
+            l_col = (
+                l_ref.column_sql
+                if l_ref.column_sql is not None
+                else self._collection_relation_leaf_sql(l_ref)
+            )
+            r_col = (
+                r_ref.column_sql
+                if r_ref.column_sql is not None
+                else self._collection_relation_leaf_sql(r_ref)
+            )
             sql_op = _STANDARD_OPS.get(op, "=")
-            if l_group == r_group:
-                return _CollectionCondition(l_coll, l_group, f"{l_col} {sql_op} {r_col}")
+            inner = f"{l_col} {sql_op} {r_col}"
+            if l_ref.column_sql is None:
+                inner = self._wrap_collection_relation_exists(l_ref, inner)
+            if r_ref.column_sql is None:
+                inner = self._wrap_collection_relation_exists(r_ref, inner)
+            if l_ref.group_key == r_ref.group_key:
+                return _CollectionCondition(l_ref.table_name, l_ref.group_key, inner)
             # Cross-collection → inline EXISTS with two tables
             return (
-                f'EXISTS (SELECT 1 FROM "{l_coll}" AS "_cl" , "{r_coll}" AS "_cr" '
-                f'WHERE "_cl"."{l_field}" {sql_op} "_cr"."{r_field}")'
+                f'EXISTS (SELECT 1 FROM "{l_ref.table_name}", "{r_ref.table_name}" '
+                f"WHERE {inner})"
             )
 
         # One side is @collection -------------------------------------------
         if left_is_coll:
-            coll_name, coll_field, coll_group = left[1], left[2], left[3]
-            coll_col = f'"{coll_name}"."{coll_field}"'
+            ref = self._resolve_collection_ref(left)
             other = right
             coll_is_left = True
         else:
-            coll_name, coll_field, coll_group = right[1], right[2], right[3]
-            coll_col = f'"{coll_name}"."{coll_field}"'
+            ref = self._resolve_collection_ref(right)
             other = left
             coll_is_left = False
 
-        other_sql = self._operand_to_sql(other)
-
-        # Standard operators -------------------------------------------------
-        if op in _STANDARD_OPS:
-            sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
-                if sql_op == "=":
-                    return _CollectionCondition(coll_name, coll_group, f"{coll_col} IS NULL")
-                if sql_op == "!=":
-                    return _CollectionCondition(coll_name, coll_group, f"{coll_col} IS NOT NULL")
-            if coll_is_left:
-                return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} {other_sql}")
-            return _CollectionCondition(coll_name, coll_group, f"{other_sql} {sql_op} {coll_col}")
-
-        # LIKE operators -----------------------------------------------------
-        if op in _LIKE_OPS:
-            sql_op = _LIKE_OPS[op]
-            if coll_is_left:
-                if other[0] == "literal" and isinstance(other[1], str):
-                    wrapped = f"%{other[1]}%"
-                    pname = self._next_param(wrapped)
-                    return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} :{pname}")
-                return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} {other_sql}")
-            else:
-                if other[0] == "literal" and isinstance(other[1], str):
-                    wrapped = f"%{other[1]}%"
-                    pname = self._next_param(wrapped)
-                    return _CollectionCondition(coll_name, coll_group, f":{pname} {sql_op} {coll_col}")
-                return _CollectionCondition(coll_name, coll_group, f"{other_sql} {sql_op} {coll_col}")
-
-        # ANY standard operators ---------------------------------------------
-        if op in _ANY_STANDARD_OPS:
-            sql_op = _ANY_STANDARD_OPS[op]
-            if coll_is_left:
-                # @collection.X.Y ?= val → val = ANY("X"."Y")
-                return _CollectionCondition(coll_name, coll_group, f"{other_sql} {sql_op} ANY({coll_col})")
-            else:
-                # field ?= @collection.X.Y → "X"."Y" = ANY(field)
-                return _CollectionCondition(coll_name, coll_group, f"{coll_col} {sql_op} ANY({other_sql})")
-
-        # ANY LIKE operators -------------------------------------------------
-        if op in _ANY_LIKE_OPS:
-            sql_op = _ANY_LIKE_OPS[op]
-            if coll_is_left:
-                if other[0] == "literal" and isinstance(other[1], str):
-                    wrapped = f"%{other[1]}%"
-                    pname = self._next_param(wrapped)
-                    return _CollectionCondition(
-                        coll_name,
-                        coll_group,
-                        f"EXISTS (SELECT 1 FROM unnest({coll_col}) AS _elem "
-                        f"WHERE _elem {sql_op} :{pname})",
-                    )
-                return _CollectionCondition(
-                    coll_name,
-                    coll_group,
-                    f"EXISTS (SELECT 1 FROM unnest({coll_col}) AS _elem "
-                    f"WHERE _elem {sql_op} {other_sql})",
-                )
-            else:
-                return _CollectionCondition(
-                    coll_name,
-                    coll_group,
-                    f"EXISTS (SELECT 1 FROM unnest({other_sql}) AS _elem "
-                    f"WHERE _elem {sql_op} {coll_col})",
-                )
-
-        # Fallback
-        if coll_is_left:
-            return _CollectionCondition(coll_name, coll_group, f"{coll_col} = {other_sql}")
-        return _CollectionCondition(coll_name, coll_group, f"{other_sql} = {coll_col}")
+        condition = self._collection_ref_condition(
+            ref,
+            op,
+            other,
+            ref_is_left=coll_is_left,
+        )
+        return _CollectionCondition(ref.table_name, ref.group_key, condition)
 
     # -- Relation traversal comparison helpers --------------------------------
 
@@ -526,84 +1074,78 @@ class _FilterTransformer(Transformer):
     ) -> _RelationCondition | str:
         """Handle comparisons where at least one side is a relation traversal."""
 
-        def _relation_leaf_sql(steps: list[tuple[str, str, int]], leaf_field: str) -> str:
-            return f'"{steps[-1][1]}"."{leaf_field}"'
-
         def _wrap_nested_relation_exists(
-            steps: list[tuple[str, str, int]],
+            steps: list[_TraversalStep],
             leaf_condition: str,
+            root_parent_table: str | None = None,
         ) -> str:
             wrapped = leaf_condition
             for idx in range(len(steps) - 1, -1, -1):
-                field_name, target_table, max_select = steps[idx]
-                if idx == 0:
-                    source_expr = f'"{field_name}"'
-                else:
-                    parent_table = steps[idx - 1][1]
-                    source_expr = f'"{parent_table}"."{field_name}"'
-                join_cond = (
-                    f'"{target_table}"."id" = ANY({source_expr})'
-                    if max_select > 1
-                    else f'"{target_table}"."id" = {source_expr}'
+                step = steps[idx]
+                parent_table = (
+                    root_parent_table
+                    if idx == 0
+                    else steps[idx - 1].target_table
                 )
+                join_cond = self._join_condition_for_step(step, parent_table)
                 wrapped = (
-                    f'EXISTS (SELECT 1 FROM "{target_table}" '
+                    f'EXISTS (SELECT 1 FROM "{step.target_table}" '
                     f'WHERE {join_cond} AND {wrapped})'
                 )
             return wrapped
 
+        def _relation_condition_for_steps(
+            steps: list[_TraversalStep],
+            leaf_condition: str,
+        ) -> _RelationCondition:
+            first = steps[0]
+            first_join = self._join_condition_for_step(first, None)
+            where_cond = (
+                leaf_condition
+                if len(steps) == 1
+                else _wrap_nested_relation_exists(
+                    steps[1:],
+                    leaf_condition,
+                    first.target_table,
+                )
+            )
+            return _RelationCondition(
+                first.relation_key,
+                first.target_table,
+                first_join,
+                where_cond,
+            )
+
         # Both sides are relation refs (rare) --------------------------------
         if left_is_rel and right_is_rel:
-            l_steps, l_leaf = left[1], left[2]
-            r_steps, r_leaf = right[1], right[2]
+            l_steps, l_col = left[1], left[2]
+            r_steps, r_col = right[1], right[2]
             if len(l_steps) > 1 or len(r_steps) > 1:
                 raise ValueError(
                     "Comparisons between two nested relation traversals are not supported."
                 )
 
-            l_field, l_tbl, l_max = l_steps[0]
-            r_field, r_tbl, r_max = r_steps[0]
-            l_col = f'"{l_tbl}"."{l_leaf}"'
-            r_col = f'"{r_tbl}"."{r_leaf}"'
-            l_join = (
-                f'"{l_tbl}"."id" = ANY("{l_field}")'
-                if l_max > 1
-                else f'"{l_tbl}"."id" = "{l_field}"'
-            )
-            r_join = (
-                f'"{r_tbl}"."id" = ANY("{r_field}")'
-                if r_max > 1
-                else f'"{r_tbl}"."id" = "{r_field}"'
-            )
+            l_step = l_steps[0]
+            r_step = r_steps[0]
+            l_join = self._join_condition_for_step(l_step, None)
+            r_join = self._join_condition_for_step(r_step, None)
             sql_op = _STANDARD_OPS.get(op, "=")
             return (
-                f'EXISTS (SELECT 1 FROM "{l_tbl}", "{r_tbl}" '
+                f'EXISTS (SELECT 1 FROM "{l_step.target_table}", "{r_step.target_table}" '
                 f"WHERE {l_join} AND {r_join} AND {l_col} {sql_op} {r_col})"
             )
 
         # One side is a relation ref -----------------------------------------
         if left_is_rel:
-            rel_steps, traversed = left[1], left[2]
+            rel_steps, rel_col = left[1], left[2]
             other = right
             rel_is_left = True
         else:
-            rel_steps, traversed = right[1], right[2]
+            rel_steps, rel_col = right[1], right[2]
             other = left
             rel_is_left = False
 
-        rel_col = _relation_leaf_sql(rel_steps, traversed)
         other_sql = self._operand_to_sql(other)
-
-        # Single-level paths keep grouped EXISTS behavior for AND clauses.
-        if len(rel_steps) == 1:
-            rel_field, target, max_sel = rel_steps[0]
-            join_cond = (
-                f'"{target}"."id" = ANY("{rel_field}")'
-                if max_sel > 1
-                else f'"{target}"."id" = "{rel_field}"'
-            )
-        else:
-            join_cond = ""
 
         # WHERE condition — mirrors operator handling of _collection_comparison
         where_cond: str
@@ -621,9 +1163,7 @@ class _FilterTransformer(Transformer):
                 where_cond = f"{rel_col} {sql_op} {other_sql}"
             else:
                 where_cond = f"{other_sql} {sql_op} {rel_col}"
-            if len(rel_steps) == 1:
-                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
-            return _wrap_nested_relation_exists(rel_steps, where_cond)
+            return _relation_condition_for_steps(rel_steps, where_cond)
 
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
@@ -635,51 +1175,34 @@ class _FilterTransformer(Transformer):
                 where_cond = f"{rel_col} {sql_op} {other_sql}"
             else:
                 where_cond = f"{other_sql} {sql_op} {rel_col}"
-            if len(rel_steps) == 1:
-                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
-            return _wrap_nested_relation_exists(rel_steps, where_cond)
+            return _relation_condition_for_steps(rel_steps, where_cond)
 
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
             if rel_is_left:
-                where_cond = f"{other_sql} {sql_op} ANY({rel_col})"
+                where_cond = self._scalar_or_array_any_sql(rel_col, other_sql, sql_op)
             else:
-                where_cond = f"{rel_col} {sql_op} ANY({other_sql})"
-            if len(rel_steps) == 1:
-                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
-            return _wrap_nested_relation_exists(rel_steps, where_cond)
+                where_cond = self._scalar_or_array_any_sql(other_sql, rel_col, sql_op)
+            return _relation_condition_for_steps(rel_steps, where_cond)
 
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
             if rel_is_left and other[0] == "literal" and isinstance(other[1], str):
                 wrapped = f"%{other[1]}%"
                 pname = self._next_param(wrapped)
-                where_cond = (
-                    f"EXISTS (SELECT 1 FROM unnest({rel_col}) AS _elem "
-                    f"WHERE _elem {sql_op} :{pname})"
-                )
+                where_cond = self._scalar_or_array_like_sql(rel_col, f":{pname}", sql_op)
             elif rel_is_left:
-                where_cond = (
-                    f"EXISTS (SELECT 1 FROM unnest({rel_col}) AS _elem "
-                    f"WHERE _elem {sql_op} {other_sql})"
-                )
+                where_cond = self._scalar_or_array_like_sql(rel_col, other_sql, sql_op)
             else:
-                where_cond = (
-                    f"EXISTS (SELECT 1 FROM unnest({other_sql}) AS _elem "
-                    f"WHERE _elem {sql_op} {rel_col})"
-                )
-            if len(rel_steps) == 1:
-                return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
-            return _wrap_nested_relation_exists(rel_steps, where_cond)
+                where_cond = self._scalar_or_array_like_sql(other_sql, rel_col, sql_op)
+            return _relation_condition_for_steps(rel_steps, where_cond)
 
         # Fallback
         if rel_is_left:
             where_cond = f"{rel_col} = {other_sql}"
         else:
             where_cond = f"{other_sql} = {rel_col}"
-        if len(rel_steps) == 1:
-            return _RelationCondition(rel_steps[0][0], rel_steps[0][1], join_cond, where_cond)
-        return _wrap_nested_relation_exists(rel_steps, where_cond)
+        return _relation_condition_for_steps(rel_steps, where_cond)
 
     # -- :each modifier helpers ---------------------------------------------
 
@@ -885,6 +1408,8 @@ class _FilterTransformer(Transformer):
             field_name = value
             modifier = node[2]
             return self._resolve_field_modifier(field_name, modifier)
+        if kind == "sql_ref":
+            return str(value)
         if kind == "macro":
             return self._resolve_macro(value)
         return str(value)
@@ -904,7 +1429,11 @@ class _FilterTransformer(Transformer):
         for ch in safe:
             if ch not in _SAFE_IDENT_CHARS and ch != ".":
                 raise ValueError(f"Invalid character in field name: {ch!r}")
-        return f'"{safe}"' if "." not in safe else safe
+        if "." in safe:
+            return safe
+        if self._current_table:
+            return self._qualified_column(self._current_table, safe)
+        return f'"{safe}"'
 
     def _value_length(self, value: Any) -> int:
         """Compute a PocketBase-like length for request payload values."""
@@ -983,15 +1512,24 @@ class _FilterTransformer(Transformer):
         if name == "todayStart":
             return "(date_trunc('day', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
         if name == "todayEnd":
-            return "((date_trunc('day', TIMEZONE('UTC', NOW())) + INTERVAL '1 day' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            return (
+                "((date_trunc('day', TIMEZONE('UTC', NOW())) + INTERVAL '1 day' "
+                "- INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            )
         if name == "monthStart":
             return "(date_trunc('month', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
         if name == "monthEnd":
-            return "((date_trunc('month', TIMEZONE('UTC', NOW())) + INTERVAL '1 month' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            return (
+                "((date_trunc('month', TIMEZONE('UTC', NOW())) + INTERVAL '1 month' "
+                "- INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            )
         if name == "yearStart":
             return "(date_trunc('year', TIMEZONE('UTC', NOW())) AT TIME ZONE 'UTC')"
         if name == "yearEnd":
-            return "((date_trunc('year', TIMEZONE('UTC', NOW())) + INTERVAL '1 year' - INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            return (
+                "((date_trunc('year', TIMEZONE('UTC', NOW())) + INTERVAL '1 year' "
+                "- INTERVAL '1 microsecond') AT TIME ZONE 'UTC')"
+            )
         if name == "request.context":
             context = self._request_context.get("context", "")
             pname = self._next_param(context)
@@ -1092,6 +1630,8 @@ def parse_filter(
     filter_str: str,
     request_context: dict[str, Any] | None = None,
     relation_resolver: dict[str, dict[str, Any]] | None = None,
+    collection_resolver: dict[str, dict[str, Any]] | None = None,
+    current_table: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Parse a PocketBase filter expression into a SQL WHERE clause.
 
@@ -1104,6 +1644,10 @@ def parse_filter(
             When provided, dotted field paths like ``author.company.name`` are
             resolved as nested relation traversals and generate ``EXISTS``
             subqueries.
+        collection_resolver: Optional mapping used to resolve relation paths in
+            ``@collection.collection.relation.field`` references.
+        current_table: Optional current table name used to qualify outer field
+            references inside correlated ``@collection`` subqueries.
 
     Returns:
         A tuple of ``(where_sql, params)`` where ``where_sql`` is a SQL
@@ -1121,7 +1665,12 @@ def parse_filter(
     except Exception as exc:
         raise ValueError(f"Invalid filter syntax: {exc}") from exc
 
-    transformer = _FilterTransformer(request_context, relation_resolver)
+    transformer = _FilterTransformer(
+        request_context,
+        relation_resolver,
+        collection_resolver,
+        current_table,
+    )
     where_sql = transformer.transform(tree)
     return (str(where_sql), transformer._params)
 

@@ -9,6 +9,51 @@ from httpx import AsyncClient
 
 
 @pytest.mark.asyncio
+async def test_records_list_accepts_pocketbase_datetime_string_filter(
+    app_client: AsyncClient,
+    admin_token: str,
+):
+    """PocketBase clients send datetime filters as strings."""
+    coll_name = f"dt_string_{uuid.uuid4().hex[:8]}"
+
+    create_coll = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": coll_name,
+            "type": "base",
+            "schema": [{"name": "title", "type": "text"}],
+            "createRule": "",
+            "listRule": "",
+            "viewRule": "",
+            "updateRule": "",
+            "deleteRule": "",
+        },
+    )
+    assert create_coll.status_code == 200
+
+    create_record = await app_client.post(
+        f"/api/collections/{coll_name}/records",
+        json={"title": "datetime-string-filter"},
+    )
+    assert create_record.status_code == 200
+
+    list_records = await app_client.get(
+        f"/api/collections/{coll_name}/records",
+        params={
+            "filter": (
+                'created >= "1970-01-01 00:00:00" '
+                '&& created <= "2999-12-31 23:59:59"'
+            ),
+        },
+    )
+    assert list_records.status_code == 200
+    payload = list_records.json()
+    assert payload["totalItems"] == 1
+    assert payload["items"][0]["title"] == "datetime-string-filter"
+
+
+@pytest.mark.asyncio
 async def test_records_list_rule_supports_datetime_boundary_macros(
     app_client: AsyncClient,
     admin_token: str,
