@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from ppbase import PPBase
@@ -12,6 +12,7 @@ from ppbase.api import records as records_api
 from ppbase.ext.registry import (
     ExtensionRegistry,
     HOOK_RECORD_CREATE_REQUEST,
+    HOOK_RECORD_DELETE_REQUEST,
     HOOK_RECORD_UPDATE_REQUEST,
 )
 
@@ -249,7 +250,9 @@ async def test_record_create_hook_exception_rolls_back(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_record_create_hook_can_apply_builtin_auth_middleware(monkeypatch) -> None:
+async def test_record_create_hook_can_apply_builtin_auth_middleware(
+    monkeypatch,
+) -> None:
     app_pb = PPBase()
     fake_engine = _FakeEngine()
     called = False
@@ -287,10 +290,14 @@ async def test_record_create_hook_can_apply_builtin_auth_middleware(monkeypatch)
     app = _build_records_app(app_pb._extensions)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.post("/api/collections/templates/records", json={"title": "blocked"})
+        response = await client.post(
+            "/api/collections/templates/records", json={"title": "blocked"}
+        )
 
     assert response.status_code == 401
-    assert response.json()["detail"]["message"] == "The request requires authentication."
+    assert (
+        response.json()["detail"]["message"] == "The request requires authentication."
+    )
     assert called is False
 
 
@@ -341,8 +348,428 @@ async def test_record_create_hook_supports_multiple_middlewares(monkeypatch) -> 
     app = _build_records_app(app_pb._extensions)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.post("/api/collections/templates/records", json={"title": "ok"})
+        response = await client.post(
+            "/api/collections/templates/records", json={"title": "ok"}
+        )
 
     assert response.status_code == 200, response.text
     assert response.json()["title"] == "ok"
     assert calls == ["mw:first", "mw:second", "hook", "default"]
+
+
+@pytest.mark.asyncio
+async def test_batch_create_triggers_record_create_hook(monkeypatch) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    created_payloads: list[dict[str, object]] = []
+
+    async def _set_batch_defaults(e):
+        e.data.setdefault("title", "set-by-hook")
+        e.data["status"] = True
+        return await e.next()
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            create_rule="",
+            options={},
+        )
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        created_payloads.append(dict(payload))
+        return {
+            "id": "rec_batch",
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+            "status": payload.get("status"),
+        }
+
+    async def _fake_get_all_collections(_engine):
+        return []
+
+    extensions.hooks.get(HOOK_RECORD_CREATE_REQUEST).bind_func(_set_batch_defaults)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+    monkeypatch.setattr(records_api, "get_all_collections", _fake_get_all_collections)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/batch",
+            json={
+                "requests": [
+                    {
+                        "method": "POST",
+                        "url": "/api/collections/posts/records",
+                        "body": {},
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {
+            "status": 200,
+            "body": {
+                "id": "rec_batch",
+                "collectionId": "posts_id",
+                "collectionName": "posts",
+                "title": "set-by-hook",
+                "status": True,
+            },
+        }
+    ]
+    assert created_payloads == [{"title": "set-by-hook", "status": True}]
+
+
+@pytest.mark.asyncio
+async def test_batch_create_exposes_subrequest_headers_and_context(
+    monkeypatch,
+) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    seen_request: list[dict[str, object]] = []
+    seen_rule_contexts: list[dict[str, object]] = []
+    created_payloads: list[dict[str, object]] = []
+
+    async def _capture_subrequest(e):
+        seen_request.append(
+            {
+                "business_id": e.request.headers.get("business_id"),
+                "authorization": e.request.headers.get("authorization"),
+                "method": e.request.method,
+                "query": dict(e.request.query_params),
+                "path": e.request.url.path,
+            }
+        )
+        e.data["business"] = e.request.headers.get("business_id")
+        return await e.next()
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            create_rule='@request.context = "batch"',
+            options={},
+        )
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        created_payloads.append(dict(payload))
+        return {
+            "id": "rec_batch",
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+            "business": payload.get("business"),
+        }
+
+    async def _fake_check_record_rule(
+        _engine,
+        _collection,
+        _record_id,
+        _rule,
+        request_context,
+    ):
+        seen_rule_contexts.append(dict(request_context))
+        return True
+
+    async def _fake_get_all_collections(_engine):
+        return []
+
+    extensions.hooks.get(HOOK_RECORD_CREATE_REQUEST).bind_func(_capture_subrequest)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+    monkeypatch.setattr(records_api, "check_record_rule", _fake_check_record_rule)
+    monkeypatch.setattr(records_api, "get_all_collections", _fake_get_all_collections)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/batch",
+            headers={"Authorization": "Bearer outer", "business_id": "outer"},
+            json={
+                "requests": [
+                    {
+                        "method": "POST",
+                        "url": "/api/collections/posts/records?source=batch",
+                        "headers": {
+                            "business_id": "biz-inner",
+                            "Authorization": "Bearer inner",
+                        },
+                        "body": {"title": "from-batch"},
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["body"]["business"] == "biz-inner"
+    assert seen_request == [
+        {
+            "business_id": "biz-inner",
+            "authorization": "Bearer outer",
+            "method": "POST",
+            "query": {"source": "batch"},
+            "path": "/api/collections/posts/records",
+        }
+    ]
+    assert seen_rule_contexts
+    assert seen_rule_contexts[0]["context"] == "batch"
+    assert seen_rule_contexts[0]["headers"]["business_id"] == "biz-inner"
+    assert seen_rule_contexts[0]["headers"]["authorization"] == "Bearer outer"
+    assert seen_rule_contexts[0]["method"] == "POST"
+    assert seen_rule_contexts[0]["query"] == {"source": "batch"}
+    assert created_payloads == [{"title": "from-batch", "business": "biz-inner"}]
+
+
+@pytest.mark.asyncio
+async def test_batch_upsert_rewrites_subrequest_for_record_hooks(
+    monkeypatch,
+) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    calls: list[str] = []
+
+    async def _create_hook(e):
+        calls.append(f"create:{e.request.method}:{e.request.url.path}")
+        return await e.next()
+
+    async def _update_hook(e):
+        calls.append(f"update:{e.request.method}:{e.request.url.path}:{e.record_id}")
+        return await e.next()
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            create_rule="",
+            update_rule="",
+            options={},
+        )
+
+    async def _fake_get_record(_engine, _collection, record_id, **_kwargs):
+        if record_id == "existing_rec":
+            return {"id": record_id, "title": "existing"}
+        return None
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        return {
+            "id": payload.get("id"),
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+        }
+
+    async def _fake_update_record(_engine, _collection, record_id, payload, files=None):
+        return {
+            "id": record_id,
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+        }
+
+    async def _fake_get_all_collections(_engine):
+        return []
+
+    extensions.hooks.get(HOOK_RECORD_CREATE_REQUEST).bind_func(_create_hook)
+    extensions.hooks.get(HOOK_RECORD_UPDATE_REQUEST).bind_func(_update_hook)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "get_record", _fake_get_record)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+    monkeypatch.setattr(records_api, "update_record", _fake_update_record)
+    monkeypatch.setattr(records_api, "get_all_collections", _fake_get_all_collections)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/batch",
+            json={
+                "requests": [
+                    {
+                        "method": "PUT",
+                        "url": "/api/collections/posts/records?source=upsert",
+                        "body": {"id": "new_rec", "title": "created"},
+                    },
+                    {
+                        "method": "PUT",
+                        "url": "/api/collections/posts/records?source=upsert",
+                        "body": {"id": "existing_rec", "title": "updated"},
+                    },
+                ]
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert [item["status"] for item in response.json()] == [200, 200]
+    assert calls == [
+        "create:POST:/api/collections/posts/records",
+        "update:PATCH:/api/collections/posts/records/existing_rec:existing_rec",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_create_hook_rejection_rolls_back_transaction(monkeypatch) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    writes = 0
+
+    async def _reject_batch_create(e):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "Rejected by hook.",
+                "data": {"title": {"code": "hook_rejected", "message": "Nope."}},
+            },
+        )
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            create_rule="",
+            options={},
+        )
+
+    async def _fake_create_record(_engine, _collection, payload, files=None):
+        nonlocal writes
+        writes += 1
+        return {"id": "should_not_commit"}
+
+    async def _fake_get_all_collections(_engine):
+        return []
+
+    extensions.hooks.get(HOOK_RECORD_CREATE_REQUEST).bind_func(_reject_batch_create)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "create_record", _fake_create_record)
+    monkeypatch.setattr(records_api, "get_all_collections", _fake_get_all_collections)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/batch",
+            json={
+                "requests": [
+                    {
+                        "method": "POST",
+                        "url": "/api/collections/posts/records",
+                        "body": {"title": "blocked"},
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["message"] == "Batch transaction failed."
+    assert body["data"]["requests"]["0"]["response"]["message"] == "Rejected by hook."
+    assert writes == 0
+    assert fake_engine.last_exc_type is records_api._BatchRequestFailed
+
+
+@pytest.mark.asyncio
+async def test_batch_update_and_delete_trigger_record_hooks(monkeypatch) -> None:
+    extensions = ExtensionRegistry()
+    fake_engine = _FakeEngine()
+    calls: list[str] = []
+    updated_payloads: list[dict[str, object]] = []
+    deleted_ids: list[str] = []
+
+    async def _update_hook(e):
+        calls.append(f"update:{e.record_id}")
+        e.data["updatedByHook"] = True
+        return await e.next()
+
+    async def _delete_hook(e):
+        calls.append(f"delete:{e.record_id}")
+        return await e.next()
+
+    async def _fake_resolve_collection(_engine, _collection):
+        return SimpleNamespace(
+            id="posts_id",
+            name="posts",
+            type="base",
+            update_rule="",
+            delete_rule="",
+            options={},
+        )
+
+    async def _fake_update_record(_engine, _collection, record_id, payload, files=None):
+        updated_payloads.append(dict(payload))
+        return {
+            "id": record_id,
+            "collectionId": "posts_id",
+            "collectionName": "posts",
+            "title": payload.get("title"),
+            "updatedByHook": payload.get("updatedByHook"),
+        }
+
+    async def _fake_delete_record(
+        _engine, _collection, record_id, all_collections=None
+    ):
+        deleted_ids.append(record_id)
+        return True
+
+    async def _fake_get_all_collections(_engine):
+        return []
+
+    extensions.hooks.get(HOOK_RECORD_UPDATE_REQUEST).bind_func(_update_hook)
+    extensions.hooks.get(HOOK_RECORD_DELETE_REQUEST).bind_func(_delete_hook)
+    monkeypatch.setattr(records_api, "get_engine", lambda: fake_engine)
+    monkeypatch.setattr(records_api, "resolve_collection", _fake_resolve_collection)
+    monkeypatch.setattr(records_api, "update_record", _fake_update_record)
+    monkeypatch.setattr(records_api, "delete_record", _fake_delete_record)
+    monkeypatch.setattr(records_api, "get_all_collections", _fake_get_all_collections)
+
+    app = _build_records_app(extensions)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/api/batch",
+            json={
+                "requests": [
+                    {
+                        "method": "PATCH",
+                        "url": "/api/collections/posts/records/rec1",
+                        "body": {"title": "patched"},
+                    },
+                    {
+                        "method": "DELETE",
+                        "url": "/api/collections/posts/records/rec1",
+                    },
+                ]
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {
+            "status": 200,
+            "body": {
+                "id": "rec1",
+                "collectionId": "posts_id",
+                "collectionName": "posts",
+                "title": "patched",
+                "updatedByHook": True,
+            },
+        },
+        {"status": 204, "body": None},
+    ]
+    assert calls == ["update:rec1", "delete:rec1"]
+    assert updated_payloads == [{"title": "patched", "updatedByHook": True}]
+    assert deleted_ids == ["rec1"]
