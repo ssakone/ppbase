@@ -953,14 +953,14 @@ async def update_record(
 
         processed_fields.add(field_name)
 
-        if field_def.type == FieldType.FILE:
-            old_files = set(_raw_file_list(raw_current))
-            new_files = set(_raw_file_list(value))
-            files_to_delete.extend(old_files - new_files)
-
         try:
             validated = validate_field_value(field_def, value)
-            updates[field_name] = _serialize_for_pg(validated, field_def)
+            serialized = _serialize_for_pg(validated, field_def)
+            updates[field_name] = serialized
+            if field_def.type == FieldType.FILE:
+                old_files = set(_raw_file_list(raw_current))
+                new_files = set(_raw_file_list(validated))
+                files_to_delete.extend(old_files - new_files)
         except FieldValidationError as exc:
             errors[exc.field_name] = {"code": exc.code, "message": exc.message}
 
@@ -1022,7 +1022,7 @@ def _apply_append(
         return cur + inc
 
     # Multi-value fields (select, relation, file)
-    cur_list = list(current) if isinstance(current, (list, tuple)) else []
+    cur_list = _coerce_modifier_values(current)
     if isinstance(new_values, list):
         cur_list.extend(new_values)
     elif new_values is not None:
@@ -1041,7 +1041,7 @@ def _apply_prepend(
         inc = float(new_values) if new_values is not None else 0.0
         return cur + inc
 
-    cur_list = list(current) if isinstance(current, (list, tuple)) else []
+    cur_list = _coerce_modifier_values(current)
     prepend_values: list[Any]
     if isinstance(new_values, list):
         prepend_values = list(new_values)
@@ -1063,7 +1063,7 @@ def _apply_remove(
         dec = float(remove_values) if remove_values is not None else 0.0
         return cur - dec
 
-    cur_list = list(current) if isinstance(current, (list, tuple)) else []
+    cur_list = _coerce_modifier_values(current)
     if isinstance(remove_values, list):
         to_remove = set(str(v) for v in remove_values)
     elif remove_values is not None:
@@ -1071,6 +1071,15 @@ def _apply_remove(
     else:
         to_remove = set()
     return [v for v in cur_list if str(v) not in to_remove]
+
+
+def _coerce_modifier_values(value: Any) -> list[Any]:
+    """Return a list-like field value without splitting scalar strings."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if value is None or value == "":
+        return []
+    return [value]
 
 
 # ---------------------------------------------------------------------------

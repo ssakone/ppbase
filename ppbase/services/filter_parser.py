@@ -759,12 +759,7 @@ class _FilterTransformer(Transformer):
         # LIKE / NOT LIKE
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
-            # Auto-wrap value with % for LIKE
-            if right[0] == "literal" and isinstance(right[1], str):
-                wrapped = f"%{right[1]}%"
-                pname = self._next_param(wrapped)
-                return f"{left_sql} {sql_op} :{pname}"
-            return f"{left_sql} {sql_op} {right_sql}"
+            return self._like_comparison_sql(left_sql, right, right_sql, sql_op)
 
         # ANY standard operators (for array columns)
         if op in _ANY_STANDARD_OPS:
@@ -774,11 +769,8 @@ class _FilterTransformer(Transformer):
         # ANY LIKE operators
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
-            if right[0] == "literal" and isinstance(right[1], str):
-                wrapped = f"%{right[1]}%"
-                pname = self._next_param(wrapped)
-                return self._scalar_or_array_like_sql(left_sql, f":{pname}", sql_op)
-            return self._scalar_or_array_like_sql(left_sql, right_sql, sql_op)
+            pattern_sql = self._like_pattern_sql(right, right_sql)
+            return self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op)
 
         return f"{left_sql} = {right_sql}"
 
@@ -796,6 +788,27 @@ class _FilterTransformer(Transformer):
         if sql_expr.startswith(":"):
             return f"CAST({sql_expr} AS text)"
         return f"{sql_expr}::text"
+
+    def _like_pattern_sql(self, node: tuple[str, Any], operand_sql: str) -> str:
+        """Build a PocketBase-like contains pattern for LIKE comparisons."""
+        if node[0] == "literal":
+            pname = self._next_param(f"%{node[1]}%")
+            return f":{pname}"
+        if node[0] == "null":
+            return "NULL"
+        return f"('%' || {self._text_cast_sql(operand_sql)} || '%')"
+
+    def _like_comparison_sql(
+        self,
+        match_sql: str,
+        pattern_node: tuple[str, Any],
+        pattern_sql: str,
+        sql_op: str,
+    ) -> str:
+        return (
+            f"{self._text_cast_sql(match_sql)} {sql_op} "
+            f"{self._like_pattern_sql(pattern_node, pattern_sql)}"
+        )
 
     def _scalar_or_array_any_sql(
         self,
@@ -831,12 +844,13 @@ class _FilterTransformer(Transformer):
         sql_op: str,
     ) -> str:
         """Build scalar-safe ``?~``/``?!~`` SQL."""
+        container_text = self._text_cast_sql(container_sql)
         return (
             "(CASE "
             f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
             f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(to_jsonb({container_sql})) "
             f"AS _elem(value) WHERE _elem.value {sql_op} {pattern_sql}) "
-            f"ELSE {container_sql}::text {sql_op} {pattern_sql} "
+            f"ELSE {container_text} {sql_op} {pattern_sql} "
             "END)"
         )
 
@@ -971,14 +985,15 @@ class _FilterTransformer(Transformer):
                 condition = f"{other_sql} {sql_op} {ref_sql}"
         elif op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
-            if other[0] == "literal" and isinstance(other[1], str):
-                wrapped = f"%{other[1]}%"
-                pname = self._next_param(wrapped)
-                other_sql = f":{pname}"
             if ref_is_left:
-                condition = f"{ref_sql} {sql_op} {other_sql}"
+                condition = self._like_comparison_sql(ref_sql, other, other_sql, sql_op)
             else:
-                condition = f"{other_sql} {sql_op} {ref_sql}"
+                condition = self._like_comparison_sql(
+                    other_sql,
+                    ("sql_ref", ref_sql),
+                    ref_sql,
+                    sql_op,
+                )
         elif op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
             if ref_is_left:
@@ -987,14 +1002,12 @@ class _FilterTransformer(Transformer):
                 condition = self._scalar_or_array_any_sql(other_sql, ref_sql, sql_op)
         elif op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
-            if other[0] == "literal" and isinstance(other[1], str):
-                wrapped = f"%{other[1]}%"
-                pname = self._next_param(wrapped)
-                other_sql = f":{pname}"
             if ref_is_left:
-                condition = self._scalar_or_array_like_sql(ref_sql, other_sql, sql_op)
+                pattern_sql = self._like_pattern_sql(other, other_sql)
+                condition = self._scalar_or_array_like_sql(ref_sql, pattern_sql, sql_op)
             else:
-                condition = self._scalar_or_array_like_sql(other_sql, ref_sql, sql_op)
+                pattern_sql = self._like_pattern_sql(("sql_ref", ref_sql), ref_sql)
+                condition = self._scalar_or_array_like_sql(other_sql, pattern_sql, sql_op)
         else:
             condition = (
                 f"{ref_sql} = {other_sql}"
@@ -1167,14 +1180,15 @@ class _FilterTransformer(Transformer):
 
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
-            if rel_is_left and other[0] == "literal" and isinstance(other[1], str):
-                wrapped = f"%{other[1]}%"
-                pname = self._next_param(wrapped)
-                where_cond = f"{rel_col} {sql_op} :{pname}"
-            elif rel_is_left:
-                where_cond = f"{rel_col} {sql_op} {other_sql}"
+            if rel_is_left:
+                where_cond = self._like_comparison_sql(rel_col, other, other_sql, sql_op)
             else:
-                where_cond = f"{other_sql} {sql_op} {rel_col}"
+                where_cond = self._like_comparison_sql(
+                    other_sql,
+                    ("sql_ref", rel_col),
+                    rel_col,
+                    sql_op,
+                )
             return _relation_condition_for_steps(rel_steps, where_cond)
 
         if op in _ANY_STANDARD_OPS:
@@ -1187,14 +1201,12 @@ class _FilterTransformer(Transformer):
 
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
-            if rel_is_left and other[0] == "literal" and isinstance(other[1], str):
-                wrapped = f"%{other[1]}%"
-                pname = self._next_param(wrapped)
-                where_cond = self._scalar_or_array_like_sql(rel_col, f":{pname}", sql_op)
-            elif rel_is_left:
-                where_cond = self._scalar_or_array_like_sql(rel_col, other_sql, sql_op)
+            if rel_is_left:
+                pattern_sql = self._like_pattern_sql(other, other_sql)
+                where_cond = self._scalar_or_array_like_sql(rel_col, pattern_sql, sql_op)
             else:
-                where_cond = self._scalar_or_array_like_sql(other_sql, rel_col, sql_op)
+                pattern_sql = self._like_pattern_sql(("sql_ref", rel_col), rel_col)
+                where_cond = self._scalar_or_array_like_sql(other_sql, pattern_sql, sql_op)
             return _relation_condition_for_steps(rel_steps, where_cond)
 
         # Fallback
@@ -1283,16 +1295,13 @@ class _FilterTransformer(Transformer):
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
             if each_is_left:
-                if other[0] == "literal" and isinstance(other[1], str):
-                    wrapped = f"%{other[1]}%"
-                    pname = self._next_param(wrapped)
-                    return f"{item_sql} {sql_op} :{pname}"
-                return f"{item_sql} {sql_op} {other_sql}"
-            if other[0] == "literal" and isinstance(other[1], str):
-                wrapped = f"%{other[1]}%"
-                pname = self._next_param(wrapped)
-                return f":{pname} {sql_op} {item_sql}"
-            return f"{other_sql} {sql_op} {item_sql}"
+                return self._like_comparison_sql(item_sql, other, other_sql, sql_op)
+            return self._like_comparison_sql(
+                other_sql,
+                ("sql_ref", item_sql),
+                item_sql,
+                sql_op,
+            )
 
         # Fallback to "=" semantics for unsupported operator combos.
         if each_is_left:

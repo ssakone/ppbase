@@ -103,6 +103,80 @@ async def test_serve_file_download_query_param_controls_content_disposition(
         )
 
 
+async def test_single_file_append_modifier_stores_plain_filename(
+    app_client: AsyncClient,
+    admin_token: str,
+) -> None:
+    collection_name = f"files_single_append_{uuid.uuid4().hex[:8]}"
+
+    create_collection_response = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": collection_name,
+            "type": "base",
+            "schema": [
+                {
+                    "name": "doc",
+                    "type": "file",
+                    "required": False,
+                    "options": {"maxSelect": 1},
+                }
+            ],
+            "listRule": "",
+            "viewRule": "",
+            "createRule": "",
+            "updateRule": "",
+            "deleteRule": "",
+        },
+    )
+    assert create_collection_response.status_code == 200, (
+        create_collection_response.text
+    )
+    collection = create_collection_response.json()
+
+    try:
+        create_record_response = await app_client.post(
+            f"/api/collections/{collection_name}/records",
+            headers={"Authorization": admin_token},
+            data={},
+            files=[("doc", ("first.txt", b"first-file-body", "text/plain"))],
+        )
+        assert create_record_response.status_code == 200, create_record_response.text
+        record = create_record_response.json()
+        first_filename = str(record.get("doc", "") or "")
+        assert re.match(r"^first_[A-Za-z0-9]{10}\.txt$", first_filename)
+
+        update_response = await app_client.patch(
+            f"/api/collections/{collection_name}/records/{record['id']}",
+            headers={"Authorization": admin_token},
+            data={},
+            files=[("doc+", ("second.txt", b"second-file-body", "text/plain"))],
+        )
+        assert update_response.status_code == 200, update_response.text
+        updated = update_response.json()
+
+        updated_filename = updated.get("doc")
+        assert isinstance(updated_filename, str)
+        assert re.match(r"^second_[A-Za-z0-9]{10}\.txt$", updated_filename)
+
+        stale_file_response = await app_client.get(
+            f"/api/files/{collection['id']}/{record['id']}/{first_filename}"
+        )
+        assert stale_file_response.status_code == 404, stale_file_response.text
+
+        updated_file_response = await app_client.get(
+            f"/api/files/{collection['id']}/{record['id']}/{updated_filename}"
+        )
+        assert updated_file_response.status_code == 200, updated_file_response.text
+        assert updated_file_response.content == b"second-file-body"
+    finally:
+        await app_client.delete(
+            f"/api/collections/{collection['id']}",
+            headers={"Authorization": admin_token},
+        )
+
+
 async def test_serve_view_file_uses_original_record_storage(
     app_client: AsyncClient,
     admin_token: str,
