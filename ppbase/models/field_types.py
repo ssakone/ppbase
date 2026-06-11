@@ -400,13 +400,15 @@ def _validate_file(field: FieldDefinition, value: Any) -> str | list[str]:
     max_select: int = opts.get("maxSelect", 1) or 1
     is_multi = max_select > 1
 
+    def file_list(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [str(v) for v in raw if v]
+        return [str(raw)] if raw else []
+
     if is_multi:
-        if value is None:
-            val_list: list[str] = []
-        elif isinstance(value, list):
-            val_list = [str(v) for v in value if v]
-        else:
-            val_list = [str(value)] if value else []
+        val_list = file_list(value)
 
         if field.required and not val_list:
             raise FieldValidationError(
@@ -420,7 +422,8 @@ def _validate_file(field: FieldDefinition, value: Any) -> str | list[str]:
             )
         return val_list
     else:
-        val = str(value) if value is not None else ""
+        values = file_list(value)
+        val = values[-1] if values else ""
         if field.required and not val:
             raise FieldValidationError(
                 field.name, "validation_required", "Cannot be blank."

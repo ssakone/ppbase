@@ -8,6 +8,7 @@ from ppbase.models.field_types import (
     FieldValidationError,
     validate_field_value,
 )
+from ppbase.services.record_service import _apply_append
 
 
 def test_json_max_size_zero_means_unlimited() -> None:
@@ -76,3 +77,26 @@ def test_editor_max_size_zero_means_unlimited() -> None:
     )
 
     assert validate_field_value(field, "long editor content") == "long editor content"
+
+
+def test_single_file_list_value_normalizes_to_last_filename_like_pocketbase() -> None:
+    field = FieldDefinition(
+        name="photo",
+        type=FieldType.FILE,
+        options={"maxSelect": 1},
+    )
+
+    assert validate_field_value(field, ["old.jpg", "new.jpg"]) == "new.jpg"
+
+
+def test_single_file_append_modifier_normalizes_to_plain_filename() -> None:
+    field = FieldDefinition(
+        name="photo",
+        type=FieldType.FILE,
+        options={"maxSelect": 1},
+    )
+
+    appended = _apply_append("old.jpg", ["new.jpg"], field)
+
+    assert appended == ["old.jpg", "new.jpg"]
+    assert validate_field_value(field, appended) == "new.jpg"
