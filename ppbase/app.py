@@ -48,11 +48,17 @@ async def _lifespan(app: FastAPI):
     """Manage startup and shutdown of the database engine."""
     import asyncio
     from ppbase.db.engine import init_engine, close_engine
-    from ppbase.db.system_tables import create_system_tables
+    from ppbase.db.system_tables import ParamRecord
     from ppbase.ext.events import BootstrapEvent, ServeEvent, TerminateEvent
     from ppbase.ext.registry import HOOK_BOOTSTRAP, HOOK_SERVE, HOOK_TERMINATE
+    from ppbase.services.database_preparation import prepare_database
+    from ppbase.services.file_storage import (
+        configure_storage_runtime_from_settings_payload,
+    )
     from ppbase.services.process_control import schedule_process_restart
     from ppbase.services.realtime_service import SubscriptionManager, listen_for_db_events
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     settings: Settings = app.state.settings
     extensions = getattr(app.state, "extension_registry", None)
@@ -68,185 +74,182 @@ async def _lifespan(app: FastAPI):
             BootstrapEvent(app=app, settings=settings),
         )
 
-    # Startup: create engine and ensure system tables exist
+    engine = None
+    listen_task = None
+    hooks_watcher_task = None
+    serve_started = False
+
+    # Startup preparation happens before LISTEN, hooks/jobs, and the lifespan
+    # yield that opens the app to HTTP traffic.
     try:
-        engine = await init_engine(
-            settings.database_url,
-            pool_size=settings.pool_size,
-            max_overflow=settings.max_overflow,
-            echo=settings.dev,
+        try:
+            engine = await init_engine(
+                settings.database_url,
+                pool_size=settings.pool_size,
+                max_overflow=settings.max_overflow,
+                echo=settings.dev,
+            )
+            # Force the lazy SQLAlchemy engine to establish its initial
+            # PostgreSQL connection while the friendly startup error handler
+            # is still in scope. Migration code runs outside this handler so
+            # its own FileNotFoundError/PermissionError/OSError keeps the real
+            # exception type and traceback.
+            async with engine.connect():
+                pass
+        except (ConnectionRefusedError, OSError) as exc:
+            _handle_db_connection_error(settings.database_url, exc)
+
+        applied = await prepare_database(
+            engine,
+            settings.migrations_dir,
+            apply_migrations=settings.should_apply_migrations(),
+            lock_timeout_seconds=settings.migration_lock_timeout,
         )
-        await create_system_tables(engine)
-    except (ConnectionRefusedError, OSError) as exc:
-        _handle_db_connection_error(settings.database_url, exc)
 
-    # Initialize realtime subscription manager
-    subscription_manager = SubscriptionManager(extension_registry=extensions)
-    app.state.subscription_manager = subscription_manager
+        if settings.should_apply_migrations():
+            if applied:
+                logger.info(
+                    "Applied %d pending migration(s) on startup", len(applied)
+                )
+            else:
+                logger.debug("No pending migrations to apply")
+        else:
+            logger.info("Startup migration application disabled")
 
-    # Start PostgreSQL LISTEN task for realtime events
-    listen_task = asyncio.create_task(
-        listen_for_db_events(engine, subscription_manager)
-    )
-    logger.info("Started PostgreSQL LISTEN task for realtime events")
+        session_factory = async_sessionmaker(
+            bind=engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
 
-    # Bootstrap all system collections and backfill auth options
-    from ppbase.db.bootstrap import bootstrap_system_collections
-    from ppbase.db.system_tables import ParamRecord
-    from ppbase.services.auth_service import generate_default_auth_options
-    from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
-    from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker as _asm
-
-    _boot_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
-    async with _boot_factory() as _boot_session:
-        async with _boot_session.begin():
-            await bootstrap_system_collections(_boot_session, engine)
-
-            # Backfill auth options for existing auth collections
-            from ppbase.db.system_tables import CollectionRecord
-            from sqlalchemy import select
-
-            stmt = select(CollectionRecord).where(CollectionRecord.type == "auth")
-            auth_colls = (await _boot_session.execute(stmt)).scalars().all()
-            for coll in auth_colls:
-                opts = coll.options or {}
-                if not opts.get("authToken"):
-                    is_su = (coll.name == "_superusers")
-                    coll.options = generate_default_auth_options(is_superusers=is_su)
-                    await _boot_session.flush()
-
-            settings_stmt = select(ParamRecord.value).where(ParamRecord.key == "settings")
-            settings_row = (await _boot_session.execute(settings_stmt)).scalar_one_or_none()
+        # Load runtime settings only after migrations have completed.
+        async with session_factory() as session:
+            settings_stmt = select(ParamRecord.value).where(
+                ParamRecord.key == "settings"
+            )
+            settings_row = (await session.execute(settings_stmt)).scalar_one_or_none()
             configure_storage_runtime_from_settings_payload(
                 settings_row if isinstance(settings_row, dict) else None
             )
 
-    # Apply pending migrations if auto_migrate is enabled
-    if settings.auto_migrate:
-        from ppbase.services.migration_runner import apply_all_pending
-        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+        # Check if any admin exists — if not, generate the one-time setup URL.
+        from ppbase.services.admin_service import count_admins
+        from ppbase.services.setup_service import get_or_create_setup_token
 
-        migrations_dir = settings.migrations_dir
-        os.makedirs(migrations_dir, exist_ok=True)
-
-        session_factory = async_sessionmaker(
-            bind=engine, class_=AsyncSession, expire_on_commit=False,
-        )
         async with session_factory() as session:
+            admin_count = await count_admins(session)
+            setup_token = None
+            if admin_count == 0:
+                setup_token = await get_or_create_setup_token(session)
+                await session.commit()
+
+        if admin_count == 0 and setup_token:
+            display_host = (
+                settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
+            )
+            setup_url = (
+                f"http://{display_host}:{settings.port}/_/setup?token={setup_token}"
+            )
+            print(
+                "\n"
+                "  No admin account found. Create your first admin:\n"
+                "\n"
+                f"  {setup_url}\n"
+                "\n"
+                "  This is a one-time link — open it in your browser.\n"
+            )
             try:
-                async with session.begin():
-                    applied = await apply_all_pending(session, engine, migrations_dir)
-                if applied:
-                    logger.info(
-                        "Applied %d pending migration(s) on startup", len(applied)
+                import webbrowser
+
+                if sys.stdin.isatty():
+                    webbrowser.open(setup_url)
+            except Exception:
+                pass
+
+        # Restore hook runtime state after the database is fully migrated.
+        hook_manager = getattr(app.state, "hook_manager", None)
+        if hook_manager is not None:
+            async with session_factory() as session:
+                stmt = select(ParamRecord.value).where(
+                    ParamRecord.key == "hooks_runtime"
+                )
+                hooks_runtime = (await session.execute(stmt)).scalar_one_or_none()
+                if isinstance(hooks_runtime, dict):
+                    disabled = set(hooks_runtime.get("disabled", []))
+                    hook_manager.set_auto_restart_on_change(
+                        bool(hooks_runtime.get("autoRestartOnChange", False))
                     )
-                else:
-                    logger.debug("No pending migrations to apply")
-            except Exception as exc:
-                logger.error(
-                    "Migration failed during startup: %s", exc
-                )
-                raise
-    else:
-        logger.info("Auto-migrate disabled, skipping migration check")
-
-    # Check if any admin exists — if not, generate setup token and print unique URL
-    from ppbase.services.admin_service import count_admins
-    from ppbase.services.setup_service import get_or_create_setup_token
-    from sqlalchemy.ext.asyncio import AsyncSession as _CheckAS, async_sessionmaker as _check_asm
-
-    _check_factory = _check_asm(bind=engine, class_=_CheckAS, expire_on_commit=False)
-    async with _check_factory() as _check_session:
-        admin_count = await count_admins(_check_session)
-        if admin_count == 0:
-            setup_token = await get_or_create_setup_token(_check_session)
-            await _check_session.commit()
-
-    if admin_count == 0:
-        display_host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-        setup_url = f"http://{display_host}:{settings.port}/_/setup?token={setup_token}"
-        print(
-            "\n"
-            "  No admin account found. Create your first admin:\n"
-            "\n"
-            f"  {setup_url}\n"
-            "\n"
-            "  This is a one-time link — open it in your browser.\n"
-        )
-        # Try to open in browser (PocketBase-style)
-        try:
-            import webbrowser
-            if sys.stdin.isatty():
-                webbrowser.open(setup_url)
-        except Exception:
-            pass
-
-    # Load persisted disabled hooks state and apply to hook manager
-    hook_manager = getattr(app.state, "hook_manager", None)
-    if hook_manager is not None:
-        _hooks_factory = _asm(bind=engine, class_=_AS, expire_on_commit=False)
-        async with _hooks_factory() as _hooks_session:
-            from sqlalchemy import select as _hsel
-            stmt = _hsel(ParamRecord.value).where(ParamRecord.key == "hooks_runtime")
-            hooks_runtime = (await _hooks_session.execute(stmt)).scalar_one_or_none()
-            if isinstance(hooks_runtime, dict):
-                disabled = set(hooks_runtime.get("disabled", []))
-                hook_manager.set_auto_restart_on_change(
-                    bool(hooks_runtime.get("autoRestartOnChange", False))
-                )
-                if disabled:
                     for hook_id in disabled:
                         hook_manager.disable_hook(hook_id)
-                    logger.info("Restored %d disabled hook(s) from settings", len(disabled))
+                    if disabled:
+                        logger.info(
+                            "Restored %d disabled hook(s) from settings",
+                            len(disabled),
+                        )
 
-    if extensions is not None:
-        await extensions.hooks.get(HOOK_SERVE).trigger(
-            ServeEvent(app=app, settings=settings),
+        # Realtime starts only after bootstrap and migrations succeed.
+        subscription_manager = SubscriptionManager(extension_registry=extensions)
+        app.state.subscription_manager = subscription_manager
+        listen_task = asyncio.create_task(
+            listen_for_db_events(engine, subscription_manager)
         )
+        logger.info("Started PostgreSQL LISTEN task for realtime events")
 
-    # Start hooks directory watcher task (polls every 2 seconds)
-    hooks_watcher_task = None
-    if hook_manager is not None:
-        async def _hooks_watcher() -> None:
-            while True:
-                await asyncio.sleep(2)
-                try:
-                    reloaded = hook_manager.rescan()
-                    if reloaded:
-                        logger.info("Hot-reloaded hook file(s): %s", ", ".join(reloaded))
-                        if hook_manager.get_auto_restart_on_change():
-                            schedule_process_restart(
-                                f"Detected hook file changes: {', '.join(reloaded)}"
+        if extensions is not None:
+            await extensions.hooks.get(HOOK_SERVE).trigger(
+                ServeEvent(app=app, settings=settings),
+            )
+        serve_started = True
+
+        # Start hooks directory watcher task (polls every 2 seconds).
+        if hook_manager is not None:
+            async def _hooks_watcher() -> None:
+                while True:
+                    await asyncio.sleep(2)
+                    try:
+                        reloaded = hook_manager.rescan()
+                        if reloaded:
+                            logger.info(
+                                "Hot-reloaded hook file(s): %s", ", ".join(reloaded)
                             )
-                except Exception as exc:
-                    logger.error("Hook watcher error: %s", exc)
+                            if hook_manager.get_auto_restart_on_change():
+                                schedule_process_restart(
+                                    "Detected hook file changes: "
+                                    f"{', '.join(reloaded)}"
+                                )
+                    except Exception as exc:
+                        logger.error("Hook watcher error: %s", exc)
 
-        hooks_watcher_task = asyncio.create_task(_hooks_watcher())
-        logger.info("Started pb_hooks/ watcher task (polling every 2s)")
+            hooks_watcher_task = asyncio.create_task(_hooks_watcher())
+            logger.info("Started pb_hooks/ watcher task (polling every 2s)")
 
-    yield
+        yield
+    finally:
+        if serve_started and extensions is not None:
+            try:
+                await extensions.hooks.get(HOOK_TERMINATE).trigger(
+                    TerminateEvent(app=app, settings=settings),
+                )
+            except Exception:
+                logger.exception("Terminate hook failed")
 
-    if extensions is not None:
-        await extensions.hooks.get(HOOK_TERMINATE).trigger(
-            TerminateEvent(app=app, settings=settings),
-        )
+        if hooks_watcher_task is not None:
+            hooks_watcher_task.cancel()
+            try:
+                await hooks_watcher_task
+            except asyncio.CancelledError:
+                pass
 
-    # Shutdown: cancel watcher and LISTEN tasks, dispose of the connection pool
-    if hooks_watcher_task is not None:
-        hooks_watcher_task.cancel()
-        try:
-            await hooks_watcher_task
-        except asyncio.CancelledError:
-            pass
+        if listen_task is not None:
+            logger.info("Shutting down PostgreSQL LISTEN task")
+            listen_task.cancel()
+            try:
+                await listen_task
+            except asyncio.CancelledError:
+                pass
 
-    logger.info("Shutting down PostgreSQL LISTEN task")
-    listen_task.cancel()
-    try:
-        await listen_task
-    except asyncio.CancelledError:
-        pass
-
-    await close_engine()
+        if engine is not None:
+            await close_engine()
 
 
 def create_app(

@@ -104,9 +104,6 @@ async def get_optional_auth(
 
         # Look up the auth collection's record to get token_key
         from sqlalchemy import text as _text
-        from ppbase.db.engine import get_engine
-
-        engine = get_engine()
         # First resolve the collection to get its table name
         stmt = select(CollectionRecord).where(
             CollectionRecord.id == collection_id
@@ -128,9 +125,10 @@ async def get_optional_auth(
         sql = _text(
             f'SELECT "token_key" FROM "{table_name}" WHERE "id" = :rid LIMIT 1'
         )
-        async with engine.connect() as conn:
-            result = await conn.execute(sql, {"rid": token_id})
-            row = result.mappings().first()
+        # Reuse the authentication session. Opening a second engine connection
+        # here deadlocks deployments configured with a one-connection pool.
+        result = await session.execute(sql, {"rid": token_id})
+        row = result.mappings().first()
 
         if row is None:
             return None

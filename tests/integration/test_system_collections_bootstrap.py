@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,6 +38,40 @@ class TestSystemCollectionExistence:
         assert data["name"] == "_externalAuths"
         assert data["type"] == "base"
         assert data["system"] is True
+
+    async def test_external_auth_tables_remain_distinct(
+        self,
+        app_client: AsyncClient,
+        admin_token: str,
+    ):
+        # Trigger/verify bootstrap before inspecting the physical schema.
+        response = await app_client.get(
+            "/api/collections/_externalAuths",
+            headers={"Authorization": admin_token},
+        )
+        assert response.status_code == 200
+
+        from ppbase.db.engine import get_engine
+
+        async with get_engine().connect() as connection:
+            result = await connection.execute(
+                text(
+                    "SELECT table_name, column_name "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'public' "
+                    "AND table_name IN ('_external_auths', '_externalAuths')"
+                )
+            )
+            columns: dict[str, set[str]] = {}
+            for table_name, column_name in result:
+                columns.setdefault(table_name, set()).add(column_name)
+
+        assert {"collection_id", "record_id", "provider_id"}.issubset(
+            columns["_external_auths"]
+        )
+        assert {"collectionRef", "recordRef", "providerId"}.issubset(
+            columns["_externalAuths"]
+        )
 
     async def test_mfas_collection_exists(self, app_client: AsyncClient, admin_token: str):
         resp = await app_client.get(

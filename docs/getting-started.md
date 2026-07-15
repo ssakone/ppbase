@@ -144,6 +144,7 @@ curl http://127.0.0.1:8090/hello
 ```
 my_project/
 ├── main.py            ← entry-point
+├── pb_migrations/     ← this application's versioned migrations
 ├── hooks/
 │   ├── users.py       ← user-related hooks
 │   ├── posts.py       ← post hooks
@@ -151,7 +152,7 @@ my_project/
 ├── routes/
 │   ├── blog.py        ← blog API routes
 │   └── metrics.py     ← internal metrics
-└── ppbase/            ← ppbase package (git submodule or pip-installed)
+└── requirements.txt   ← includes the pip-installed ppbase package
 ```
 
 ```python
@@ -210,6 +211,56 @@ if __name__ == "__main__":
 ```
 
 `pb.configure()` raises `RuntimeError` if called after the app is materialised.
+
+## Migrations
+
+PPBase bootstraps its internal schema and the default `users` collection, then
+applies pending Python files from `migrations_dir` before it starts accepting
+traffic. Each file is committed independently with its `_migrations` history
+row, and PostgreSQL advisory locking prevents duplicate application when two
+instances start together. Dashboard/API producers acquire the same lock before
+publishing a generated migration and committing their schema change.
+
+```bash
+python -m ppbase migrate create add_posts
+python -m ppbase migrate status
+python -m ppbase migrate up
+python -m ppbase migrate down 1
+python -m ppbase migrate snapshot
+```
+
+`migrate status` is read-only. On a blank database it reports every local file
+as pending without creating PPBase tables or the default users collection.
+
+Snapshots replay in PocketBase-style extend mode and topologically order
+dependent PostgreSQL views. Because PPBase records a snapshot as an already
+applied baseline on its source database, the generated `down()` intentionally
+does nothing: it cannot know which collections or data existed before the
+snapshot. Use PostgreSQL backups for data recovery.
+
+The migration directory belongs to the consuming application. Commit your
+backend's `pb_migrations/` (or custom directory) to that backend's repository
+so deployments receive and apply the same history. PPBase's own source checkout
+ignores its root `pb_migrations/` because that directory is only local runtime
+data for framework development; it is not bundled in the PyPI package.
+
+PocketBase uses “automigrate” for migration-file generation after Dashboard
+collection changes. PPBase now exposes the two concerns separately:
+
+- `apply_migrations_on_start`: apply pending files during startup;
+- `generate_migrations`: generate files for Dashboard/API collection changes.
+
+For backwards compatibility, either unset option inherits the legacy
+`auto_migrate` value.
+
+Generated files and PostgreSQL cannot share one physical transaction. PPBase
+publishes the file first as durable intent while holding the shared migration
+lock, then commits DDL, metadata, and history together. After a crash, an
+uncommitted file can remain pending and be applied on the next run. A lost
+COMMIT acknowledgement is checked against `_migrations` only after reacquiring
+that same runner lock; unverifiable outcomes preserve the file and require
+`migrate status` before retrying. Disabling `generate_migrations` suppresses
+only the file: physical collection-schema mutations still take the lock.
 
 ## Verify the app boots
 

@@ -12,6 +12,7 @@ import math
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
@@ -149,7 +150,7 @@ async def _maybe_generate_migration(
     kind: str,
     record: CollectionRecord | None = None,
     old_snapshot: Any | None = None,
-) -> None:
+) -> str | None:
     """Generate a migration file and record it as applied if auto_migrate is on.
 
     Args:
@@ -161,36 +162,195 @@ async def _maybe_generate_migration(
         old_snapshot: For updates, the snapshot of the old state.
     """
     if not auto_migrate or not migrations_dir:
-        return
+        return None
 
-    try:
-        from ppbase.services.migration_generator import (
-            generate_create_migration,
-            generate_delete_migration,
-            generate_update_migration,
-        )
-    except ImportError:
-        logger.warning("migration_generator module not available; skipping migration generation")
-        return
+    from ppbase.services.migration_generator import (
+        generate_create_migration,
+        generate_delete_migration,
+        generate_update_migration,
+    )
 
     os.makedirs(migrations_dir, exist_ok=True)
 
+    generated_path: str | None = None
     try:
         if kind == "create" and record is not None:
-            filename = generate_create_migration(record, migrations_dir)
+            generated_path = generate_create_migration(record, migrations_dir)
         elif kind == "update" and old_snapshot is not None and record is not None:
-            filename = generate_update_migration(old_snapshot, record, migrations_dir)
+            generated_path = generate_update_migration(
+                old_snapshot,
+                record,
+                migrations_dir,
+            )
         elif kind == "delete" and record is not None:
-            filename = generate_delete_migration(record, migrations_dir)
+            generated_path = generate_delete_migration(record, migrations_dir)
         else:
-            return
+            return None
 
-        if filename:
+        if generated_path:
             # Store just the basename, not the full path
-            basename = os.path.basename(filename)
+            basename = os.path.basename(generated_path)
             await _record_migration(session, basename)
-    except Exception:
-        logger.exception("Failed to generate migration file (kind=%s)", kind)
+        return generated_path
+    except BaseException:
+        if generated_path:
+            Path(generated_path).unlink(missing_ok=True)
+        raise
+
+
+def _cleanup_generated_migrations(paths: list[str]) -> None:
+    """Remove only migration files created by the current failed mutation."""
+    for path in paths:
+        Path(path).unlink(missing_ok=True)
+
+
+async def _recorded_generated_migrations(
+    session: AsyncSession,
+    filenames: list[str],
+) -> set[str]:
+    """Read matching migration history through the verifier transaction."""
+    from ppbase.db.system_tables import MigrationRecord
+
+    result = await session.execute(
+        select(MigrationRecord.file).where(MigrationRecord.file.in_(filenames))
+    )
+    return set(result.scalars().all())
+
+
+async def _reconcile_generated_migrations(
+    engine: AsyncEngine,
+    generated_paths: list[str],
+    *,
+    lock_timeout_seconds: float,
+) -> set[str]:
+    """Fence runners while verifying history and deleting rolled-back intent.
+
+    The producer's transaction-level advisory lock necessarily ends with its
+    uncertain COMMIT. A fresh verifier transaction therefore reacquires the
+    same lock before consulting ``_migrations``. If a runner won the race, the
+    verifier waits for it and observes its committed history. If the verifier
+    wins, a known rollback is cleaned up before any runner can consume the
+    generated file.
+    """
+    from ppbase.services.migration_runner import (
+        acquire_migration_transaction_lock,
+    )
+
+    filenames = [Path(path).name for path in generated_paths]
+    async with AsyncSession(bind=engine, expire_on_commit=False) as verifier:
+        await acquire_migration_transaction_lock(
+            verifier,
+            timeout_seconds=lock_timeout_seconds,
+        )
+        committed = await _recorded_generated_migrations(verifier, filenames)
+        if not committed:
+            # Keep the verifier's transaction lock until every current intent
+            # file is gone, preventing a runner from discovering it midway.
+            _cleanup_generated_migrations(generated_paths)
+        await verifier.rollback()
+        return committed
+
+
+async def _commit_with_generated_migrations(
+    session: AsyncSession,
+    engine: AsyncEngine,
+    generated_paths: list[str],
+    *,
+    migration_lock_timeout: float = 30.0,
+) -> None:
+    """Commit schema/history and reconcile a potentially lost COMMIT ACK.
+
+    The filesystem cannot participate in the PostgreSQL transaction. Migration
+    files are therefore durable intent records published before COMMIT. On a
+    commit error a fresh verifier reacquires the runner lock before reading
+    ``_migrations``. A complete history match proves that the generated intent
+    is now applied (either by the original COMMIT or by a runner that won the
+    lock race); no matches while fenced allows cleanup. Any unverifiable or
+    partial outcome preserves the files for operator recovery.
+    """
+    try:
+        await session.commit()
+    except BaseException as commit_error:
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("Rollback failed after collection commit error")
+
+        # Release the request connection before reconciliation so deployments
+        # with pool_size=1 can still query the authoritative history row.
+        try:
+            await session.close()
+        except Exception:
+            logger.exception("Session close failed after collection commit error")
+
+        if not generated_paths:
+            raise
+
+        from ppbase.services.migration_runner import MigrationCommitOutcomeError
+
+        filenames = [Path(path).name for path in generated_paths]
+        try:
+            committed = await _reconcile_generated_migrations(
+                engine,
+                generated_paths,
+                lock_timeout_seconds=migration_lock_timeout,
+            )
+        except BaseException as verify_error:
+            raise MigrationCommitOutcomeError(
+                "PostgreSQL commit outcome is unknown for generated migrations "
+                f"{filenames!r}. Their files were preserved; inspect migration "
+                "status before retrying the collection mutation."
+            ) from verify_error
+
+        expected = set(filenames)
+        if committed == expected:
+            logger.warning(
+                "Collection COMMIT acknowledgement was lost, but migration "
+                "history now confirms the generated intent for %s",
+                filenames,
+            )
+            return
+        if not committed:
+            raise commit_error
+
+        raise MigrationCommitOutcomeError(
+            "PostgreSQL returned a partial migration-history match after a "
+            f"commit error (expected {sorted(expected)!r}, found "
+            f"{sorted(committed)!r}). Files were preserved; manual inspection "
+            "is required before retrying."
+        ) from commit_error
+
+
+async def _lock_migration_producer(
+    session: AsyncSession,
+    *,
+    migration_lock_timeout: float,
+) -> None:
+    """Serialize every collection mutation with migration runners."""
+
+    from ppbase.services.migration_runner import (
+        acquire_migration_transaction_lock,
+    )
+
+    await acquire_migration_transaction_lock(
+        session,
+        timeout_seconds=migration_lock_timeout,
+    )
+
+
+async def _generate_migration_or_rollback(
+    session: AsyncSession,
+    **kwargs: Any,
+) -> str | None:
+    """Generate/history-sync a file or roll back the collection mutation."""
+    try:
+        return await _maybe_generate_migration(session, **kwargs)
+    except BaseException:
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("Rollback failed after migration generation error")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +418,13 @@ async def create_collection(
     *,
     auto_migrate: bool = False,
     migrations_dir: str | None = None,
+    migration_lock_timeout: float = 30.0,
 ) -> CollectionResponse:
     """Create a new collection record and the corresponding table."""
+    await _lock_migration_producer(
+        session,
+        migration_lock_timeout=migration_lock_timeout,
+    )
     _validate_collection_name(data.name)
 
     # Check uniqueness
@@ -303,10 +468,10 @@ async def create_collection(
     await session.flush()
 
     # Create the physical table
-    await create_collection_table(engine, record)
+    await create_collection_table(session, record)
 
     # Generate migration file if auto_migrate is enabled
-    await _maybe_generate_migration(
+    generated_path = await _generate_migration_or_rollback(
         session,
         auto_migrate=auto_migrate,
         migrations_dir=migrations_dir,
@@ -314,7 +479,12 @@ async def create_collection(
         record=record,
     )
 
-    await session.commit()
+    await _commit_with_generated_migrations(
+        session,
+        engine,
+        [generated_path] if generated_path else [],
+        migration_lock_timeout=migration_lock_timeout,
+    )
 
     return CollectionResponse.from_record(record)
 
@@ -327,8 +497,13 @@ async def update_collection(
     *,
     auto_migrate: bool = False,
     migrations_dir: str | None = None,
+    migration_lock_timeout: float = 30.0,
 ) -> CollectionResponse:
     """Update a collection record and alter the underlying table if needed."""
+    await _lock_migration_producer(
+        session,
+        migration_lock_timeout=migration_lock_timeout,
+    )
     record = await _find_collection(session, id_or_name)
 
     if record.system:
@@ -409,45 +584,38 @@ async def update_collection(
         else:
             record.options = incoming_options
         flag_modified(record, "options")
+    elif (record.type or "base") == "auth" and old_snapshot.type != "auth":
+        from ppbase.services.auth_service import generate_default_auth_options
+
+        existing_options = record.options if isinstance(record.options, dict) else {}
+        record.options = _deep_merge_dicts(
+            generate_default_auth_options(is_superusers=record.name == "_superusers"),
+            existing_options,
+        )
+        flag_modified(record, "options")
 
     record.updated = datetime.now(timezone.utc)
 
     await session.flush()
 
-    # View collections: recreate the VIEW if query or name changed
-    col_type = record.type or "base"
-    if col_type == "view":
-        old_options = old_snapshot.options if hasattr(old_snapshot, "options") else {}
-        new_options = record.options if isinstance(record.options, dict) else {}
-        old_query = old_options.get("query", "")
-        new_query = new_options.get("query", "")
-        if old_snapshot.name != record.name or old_query != new_query:
-            if new_query:
-                from ppbase.db.schema_manager import (
-                    delete_collection_table,
-                    validate_view_query,
-                )
-
-                await validate_view_query(engine, new_query)
-                # Drop old view/table, then create new view
-                await delete_collection_table(
-                    engine, old_snapshot.name, "view"
-                )
-                await create_collection_table(engine, record)
-            elif old_snapshot.name != record.name:
-                # Just rename
-                await update_collection_table(engine, old_snapshot, record)
-    else:
-        # Alter the physical table
-        schema_changed = (
-            old_snapshot.name != record.name
-            or old_snapshot.schema != (record.schema if isinstance(record.schema, list) else [])
+    physical_schema_changed = (
+        old_snapshot.name != record.name
+        or old_snapshot.type != record.type
+        or old_snapshot.schema
+        != (record.schema if isinstance(record.schema, list) else [])
+        or old_snapshot.indexes
+        != (record.indexes if isinstance(record.indexes, list) else [])
+        or (
+            (old_snapshot.type == "view" or record.type == "view")
+            and old_snapshot.options
+            != (record.options if isinstance(record.options, dict) else {})
         )
-        if schema_changed:
-            await update_collection_table(engine, old_snapshot, record)
+    )
+    if physical_schema_changed:
+        await update_collection_table(session, old_snapshot, record)
 
     # Generate migration file if auto_migrate is enabled
-    await _maybe_generate_migration(
+    generated_path = await _generate_migration_or_rollback(
         session,
         auto_migrate=auto_migrate,
         migrations_dir=migrations_dir,
@@ -456,7 +624,12 @@ async def update_collection(
         old_snapshot=old_snapshot,
     )
 
-    await session.commit()
+    await _commit_with_generated_migrations(
+        session,
+        engine,
+        [generated_path] if generated_path else [],
+        migration_lock_timeout=migration_lock_timeout,
+    )
 
     return CollectionResponse.from_record(record)
 
@@ -468,8 +641,13 @@ async def delete_collection(
     *,
     auto_migrate: bool = False,
     migrations_dir: str | None = None,
+    migration_lock_timeout: float = 30.0,
 ) -> None:
     """Delete a collection record and drop the underlying table."""
+    await _lock_migration_producer(
+        session,
+        migration_lock_timeout=migration_lock_timeout,
+    )
     record = await _find_collection(session, id_or_name)
 
     if record.system:
@@ -498,10 +676,10 @@ async def delete_collection(
     await session.delete(record)
     await session.flush()
 
-    await delete_collection_table(engine, table_name, col_type)
+    await delete_collection_table(session, table_name, col_type)
 
     # Generate migration file if auto_migrate is enabled
-    await _maybe_generate_migration(
+    generated_path = await _generate_migration_or_rollback(
         session,
         auto_migrate=auto_migrate,
         migrations_dir=migrations_dir,
@@ -509,7 +687,12 @@ async def delete_collection(
         record=saved_record,
     )
 
-    await session.commit()
+    await _commit_with_generated_migrations(
+        session,
+        engine,
+        [generated_path] if generated_path else [],
+        migration_lock_timeout=migration_lock_timeout,
+    )
 
 
 async def truncate_collection(
@@ -519,14 +702,16 @@ async def truncate_collection(
 ) -> None:
     """Truncate all records from a collection table."""
     record = await _find_collection(session, id_or_name)
-    await truncate_collection_table(engine, record.name)
+    await truncate_collection_table(session, record.name)
+    await session.commit()
 
 
-async def import_collections(
+async def _import_collections_impl(
     session: AsyncSession,
     engine: AsyncEngine,
     collections_data: list[dict[str, Any]],
     *,
+    generated_paths: list[str],
     delete_missing: bool = False,
     auto_migrate: bool = False,
     migrations_dir: str | None = None,
@@ -578,20 +763,43 @@ async def import_collections(
             record.create_rule = coll_data.get("createRule", record.create_rule)
             record.update_rule = coll_data.get("updateRule", record.update_rule)
             record.delete_rule = coll_data.get("deleteRule", record.delete_rule)
-            record.options = coll_data.get("options", record.options)
+            incoming_options = coll_data.get("options", record.options)
+            if record.type == "auth" and isinstance(incoming_options, dict):
+                from ppbase.services.auth_service import generate_default_auth_options
+
+                existing_options = (
+                    record.options if isinstance(record.options, dict) else {}
+                )
+                merged_options = _deep_merge_dicts(
+                    generate_default_auth_options(
+                        is_superusers=record.name == "_superusers"
+                    ),
+                    existing_options,
+                )
+                record.options = _deep_merge_dicts(merged_options, incoming_options)
+            else:
+                record.options = incoming_options
             record.updated = datetime.now(timezone.utc)
 
             await session.flush()
 
             schema_changed = (
                 old.name != record.name
+                or old.type != record.type
                 or old.schema != (record.schema if isinstance(record.schema, list) else [])
+                or old.indexes
+                != (record.indexes if isinstance(record.indexes, list) else [])
+                or (
+                    (old.type == "view" or record.type == "view")
+                    and old.options
+                    != (record.options if isinstance(record.options, dict) else {})
+                )
             )
             if schema_changed:
-                await update_collection_table(engine, old, record)
+                await update_collection_table(session, old, record)
 
             # Generate update migration for imported change
-            await _maybe_generate_migration(
+            generated_path = await _maybe_generate_migration(
                 session,
                 auto_migrate=auto_migrate,
                 migrations_dir=migrations_dir,
@@ -599,6 +807,8 @@ async def import_collections(
                 record=record,
                 old_snapshot=old,
             )
+            if generated_path:
+                generated_paths.append(generated_path)
         else:
             # Create new
             import_options = coll_data.get("options", {})
@@ -646,16 +856,18 @@ async def import_collections(
             )
             session.add(record)
             await session.flush()
-            await create_collection_table(engine, record)
+            await create_collection_table(session, record)
 
             # Generate create migration for imported collection
-            await _maybe_generate_migration(
+            generated_path = await _maybe_generate_migration(
                 session,
                 auto_migrate=auto_migrate,
                 migrations_dir=migrations_dir,
                 kind="create",
                 record=record,
             )
+            if generated_path:
+                generated_paths.append(generated_path)
 
     # Delete missing collections if requested
     if delete_missing:
@@ -682,15 +894,68 @@ async def import_collections(
                 col_type = record.type or "base"
                 await session.delete(record)
                 await session.flush()
-                await delete_collection_table(engine, table_name, col_type)
+                await delete_collection_table(session, table_name, col_type)
 
                 # Generate delete migration for removed collection
-                await _maybe_generate_migration(
+                generated_path = await _maybe_generate_migration(
                     session,
                     auto_migrate=auto_migrate,
                     migrations_dir=migrations_dir,
                     kind="delete",
                     record=saved,
                 )
+                if generated_path:
+                    generated_paths.append(generated_path)
 
-    await session.commit()
+
+async def import_collections(
+    session: AsyncSession,
+    engine: AsyncEngine,
+    collections_data: list[dict[str, Any]],
+    *,
+    delete_missing: bool = False,
+    auto_migrate: bool = False,
+    migrations_dir: str | None = None,
+    migration_lock_timeout: float = 30.0,
+) -> None:
+    """Bulk import collections and their generated files atomically."""
+    from ppbase.services.migration_runner import MigrationCommitOutcomeError
+
+    generated_paths: list[str] = []
+    try:
+        await _lock_migration_producer(
+            session,
+            migration_lock_timeout=migration_lock_timeout,
+        )
+        await _import_collections_impl(
+            session,
+            engine,
+            collections_data,
+            generated_paths=generated_paths,
+            delete_missing=delete_missing,
+            auto_migrate=auto_migrate,
+            migrations_dir=migrations_dir,
+        )
+        await _commit_with_generated_migrations(
+            session,
+            engine,
+            generated_paths,
+            migration_lock_timeout=migration_lock_timeout,
+        )
+    except MigrationCommitOutcomeError:
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after ambiguous collection import commit"
+            )
+        # The commit reconciler deliberately preserves durable intent when it
+        # cannot prove the database outcome. Do not erase those recovery files.
+        raise
+    except BaseException:
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("Rollback failed after collection import error")
+        _cleanup_generated_migrations(generated_paths)
+        raise

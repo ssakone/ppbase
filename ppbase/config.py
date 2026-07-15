@@ -75,7 +75,14 @@ class Settings(BaseSettings):
     origins: list[str] = ["*"]
 
     # ---- Migrations ----
+    # ``auto_migrate`` is the legacy PPBase switch that historically
+    # controlled both startup application and Dashboard file generation.
+    # The two optional settings below separate those concerns while keeping
+    # existing deployments backwards compatible when they are unset.
     auto_migrate: bool = True
+    apply_migrations_on_start: bool | None = None
+    generate_migrations: bool | None = None
+    migration_lock_timeout: float = 30.0
     migrations_dir: str = "./pb_migrations"
 
     # ---- Hooks ----
@@ -140,3 +147,15 @@ class Settings(BaseSettings):
 
         Settings._resolved_jwt_secret[cache_key] = generated
         return generated
+
+    def should_apply_migrations(self) -> bool:
+        """Return whether pending migration files run during startup."""
+        if self.apply_migrations_on_start is not None:
+            return self.apply_migrations_on_start
+        return self.auto_migrate
+
+    def should_generate_migrations(self) -> bool:
+        """Return whether collection changes generate migration files."""
+        if self.generate_migrations is not None:
+            return self.generate_migrations
+        return self.auto_migrate

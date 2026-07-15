@@ -90,7 +90,10 @@ All settings use the `PPBASE_` prefix:
 | `PPBASE_DEV` | `false` | Enable debug mode + Swagger UI |
 | `PPBASE_LOG_LEVEL` | `INFO` | Uvicorn log level |
 | `PPBASE_ORIGINS` | `*` | CORS allowed origins (comma-separated) |
-| `PPBASE_AUTO_MIGRATE` | `true` | Auto-apply migrations on start |
+| `PPBASE_AUTO_MIGRATE` | `true` | Legacy fallback for application + generation |
+| `PPBASE_APPLY_MIGRATIONS_ON_START` | inherits legacy setting | Apply pending files before traffic/jobs |
+| `PPBASE_GENERATE_MIGRATIONS` | inherits legacy setting | Generate files after collection mutations |
+| `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | PostgreSQL migration-lock timeout in seconds |
 | `PPBASE_PUBLIC_DIR` | _(none)_ | Optional directory served as static files at `/` |
 | `PPBASE_MIGRATIONS_DIR` | `pb_migrations` | Directory where migration files live |
 | `PPBASE_STORAGE_BACKEND` | `local` | `local` or `s3` |
@@ -101,6 +104,24 @@ All settings use the `PPBASE_` prefix:
 | `PPBASE_S3_SECRET_KEY` | _(none)_ | Secret key |
 | `PPBASE_S3_FORCE_PATH_STYLE` | `false` | Force path-style addressing |
 | `PPBASE_JWT_SECRET` | _(auto)_ | If unset, generated and persisted to `data_dir/.jwt_secret` |
+
+### Migration ownership
+
+The installed `ppbase` package supplies the runner and bootstrap schema; it
+does not ship a project's migration history. A consuming backend should keep
+its configured `pb_migrations/` directory in that backend's version control.
+The same-named directory in the PPBase framework repository is intentionally
+ignored because it is only local development state.
+
+Pending application migrations run after PPBase creates its internal tables
+and the stable `_pb_users_auth_` `users` collection, but before HTTP traffic,
+realtime listeners, and serve hooks. PostgreSQL DDL, `_collections` metadata,
+and `_migrations` history share one transaction per file. A database-scoped
+advisory lock prevents two instances from applying the same file concurrently
+and is also acquired by Dashboard migration producers. This lock requires a
+direct PostgreSQL connection or PgBouncer **session** pooling; transaction and
+statement pooling do not preserve session advisory locks across per-file
+commits.
 
 Settings can also be passed to `FlaskLikePB()` directly or overridden via `pb.configure()`:
 

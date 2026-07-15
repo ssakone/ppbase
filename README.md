@@ -60,6 +60,13 @@ python -m ppbase db status          # check container status
 
 # Admin
 python -m ppbase create-admin --email <email> --password <pass>
+
+# Application migrations
+python -m ppbase migrate status
+python -m ppbase migrate up
+python -m ppbase migrate down 1
+python -m ppbase migrate create add_posts
+python -m ppbase migrate snapshot
 ```
 
 A shell script (`ppctl.sh`) is also available:
@@ -155,7 +162,39 @@ HTTP Request -> FastAPI
 - **Hybrid SQLAlchemy**: ORM for system tables, Core for dynamic collection tables
 - **Physical columns**: Each field type maps to a real PostgreSQL column (not JSONB)
 - **Filter parser**: Lark EBNF grammar translates PocketBase filter syntax to parameterized SQL
-- **No migration system**: `_collections` table is the source of truth; DDL is applied directly
+- **PocketBase-style migrations**: native Python files update collection metadata
+  and PostgreSQL DDL together
+- **Atomic PostgreSQL execution**: one transaction per migration file, tracked in
+  `_migrations`, with an advisory lock shared by runners and Dashboard producers
+
+## Application-owned migrations
+
+PPBase is the migration engine. Each application using the PyPI package owns
+and versions its configured migration directory (usually `pb_migrations/`).
+Those files are applied after PPBase bootstraps its internal schema and the
+stable `users` collection, and before HTTP traffic, realtime listeners, or
+serve hooks start.
+
+The `pb_migrations/` directory at the root of the PPBase source repository is
+intentionally ignored because it is only local framework-development runtime
+data. This does **not** mean consumer projects should ignore their own
+migrations; application migrations belong in the consumer project's VCS.
+
+PostgreSQL DDL, collection metadata, and migration history are atomic inside
+each file. The migration filesystem is a separate durability domain: generated
+files are published as durable intent before the database commit, under the
+same advisory lock. A crash may therefore leave a pending file that the next
+runner applies. After a COMMIT error PPBase reacquires the runner lock before
+checking `_migrations` or deleting rolled-back intent, and preserves the file
+when the outcome cannot be proven; it does not claim a distributed PostgreSQL +
+filesystem transaction. Schema mutations take the lock even when Dashboard
+migration-file generation is disabled.
+
+`migrate snapshot` follows PocketBase's extend-mode idea: it updates existing
+collections, creates missing ones, and orders dependent views. Its `down()` is
+intentionally a safe no-op because the pre-snapshot state is unknowable; a
+schema snapshot is not a database/data backup. `migrate status` is read-only and
+does not bootstrap a blank database.
 
 ## Configuration
 
@@ -166,6 +205,11 @@ All settings use the `PPBASE_` environment variable prefix:
 | `PPBASE_DATABASE_URL` | `postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase` | PostgreSQL connection |
 | `PPBASE_PORT` | `8090` | Server port |
 | `PPBASE_HOST` | `0.0.0.0` | Bind address |
+| `PPBASE_MIGRATIONS_DIR` | `./pb_migrations` | Consumer application's migration directory |
+| `PPBASE_AUTO_MIGRATE` | `true` | Legacy fallback for startup application and file generation |
+| `PPBASE_APPLY_MIGRATIONS_ON_START` | inherits legacy setting | Apply pending files before serving traffic |
+| `PPBASE_GENERATE_MIGRATIONS` | inherits legacy setting | Generate files after Dashboard collection changes |
+| `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | Seconds to wait for another instance's migration lock |
 
 ## Development
 
