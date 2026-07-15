@@ -7,6 +7,7 @@ dynamically-created collection tables.  All SQL is parameterized.
 from __future__ import annotations
 
 import json as _json
+import logging
 import mimetypes
 from datetime import datetime, timezone
 from typing import Any
@@ -16,6 +17,7 @@ from sqlalchemy.exc import NotSupportedError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.core.id_generator import generate_id
+from ppbase.core.storage_safety import StorageSafetyError, validate_record_id
 from ppbase.db.system_tables import CollectionRecord
 from ppbase.models.field_types import (
     _EMAIL_RE,
@@ -30,6 +32,30 @@ from ppbase.models.record import (
     format_datetime,
 )
 from ppbase.services.filter_parser import parse_filter, parse_sort
+
+logger = logging.getLogger(__name__)
+
+
+def _cleanup_new_storage_files(
+    collection_id: str,
+    record_id: str,
+    filenames: list[str],
+) -> None:
+    """Best-effort cleanup for writes not committed to a record value."""
+    if not filenames:
+        return
+
+    from ppbase.services.file_storage import (
+        delete_files,
+        delete_storage_dir_if_empty,
+    )
+
+    try:
+        delete_files(collection_id, record_id, filenames)
+        delete_storage_dir_if_empty(collection_id, record_id)
+    except (OSError, StorageSafetyError):
+        logger.warning("Skipped unsafe or failed cleanup of uncommitted files")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -576,7 +602,21 @@ async def create_record(
     now = datetime.now(timezone.utc)
     now_str = format_datetime(now)
 
-    record_id = data.pop("id", None) or generate_id()
+    raw_record_id = data.pop("id", None)
+    if raw_record_id is None or raw_record_id == "":
+        record_id = generate_id()
+    else:
+        try:
+            record_id = validate_record_id(raw_record_id)
+        except StorageSafetyError as exc:
+            raise _ValidationErrors(
+                {
+                    "id": {
+                        "code": "validation_invalid_record_id",
+                        "message": "Must be a valid record ID.",
+                    }
+                }
+            ) from exc
 
     # Validate and collect column values
     columns: dict[str, Any] = {
@@ -586,6 +626,7 @@ async def create_record(
     }
 
     errors: dict[str, dict[str, str]] = {}
+    saved_upload_names: list[str] = []
 
     # --- Auth collection: password & system columns ---
     col_type = _collection_type(collection)
@@ -672,38 +713,64 @@ async def create_record(
             if upload_has_error:
                 continue
             max_select = field_def.options.get("maxSelect", 1) or 1
-            saved_names = save_files(
-                collection.id, record_id, field_name, file_list, max_select
-            )
+            try:
+                saved_names = save_files(
+                    collection.id, record_id, field_name, file_list, max_select
+                )
+            except Exception:
+                _cleanup_new_storage_files(
+                    collection.id,
+                    record_id,
+                    saved_upload_names,
+                )
+                raise
+            saved_upload_names.extend(saved_names)
             if max_select == 1:
                 data[field_name] = saved_names[0] if saved_names else ""
             else:
                 data[field_name] = saved_names
 
-    for field_def in schema_fields:
-        # Skip autodate fields -- we handle created/updated ourselves
-        if field_def.type == FieldType.AUTODATE:
-            continue
+    try:
+        for field_def in schema_fields:
+            # Skip autodate fields -- we handle created/updated ourselves
+            if field_def.type == FieldType.AUTODATE:
+                continue
 
-        value = data.get(field_def.name)
+            value = data.get(field_def.name)
 
-        try:
-            validated = validate_field_value(field_def, value)
-            columns[field_def.name] = _serialize_for_pg(validated, field_def)
-        except FieldValidationError as exc:
-            errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+            try:
+                validated = validate_field_value(field_def, value)
+                columns[field_def.name] = _serialize_for_pg(validated, field_def)
+            except FieldValidationError as exc:
+                errors[exc.field_name] = {
+                    "code": exc.code,
+                    "message": exc.message,
+                }
+    except BaseException:
+        _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
+        raise
 
     if errors:
+        _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         raise _ValidationErrors(errors)
 
     # Email uniqueness check for auth collections
     if col_type == "auth" and "email" in columns:
         dup_sql = f'SELECT 1 FROM "{table}" WHERE "email" = :email LIMIT 1'
-        async with engine.connect() as conn:
-            dup = (
-                await conn.execute(text(dup_sql), {"email": columns["email"]})
-            ).first()
+        try:
+            async with engine.connect() as conn:
+                dup = (
+                    await conn.execute(text(dup_sql), {"email": columns["email"]})
+                ).first()
+        except BaseException:
+            _cleanup_new_storage_files(
+                collection.id,
+                record_id,
+                saved_upload_names,
+            )
+            raise
         if dup:
+            _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
             raise _ValidationErrors(
                 {
                     "email": {
@@ -718,11 +785,28 @@ async def create_record(
     placeholders = ", ".join(f":{c}" for c in columns)
     insert_sql = f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders})'
 
-    async with engine.begin() as conn:
-        await conn.execute(text(insert_sql), columns)
+    db_write_finished = False
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(insert_sql), columns)
 
-        # Send PostgreSQL NOTIFY for realtime updates
-        await _notify_record_change(conn, collection.name, record_id, "create")
+            # Send PostgreSQL NOTIFY for realtime updates
+            await _notify_record_change(conn, collection.name, record_id, "create")
+            db_write_finished = True
+    except Exception:
+        if not db_write_finished:
+            _cleanup_new_storage_files(
+                collection.id,
+                record_id,
+                saved_upload_names,
+            )
+        elif saved_upload_names:
+            logger.warning(
+                "Preserving %d new storage file(s) after an ambiguous record "
+                "create commit",
+                len(saved_upload_names),
+            )
+        raise
 
     # Fetch and return the created record
     return (await get_record(engine, collection, record_id)) or {
@@ -756,6 +840,7 @@ async def update_record(
     """
     from ppbase.services.file_storage import delete_files, save_files
 
+    record_id = validate_record_id(record_id)
     table = _table_name(collection)
     schema_fields = _get_schema_fields(collection)
 
@@ -835,6 +920,7 @@ async def update_record(
 
     # Track file fields that need cleanup after update
     files_to_delete: list[str] = []
+    saved_upload_names: list[str] = []
 
     def _parse_modifier_key(key: str) -> tuple[str, str | None]:
         field_name = key
@@ -923,48 +1009,78 @@ async def update_record(
                 continue
 
             max_select = field_def.options.get("maxSelect", 1) or 1
-            saved_names = save_files(
-                collection.id, record_id, field_name, file_list, max_select
-            )
-
-            current = field_state.get(field_name)
-            if modifier == "+":
-                field_state[field_name] = _apply_append(current, saved_names, field_def)
-            elif modifier == "prepend":
-                field_state[field_name] = _apply_prepend(
-                    current, saved_names, field_def
+            try:
+                saved_names = save_files(
+                    collection.id, record_id, field_name, file_list, max_select
                 )
-            else:
-                field_state[field_name] = _coerce_file_value(field_def, saved_names)
+            except Exception:
+                _cleanup_new_storage_files(
+                    collection.id,
+                    record_id,
+                    saved_upload_names,
+                )
+                raise
+            saved_upload_names.extend(saved_names)
+
+            try:
+                current = field_state.get(field_name)
+                if modifier == "+":
+                    field_state[field_name] = _apply_append(
+                        current, saved_names, field_def
+                    )
+                elif modifier == "prepend":
+                    field_state[field_name] = _apply_prepend(
+                        current, saved_names, field_def
+                    )
+                else:
+                    field_state[field_name] = _coerce_file_value(
+                        field_def,
+                        saved_names,
+                    )
+            except BaseException:
+                _cleanup_new_storage_files(
+                    collection.id,
+                    record_id,
+                    saved_upload_names,
+                )
+                raise
 
     # Validate final field state and derive removed physical files from the
     # final DB value instead of from intermediate mutations.
     processed_fields: set[str] = set()
-    for field_name, value in field_state.items():
-        field_def = field_map.get(field_name)
-        if field_def is None:
-            continue
-        if field_def.type == FieldType.AUTODATE:
-            continue
+    try:
+        for field_name, value in field_state.items():
+            field_def = field_map.get(field_name)
+            if field_def is None:
+                continue
+            if field_def.type == FieldType.AUTODATE:
+                continue
 
-        raw_current = raw_row.get(field_name)
-        if value == raw_current:
-            continue
+            raw_current = raw_row.get(field_name)
+            if value == raw_current:
+                continue
 
-        processed_fields.add(field_name)
+            processed_fields.add(field_name)
 
-        try:
-            validated = validate_field_value(field_def, value)
-            serialized = _serialize_for_pg(validated, field_def)
-            updates[field_name] = serialized
-            if field_def.type == FieldType.FILE:
-                old_files = set(_raw_file_list(raw_current))
-                new_files = set(_raw_file_list(validated))
-                files_to_delete.extend(old_files - new_files)
-        except FieldValidationError as exc:
-            errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+            try:
+                validated = validate_field_value(field_def, value)
+                serialized = _serialize_for_pg(validated, field_def)
+                updates[field_name] = serialized
+                if field_def.type == FieldType.FILE:
+                    old_files = set(_raw_file_list(raw_current))
+                    new_files = set(_raw_file_list(validated))
+                    files_to_delete.extend(old_files - new_files)
+            except FieldValidationError as exc:
+                errors[exc.field_name] = {
+                    "code": exc.code,
+                    "message": exc.message,
+                }
+    except BaseException:
+        _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
+        raise
 
     if errors:
+        _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         raise _ValidationErrors(errors)
 
     # Email uniqueness check for auth collections on update
@@ -972,13 +1088,23 @@ async def update_record(
         dup_sql = (
             f'SELECT 1 FROM "{table}" WHERE "email" = :email AND "id" != :rid LIMIT 1'
         )
-        async with engine.connect() as conn:
-            dup = (
-                await conn.execute(
-                    text(dup_sql), {"email": updates["email"], "rid": record_id}
-                )
-            ).first()
+        try:
+            async with engine.connect() as conn:
+                dup = (
+                    await conn.execute(
+                        text(dup_sql),
+                        {"email": updates["email"], "rid": record_id},
+                    )
+                ).first()
+        except BaseException:
+            _cleanup_new_storage_files(
+                collection.id,
+                record_id,
+                saved_upload_names,
+            )
+            raise
         if dup:
+            _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
             raise _ValidationErrors(
                 {
                     "email": {
@@ -990,6 +1116,7 @@ async def update_record(
 
     if len(updates) <= 1:
         # Only "updated" timestamp -- nothing else changed
+        _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         return existing
 
     # Build UPDATE
@@ -997,15 +1124,35 @@ async def update_record(
     update_sql = f'UPDATE "{table}" SET {set_clauses} WHERE "id" = :_rec_id'
     params = {**updates, "_rec_id": record_id}
 
-    async with engine.begin() as conn:
-        await conn.execute(text(update_sql), params)
+    db_write_finished = False
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(update_sql), params)
 
-        # Send PostgreSQL NOTIFY for realtime updates
-        await _notify_record_change(conn, collection.name, record_id, "update")
+            # Send PostgreSQL NOTIFY for realtime updates
+            await _notify_record_change(conn, collection.name, record_id, "update")
+            db_write_finished = True
+    except Exception:
+        if not db_write_finished:
+            _cleanup_new_storage_files(
+                collection.id,
+                record_id,
+                saved_upload_names,
+            )
+        elif saved_upload_names:
+            logger.warning(
+                "Preserving %d new storage file(s) after an ambiguous record "
+                "update commit",
+                len(saved_upload_names),
+            )
+        raise
 
     # Delete removed files from disk
     if files_to_delete:
-        delete_files(collection.id, record_id, files_to_delete)
+        try:
+            delete_files(collection.id, record_id, files_to_delete)
+        except StorageSafetyError:
+            logger.warning("Skipped unsafe stored-file cleanup after record update")
 
     return await get_record(engine, collection, record_id)
 
@@ -1101,18 +1248,33 @@ async def delete_record(
 
     Returns True if a record was deleted, False if not found.
     """
-    from ppbase.services.file_storage import delete_all_files
+    from ppbase.services.file_storage import delete_files
 
+    record_id = validate_record_id(record_id)
     table = _table_name(collection)
 
-    # Check existence
+    # Capture only the file references owned by the row being deleted.  A
+    # record may be recreated after commit; deleting its entire storage prefix
+    # could otherwise remove new concurrent uploads.
+    files_to_delete: list[str] = []
+    schema_fields = _get_schema_fields(collection)
     async with engine.connect() as conn:
         result = await conn.execute(
-            text(f'SELECT "id" FROM "{table}" WHERE "id" = :id LIMIT 1'),
+            text(f'SELECT * FROM "{table}" WHERE "id" = :id LIMIT 1'),
             {"id": record_id},
         )
-        if result.first() is None:
+        row = result.mappings().first()
+        if row is None:
             return False
+        row_dict = dict(row)
+        for field_def in schema_fields:
+            if field_def.type != FieldType.FILE:
+                continue
+            raw_value = row_dict.get(field_def.name)
+            if isinstance(raw_value, (list, tuple, set)):
+                files_to_delete.extend(str(value) for value in raw_value if value)
+            elif raw_value:
+                files_to_delete.append(str(raw_value))
 
     # Handle cascade deletes
     if all_collections:
@@ -1126,8 +1288,13 @@ async def delete_record(
         # Send PostgreSQL NOTIFY for realtime updates
         await _notify_record_change(conn, collection.name, record_id, "delete")
 
-    # Delete all associated files from disk
-    delete_all_files(collection.id, record_id)
+    # Delete only the references captured from the deleted row. Historical
+    # orphans are intentionally left for a janitor rather than risking a
+    # concurrent delete/recreate race.
+    try:
+        delete_files(collection.id, record_id, files_to_delete)
+    except StorageSafetyError:
+        logger.warning("Skipped unsafe storage cleanup after record deletion")
 
     return True
 

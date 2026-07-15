@@ -9,12 +9,14 @@ from httpx import ASGITransport, AsyncClient
 
 from ppbase import PPBase
 from ppbase.api import records as records_api
+from ppbase.config import Settings
 from ppbase.ext.registry import (
     ExtensionRegistry,
     HOOK_RECORD_CREATE_REQUEST,
     HOOK_RECORD_DELETE_REQUEST,
     HOOK_RECORD_UPDATE_REQUEST,
 )
+from ppbase.services import file_storage
 
 
 class _FakeBeginContext:
@@ -203,10 +205,20 @@ async def test_record_update_route_decodes_multipart_json_payload(monkeypatch) -
 
 
 @pytest.mark.asyncio
-async def test_record_create_hook_exception_rolls_back(monkeypatch) -> None:
+async def test_record_create_hook_exception_rolls_back(
+    monkeypatch,
+    tmp_path,
+) -> None:
     extensions = ExtensionRegistry()
     fake_engine = _FakeEngine()
     writes = 0
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(
+        file_storage,
+        "_settings",
+        Settings(data_dir=str(data_dir), storage_backend="local"),
+    )
+    monkeypatch.setattr(file_storage, "_runtime_storage_overrides", None)
 
     async def _explode_after_next(e):
         await e.next()
@@ -224,11 +236,18 @@ async def test_record_create_hook_exception_rolls_back(monkeypatch) -> None:
     async def _fake_create_record(_engine, _collection, payload, files=None):
         nonlocal writes
         writes += 1
+        saved = file_storage.save_files(
+            "posts_id",
+            "rec2",
+            "attachment",
+            (files or {}).get("attachment", []),
+        )
         return {
             "id": "rec2",
             "collectionId": "posts_id",
             "collectionName": "posts",
             "title": payload.get("title"),
+            "attachment": saved[0] if saved else "",
         }
 
     extensions.hooks.get(HOOK_RECORD_CREATE_REQUEST).bind_func(_explode_after_next)
@@ -242,11 +261,19 @@ async def test_record_create_hook_exception_rolls_back(monkeypatch) -> None:
         with pytest.raises(RuntimeError, match="hook exploded"):
             await client.post(
                 "/api/collections/posts/records",
-                json={"title": "will-rollback"},
+                data={"title": "will-rollback"},
+                files={
+                    "attachment": (
+                        "rollback.txt",
+                        b"must be removed",
+                        "text/plain",
+                    )
+                },
             )
 
     assert writes == 1
     assert fake_engine.last_exc_type is RuntimeError
+    assert not file_storage.get_storage_path("posts_id", "rec2").exists()
 
 
 @pytest.mark.asyncio

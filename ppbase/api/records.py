@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -49,6 +50,7 @@ from ppbase.services.record_service import (
 from ppbase.services.rule_engine import check_rule
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +182,238 @@ class _ConnectionEngineAdapter:
 class _AbortWithResponse(Exception):
     """Rollback marker carrying an HTTP response."""
 
-    def __init__(self, response: JSONResponse):
+    def __init__(self, response: Response):
         super().__init__("Abort request with HTTP response.")
         self.response = response
+
+
+def _cleanup_created_record_files(
+    created_targets: set[tuple[str, str, str]],
+) -> None:
+    """Remove only files created by a failed batch, then prune empty dirs."""
+    from ppbase.core.storage_safety import StorageSafetyError
+    from ppbase.services.file_storage import (
+        delete_files,
+        delete_storage_dir_if_empty,
+    )
+
+    record_targets: set[tuple[str, str]] = set()
+    for collection_id, record_id, filename in created_targets:
+        record_targets.add((collection_id, record_id))
+        try:
+            delete_files(collection_id, record_id, [filename])
+        except (OSError, StorageSafetyError):
+            logger.warning("Skipped unsafe or failed batch storage cleanup")
+
+    for collection_id, record_id in record_targets:
+        try:
+            delete_storage_dir_if_empty(collection_id, record_id)
+        except (OSError, StorageSafetyError):
+            logger.warning("Skipped unsafe or failed empty storage-dir cleanup")
+
+
+def _raw_batch_file_references(value: Any) -> list[str]:
+    """Return stored file references from a raw PostgreSQL field value."""
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                decoded = json.loads(stripped)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, list):
+                return [str(item) for item in decoded if item]
+        return [value]
+    if value:
+        return [str(value)]
+    return []
+
+
+async def _final_batch_file_references(
+    engine: Any,
+    all_collections: list[Any],
+    targets: set[tuple[str, str]],
+) -> set[tuple[str, str, str]]:
+    """Read final in-transaction file references before committing a batch."""
+    collections_by_id = {
+        str(getattr(collection, "id", "") or ""): collection
+        for collection in all_collections
+    }
+    preserved: set[tuple[str, str, str]] = set()
+
+    async with engine.connect() as conn:
+        for collection_id, record_id in sorted(targets):
+            collection = collections_by_id.get(collection_id)
+            if collection is None:
+                raise RuntimeError("Missing collection during batch file reconciliation.")
+            table_name = str(getattr(collection, "name", "") or "")
+            quoted_table = table_name.replace('"', '""')
+            result = await conn.execute(
+                text(f'SELECT * FROM "{quoted_table}" WHERE "id" = :rid LIMIT 1'),
+                {"rid": record_id},
+            )
+            row = result.mappings().first()
+            if row is None:
+                continue
+            row_dict = dict(row)
+            for raw_field in getattr(collection, "schema", None) or []:
+                if not isinstance(raw_field, dict) or raw_field.get("type") != "file":
+                    continue
+                field_name = str(raw_field.get("name", "") or "")
+                if not field_name:
+                    continue
+                preserved.update(
+                    (collection_id, record_id, filename)
+                    for filename in _raw_batch_file_references(
+                        row_dict.get(field_name)
+                    )
+                )
+    return preserved
+
+
+def _affected_storage_records(
+    created_file_targets: set[tuple[str, str, str]],
+    deferred_storage_deletes: list[tuple[str, str, str, tuple[str, ...]]],
+) -> set[tuple[str, str]]:
+    """Return record identities touched by coordinated storage changes."""
+    affected = {
+        (collection_id, record_id)
+        for collection_id, record_id, _filename in created_file_targets
+    }
+    affected.update(
+        (collection_id, record_id)
+        for _action, collection_id, record_id, _filenames
+        in deferred_storage_deletes
+    )
+    return affected
+
+
+async def _reconcile_storage_file_references(
+    engine: Any,
+    targets: set[tuple[str, str]],
+) -> set[tuple[str, str, str]] | None:
+    """Read durable file references after an ambiguous commit outcome."""
+    if not targets:
+        return set()
+    try:
+        all_collections = await get_all_collections(engine)
+        return await _final_batch_file_references(
+            engine,
+            all_collections,
+            targets,
+        )
+    except Exception:
+        logger.exception(
+            "Unable to reconcile durable storage references after an "
+            "ambiguous database commit"
+        )
+        return None
+
+
+def _cleanup_unreferenced_created_files(
+    created_file_targets: set[tuple[str, str, str]],
+    final_file_references: set[tuple[str, str, str]],
+) -> None:
+    orphaned_writes = created_file_targets - final_file_references
+    if orphaned_writes:
+        _cleanup_created_record_files(orphaned_writes)
+
+
+async def _run_storage_transaction(
+    engine: Any,
+    operation: Callable[[_ConnectionEngineAdapter], Awaitable[Any]],
+) -> Any:
+    """Coordinate DB commit with exact file-write/delete compensation."""
+    created_file_targets: set[tuple[str, str, str]] = set()
+    deferred_storage_deletes: list[
+        tuple[str, str, str, tuple[str, ...]]
+    ] = []
+    final_file_references: set[tuple[str, str, str]] = set()
+    transaction_body_finished = False
+
+    from ppbase.services.file_storage import (
+        capture_storage_writes,
+        defer_storage_deletes,
+        flush_deferred_storage_deletes,
+        pin_storage_config,
+    )
+
+    with pin_storage_config():
+        try:
+            with (
+                capture_storage_writes(created_file_targets),
+                defer_storage_deletes(deferred_storage_deletes),
+            ):
+                async with engine.begin() as conn:
+                    active_engine = _ConnectionEngineAdapter(conn)
+                    result = await operation(active_engine)
+                    if isinstance(result, Response) and result.status_code >= 400:
+                        raise _AbortWithResponse(result)
+                    affected_records = _affected_storage_records(
+                        created_file_targets,
+                        deferred_storage_deletes,
+                    )
+                    if affected_records:
+                        all_collections = await get_all_collections(active_engine)
+                        final_file_references = await _final_batch_file_references(
+                            active_engine,
+                            all_collections,
+                            affected_records,
+                        )
+                    transaction_body_finished = True
+        except BaseException as exc:
+            if transaction_body_finished and isinstance(exc, Exception):
+                durable_references = await _reconcile_storage_file_references(
+                    engine,
+                    _affected_storage_records(
+                        created_file_targets,
+                        deferred_storage_deletes,
+                    ),
+                )
+                if durable_references is not None:
+                    _cleanup_unreferenced_created_files(
+                        created_file_targets,
+                        durable_references,
+                    )
+                elif created_file_targets:
+                    logger.warning(
+                        "Preserving %d new storage file(s) because the database "
+                        "commit outcome could not be reconciled",
+                        len(created_file_targets),
+                    )
+                if deferred_storage_deletes:
+                    logger.warning(
+                        "Preserving %d deferred storage deletion(s) after an "
+                        "ambiguous database commit; a janitor may reconcile them",
+                        len(deferred_storage_deletes),
+                    )
+            elif transaction_body_finished:
+                logger.warning(
+                    "Preserving storage changes because database commit was "
+                    "interrupted before its outcome could be reconciled"
+                )
+            elif created_file_targets:
+                _cleanup_created_record_files(created_file_targets)
+            raise
+
+        _cleanup_unreferenced_created_files(
+            created_file_targets,
+            final_file_references,
+        )
+        cleanup_failures = flush_deferred_storage_deletes(
+            deferred_storage_deletes,
+            preserved_files=final_file_references,
+        )
+        if cleanup_failures:
+            logger.warning(
+                "Skipped %d unsafe or conflicting committed storage cleanup(s)",
+                cleanup_failures,
+            )
+        return result
 
 
 class _BatchRequestProxy:
@@ -1058,7 +1289,7 @@ async def _execute_batch_request(
     batch_request: Any,
     request_files: dict[str, list[tuple[str, bytes]]],
     all_collections: list[Any],
-) -> tuple[int, Any, tuple[str, str] | None] | JSONResponse:
+) -> tuple[int, Any] | JSONResponse:
     if not isinstance(batch_request, dict):
         return _error_response(400, "Invalid batch request.")
 
@@ -1108,12 +1339,7 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        created_target: tuple[str, str] | None = None
-        if status == 200 and isinstance(response_body, dict):
-            created_id = str(response_body.get("id", "")).strip()
-            if created_id:
-                created_target = (collection.id, created_id)
-        return status, response_body, created_target
+        return status, response_body
     if action == "update" and record_id is not None:
         result = await _apply_batch_update(
             engine,
@@ -1129,7 +1355,7 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        return status, response_body, None
+        return status, response_body
     if action == "delete" and record_id is not None:
         result = await _apply_batch_delete(
             engine,
@@ -1143,9 +1369,29 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        return status, response_body, None
+        return status, response_body
     if action == "upsert":
-        upsert_id = str(body.get("id", "")).strip()
+        from ppbase.core.storage_safety import (
+            StorageSafetyError,
+            validate_record_id,
+        )
+
+        raw_upsert_id = body.get("id")
+        upsert_id = ""
+        if raw_upsert_id is not None and raw_upsert_id != "":
+            try:
+                upsert_id = validate_record_id(raw_upsert_id)
+            except StorageSafetyError:
+                return _error_response(
+                    400,
+                    "Failed to create or update record.",
+                    {
+                        "id": {
+                            "code": "validation_invalid_record_id",
+                            "message": "Must be a valid record ID.",
+                        }
+                    },
+                )
         if upsert_id:
             existing = await get_record(engine, collection, upsert_id)
             if existing is not None:
@@ -1174,7 +1420,7 @@ async def _execute_batch_request(
                 if isinstance(result, JSONResponse):
                     return result
                 status, response_body = result
-                return status, response_body, None
+                return status, response_body
 
         create_payload = dict(body)
         if upsert_id:
@@ -1199,14 +1445,7 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        created_target: tuple[str, str] | None = None
-        if status == 200 and upsert_id:
-            created_target = (collection.id, upsert_id)
-        elif status == 200 and isinstance(response_body, dict):
-            created_id = str(response_body.get("id", "")).strip()
-            if created_id:
-                created_target = (collection.id, created_id)
-        return status, response_body, created_target
+        return status, response_body
 
     return _error_response(400, "Invalid batch request.")
 
@@ -1443,15 +1682,17 @@ async def api_create_record(
 
         return JSONResponse(content=record, status_code=200)
 
+    async def _run_create(active_engine: _ConnectionEngineAdapter) -> Any:
+        event.engine = active_engine
+        return await _trigger_record_request_hook(
+            request,
+            HOOK_RECORD_CREATE_REQUEST,
+            event,
+            _default_create_handler,
+        )
+
     try:
-        async with engine.begin() as conn:
-            event.engine = _ConnectionEngineAdapter(conn)
-            return await _trigger_record_request_hook(
-                request,
-                HOOK_RECORD_CREATE_REQUEST,
-                event,
-                _default_create_handler,
-            )
+        return await _run_storage_transaction(engine, _run_create)
     except _AbortWithResponse as abort:
         return abort.response
 
@@ -1681,15 +1922,17 @@ async def api_update_record(
 
         return JSONResponse(content=record, status_code=200)
 
+    async def _run_update(active_engine: _ConnectionEngineAdapter) -> Any:
+        event.engine = active_engine
+        return await _trigger_record_request_hook(
+            request,
+            HOOK_RECORD_UPDATE_REQUEST,
+            event,
+            _default_update_handler,
+        )
+
     try:
-        async with engine.begin() as conn:
-            event.engine = _ConnectionEngineAdapter(conn)
-            return await _trigger_record_request_hook(
-                request,
-                HOOK_RECORD_UPDATE_REQUEST,
-                event,
-                _default_update_handler,
-            )
+        return await _run_storage_transaction(engine, _run_update)
     except _AbortWithResponse as abort:
         return abort.response
 
@@ -1767,15 +2010,17 @@ async def api_delete_record(
 
         return Response(status_code=204)
 
+    async def _run_delete(active_engine: _ConnectionEngineAdapter) -> Any:
+        event.engine = active_engine
+        return await _trigger_record_request_hook(
+            request,
+            HOOK_RECORD_DELETE_REQUEST,
+            event,
+            _default_delete_handler,
+        )
+
     try:
-        async with engine.begin() as conn:
-            event.engine = _ConnectionEngineAdapter(conn)
-            return await _trigger_record_request_hook(
-                request,
-                HOOK_RECORD_DELETE_REQUEST,
-                event,
-                _default_delete_handler,
-            )
+        return await _run_storage_transaction(engine, _run_delete)
     except _AbortWithResponse as abort:
         return abort.response
 
@@ -1825,42 +2070,114 @@ async def api_batch_records(
         )
 
     result_items: list[dict[str, Any]] = []
-    created_targets: set[tuple[str, str]] = set()
+    created_file_targets: set[tuple[str, str, str]] = set()
+    deferred_storage_deletes: list[
+        tuple[str, str, str, tuple[str, ...]]
+    ] = []
+    final_file_references: set[tuple[str, str, str]] = set()
+    transaction_body_finished = False
     try:
-        async with asyncio.timeout(timeout_seconds):
-            async with engine.begin() as conn:
-                batch_engine = _ConnectionEngineAdapter(conn)
-                all_collections = await get_all_collections(batch_engine)
+        from ppbase.services.file_storage import (
+            capture_storage_writes,
+            defer_storage_deletes,
+            flush_deferred_storage_deletes,
+            pin_storage_config,
+        )
 
-                for index, item in enumerate(requests_payload):
-                    response_or_error = await _execute_batch_request(
-                        batch_engine,
-                        request,
-                        auth,
-                        item,
-                        files_by_request.get(index, {}),
-                        all_collections,
-                    )
-                    if isinstance(response_or_error, JSONResponse):
-                        raise _BatchRequestFailed(
-                            index, _response_json_body(response_or_error)
+        with pin_storage_config():
+            try:
+                with (
+                    capture_storage_writes(created_file_targets),
+                    defer_storage_deletes(deferred_storage_deletes),
+                ):
+                    async with asyncio.timeout(timeout_seconds):
+                        async with engine.begin() as conn:
+                            batch_engine = _ConnectionEngineAdapter(conn)
+                            all_collections = await get_all_collections(batch_engine)
+
+                            for index, item in enumerate(requests_payload):
+                                response_or_error = await _execute_batch_request(
+                                    batch_engine,
+                                    request,
+                                    auth,
+                                    item,
+                                    files_by_request.get(index, {}),
+                                    all_collections,
+                                )
+                                if isinstance(response_or_error, JSONResponse):
+                                    raise _BatchRequestFailed(
+                                        index, _response_json_body(response_or_error)
+                                    )
+
+                                status, body = response_or_error
+                                result_items.append(
+                                    {
+                                        "status": status,
+                                        "body": body,
+                                    }
+                                )
+                            affected_records = _affected_storage_records(
+                                created_file_targets,
+                                deferred_storage_deletes,
+                            )
+                            if affected_records:
+                                final_file_references = (
+                                    await _final_batch_file_references(
+                                        batch_engine,
+                                        all_collections,
+                                        affected_records,
+                                    )
+                                )
+                            transaction_body_finished = True
+            except BaseException as exc:
+                if transaction_body_finished and isinstance(exc, Exception):
+                    durable_references = await _reconcile_storage_file_references(
+                        engine,
+                        _affected_storage_records(
+                            created_file_targets,
+                            deferred_storage_deletes,
                         )
-
-                    status, body, created_target = response_or_error
-                    if created_target is not None:
-                        created_targets.add(created_target)
-                    result_items.append(
-                        {
-                            "status": status,
-                            "body": body,
-                        }
                     )
-    except _BatchRequestFailed as exc:
-        if created_targets:
-            from ppbase.services.file_storage import delete_all_files
+                    if durable_references is not None:
+                        _cleanup_unreferenced_created_files(
+                            created_file_targets,
+                            durable_references,
+                        )
+                    elif created_file_targets:
+                        logger.warning(
+                            "Preserving %d new batch storage file(s) because the "
+                            "database commit outcome could not be reconciled",
+                            len(created_file_targets),
+                        )
+                    if deferred_storage_deletes:
+                        logger.warning(
+                            "Preserving %d deferred batch storage deletion(s) "
+                            "after an ambiguous database commit",
+                            len(deferred_storage_deletes),
+                        )
+                elif transaction_body_finished:
+                    logger.warning(
+                        "Preserving batch storage changes because database commit "
+                        "was interrupted before its outcome could be reconciled"
+                    )
+                elif created_file_targets:
+                    _cleanup_created_record_files(created_file_targets)
+                raise
 
-            for collection_id, record_id in created_targets:
-                delete_all_files(collection_id, record_id)
+            _cleanup_unreferenced_created_files(
+                created_file_targets,
+                final_file_references,
+            )
+            cleanup_failures = flush_deferred_storage_deletes(
+                deferred_storage_deletes,
+                preserved_files=final_file_references,
+            )
+            if cleanup_failures:
+                logger.warning(
+                    "Skipped %d unsafe or conflicting committed batch storage cleanup(s)",
+                    cleanup_failures,
+                )
+    except _BatchRequestFailed as exc:
         return _error_response(
             400,
             "Batch transaction failed.",
@@ -1875,11 +2192,6 @@ async def api_batch_records(
             },
         )
     except TimeoutError:
-        if created_targets:
-            from ppbase.services.file_storage import delete_all_files
-
-            for collection_id, record_id in created_targets:
-                delete_all_files(collection_id, record_id)
         return _error_response(
             400,
             "Batch transaction failed.",
@@ -1890,5 +2202,4 @@ async def api_batch_records(
                 },
             },
         )
-
     return JSONResponse(content=result_items, status_code=200)

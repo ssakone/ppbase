@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from ppbase.core.id_generator import generate_id
+from ppbase.core.storage_safety import validate_collection_id
 from ppbase.db.schema_manager import (
     create_collection_table,
     delete_collection_table,
@@ -549,8 +550,14 @@ class MigrationApp:
             )
             options = _merge_auth_options(defaults, {}, options)
 
+        raw_collection_id = definition.get("id")
+        collection_id = (
+            generate_id()
+            if raw_collection_id is None or raw_collection_id == ""
+            else validate_collection_id(raw_collection_id)
+        )
         record = CollectionRecord(
-            id=definition.get("id") or generate_id(),
+            id=collection_id,
             name=definition["name"],
             type=collection_type,
             system=definition.get("system", False),

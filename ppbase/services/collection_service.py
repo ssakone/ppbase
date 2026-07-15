@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from ppbase.core.id_generator import generate_id
+from ppbase.core.storage_safety import validate_collection_id
 from ppbase.db.schema_manager import (
     create_collection_table,
     delete_collection_table,
@@ -447,8 +448,13 @@ async def create_collection(
         )
 
     now = datetime.now(timezone.utc)
+    collection_id = (
+        generate_id()
+        if data.id is None or data.id == ""
+        else validate_collection_id(data.id)
+    )
     record = CollectionRecord(
-        id=data.id or generate_id(),
+        id=collection_id,
         name=data.name,
         type=data.type,
         system=data.system,
@@ -838,8 +844,13 @@ async def _import_collections_impl(
                 options=import_options,
             )
             now = datetime.now(timezone.utc)
+            collection_id = (
+                generate_id()
+                if create_data.id is None or create_data.id == ""
+                else validate_collection_id(create_data.id)
+            )
             record = CollectionRecord(
-                id=create_data.id or generate_id(),
+                id=collection_id,
                 name=create_data.name,
                 type=create_data.type,
                 system=create_data.system,
