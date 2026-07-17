@@ -111,7 +111,8 @@ async def get_backup_identity(
     _admin: dict[str, Any] = Depends(_require_backup_admin),
 ) -> dict[str, Any]:
     try:
-        return _service(request).get_identity()
+        with _service(request) as service:
+            return service.get_identity()
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
@@ -123,9 +124,10 @@ async def create_local_backup(
 ) -> dict[str, Any]:
     """Create and seal one local backup synchronously."""
     try:
-        return await _service(request).create_local_backup(
-            actor_id=_actor_id(admin),
-        )
+        with _service(request) as service:
+            return await service.create_local_backup(
+                actor_id=_actor_id(admin),
+            )
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
@@ -136,7 +138,8 @@ async def list_local_backups(
     _admin: dict[str, Any] = Depends(_require_backup_admin),
 ) -> list[dict[str, Any]]:
     try:
-        return await _service(request).list_local_backups()
+        with _service(request) as service:
+            return await service.list_local_backups()
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
@@ -148,7 +151,8 @@ async def inspect_local_backup(
     _admin: dict[str, Any] = Depends(_require_backup_admin),
 ) -> dict[str, Any]:
     try:
-        return await _service(request).inspect_local_backup(backup_id)
+        with _service(request) as service:
+            return await service.inspect_local_backup(backup_id)
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
@@ -164,11 +168,12 @@ async def create_staging_plan(
     if not isinstance(body, StagingPlanCreateBody):  # pragma: no cover
         raise RuntimeError("Invalid staging plan model")
     try:
-        return await _service(request).create_staging_plan(
-            backup_id,
-            jwt_secret_mode=body.jwt_secret_mode,
-            actor_id=_actor_id(admin),
-        )
+        with _service(request) as service:
+            return await service.create_staging_plan(
+                backup_id,
+                jwt_secret_mode=body.jwt_secret_mode,
+                actor_id=_actor_id(admin),
+            )
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
@@ -180,7 +185,8 @@ async def inspect_staging_plan(
     _admin: dict[str, Any] = Depends(_require_backup_admin),
 ) -> dict[str, Any]:
     try:
-        return _service(request).inspect_staging_plan(plan_id)
+        with _service(request) as service:
+            return service.inspect_staging_plan(plan_id)
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
@@ -196,9 +202,10 @@ async def execute_staging_plan(
     if not isinstance(body, StagingExecuteBody):  # pragma: no cover
         raise RuntimeError("Invalid staging execute model")
     try:
-        return await _service(request).execute_staging_plan(
-            plan_id,
-            expected_plan_hash=body.plan_hash,
-        )
+        with _service(request) as service:
+            return await service.execute_staging_plan(
+                plan_id,
+                expected_plan_hash=body.plan_hash,
+            )
     except BackupServiceError as exc:
         _raise_backup_error(exc)

@@ -9,6 +9,7 @@ from ppbase.backup.identity import (
     MANIFEST_SIGNATURE_DOMAIN,
     BackupIdentity,
     BackupIdentityError,
+    BackupIdentityMissingError,
     public_key_fingerprint,
     verify_manifest_signature,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "BackupError",
     "BackupIdentity",
     "BackupIdentityError",
+    "BackupIdentityMissingError",
     "BackupInspection",
     "BackupIntegrityError",
     "BackupManifest",

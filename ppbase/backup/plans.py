@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
 import stat
-import fcntl
-from dataclasses import dataclass
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
+from ppbase.backup.control import (
+    ControlPlaneRoot,
+    ControlPlaneSafetyError,
+    open_flags as _open_flags,
+    open_private_directory_at as _control_open_private_directory_at,
+    same_file_identity as _same_file_identity,
+    validate_entry_name as _control_validate_entry_name,
+    verify_directory_attached_at as _control_verify_directory_attached_at,
+)
 from ppbase.backup.models import (
     BackupManifestError,
     canonical_json_bytes,
@@ -25,6 +36,9 @@ _ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _PLAN_DOMAIN = b"PPBASE-RESTORE-STAGING-PLAN-V1\0"
 _TERMINAL_STATUS_FILENAME = "terminal.json"
+_TERMINAL_TEMP_PREFIX = ".terminal-"
+_TERMINAL_TEMP_SUFFIX = ".tmp"
+_MAX_TERMINAL_TEMP_FILES = 32
 _MAX_PLAN_JSON_BYTES = 64 * 1024
 JwtSecretMode = Literal["disaster_recovery", "clone"]
 
@@ -40,34 +54,333 @@ def _canonical_json_bytes(value: Any) -> bytes:
         raise StagingPlanError(str(exc)) from exc
 
 
-def _write_exclusive(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        mode,
+def _validate_entry_name(name: str) -> None:
+    try:
+        _control_validate_entry_name(name)
+    except ControlPlaneSafetyError as exc:
+        raise StagingPlanError(str(exc)) from exc
+
+
+def _open_private_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+    create_missing: bool,
+    exclusive: bool = False,
+) -> int:
+    try:
+        return _control_open_private_directory_at(
+            parent_fd,
+            name,
+            label=label,
+            create_missing=create_missing,
+            exclusive=exclusive,
+        )
+    except ControlPlaneSafetyError as exc:
+        raise StagingPlanError(str(exc)) from exc
+
+
+def _verify_directory_attached_at(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    *,
+    label: str,
+) -> None:
+    try:
+        _control_verify_directory_attached_at(
+            parent_fd,
+            name,
+            directory_fd,
+            label=label,
+        )
+    except ControlPlaneSafetyError as exc:
+        raise StagingPlanError(str(exc)) from exc
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise StagingPlanError("Short write while persisting staging state.")
+        remaining = remaining[written:]
+
+
+def _fsync_directory(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _write_exclusive_at(
+    parent_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    keep_open: bool = False,
+) -> int | None:
+    _validate_entry_name(name)
+    descriptor: int | None = os.open(
+        name,
+        _open_flags(
+            (os.O_RDWR if keep_open else os.O_WRONLY)
+            | os.O_CREAT
+            | os.O_EXCL
+        ),
+        0o600,
+        dir_fd=parent_fd,
     )
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
+        os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise StagingPlanError("The staging plan file is unsafe.")
+        _write_all(descriptor, payload)
         os.fsync(descriptor)
+        if keep_open:
+            result = descriptor
+            descriptor = None
+            return result
+        return None
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _remove_owned_regular_file_at(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    try:
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(visible.st_mode)
+        or not _same_file_identity(visible, expected)
+    ):
+        raise StagingPlanError(
+            "The staging terminal file changed before rollback."
+        )
+    os.unlink(name, dir_fd=parent_fd)
+    _fsync_directory(parent_fd)
+
+
+def _cleanup_terminal_temporaries_at(parent_fd: int) -> int:
+    try:
+        names: list[str] = []
+        with os.scandir(parent_fd) as entries:
+            for entry in entries:
+                if not (
+                    entry.name.startswith(_TERMINAL_TEMP_PREFIX)
+                    and entry.name.endswith(_TERMINAL_TEMP_SUFFIX)
+                ):
+                    continue
+                names.append(entry.name)
+                if len(names) >= _MAX_TERMINAL_TEMP_FILES:
+                    break
+    except OSError as exc:
+        raise StagingPlanError(
+            "Terminal status temporaries cannot be inspected safely."
+        ) from exc
+
+    removed_count = 0
+    for name in names:
+        _validate_entry_name(name)
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink not in {1, 2}
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise StagingPlanError(
+                "A terminal status temporary is unsafe."
+            )
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            continue
+        removed_count += 1
+    if removed_count:
+        _fsync_directory(parent_fd)
+    return removed_count
+
+
+def _publish_terminal_at(
+    parent_fd: int,
+    payload: bytes,
+    *,
+    pre_commit_guard: Callable[[], None] | None = None,
+) -> None:
+    """Publish a complete terminal JSON atomically without replacement."""
+    if len(payload) > _MAX_PLAN_JSON_BYTES:
+        raise StagingPlanError("Staging plan JSON exceeds its size limit.")
+
+    temporary_name = (
+        f"{_TERMINAL_TEMP_PREFIX}{secrets.token_hex(8)}"
+        f"{_TERMINAL_TEMP_SUFFIX}"
+    )
+    temporary_exists = False
+    terminal_linked = False
+    expected: os.stat_result | None = None
+    try:
+        _write_exclusive_at(parent_fd, temporary_name, payload)
+        temporary_exists = True
+        expected = os.stat(
+            temporary_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(expected.st_mode)
+            or expected.st_uid != os.geteuid()
+            or expected.st_nlink != 1
+            or stat.S_IMODE(expected.st_mode) != 0o600
+        ):
+            raise StagingPlanError("The staging terminal file is unsafe.")
+        _fsync_directory(parent_fd)
+        if pre_commit_guard is not None:
+            pre_commit_guard()
+        os.link(
+            temporary_name,
+            _TERMINAL_STATUS_FILENAME,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        terminal_linked = True
+        published = os.stat(
+            _TERMINAL_STATUS_FILENAME,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not _same_file_identity(expected, published):
+            raise StagingPlanError(
+                "The staging terminal file changed during publication."
+            )
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_exists = False
+        _fsync_directory(parent_fd)
+    except BaseException as exc:
+        cleanup_failed = False
+        if terminal_linked and expected is not None:
+            try:
+                _remove_owned_regular_file_at(
+                    parent_fd,
+                    _TERMINAL_STATUS_FILENAME,
+                    expected,
+                )
+            except BaseException:
+                cleanup_failed = True
+        if temporary_exists and expected is not None:
+            try:
+                _remove_owned_regular_file_at(
+                    parent_fd,
+                    temporary_name,
+                    expected,
+                )
+            except BaseException:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise StagingPlanError(
+                "Terminal status publication failed and could not be "
+                "rolled back safely."
+            ) from exc
+        raise
+
+    # Commit point: terminal.json and removal of its publication temporary are
+    # both durable. Cleanup must never re-enter the rollback path from here.
+    try:
+        _cleanup_terminal_temporaries_at(parent_fd)
+    except (OSError, StagingPlanError):
+        pass
+
+
+def _publish_plan_seal_at(
+    parent_fd: int,
+    *,
+    pre_commit_guard: Callable[[], None] | None = None,
+) -> None:
+    """Publish the immutable plan seal after its commit guard passes."""
+    temporary_name = f".SEALED-{secrets.token_hex(8)}.tmp"
+    temporary_exists = False
+    seal_linked = False
+    expected: os.stat_result | None = None
+    try:
+        _write_exclusive_at(parent_fd, temporary_name, b"sealed\n")
+        temporary_exists = True
+        expected = os.stat(
+            temporary_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(expected.st_mode)
+            or expected.st_uid != os.geteuid()
+            or expected.st_nlink != 1
+            or stat.S_IMODE(expected.st_mode) != 0o600
+        ):
+            raise StagingPlanError("The staging plan seal is unsafe.")
+        _fsync_directory(parent_fd)
+        if pre_commit_guard is not None:
+            pre_commit_guard()
+        os.link(
+            temporary_name,
+            "SEALED",
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        seal_linked = True
+        published = os.stat("SEALED", dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_file_identity(expected, published):
+            raise StagingPlanError(
+                "The staging plan seal changed during publication."
+            )
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_exists = False
+        _fsync_directory(parent_fd)
+    except BaseException as exc:
+        cleanup_failed = False
+        if seal_linked and expected is not None:
+            try:
+                _remove_owned_regular_file_at(parent_fd, "SEALED", expected)
+            except BaseException:
+                cleanup_failed = True
+        if temporary_exists and expected is not None:
+            try:
+                _remove_owned_regular_file_at(
+                    parent_fd,
+                    temporary_name,
+                    expected,
+                )
+            except BaseException:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise StagingPlanError(
+                "Staging plan seal publication failed and could not be "
+                "rolled back safely."
+            ) from exc
+        raise
+
+
+def _read_json_at(
+    parent_fd: int,
+    name: str,
+    *,
+    allowed_link_counts: tuple[int, ...] = (1,),
+    require_canonical: bool = False,
+) -> dict[str, Any]:
     def reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -78,14 +391,19 @@ def _read_json(path: Path) -> dict[str, Any]:
 
     descriptor: int | None = None
     try:
+        _validate_entry_name(name)
         descriptor = os.open(
-            path,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            name,
+            _open_flags(os.O_RDONLY),
+            dir_fd=parent_fd,
         )
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink not in allowed_link_counts
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
             raise StagingPlanError("Staging plan JSON is not a private regular file.")
         if info.st_size > _MAX_PLAN_JSON_BYTES:
             raise StagingPlanError("Staging plan JSON exceeds its size limit.")
@@ -97,6 +415,19 @@ def _read_json(path: Path) -> dict[str, Any]:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_uid != os.geteuid()
+            or after.st_nlink not in allowed_link_counts
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or not _same_file_identity(info, after)
+            or not _same_file_identity(after, visible)
+        ):
+            raise StagingPlanError(
+                "Staging plan JSON changed while it was read."
+            )
         raw = b"".join(chunks)
         if len(raw) > _MAX_PLAN_JSON_BYTES:
             raise StagingPlanError("Staging plan JSON exceeds its size limit.")
@@ -122,7 +453,34 @@ def _read_json(path: Path) -> dict[str, Any]:
             os.close(descriptor)
     if not isinstance(value, dict):
         raise StagingPlanError("Staging plan JSON must be an object.")
+    if require_canonical and raw != _canonical_json_bytes(value):
+        raise StagingPlanError("Staging plan JSON is not canonical.")
     return value
+
+
+def _path_exists_at(parent_fd: int, name: str) -> bool:
+    _validate_entry_name(name)
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StagingPlanError("The staging plan entry cannot be inspected.") from exc
+    return True
+
+
+def _is_private_regular_file_at(parent_fd: int, name: str) -> bool:
+    _validate_entry_name(name)
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and info.st_nlink == 1
+        and stat.S_IMODE(info.st_mode) == 0o600
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,16 +515,127 @@ class StagingPlan:
         }
 
 
+@dataclass(slots=True)
+class _ExecutionLease:
+    attempt_id: str
+    lease_fd: int
+    plan_fd: int
+
+
 class StagingPlanStore:
     """Persist immutable plans and mutable execution status outside the DB."""
 
-    def __init__(self, control_dir: str | Path, staging_root: str | Path):
-        self.control_dir = Path(control_dir).expanduser().resolve(strict=False)
+    def __init__(
+        self,
+        control_dir: str | Path | ControlPlaneRoot,
+        staging_root: str | Path,
+    ):
+        if isinstance(control_dir, ControlPlaneRoot):
+            self._control_root = control_dir
+            self._owns_control_root = False
+        else:
+            try:
+                self._control_root = ControlPlaneRoot.open(control_dir)
+            except ControlPlaneSafetyError as exc:
+                raise StagingPlanError(str(exc)) from exc
+            self._owns_control_root = True
+        self.control_dir = self._control_root.path
         self.staging_root = Path(staging_root).expanduser().resolve(strict=False)
         self.plans_dir = self.control_dir / "plans"
-        self.plans_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.plans_dir, 0o700)
-        self._execution_leases: dict[str, tuple[str, int]] = {}
+        self._execution_leases: dict[str, _ExecutionLease] = {}
+
+        try:
+            plans_fd = self._control_root.open_private_directory(
+                "plans",
+                label="The backup plans directory",
+                create_missing=True,
+            )
+            os.close(plans_fd)
+        except ControlPlaneSafetyError as exc:
+            if self._owns_control_root:
+                self._control_root.close()
+            raise StagingPlanError(str(exc)) from exc
+        except BaseException:
+            if self._owns_control_root:
+                self._control_root.close()
+            raise
+
+    @contextmanager
+    def _open_plans_directory(self) -> Iterator[int]:
+        plans_fd: int | None = None
+        try:
+            try:
+                plans_fd = self._control_root.open_private_directory(
+                    "plans",
+                    label="The backup plans directory",
+                    create_missing=False,
+                )
+            except ControlPlaneSafetyError as exc:
+                raise StagingPlanError(str(exc)) from exc
+            self._verify_plans_attachment(plans_fd)
+            yield plans_fd
+        finally:
+            if plans_fd is not None:
+                try:
+                    os.close(plans_fd)
+                except OSError:
+                    pass
+
+    def _verify_plans_attachment(self, plans_fd: int) -> None:
+        try:
+            self._control_root.verify_attached()
+        except ControlPlaneSafetyError as exc:
+            raise StagingPlanError(str(exc)) from exc
+        _verify_directory_attached_at(
+            self._control_root.fileno(),
+            "plans",
+            plans_fd,
+            label="The backup plans directory",
+        )
+        try:
+            self._control_root.verify_attached()
+        except ControlPlaneSafetyError as exc:
+            raise StagingPlanError(str(exc)) from exc
+
+    def _verify_plan_attachment_chain(
+        self,
+        plans_fd: int,
+        plan_id: str,
+        plan_fd: int,
+    ) -> None:
+        self._verify_plans_attachment(plans_fd)
+        _verify_directory_attached_at(
+            plans_fd,
+            plan_id,
+            plan_fd,
+            label="Staging plan",
+        )
+        self._verify_plans_attachment(plans_fd)
+
+    def close(self) -> None:
+        for plan_id, owned in list(
+            getattr(self, "_execution_leases", {}).items()
+        ):
+            self._release_execution_lease(plan_id, owned.attempt_id)
+        if getattr(self, "_owns_control_root", False):
+            self._control_root.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    @staticmethod
+    def _open_plan_directory(plans_fd: int, plan_id: str) -> int:
+        if not _ID_RE.fullmatch(str(plan_id)):
+            raise StagingPlanError("Invalid staging plan ID.")
+        try:
+            return _open_private_directory_at(
+                plans_fd,
+                plan_id,
+                label="Staging plan",
+                create_missing=False,
+            )
+        except StagingPlanError as exc:
+            raise StagingPlanError("Staging plan was not found or is unsafe.") from exc
 
     def create(
         self,
@@ -176,6 +645,7 @@ class StagingPlanStore:
         destination_fingerprint_sha256: str,
         jwt_secret_mode: str,
         actor_id: str | None,
+        pre_commit_guard: Callable[[], None] | None = None,
     ) -> StagingPlan:
         if jwt_secret_mode not in {"disaster_recovery", "clone"}:
             raise StagingPlanError(
@@ -213,32 +683,87 @@ class StagingPlanStore:
         ).hexdigest()
         payload = {**immutable, "planHash": plan_hash}
 
-        plan_dir = self.plans_dir / plan_id
-        plan_dir.mkdir(mode=0o700)
-        try:
-            _write_exclusive(plan_dir / "plan.json", _canonical_json_bytes(payload))
-            _write_exclusive(
-                plan_dir / "status.json",
-                _canonical_json_bytes({"status": "planned"}),
+        with self._open_plans_directory() as plans_fd:
+            plan_fd = _open_private_directory_at(
+                plans_fd,
+                plan_id,
+                label="Staging plan",
+                create_missing=True,
+                exclusive=True,
             )
-            _write_exclusive(plan_dir / "SEALED", b"sealed\n")
-            _fsync_directory(plan_dir)
-            _fsync_directory(self.plans_dir)
-        except BaseException:
-            # A failed unpublished plan is never returned or reused. It is safe
-            # to leave forensic partial files under its random control-plane ID.
-            raise
+            try:
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                _write_exclusive_at(
+                    plan_fd,
+                    "plan.json",
+                    _canonical_json_bytes(payload),
+                )
+                _write_exclusive_at(
+                    plan_fd,
+                    "status.json",
+                    _canonical_json_bytes({"status": "planned"}),
+                )
+                def plan_seal_commit_guard() -> None:
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        plan_fd,
+                    )
+                    if pre_commit_guard is not None:
+                        pre_commit_guard()
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        plan_fd,
+                    )
+
+                _publish_plan_seal_at(
+                    plan_fd,
+                    pre_commit_guard=plan_seal_commit_guard,
+                )
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                _fsync_directory(plans_fd)
+            except BaseException:
+                # A failed unpublished plan is never returned or reused. It is
+                # safe to leave forensic partial files under its random ID.
+                raise
+            finally:
+                os.close(plan_fd)
         return self.inspect(plan_id)
 
     def inspect(self, plan_id: str) -> StagingPlan:
-        plan_dir = self._plan_dir(plan_id)
-        if not self._is_private_regular_file(plan_dir / "SEALED"):
+        with self._open_plans_directory() as plans_fd:
+            plan_fd = self._open_plan_directory(plans_fd, plan_id)
+            try:
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                result = self._inspect_open_plan(plan_id, plan_fd)
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                return result
+            finally:
+                os.close(plan_fd)
+
+    def _inspect_open_plan(self, plan_id: str, plan_fd: int) -> StagingPlan:
+        if not _is_private_regular_file_at(plan_fd, "SEALED"):
             raise StagingPlanError("The staging plan is not sealed.")
-        payload = _read_json(plan_dir / "plan.json")
-        terminal_path = plan_dir / _TERMINAL_STATUS_FILENAME
-        running_path = plan_dir / "RUNNING"
-        terminal_exists = self._path_exists(terminal_path)
-        running_exists = self._path_exists(running_path)
+        payload = _read_json_at(plan_fd, "plan.json")
+        terminal_exists = _path_exists_at(plan_fd, _TERMINAL_STATUS_FILENAME)
+        running_exists = _path_exists_at(plan_fd, "RUNNING")
         expected_fields = {
             "formatVersion",
             "id",
@@ -268,15 +793,24 @@ class StagingPlanStore:
             raise StagingPlanError("The staging plan hash is invalid.")
         running_marker: dict[str, Any] | None = None
         if running_exists:
-            running_marker = _read_json(running_path)
+            running_marker = _read_json_at(plan_fd, "RUNNING")
             self._validate_running_marker(running_marker, declared_hash)
-            if not terminal_exists and self._reconcile_orphaned_execution(
+            reconciled_terminal, owner_active = self._reconcile_orphaned_execution(
                 plan_id,
-                plan_dir,
+                plan_fd,
                 running_marker,
                 payload,
-            ):
-                terminal_exists = self._path_exists(terminal_path)
+                terminal_exists=terminal_exists,
+            )
+            if owner_active:
+                # A terminal hard-link can be visible briefly before its
+                # directory fsync commits. The owner lease is the commit gate.
+                terminal_exists = False
+            elif reconciled_terminal:
+                terminal_exists = _path_exists_at(
+                    plan_fd,
+                    _TERMINAL_STATUS_FILENAME,
+                )
         if (
             isinstance(payload.get("formatVersion"), bool)
             or payload.get("formatVersion") != 1
@@ -314,7 +848,11 @@ class StagingPlanStore:
         ):
             raise StagingPlanError("The staging actor ID is invalid.")
         if terminal_exists:
-            status = _read_json(terminal_path)
+            status = _read_json_at(
+                plan_fd,
+                _TERMINAL_STATUS_FILENAME,
+                allowed_link_counts=(1, 2),
+            )
         elif running_exists:
             status = {
                 "status": "running",
@@ -322,7 +860,7 @@ class StagingPlanStore:
                 "startedAt": str((running_marker or {}).get("startedAt", "")),
             }
         else:
-            status = _read_json(plan_dir / "status.json")
+            status = _read_json_at(plan_fd, "status.json")
         if not isinstance(status.get("status"), str):
             raise StagingPlanError("The staging status is invalid.")
         status_value = str(status["status"])
@@ -367,63 +905,92 @@ class StagingPlanStore:
         )
 
     def begin_execution(self, plan_id: str, *, expected_plan_hash: str) -> StagingPlan:
-        plan = self.inspect(plan_id)
-        if plan.plan_hash != expected_plan_hash:
-            raise StagingPlanError("The supplied planHash does not match the plan.")
-        if plan.status != "planned":
-            raise StagingPlanError(
-                f"Staging plan is not executable from status {plan.status!r}."
-            )
-        plan_dir = self._plan_dir(plan_id)
         attempt_id = secrets.token_hex(16)
         lease_name = f"attempt-{attempt_id}.lease"
-        lease_path = plan_dir / lease_name
-        _write_exclusive(lease_path, b"lease\n")
-        lease_fd = os.open(
-            lease_path,
-            os.O_RDWR
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
+        plan_fd: int | None = None
+        lease_fd: int | None = None
         lease_registered = False
         try:
-            lease_info = os.fstat(lease_fd)
-            if (
-                not stat.S_ISREG(lease_info.st_mode)
-                or stat.S_IMODE(lease_info.st_mode) != 0o600
-            ):
-                raise StagingPlanError("The staging execution lease is unsafe.")
-            fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._execution_leases[plan_id] = (attempt_id, lease_fd)
-            lease_registered = True
-            _write_exclusive(
-                plan_dir / "RUNNING",
-                _canonical_json_bytes(
-                    {
-                        "planHash": plan.plan_hash,
-                        "attemptId": attempt_id,
-                        "ownerPid": os.getpid(),
-                        "startedAt": datetime.now(timezone.utc)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                        "leaseFile": lease_name,
-                    }
-                ),
-            )
-            _fsync_directory(plan_dir)
-            return self.inspect(plan_id)
+            with self._open_plans_directory() as plans_fd:
+                plan_fd = self._open_plan_directory(plans_fd, plan_id)
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                plan = self._inspect_open_plan(plan_id, plan_fd)
+                if plan.plan_hash != expected_plan_hash:
+                    raise StagingPlanError(
+                        "The supplied planHash does not match the plan."
+                    )
+                if plan.status != "planned":
+                    raise StagingPlanError(
+                        "Staging plan is not executable from status "
+                        f"{plan.status!r}."
+                    )
+
+                lease_fd = _write_exclusive_at(
+                    plan_fd,
+                    lease_name,
+                    b"lease\n",
+                    keep_open=True,
+                )
+                if lease_fd is None:
+                    raise StagingPlanError(
+                        "The staging execution lease could not be retained."
+                    )
+                fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lease = _ExecutionLease(
+                    attempt_id=attempt_id,
+                    lease_fd=lease_fd,
+                    plan_fd=plan_fd,
+                )
+                self._execution_leases[plan_id] = lease
+                lease_registered = True
+                lease_fd = None
+                plan_fd = None
+
+                _write_exclusive_at(
+                    lease.plan_fd,
+                    "RUNNING",
+                    _canonical_json_bytes(
+                        {
+                            "planHash": plan.plan_hash,
+                            "attemptId": attempt_id,
+                            "ownerPid": os.getpid(),
+                            "startedAt": datetime.now(timezone.utc)
+                            .isoformat()
+                            .replace("+00:00", "Z"),
+                            "leaseFile": lease_name,
+                        }
+                    ),
+                )
+                _fsync_directory(lease.plan_fd)
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    lease.plan_fd,
+                )
+                result = self._inspect_open_plan(plan_id, lease.plan_fd)
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    lease.plan_fd,
+                )
+                return result
         except FileExistsError as exc:
             if lease_registered:
                 self._release_execution_lease(plan_id, attempt_id)
-            else:
-                os.close(lease_fd)
             raise StagingPlanError("The staging plan was already executed.") from exc
         except BaseException:
             if lease_registered:
                 self._release_execution_lease(plan_id, attempt_id)
-            else:
-                os.close(lease_fd)
             raise
+        finally:
+            if lease_fd is not None:
+                os.close(lease_fd)
+            if plan_fd is not None:
+                os.close(plan_fd)
 
     def finish(
         self,
@@ -432,49 +999,122 @@ class StagingPlanStore:
         status: Literal["validated", "failed", "quarantined"],
         expected_attempt_id: str,
         data: dict[str, Any] | None = None,
+        pre_commit_guard: Callable[[], None] | None = None,
     ) -> StagingPlan:
         if status not in {"validated", "failed", "quarantined"}:
             raise StagingPlanError("Invalid terminal staging status.")
-        plan = self.inspect(plan_id)
-        if plan.status != "running":
-            raise StagingPlanError(
-                f"Staging plan cannot finish from status {plan.status!r}."
-            )
-        plan_dir = self._plan_dir(plan_id)
         owned = self._execution_leases.get(plan_id)
-        if owned is None or owned[0] != expected_attempt_id:
+        if owned is None:
+            current = self.inspect(plan_id)
+            if current.status != "running":
+                raise StagingPlanError(
+                    f"Staging plan cannot finish from status {current.status!r}."
+                )
             raise StagingPlanError(
                 "The staging execution attempt is not owned by this process."
             )
-        if not self._is_private_regular_file(plan_dir / "RUNNING"):
-            raise StagingPlanError("The staging plan has not started.")
-        running_marker = _read_json(plan_dir / "RUNNING")
-        self._validate_running_marker(running_marker, plan.plan_hash)
-        if running_marker["attemptId"] != expected_attempt_id:
-            raise StagingPlanError("The staging execution attempt does not match.")
-        try:
-            _write_exclusive(
-                plan_dir / _TERMINAL_STATUS_FILENAME,
-                _canonical_json_bytes(
-                    {
-                        **(data or {}),
-                        "attemptId": expected_attempt_id,
-                        "status": status,
-                    }
-                ),
-            )
-        except FileExistsError as exc:
+        if owned.attempt_id != expected_attempt_id:
             raise StagingPlanError(
-                "The staging plan already has a terminal status."
-            ) from exc
-        _fsync_directory(plan_dir)
+                "The staging execution attempt is not owned by this process."
+            )
+        with self._open_plans_directory() as plans_fd:
+            self._verify_plan_attachment_chain(
+                plans_fd,
+                plan_id,
+                owned.plan_fd,
+            )
+            plan = self._inspect_open_plan(plan_id, owned.plan_fd)
+            if plan.status != "running":
+                raise StagingPlanError(
+                    f"Staging plan cannot finish from status {plan.status!r}."
+                )
+            if not _is_private_regular_file_at(owned.plan_fd, "RUNNING"):
+                raise StagingPlanError("The staging plan has not started.")
+            running_marker = _read_json_at(owned.plan_fd, "RUNNING")
+            self._validate_running_marker(running_marker, plan.plan_hash)
+            if running_marker["attemptId"] != expected_attempt_id:
+                raise StagingPlanError(
+                    "The staging execution attempt does not match."
+                )
+            terminal_payload = {
+                **(data or {}),
+                "attemptId": expected_attempt_id,
+                "status": status,
+            }
+            terminal_bytes = _canonical_json_bytes(terminal_payload)
+            if len(terminal_bytes) > _MAX_PLAN_JSON_BYTES:
+                raise StagingPlanError(
+                    "Staging plan JSON exceeds its size limit."
+                )
+            self._verify_plan_attachment_chain(
+                plans_fd,
+                plan_id,
+                owned.plan_fd,
+            )
+            try:
+                def terminal_commit_guard() -> None:
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        owned.plan_fd,
+                    )
+                    if pre_commit_guard is not None:
+                        pre_commit_guard()
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        owned.plan_fd,
+                    )
+
+                _publish_terminal_at(
+                    owned.plan_fd,
+                    terminal_bytes,
+                    pre_commit_guard=terminal_commit_guard,
+                )
+            except FileExistsError as exc:
+                raise StagingPlanError(
+                    "The staging plan already has a terminal status."
+                ) from exc
+            self._verify_plan_attachment_chain(
+                plans_fd,
+                plan_id,
+                owned.plan_fd,
+            )
+            persisted_terminal = _read_json_at(
+                owned.plan_fd,
+                _TERMINAL_STATUS_FILENAME,
+                allowed_link_counts=(1,),
+                require_canonical=True,
+            )
+            if (
+                persisted_terminal.get("status") != status
+                or persisted_terminal.get("attemptId") != expected_attempt_id
+                or _canonical_json_bytes(persisted_terminal) != terminal_bytes
+            ):
+                raise StagingPlanError(
+                    "Persisted terminal status does not match the execution."
+                )
+            result = replace(
+                plan,
+                status=str(persisted_terminal["status"]),
+                status_data={
+                    key: value
+                    for key, value in persisted_terminal.items()
+                    if key != "status"
+                },
+            )
+            self._verify_plan_attachment_chain(
+                plans_fd,
+                plan_id,
+                owned.plan_fd,
+            )
         self._release_execution_lease(plan_id, expected_attempt_id)
-        return self.inspect(plan_id)
+        return result
 
     def abandon_execution(self, plan_id: str, *, expected_attempt_id: str) -> None:
         """Release a quiescent attempt whose terminal status could not persist."""
         owned = self._execution_leases.get(plan_id)
-        if owned is None or owned[0] != expected_attempt_id:
+        if owned is None or owned.attempt_id != expected_attempt_id:
             raise StagingPlanError(
                 "The staging execution attempt is not owned by this process."
             )
@@ -515,37 +1155,55 @@ class StagingPlanStore:
     def _reconcile_orphaned_execution(
         self,
         plan_id: str,
-        plan_dir: Path,
+        plan_fd: int,
         marker: dict[str, Any],
         payload: dict[str, Any],
-    ) -> bool:
+        *,
+        terminal_exists: bool,
+    ) -> tuple[bool, bool]:
         attempt_id = str(marker["attemptId"])
         owned = self._execution_leases.get(plan_id)
-        if owned is not None and owned[0] == attempt_id:
-            return False
+        if owned is not None and owned.attempt_id == attempt_id:
+            return False, True
 
         lease_fd: int | None = None
         try:
             lease_fd = os.open(
-                plan_dir / str(marker["leaseFile"]),
-                os.O_RDWR
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                str(marker["leaseFile"]),
+                _open_flags(os.O_RDWR),
+                dir_fd=plan_fd,
             )
-            info = os.fstat(lease_fd)
-            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-                raise StagingPlanError("The staging execution lease is unsafe.")
-            try:
-                fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
         except FileNotFoundError:
             lease_fd = None
+        except OSError as exc:
+            raise StagingPlanError(
+                "The staging execution lease cannot be opened safely."
+            ) from exc
 
+        lock_acquired = False
         try:
+            if lease_fd is not None:
+                info = os.fstat(lease_fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    raise StagingPlanError(
+                        "The staging execution lease is unsafe."
+                    )
+                try:
+                    fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False, True
+                lock_acquired = True
+            _cleanup_terminal_temporaries_at(plan_fd)
+            if terminal_exists:
+                return False, False
             try:
-                _write_exclusive(
-                    plan_dir / _TERMINAL_STATUS_FILENAME,
+                _publish_terminal_at(
+                    plan_fd,
                     _canonical_json_bytes(
                         {
                             "status": "quarantined",
@@ -556,65 +1214,31 @@ class StagingPlanStore:
                         }
                     ),
                 )
-                _fsync_directory(plan_dir)
             except FileExistsError:
                 pass
-            return True
+            return True, False
         finally:
             if lease_fd is not None:
                 try:
-                    fcntl.flock(lease_fd, fcntl.LOCK_UN)
+                    if lock_acquired:
+                        fcntl.flock(lease_fd, fcntl.LOCK_UN)
                 finally:
                     os.close(lease_fd)
 
     def _release_execution_lease(self, plan_id: str, attempt_id: str) -> None:
         owned = self._execution_leases.get(plan_id)
-        if owned is None or owned[0] != attempt_id:
+        if owned is None or owned.attempt_id != attempt_id:
             return
-        _owned_attempt, descriptor = self._execution_leases.pop(plan_id)
+        owned = self._execution_leases.pop(plan_id)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-
-    def _plan_dir(self, plan_id: str) -> Path:
-        if not _ID_RE.fullmatch(str(plan_id)):
-            raise StagingPlanError("Invalid staging plan ID.")
-        path = self.plans_dir / plan_id
-        try:
-            info = path.lstat()
-        except OSError as exc:
-            raise StagingPlanError("Staging plan was not found.") from exc
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or path.is_symlink()
-            or stat.S_IMODE(info.st_mode) != 0o700
-        ):
-            raise StagingPlanError("Staging plan was not found.")
-        return path
-
-    @staticmethod
-    def _path_exists(path: Path) -> bool:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            return False
-        return True
-
-    @staticmethod
-    def _is_private_regular_file(path: Path) -> bool:
-        try:
-            info = path.lstat()
+            fcntl.flock(owned.lease_fd, fcntl.LOCK_UN)
         except OSError:
-            return False
-        return (
-            stat.S_ISREG(info.st_mode)
-            and not path.is_symlink()
-            and stat.S_IMODE(info.st_mode) == 0o600
-        )
-
-    def _write_status(self, plan_dir: Path, value: dict[str, Any]) -> None:
-        temporary = plan_dir / f".status-{secrets.token_hex(8)}.tmp"
-        _write_exclusive(temporary, _canonical_json_bytes(value))
-        os.replace(temporary, plan_dir / "status.json")
-        _fsync_directory(plan_dir)
+            pass
+        try:
+            os.close(owned.lease_fd)
+        except OSError:
+            pass
+        try:
+            os.close(owned.plan_fd)
+        except OSError:
+            pass

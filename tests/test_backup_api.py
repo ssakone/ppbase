@@ -10,6 +10,18 @@ from ppbase.middleware.request_logger import RequestLoggerMiddleware
 
 
 class _FakeBackupService:
+    def __init__(self):
+        self.close_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def close(self):
+        self.close_calls += 1
+
     def get_identity(self):
         return {"algorithm": "Ed25519", "fingerprintSha256": "f" * 64}
 
@@ -97,6 +109,38 @@ async def test_backup_api_exposes_local_and_staging_workflow(monkeypatch) -> Non
         assert executed.status_code == 200
         assert executed.json()["status"] == "validated"
         assert executed.json()["activationPerformed"] is False
+
+    assert service.close_calls == 7
+
+
+@pytest.mark.asyncio
+async def test_backup_api_closes_service_when_operation_fails(monkeypatch) -> None:
+    service = _FakeBackupService()
+
+    async def fail_listing():
+        raise backups_api.BackupServiceError(
+            503,
+            "synthetic_backup_failure",
+            "Synthetic backup failure.",
+        )
+
+    service.list_local_backups = fail_listing
+    monkeypatch.setattr(backups_api, "_service", lambda _request: service)
+    app = FastAPI()
+    app.include_router(backups_api.router, prefix="/api")
+    app.dependency_overrides[backups_api._require_backup_admin] = lambda: {
+        "id": "admin_1"
+    }
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/backups")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["data"]["code"] == (
+        "synthetic_backup_failure"
+    )
+    assert service.close_calls == 1
 
 
 @pytest.mark.asyncio

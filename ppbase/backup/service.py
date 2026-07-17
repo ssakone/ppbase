@@ -20,10 +20,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ppbase import __version__
+from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
 from ppbase.backup.identity import (
-    PRIVATE_KEY_FILENAME,
     BackupIdentity,
     BackupIdentityError,
+    BackupIdentityMissingError,
 )
 from ppbase.backup.models import (
     BackupError,
@@ -353,35 +354,103 @@ class NativeBackupService:
     """Create signed local sets and validate restores in brand-new targets."""
 
     def __init__(self, engine: AsyncEngine, settings: Any) -> None:
+        self._closed = False
         self.engine = engine
         self.settings = settings
         self.backup_root = Path(settings.backup_root).expanduser().resolve(strict=False)
-        self.control_dir = Path(settings.backup_control_dir).expanduser().resolve(
-            strict=False
-        )
+        self.control_dir = Path(settings.backup_control_dir).expanduser().absolute()
         self.staging_root = Path(settings.backup_staging_root).expanduser().resolve(
             strict=False
         )
         self._validate_roots()
-        self.identity = self._load_identity()
-        self.store = LocalBackupStore(self.backup_root, identity=self.identity)
-        self.plans = StagingPlanStore(self.control_dir, self.staging_root)
+        try:
+            self.control_root = ControlPlaneRoot.open(self.control_dir)
+        except ControlPlaneSafetyError as exc:
+            raise BackupServiceError(
+                500,
+                "backup_control_invalid",
+                "The native backup control plane is missing or unsafe.",
+            ) from exc
+        try:
+            self.plans = StagingPlanStore(self.control_root, self.staging_root)
+            self.identity = self._load_identity()
+            self.store = LocalBackupStore(
+                self.backup_root,
+                identity=self.identity,
+            )
+        except BackupServiceError:
+            self.close()
+            raise
+        except StagingPlanError as exc:
+            self.close()
+            raise BackupServiceError(
+                500,
+                "backup_control_invalid",
+                "The native backup control plane is missing or unsafe.",
+            ) from exc
+        except BackupError as exc:
+            self.close()
+            raise BackupServiceError(
+                500,
+                "backup_store_invalid",
+                "The native backup store is missing or unsafe.",
+            ) from exc
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        store = getattr(self, "store", None)
+        identity = getattr(self, "identity", None)
+        plans = getattr(self, "plans", None)
+        control_root = getattr(self, "control_root", None)
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            try:
+                if identity is not None:
+                    identity.close()
+            finally:
+                try:
+                    if plans is not None:
+                        plans.close()
+                finally:
+                    if control_root is not None:
+                        control_root.close()
+
+    def __enter__(self) -> "NativeBackupService":
+        self._require_control_identity_attached()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def get_identity(self) -> dict[str, Any]:
+        self._require_control_identity_attached()
         encoded_key = base64.urlsafe_b64encode(
             self.identity.public_key_bytes
         ).decode("ascii").rstrip("=")
-        return {
+        result = {
             "algorithm": "Ed25519",
             "publicKey": encoded_key,
             "fingerprintSha256": self.identity.fingerprint_sha256,
         }
+        self._require_control_identity_attached()
+        return result
 
     async def create_local_backup(
         self,
         *,
         actor_id: str | None = None,
     ) -> dict[str, Any]:
+        self._require_control_identity_attached()
         dump_url = self._dump_configuration()
         try:
             dump_info = sqlalchemy_url_to_libpq(dump_url)
@@ -609,14 +678,17 @@ class NativeBackupService:
                 prepared,
                 seal_gate=BackupSealGate(),
                 metadata=metadata,
+                identity_guard=self._require_control_identity_attached,
             )
         except BackupError as exc:
             raise self._map_error(exc, operation="seal") from exc
         return self._inspection_dict(inspection)
 
     async def list_local_backups(self) -> list[dict[str, Any]]:
+        self._require_control_identity_attached()
         try:
-            summaries = await asyncio.to_thread(self.store.list_sets)
+            summaries = await _to_thread_quiescent(self.store.list_sets)
+            self._require_control_identity_attached()
             return [
                 {
                     "id": item.backup_id,
@@ -638,6 +710,7 @@ class NativeBackupService:
             raise self._map_error(exc, operation="list") from exc
 
     async def inspect_local_backup(self, backup_id: str) -> dict[str, Any]:
+        self._require_control_identity_attached()
         try:
             inspection = await asyncio.to_thread(
                 self.store.inspect_set,
@@ -645,6 +718,7 @@ class NativeBackupService:
                 expected_public_key=self.identity.public_key_bytes,
                 verify_resources=True,
             )
+            self._require_control_identity_attached()
         except BackupError as exc:
             raise self._map_error(exc, operation="inspect") from exc
         return self._inspection_dict(inspection)
@@ -656,6 +730,7 @@ class NativeBackupService:
         jwt_secret_mode: str,
         actor_id: str | None,
     ) -> dict[str, Any]:
+        self._require_control_identity_attached()
         try:
             inspection = await self._trusted_inspection(backup_id)
             jwt_resource_mode = self._manifest_jwt_secret_mode(inspection)
@@ -682,6 +757,7 @@ class NativeBackupService:
         manifest_sha256 = hashlib.sha256(
             inspection.manifest.to_bytes()
         ).hexdigest()
+        self._require_control_identity_attached()
         try:
             plan = self.plans.create(
                 backup_id=backup_id,
@@ -691,6 +767,7 @@ class NativeBackupService:
                 ),
                 jwt_secret_mode=jwt_secret_mode,
                 actor_id=actor_id,
+                pre_commit_guard=self._require_control_identity_attached,
             )
         except StagingPlanError as exc:
             raise BackupServiceError(
@@ -703,6 +780,7 @@ class NativeBackupService:
         return payload
 
     def inspect_staging_plan(self, plan_id: str) -> dict[str, Any]:
+        self._require_control_root_attached()
         try:
             return self.plans.inspect(plan_id).as_dict()
         except StagingPlanError as exc:
@@ -718,6 +796,7 @@ class NativeBackupService:
         *,
         expected_plan_hash: str,
     ) -> dict[str, Any]:
+        self._require_control_identity_attached()
         try:
             plan = self.plans.begin_execution(
                 plan_id,
@@ -739,11 +818,13 @@ class NativeBackupService:
 
         try:
             result = await self._execute_started_plan(plan)
+            self._require_control_identity_attached()
             return self.plans.finish(
                 plan.plan_id,
                 status="validated",
                 expected_attempt_id=attempt_id,
                 data=result,
+                pre_commit_guard=self._require_control_identity_attached,
             ).as_dict()
         except BaseException as exc:
             failure_code = (
@@ -1010,8 +1091,6 @@ class NativeBackupService:
         }
 
     def _load_identity(self) -> BackupIdentity:
-        identity_dir = self.control_dir / "identity"
-        key_path = identity_dir / PRIVATE_KEY_FILENAME
         sets_dir = self.backup_root / "sets"
         has_sealed_set = False
         if sets_dir.is_dir() and not sets_dir.is_symlink():
@@ -1028,20 +1107,50 @@ class NativeBackupService:
                     "backup_store_unreadable",
                     "The local backup store cannot be inspected safely.",
                 ) from exc
-        if has_sealed_set and not key_path.is_file():
+        try:
+            if has_sealed_set:
+                return BackupIdentity.load_existing_at(self.control_root)
+            return BackupIdentity.load_or_create_at(self.control_root)
+        except BackupIdentityMissingError as exc:
             raise BackupServiceError(
                 409,
                 "backup_identity_missing",
                 "Sealed backups exist but their local signing identity is missing.",
-            )
-        try:
-            return BackupIdentity.load_or_create(identity_dir)
+            ) from exc
         except BackupIdentityError as exc:
             raise BackupServiceError(
                 500,
                 "backup_identity_invalid",
                 "The local backup signing identity is missing or unsafe.",
             ) from exc
+
+    def _require_control_root_attached(self) -> None:
+        if self._closed:
+            raise BackupServiceError(
+                500,
+                "backup_service_closed",
+                "The native backup service is closed.",
+            )
+        try:
+            self.control_root.verify_attached()
+        except ControlPlaneSafetyError as exc:
+            raise BackupServiceError(
+                500,
+                "backup_control_detached",
+                "The native backup control plane is detached or unsafe.",
+            ) from exc
+
+    def _require_control_identity_attached(self) -> None:
+        self._require_control_root_attached()
+        try:
+            self.identity.verify_attached()
+        except BackupIdentityError as exc:
+            raise BackupServiceError(
+                500,
+                "backup_identity_invalid",
+                "The local backup signing identity is detached or unsafe.",
+            ) from exc
+        self._require_control_root_attached()
 
     def _validate_roots(self) -> None:
         active_data_dir = Path(self.settings.data_dir).expanduser().resolve(
@@ -1052,7 +1161,11 @@ class NativeBackupService:
             "backup_control_dir": self.control_dir,
             "backup_staging_root": self.staging_root,
         }
-        for label, root in named_roots.items():
+        resolved_roots = {
+            label: root.resolve(strict=False)
+            for label, root in named_roots.items()
+        }
+        for label, root in resolved_roots.items():
             if (
                 root == active_data_dir
                 or root.is_relative_to(active_data_dir)
@@ -1063,7 +1176,7 @@ class NativeBackupService:
                     "unsafe_backup_root",
                     f"{label} must be outside the active data_dir.",
                 )
-        values = list(named_roots.items())
+        values = list(resolved_roots.items())
         for index, (left_name, left) in enumerate(values):
             for right_name, right in values[index + 1 :]:
                 if left == right or left.is_relative_to(right) or right.is_relative_to(left):
@@ -1493,12 +1606,15 @@ class NativeBackupService:
         self,
         backup_id: str,
     ) -> AuthenticatedBackupInspection:
+        self._require_control_identity_attached()
         try:
-            return await asyncio.to_thread(
+            inspection = await asyncio.to_thread(
                 self.store.authenticate_set,
                 backup_id,
                 approved_public_key=self.identity.public_key_bytes,
             )
+            self._require_control_identity_attached()
+            return inspection
         except BackupError as exc:
             raise self._map_error(exc, operation="inspect") from exc
 

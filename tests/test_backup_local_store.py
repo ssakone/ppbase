@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import ppbase.backup.identity as identity_module
+import ppbase.backup.control as control_module
 import ppbase.backup.storage as storage_module
 from ppbase.backup import (
     JWT_SECRET_RESOURCE,
@@ -29,6 +29,7 @@ from ppbase.backup import (
     verify_manifest_signature,
 )
 from ppbase.backup.models import parse_canonical_json
+from ppbase.backup.control import ControlPlaneRoot
 from ppbase.core.storage_safety import local_storage_id_name
 
 
@@ -178,6 +179,139 @@ def test_finalize_fully_reinspects_published_set_before_seal(
 
     assert not (store.sets_dir / "pre-seal-corruption").exists()
     assert store.list_sets() == []
+
+
+def test_finalize_identity_guard_refuses_detachment_before_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control"
+    control.mkdir(mode=0o700)
+    control_root = ControlPlaneRoot.open(control)
+    identity = BackupIdentity.load_or_create_at(control_root)
+    store = LocalBackupStore(
+        tmp_path / "backups",
+        identity=identity,
+        identity_guard=identity.verify_attached,
+    )
+    prepared = _prepare_minimal_set(store, "identity-detached-before-seal")
+    final_path = store.sets_dir / prepared.backup_id
+    identity_path = control / "identity"
+    detached_identity = tmp_path / "detached-identity"
+    real_publish_unsealed = store._publish_unsealed
+
+    def publish_then_detach(
+        selected: PreparedBackupSet,
+    ) -> tuple[Path, tuple[int, int]]:
+        published = real_publish_unsealed(selected)
+        identity_path.rename(detached_identity)
+        identity_path.mkdir(mode=0o700)
+        return published
+
+    monkeypatch.setattr(store, "_publish_unsealed", publish_then_detach)
+    try:
+        with pytest.raises(BackupIdentityError, match="detached|substituted"):
+            store.finalize_set(prepared, created_at=FIXED_TIME)
+    finally:
+        identity.close()
+        control_root.close()
+
+    assert not final_path.exists()
+    assert not prepared.path.exists()
+    assert not (detached_identity / storage_module.SEALED_FILENAME).exists()
+
+
+def test_finalize_rechecks_identity_immediately_before_seal_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = tmp_path / "control"
+    control.mkdir(mode=0o700)
+    control_root = ControlPlaneRoot.open(control)
+    identity = BackupIdentity.load_or_create_at(control_root)
+    store = LocalBackupStore(
+        tmp_path / "backups",
+        identity=identity,
+        identity_guard=identity.verify_attached,
+    )
+    prepared = _prepare_minimal_set(store, "identity-race-at-seal")
+    final_path = store.sets_dir / prepared.backup_id
+    identity_path = control / "identity"
+    detached_identity = tmp_path / "detached-identity-at-seal"
+    real_fsync_directory = storage_module._fsync_directory
+    detached = False
+
+    def detach_during_seal_preparation(path: Path) -> None:
+        nonlocal detached
+        selected = Path(path)
+        if (
+            not detached
+            and selected == final_path
+            and tuple(final_path.glob(".SEALED-*.tmp"))
+            and not (final_path / storage_module.SEALED_FILENAME).exists()
+        ):
+            detached = True
+            identity_path.rename(detached_identity)
+            identity_path.mkdir(mode=0o700)
+        real_fsync_directory(selected)
+
+    monkeypatch.setattr(
+        storage_module,
+        "_fsync_directory",
+        detach_during_seal_preparation,
+    )
+    try:
+        with pytest.raises(BackupIdentityError, match="detached|substituted"):
+            store.finalize_set(prepared, created_at=FIXED_TIME)
+    finally:
+        identity.close()
+        control_root.close()
+
+    assert detached is True
+    assert not final_path.exists()
+    assert not prepared.path.exists()
+
+
+def test_default_store_refuses_detached_control_identity(
+    tmp_path: Path,
+) -> None:
+    backup_root = tmp_path / "backups"
+    stale_store = LocalBackupStore(backup_root)
+    prepared = _prepare_minimal_set(stale_store, "detached-default-control")
+    original_fingerprint = stale_store.identity.fingerprint_sha256
+    control = backup_root / "control"
+    detached_control = backup_root / "detached-control"
+    control.rename(detached_control)
+    replacement_store = LocalBackupStore(backup_root)
+
+    try:
+        with pytest.raises(BackupIdentityError, match="detached|substituted"):
+            stale_store.finalize_set(prepared, created_at=FIXED_TIME)
+        replacement_fingerprint = replacement_store.identity.fingerprint_sha256
+    finally:
+        stale_store.close()
+        replacement_store.close()
+
+    assert replacement_fingerprint != original_fingerprint
+    assert not (stale_store.sets_dir / prepared.backup_id).exists()
+    assert not prepared.path.exists()
+
+
+def test_default_store_close_is_terminal_and_closes_identity(
+    tmp_path: Path,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    identity = store.identity
+
+    store.close()
+    store.close()
+
+    with pytest.raises(BackupStateError, match="closed"):
+        store.begin_set("after-close")
+    with pytest.raises(BackupStateError, match="closed"):
+        store.list_sets()
+    with pytest.raises(BackupIdentityError, match="closed"):
+        identity.sign_manifest(b"manifest")
 
 
 def test_signature_write_failure_removes_the_full_partial_set(
@@ -703,16 +837,23 @@ def test_new_control_and_restore_directories_fsync_their_parents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    identity_fsyncs: list[Path] = []
+    identity_fsyncs: list[tuple[int, int]] = []
     monkeypatch.setattr(
-        identity_module,
-        "_fsync_directory",
-        lambda path: identity_fsyncs.append(Path(path)),
+        control_module,
+        "fsync_directory",
+        lambda descriptor: identity_fsyncs.append(
+            (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        ),
     )
     control_dir = tmp_path / "new-control-parent" / "identity"
     BackupIdentity.load_or_create(control_dir)
-    assert control_dir.parent in identity_fsyncs
-    assert control_dir.parent.parent in identity_fsyncs
+    assert (control_dir.parent.stat().st_dev, control_dir.parent.stat().st_ino) in (
+        identity_fsyncs
+    )
+    assert (
+        control_dir.parent.parent.stat().st_dev,
+        control_dir.parent.parent.stat().st_ino,
+    ) in identity_fsyncs
 
     monkeypatch.undo()
     store = LocalBackupStore(tmp_path / "backups")

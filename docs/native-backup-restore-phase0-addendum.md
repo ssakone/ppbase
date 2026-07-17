@@ -163,16 +163,39 @@ chaque composant avant et après les copies.
 
 PPBase doit s'exécuter sous un utilisateur de service dédié, non-root. Le
 `backup_control_dir` doit être un répertoire privé appartenant à cet utilisateur
-et protégé en `0700` avant le démarrage. Cette précondition est une frontière de
-sécurité : si le répertoire préexiste avec des permissions trop larges, un autre
-utilisateur local peut y placer un symlink avant PPBase. Les DB et `data_dir`
-restent confinés aux nouvelles cibles de staging, mais les `chmod` et écritures
-du plan store peuvent alors sortir du control-plane.
+et protégé en `0700` avant le démarrage. Le plan store applique désormais cette
+frontière : une racine préexistante qui n'appartient pas à l'utilisateur courant
+ou dont le mode n'est pas exactement `0700` est refusée sans être réparée.
+La création d'une racine manquante exige que chaque ancêtre appartienne soit à
+`root`, soit à l'utilisateur de service. Elle est également refusée sous un
+ancêtre group/world-writable non protégé par le sticky bit. Toute la chaîne de
+répertoires depuis `/` reste épinglée par des descripteurs et sa propriété, son
+mode ainsi que chaque relation parent → enfant sont revérifiés à chaque usage
+de la capacité racine.
 
-Le plan store devra être converti en opérations ancrées par descripteur avec
-refus des symlinks avant toute livraison d'upload/download ou d'activation. Ce
-P2 est non bloquant uniquement pour la tranche locale de staging actuelle ; il
-est bloquant pour ces phases produit suivantes.
+La racine est conservée comme une capacité par descripteur commune au plan store
+et à l'identité Ed25519. `control/plans`, `control/identity`, chaque répertoire de
+plan et tous les fichiers, marqueurs et leases sont ensuite ouverts avec
+`dir_fd`, `O_DIRECTORY` et `O_NOFOLLOW`. Les identités inode/device sont
+vérifiées avant et après les mutations, de la racine jusqu'au plan ; le
+descripteur du plan reste épinglé entre `begin_execution` et `finish`. Les
+statuts terminaux sont écrits et fsyncés sous un nom temporaire, puis publiés
+sans remplacement par hard-link. Après le fsync de commit, un échec du nettoyage
+best-effort ne peut plus supprimer le statut durable ; les temporaires orphelins
+sont supprimés par lots bornés sans bloquer la réconciliation. Avant de rendre
+un résultat terminal, le store relit le JSON canonique effectivement publié et
+refuse toute divergence. La clé Ed25519 persistée est également comparée à la
+clé mise en cache avant et après ses usages, puis une dernière fois juste avant
+le scellement d'un backup.
+Un symlink préexistant, une substitution par rename ou un crash avant
+publication provoque donc un échec fermé sans fichier terminal partiel et sans
+`chmod`, lecture ni écriture hors du control-plane. Cette protection reste
+complémentaire à l'exécution sous un utilisateur dédié non-root : elle ne
+transforme pas un control-plane partagé en frontière d'administration sûre.
+Les descripteurs de la racine, du répertoire d'identité, de la clé, des plans et
+des leases sont enfin fermés explicitement à la fin de chaque opération API, y
+compris en cas d'erreur. Le store local autonome possède et ferme les mêmes
+capacités lorsqu'il crée lui-même son identité.
 
 La tranche actuellement implémentée s'arrête au backup set canonique local et
 au staging vers de nouvelles cibles ; elle ne livre pas encore download,

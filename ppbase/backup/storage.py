@@ -16,10 +16,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
+from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
 from ppbase.backup.identity import (
     ED25519_PUBLIC_KEY_SIZE,
     ED25519_SIGNATURE_SIZE,
     BackupIdentity,
+    BackupIdentityError,
     verify_manifest_signature,
 )
 from ppbase.backup.models import (
@@ -1368,6 +1370,7 @@ class BackupSetBuilder:
         self._jwt_secret_copied = False
 
     def _require_building(self) -> None:
+        self._store._require_open()
         if self._state != "building":
             raise BackupStateError(f"backup builder is already {self._state}")
 
@@ -1465,16 +1468,68 @@ class LocalBackupStore:
         self,
         root: str | Path,
         identity: BackupIdentity | None = None,
+        identity_guard: Callable[[], None] | None = None,
     ) -> None:
+        self._closed = False
+        self._owned_control_root: ControlPlaneRoot | None = None
+        self._owns_identity = False
         self.root = Path(root)
         _ensure_private_directory(self.root)
         self.sets_dir = self.root / "sets"
         _ensure_private_directory(self.sets_dir)
-        self.identity = identity or BackupIdentity.load_or_create(
-            self.root / "control"
+        if identity is None:
+            try:
+                control_root = ControlPlaneRoot.open(self.root / "control")
+            except ControlPlaneSafetyError as exc:
+                raise BackupIdentityError(str(exc)) from exc
+            try:
+                identity = BackupIdentity.load_or_create_in_root(control_root)
+            except BaseException:
+                control_root.close()
+                raise
+            self._owned_control_root = control_root
+            self._owns_identity = True
+        self.identity = identity
+        self._identity_guard = (
+            identity_guard
+            if identity_guard is not None
+            else (
+                self.identity.verify_attached
+                if self.identity.control_plane_attached
+                else None
+            )
         )
         self._capability_token = object()
         _fsync_directory(self.root)
+
+    def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        control_root = self._owned_control_root
+        self._owned_control_root = None
+        try:
+            if self._owns_identity:
+                self.identity.close()
+        finally:
+            if control_root is not None:
+                control_root.close()
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise BackupStateError("local backup store is closed")
+
+    def __enter__(self) -> "LocalBackupStore":
+        self._require_open()
+        if self._identity_guard is not None:
+            self._identity_guard()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def open_staging_data_dir(
         self,
@@ -1487,6 +1542,7 @@ class LocalBackupStore:
         relative component is validated, created with ``mkdirat``, and opened
         with ``openat(O_NOFOLLOW)`` before the next component is considered.
         """
+        self._require_open()
         root_path = Path(staging_root)
         parts = _validated_relative_directory_parts(relative_target)
         root_fd: int | None = None
@@ -1556,6 +1612,7 @@ class LocalBackupStore:
         target: AnchoredStagingDataDir,
     ) -> Path:
         """Restore business files into a descriptor-anchored staging target."""
+        self._require_open()
         target._require_store(self)
         target.verify_attached()
         inspection = self._reinspect(authenticated)
@@ -1643,6 +1700,7 @@ class LocalBackupStore:
         target: AnchoredStagingDataDir,
     ) -> Path:
         """Install a signed DR JWT secret through the pinned data-dir FD."""
+        self._require_open()
         target._require_store(self)
         target.verify_attached()
         inspection = self._reinspect(authenticated)
@@ -1699,6 +1757,9 @@ class LocalBackupStore:
 
     def begin_set(self, backup_id: str | None = None) -> BackupSetBuilder:
         """Create a private partial set; no listing API can observe it."""
+        self._require_open()
+        if self._identity_guard is not None:
+            self._identity_guard()
         selected_id = validate_backup_id(backup_id or self._generate_backup_id())
         final_path = self.sets_dir / selected_id
         if _path_exists(final_path):
@@ -1727,13 +1788,18 @@ class LocalBackupStore:
         metadata: Mapping[str, JsonValue] | None = None,
         created_at: datetime | None = None,
         seal_gate: BackupSealGate | None = None,
+        identity_guard: Callable[[], None] | None = None,
     ) -> BackupInspection:
         """Revalidate, sign, publish and finally seal a prepared set."""
+        self._require_open()
         prepared_identity = self._validate_prepared_location(prepared)
         final_path: Path | None = None
         final_identity: tuple[int, int] | None = None
         sealed_committed = False
+        effective_identity_guard = identity_guard or self._identity_guard
         try:
+            if effective_identity_guard is not None:
+                effective_identity_guard()
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
@@ -1756,6 +1822,8 @@ class LocalBackupStore:
                     "generated backup manifest exceeds its size limit"
                 )
             signature = self.identity.sign_manifest(manifest_bytes)
+            if effective_identity_guard is not None:
+                effective_identity_guard()
 
             _write_exclusive(prepared.path / MANIFEST_FILENAME, manifest_bytes)
             _write_exclusive(prepared.path / SIGNATURE_FILENAME, signature)
@@ -1775,7 +1843,10 @@ class LocalBackupStore:
             )
 
             def seal() -> None:
-                self._publish_seal(final_path)
+                self._publish_seal(
+                    final_path,
+                    pre_commit_guard=effective_identity_guard,
+                )
 
             if seal_gate is None:
                 seal()
@@ -1804,6 +1875,9 @@ class LocalBackupStore:
 
     def list_sets(self) -> list[BackupSetSummary]:
         """List structurally authenticated sealed sets, never partial sets."""
+        self._require_open()
+        if self._identity_guard is not None:
+            self._identity_guard()
         summaries: list[BackupSetSummary] = []
         try:
             with os.scandir(self.sets_dir) as iterator:
@@ -1854,6 +1928,8 @@ class LocalBackupStore:
                     error_code=None,
                 )
             )
+        if self._identity_guard is not None:
+            self._identity_guard()
         return summaries
 
     def inspect_set(
@@ -1864,6 +1940,7 @@ class LocalBackupStore:
         verify_resources: bool = True,
     ) -> BackupInspection:
         """Verify canonical manifest, detached signature and resource checksums."""
+        self._require_open()
         selected_id = validate_backup_id(backup_id)
         set_path = self.sets_dir / selected_id
         if not self._has_seal(set_path):
@@ -1937,6 +2014,7 @@ class LocalBackupStore:
         approved_public_key: bytes,
     ) -> AuthenticatedBackupInspection:
         """Issue a restore capability after explicit signer-key approval."""
+        self._require_open()
         if (
             not isinstance(approved_public_key, bytes)
             or len(approved_public_key) != ED25519_PUBLIC_KEY_SIZE
@@ -1966,6 +2044,7 @@ class LocalBackupStore:
         The returned descriptor, not a reopenable path, is the only input that
         should be handed to ``pg_restore``. The caller must close it.
         """
+        self._require_open()
         inspection = self._reinspect(authenticated)
         matches = [
             resource
@@ -2081,6 +2160,7 @@ class LocalBackupStore:
         target_data_dir: str | Path,
     ) -> Path:
         """Restore files only from a store-issued authenticated capability."""
+        self._require_open()
         inspection = self._reinspect(authenticated)
         source = inspection.path / RESOURCES_DIRNAME / FILES_DIRNAME
         target = Path(target_data_dir)
@@ -2127,6 +2207,7 @@ class LocalBackupStore:
         target_data_dir: str | Path,
     ) -> Path:
         """Install the preserved JWT secret for disaster-recovery mode only."""
+        self._require_open()
         inspection = self._reinspect(authenticated)
         matches = [
             resource
@@ -2307,12 +2388,19 @@ class LocalBackupStore:
                 ) from exc
             raise
 
-    def _publish_seal(self, final_path: Path) -> None:
+    def _publish_seal(
+        self,
+        final_path: Path,
+        *,
+        pre_commit_guard: Callable[[], None] | None = None,
+    ) -> None:
         """Publish SEALED only after its private inode is durably prepared."""
         temporary = final_path / f".{SEALED_FILENAME}-{secrets.token_hex(8)}.tmp"
         _write_exclusive(temporary, b"")
         _fsync_directory(final_path)
         try:
+            if pre_commit_guard is not None:
+                pre_commit_guard()
             os.link(
                 temporary,
                 final_path / SEALED_FILENAME,
