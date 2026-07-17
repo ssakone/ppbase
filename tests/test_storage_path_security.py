@@ -1,15 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import threading
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from ppbase.config import Settings
-from ppbase.api import records as records_api
-from ppbase.api.records import _cleanup_created_record_files
 from ppbase.core.storage_safety import (
     StorageSafetyError,
     validate_collection_id,
@@ -17,11 +15,50 @@ from ppbase.core.storage_safety import (
     validate_record_id,
 )
 from ppbase.services import file_storage
+from ppbase.services import record_storage_coordinator as storage_coordinator
+from ppbase.services.record_storage_coordinator import _cleanup_created_files
+from ppbase.services.write_barrier import WriteBarrierLease, WriteBarrierMode
 
 
 VALID_COLLECTION_ID = "_pbc_2287844090"
 VALID_RECORD_ID = "kfzjt5oy8r34hvn"
 VALID_FILENAME = "report_52iWbGinWd.txt"
+
+
+@pytest.fixture(autouse=True)
+def _inject_explicit_storage_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> WriteBarrierLease:
+    """Keep low-level storage tests below the public lease-required facade."""
+    lease = WriteBarrierLease(
+        connection=None,  # type: ignore[arg-type]
+        mode=WriteBarrierMode.SHARED,
+        backend_pid=0,
+        barrier_key=0,
+    )
+    lease._active = True
+    lease._barrier_acquired = True
+
+    for name in (
+        "save_files",
+        "delete_files",
+        "delete_storage_dir_if_empty",
+        "delete_all_files_except",
+        "delete_all_files",
+        "write_local_storage_variant_bytes",
+    ):
+        original = getattr(file_storage, name)
+
+        def _with_lease(*args, _original=original, **kwargs):
+            try:
+                lease._owner_task = asyncio.current_task()
+            except RuntimeError:
+                lease._owner_task = None
+            kwargs.setdefault("lease", lease)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(file_storage, name, _with_lease)
+    return lease
 
 
 def _s3_config() -> file_storage._StorageConfig:
@@ -405,14 +442,16 @@ def test_delete_all_rejects_traversal_and_preserves_sentinel(
 
 def test_batch_cleanup_skips_unsafe_target_and_preserves_sentinel(
     local_data_dir: Path,
+    _inject_explicit_storage_lease: WriteBarrierLease,
 ) -> None:
     sentinel = local_data_dir / "sentinel"
     sentinel.mkdir(parents=True)
     marker = sentinel / "marker.txt"
     marker.write_text("keep", encoding="utf-8")
 
-    _cleanup_created_record_files(
-        {(VALID_COLLECTION_ID, "../../sentinel", VALID_FILENAME)}
+    _cleanup_created_files(
+        {(VALID_COLLECTION_ID, "../../sentinel", VALID_FILENAME)},
+        lease=_inject_explicit_storage_lease,
     )
 
     assert sentinel.is_dir()
@@ -1623,73 +1662,27 @@ def test_delete_file_rejects_symlinked_thumbnail_directory_before_unlink(
     assert marker.read_text(encoding="utf-8") == "keep"
 
 
-class _CommitAckLostEngine:
-    @asynccontextmanager
-    async def begin(self):
-        try:
-            yield object()
-        except BaseException:
-            raise
-        else:
-            raise RuntimeError("commit acknowledgement lost")
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("durably_referenced", [True, False])
 async def test_ambiguous_commit_reconciles_new_file_references(
     local_data_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
     durably_referenced: bool,
+    _inject_explicit_storage_lease: WriteBarrierLease,
 ) -> None:
-    written: list[str] = []
-
-    async def _operation(_engine) -> dict[str, object]:
-        written.extend(
-            file_storage.save_files(
-                VALID_COLLECTION_ID,
-                VALID_RECORD_ID,
-                "document",
-                [("report.txt", b"commit outcome")],
-            )
-        )
-        return {"ok": True}
-
-    async def _get_all_collections(_engine) -> list[object]:
-        return []
-
-    async def _in_transaction_references(*_args, **_kwargs):
-        return {
-            (VALID_COLLECTION_ID, VALID_RECORD_ID, written[0])
-        }
-
-    async def _durable_references(_engine, _targets):
-        if durably_referenced:
-            return {
-                (VALID_COLLECTION_ID, VALID_RECORD_ID, written[0])
-            }
-        return set()
-
-    monkeypatch.setattr(
-        records_api,
-        "get_all_collections",
-        _get_all_collections,
+    written = file_storage.save_files(
+        VALID_COLLECTION_ID,
+        VALID_RECORD_ID,
+        "document",
+        [("report.txt", b"commit outcome")],
     )
-    monkeypatch.setattr(
-        records_api,
-        "_final_batch_file_references",
-        _in_transaction_references,
-    )
-    monkeypatch.setattr(
-        records_api,
-        "_reconcile_storage_file_references",
-        _durable_references,
-    )
+    target = (VALID_COLLECTION_ID, VALID_RECORD_ID, written[0])
+    durable_references = {target} if durably_referenced else set()
 
-    with pytest.raises(RuntimeError, match="acknowledgement lost"):
-        await records_api._run_storage_transaction(
-            _CommitAckLostEngine(),
-            _operation,
-        )
+    storage_coordinator._cleanup_unreferenced_created_files(
+        {target},
+        durable_references,
+        lease=_inject_explicit_storage_lease,
+    )
 
     file_path = file_storage.get_storage_file_path(
         VALID_COLLECTION_ID,
@@ -1702,7 +1695,6 @@ async def test_ambiguous_commit_reconciles_new_file_references(
 @pytest.mark.asyncio
 async def test_ambiguous_commit_preserves_deferred_deletes(
     local_data_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     filename = file_storage.save_files(
         VALID_COLLECTION_ID,
@@ -1711,41 +1703,22 @@ async def test_ambiguous_commit_preserves_deferred_deletes(
         [("existing.txt", b"preserve on ambiguity")],
     )[0]
 
-    async def _operation(_engine) -> dict[str, object]:
+    deferred: list[tuple[str, str, str, tuple[str, ...]]] = []
+    with file_storage.defer_storage_deletes(deferred):
         file_storage.delete_files(
             VALID_COLLECTION_ID,
             VALID_RECORD_ID,
             [filename],
         )
-        return {"ok": True}
 
-    async def _get_all_collections(_engine) -> list[object]:
-        return []
-
-    async def _no_references(*_args, **_kwargs):
-        return set()
-
-    monkeypatch.setattr(
-        records_api,
-        "get_all_collections",
-        _get_all_collections,
-    )
-    monkeypatch.setattr(
-        records_api,
-        "_final_batch_file_references",
-        _no_references,
-    )
-    monkeypatch.setattr(
-        records_api,
-        "_reconcile_storage_file_references",
-        _no_references,
-    )
-
-    with pytest.raises(RuntimeError, match="acknowledgement lost"):
-        await records_api._run_storage_transaction(
-            _CommitAckLostEngine(),
-            _operation,
+    assert deferred == [
+        (
+            "files",
+            VALID_COLLECTION_ID,
+            VALID_RECORD_ID,
+            (filename,),
         )
+    ]
 
     assert file_storage.read_file_bytes(
         VALID_COLLECTION_ID,

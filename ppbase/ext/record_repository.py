@@ -14,6 +14,10 @@ from ppbase.services.record_service import (
     resolve_collection,
     update_record,
 )
+from ppbase.services.record_storage_coordinator import (
+    ConnectionEngineAdapter,
+    run_record_storage_transaction,
+)
 
 
 class RecordRepository:
@@ -72,8 +76,24 @@ class RecordRepository:
         *,
         files: dict[str, list[tuple[str, bytes]]] | None = None,
     ):
-        collection = await self.resolve_collection()
-        return await create_record(self.engine, collection, dict(data), files=files)
+        async def _create(active_engine: ConnectionEngineAdapter):
+            collection = await resolve_collection(
+                active_engine,
+                self.collection_id_or_name,
+            )
+            if collection is None:
+                raise ValueError(
+                    "Missing collection with id or name "
+                    f"'{self.collection_id_or_name}'."
+                )
+            return await create_record(
+                active_engine,
+                collection,
+                dict(data),
+                files=files,
+            )
+
+        return await run_record_storage_transaction(self.engine, _create)
 
     async def update(
         self,
@@ -82,21 +102,43 @@ class RecordRepository:
         *,
         files: dict[str, list[tuple[str, bytes]]] | None = None,
     ):
-        collection = await self.resolve_collection()
-        return await update_record(
-            self.engine,
-            collection,
-            str(record_id),
-            dict(data),
-            files=files,
-        )
+        async def _update(active_engine: ConnectionEngineAdapter):
+            collection = await resolve_collection(
+                active_engine,
+                self.collection_id_or_name,
+            )
+            if collection is None:
+                raise ValueError(
+                    "Missing collection with id or name "
+                    f"'{self.collection_id_or_name}'."
+                )
+            return await update_record(
+                active_engine,
+                collection,
+                str(record_id),
+                dict(data),
+                files=files,
+            )
+
+        return await run_record_storage_transaction(self.engine, _update)
 
     async def delete(self, record_id: str) -> bool:
-        collection = await self.resolve_collection()
-        all_collections = await get_all_collections(self.engine)
-        return await delete_record(
-            self.engine,
-            collection,
-            str(record_id),
-            all_collections=all_collections,
-        )
+        async def _delete(active_engine: ConnectionEngineAdapter) -> bool:
+            collection = await resolve_collection(
+                active_engine,
+                self.collection_id_or_name,
+            )
+            if collection is None:
+                raise ValueError(
+                    "Missing collection with id or name "
+                    f"'{self.collection_id_or_name}'."
+                )
+            all_collections = await get_all_collections(active_engine)
+            return await delete_record(
+                active_engine,
+                collection,
+                str(record_id),
+                all_collections=all_collections,
+            )
+
+        return await run_record_storage_transaction(self.engine, _delete)

@@ -65,6 +65,9 @@ async def test_record_request_event_crud_helpers_use_event_defaults(monkeypatch)
         calls["delete"] = (engine, collection.name, record_id, list(all_collections))
         return True
 
+    async def _run_record_storage_transaction(engine, operation, **_kwargs):
+        return await operation(engine)
+
     monkeypatch.setattr(repo_module, "resolve_collection", _resolve_collection)
     monkeypatch.setattr(repo_module, "create_record", _create_record)
     monkeypatch.setattr(repo_module, "get_record", _get_record)
@@ -72,6 +75,11 @@ async def test_record_request_event_crud_helpers_use_event_defaults(monkeypatch)
     monkeypatch.setattr(repo_module, "update_record", _update_record)
     monkeypatch.setattr(repo_module, "get_all_collections", _get_all_collections)
     monkeypatch.setattr(repo_module, "delete_record", _delete_record)
+    monkeypatch.setattr(
+        repo_module,
+        "run_record_storage_transaction",
+        _run_record_storage_transaction,
+    )
 
     event = RecordRequestEvent(
         collection_id_or_name="posts",

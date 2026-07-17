@@ -2124,7 +2124,7 @@ async def test_collections_http_mutation_reuses_auth_session_with_single_pool(
         assert response.json()["name"] == collection_name
         assert await _relation_exists(single_connection_engine, collection_name)
     finally:
-        file_storage.set_storage_settings(previous_storage_settings)
+        file_storage._set_storage_settings_unchecked(previous_storage_settings)
         await single_connection_engine.dispose()
 
 
@@ -2215,7 +2215,7 @@ async def test_collections_meta_tables_reuses_auth_session_with_single_pool(
         assert isinstance(tables, list)
         assert any(table.get("name") == "_collections" for table in tables)
     finally:
-        file_storage.set_storage_settings(previous_storage_settings)
+        file_storage._set_storage_settings_unchecked(previous_storage_settings)
         await single_connection_engine.dispose()
 
 

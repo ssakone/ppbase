@@ -45,6 +45,27 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_force_path_style: bool = False
 
+    # ---- Native backup / restore staging ----
+    # Canonical sets and control-plane state intentionally live outside the
+    # restored business ``data_dir``. Only ``data_dir/storage`` is copied.
+    backup_root: str = "./pb_backups"
+    backup_control_dir: str = "./pb_backup_control"
+    backup_staging_root: str = "./pb_restore_staging"
+    backup_barrier_timeout: float = 300.0
+    backup_pg_dump_path: str = "pg_dump"
+    backup_pg_restore_path: str = "pg_restore"
+    backup_psql_path: str = "psql"
+    # Read-only source login used only by pg_dump and its privilege preflight.
+    # It must be distinct from the writable PPBase runtime login.
+    backup_dump_database_url: str = ""
+    # Restore staging uses separate cluster roles. The creator DSN is used
+    # only against a maintenance DB for CREATE DATABASE; the restore DSN has
+    # no CREATEDB and connects to the newly generated target.
+    backup_creator_database_url: str = ""
+    backup_restore_database_url: str = ""
+    backup_target_owner: str = ""
+    backup_allowed_extensions: list[str] = ["plpgsql=1.0"]
+
     # ---- Auth ----
     jwt_secret: str = ""
     admin_token_duration: int = 1_209_600  # 14 days in seconds

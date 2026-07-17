@@ -14,17 +14,16 @@ import asyncio
 import json
 import logging
 import re
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import Headers, QueryParams, URL
 
-from ppbase.api.deps import get_optional_auth
+from ppbase.api.deps import get_optional_auth, get_session
 from ppbase.db.engine import get_engine
 from ppbase.ext.events import RecordRequestEvent
 from ppbase.ext.registry import (
@@ -47,7 +46,12 @@ from ppbase.services.record_service import (
     resolve_collection,
     update_record,
 )
+from ppbase.services.record_storage_coordinator import (
+    ConnectionEngineAdapter as _ConnectionEngineAdapter,
+    run_record_storage_transaction,
+)
 from ppbase.services.rule_engine import check_rule
+from ppbase.services.write_barrier import WriteBarrierTimeoutError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -155,6 +159,20 @@ _BATCH_RECORD_RE = re.compile(r"^/api/collections/([^/]+)/records/([^/]+)/?$")
 _BATCH_FILE_KEY_RE = re.compile(r"^requests(?:\.|\[)(\d+)\]?\.([A-Za-z0-9_]+)$")
 
 
+async def _get_mutation_auth(
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any] | None:
+    """Authenticate, then release the cached request connection.
+
+    Mutation coordination reserves one dedicated connection for both the
+    session-level barrier and all record SQL. Returning the read-only auth
+    transaction to the pool first is required for ``pool_size=1``.
+    """
+    await session.rollback()
+    return auth
+
+
 class _BatchRequestFailed(Exception):
     """Signals a failed nested request inside ``/api/batch``."""
 
@@ -162,21 +180,6 @@ class _BatchRequestFailed(Exception):
         super().__init__("Batch request failed.")
         self.index = index
         self.response = response
-
-
-class _ConnectionEngineAdapter:
-    """Minimal async-engine adapter that pins all work to one connection."""
-
-    def __init__(self, conn: AsyncConnection):
-        self._conn = conn
-
-    @asynccontextmanager
-    async def connect(self) -> AsyncIterator[AsyncConnection]:
-        yield self._conn
-
-    @asynccontextmanager
-    async def begin(self) -> AsyncIterator[AsyncConnection]:
-        yield self._conn
 
 
 class _AbortWithResponse(Exception):
@@ -187,233 +190,19 @@ class _AbortWithResponse(Exception):
         self.response = response
 
 
-def _cleanup_created_record_files(
-    created_targets: set[tuple[str, str, str]],
-) -> None:
-    """Remove only files created by a failed batch, then prune empty dirs."""
-    from ppbase.core.storage_safety import StorageSafetyError
-    from ppbase.services.file_storage import (
-        delete_files,
-        delete_storage_dir_if_empty,
-    )
-
-    record_targets: set[tuple[str, str]] = set()
-    for collection_id, record_id, filename in created_targets:
-        record_targets.add((collection_id, record_id))
-        try:
-            delete_files(collection_id, record_id, [filename])
-        except (OSError, StorageSafetyError):
-            logger.warning("Skipped unsafe or failed batch storage cleanup")
-
-    for collection_id, record_id in record_targets:
-        try:
-            delete_storage_dir_if_empty(collection_id, record_id)
-        except (OSError, StorageSafetyError):
-            logger.warning("Skipped unsafe or failed empty storage-dir cleanup")
-
-
-def _raw_batch_file_references(value: Any) -> list[str]:
-    """Return stored file references from a raw PostgreSQL field value."""
-    if isinstance(value, (list, tuple, set)):
-        return [str(item) for item in value if item]
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return []
-        if stripped.startswith("["):
-            try:
-                decoded = json.loads(stripped)
-            except (TypeError, ValueError):
-                decoded = None
-            if isinstance(decoded, list):
-                return [str(item) for item in decoded if item]
-        return [value]
-    if value:
-        return [str(value)]
-    return []
-
-
-async def _final_batch_file_references(
-    engine: Any,
-    all_collections: list[Any],
-    targets: set[tuple[str, str]],
-) -> set[tuple[str, str, str]]:
-    """Read final in-transaction file references before committing a batch."""
-    collections_by_id = {
-        str(getattr(collection, "id", "") or ""): collection
-        for collection in all_collections
-    }
-    preserved: set[tuple[str, str, str]] = set()
-
-    async with engine.connect() as conn:
-        for collection_id, record_id in sorted(targets):
-            collection = collections_by_id.get(collection_id)
-            if collection is None:
-                raise RuntimeError("Missing collection during batch file reconciliation.")
-            table_name = str(getattr(collection, "name", "") or "")
-            quoted_table = table_name.replace('"', '""')
-            result = await conn.execute(
-                text(f'SELECT * FROM "{quoted_table}" WHERE "id" = :rid LIMIT 1'),
-                {"rid": record_id},
-            )
-            row = result.mappings().first()
-            if row is None:
-                continue
-            row_dict = dict(row)
-            for raw_field in getattr(collection, "schema", None) or []:
-                if not isinstance(raw_field, dict) or raw_field.get("type") != "file":
-                    continue
-                field_name = str(raw_field.get("name", "") or "")
-                if not field_name:
-                    continue
-                preserved.update(
-                    (collection_id, record_id, filename)
-                    for filename in _raw_batch_file_references(
-                        row_dict.get(field_name)
-                    )
-                )
-    return preserved
-
-
-def _affected_storage_records(
-    created_file_targets: set[tuple[str, str, str]],
-    deferred_storage_deletes: list[tuple[str, str, str, tuple[str, ...]]],
-) -> set[tuple[str, str]]:
-    """Return record identities touched by coordinated storage changes."""
-    affected = {
-        (collection_id, record_id)
-        for collection_id, record_id, _filename in created_file_targets
-    }
-    affected.update(
-        (collection_id, record_id)
-        for _action, collection_id, record_id, _filenames
-        in deferred_storage_deletes
-    )
-    return affected
-
-
-async def _reconcile_storage_file_references(
-    engine: Any,
-    targets: set[tuple[str, str]],
-) -> set[tuple[str, str, str]] | None:
-    """Read durable file references after an ambiguous commit outcome."""
-    if not targets:
-        return set()
-    try:
-        all_collections = await get_all_collections(engine)
-        return await _final_batch_file_references(
-            engine,
-            all_collections,
-            targets,
-        )
-    except Exception:
-        logger.exception(
-            "Unable to reconcile durable storage references after an "
-            "ambiguous database commit"
-        )
-        return None
-
-
-def _cleanup_unreferenced_created_files(
-    created_file_targets: set[tuple[str, str, str]],
-    final_file_references: set[tuple[str, str, str]],
-) -> None:
-    orphaned_writes = created_file_targets - final_file_references
-    if orphaned_writes:
-        _cleanup_created_record_files(orphaned_writes)
-
-
 async def _run_storage_transaction(
     engine: Any,
     operation: Callable[[_ConnectionEngineAdapter], Awaitable[Any]],
 ) -> Any:
-    """Coordinate DB commit with exact file-write/delete compensation."""
-    created_file_targets: set[tuple[str, str, str]] = set()
-    deferred_storage_deletes: list[
-        tuple[str, str, str, tuple[str, ...]]
-    ] = []
-    final_file_references: set[tuple[str, str, str]] = set()
-    transaction_body_finished = False
+    """Coordinate DB commit, hooks, and exact file compensation."""
 
-    from ppbase.services.file_storage import (
-        capture_storage_writes,
-        defer_storage_deletes,
-        flush_deferred_storage_deletes,
-        pin_storage_config,
-    )
-
-    with pin_storage_config():
-        try:
-            with (
-                capture_storage_writes(created_file_targets),
-                defer_storage_deletes(deferred_storage_deletes),
-            ):
-                async with engine.begin() as conn:
-                    active_engine = _ConnectionEngineAdapter(conn)
-                    result = await operation(active_engine)
-                    if isinstance(result, Response) and result.status_code >= 400:
-                        raise _AbortWithResponse(result)
-                    affected_records = _affected_storage_records(
-                        created_file_targets,
-                        deferred_storage_deletes,
-                    )
-                    if affected_records:
-                        all_collections = await get_all_collections(active_engine)
-                        final_file_references = await _final_batch_file_references(
-                            active_engine,
-                            all_collections,
-                            affected_records,
-                        )
-                    transaction_body_finished = True
-        except BaseException as exc:
-            if transaction_body_finished and isinstance(exc, Exception):
-                durable_references = await _reconcile_storage_file_references(
-                    engine,
-                    _affected_storage_records(
-                        created_file_targets,
-                        deferred_storage_deletes,
-                    ),
-                )
-                if durable_references is not None:
-                    _cleanup_unreferenced_created_files(
-                        created_file_targets,
-                        durable_references,
-                    )
-                elif created_file_targets:
-                    logger.warning(
-                        "Preserving %d new storage file(s) because the database "
-                        "commit outcome could not be reconciled",
-                        len(created_file_targets),
-                    )
-                if deferred_storage_deletes:
-                    logger.warning(
-                        "Preserving %d deferred storage deletion(s) after an "
-                        "ambiguous database commit; a janitor may reconcile them",
-                        len(deferred_storage_deletes),
-                    )
-            elif transaction_body_finished:
-                logger.warning(
-                    "Preserving storage changes because database commit was "
-                    "interrupted before its outcome could be reconciled"
-                )
-            elif created_file_targets:
-                _cleanup_created_record_files(created_file_targets)
-            raise
-
-        _cleanup_unreferenced_created_files(
-            created_file_targets,
-            final_file_references,
-        )
-        cleanup_failures = flush_deferred_storage_deletes(
-            deferred_storage_deletes,
-            preserved_files=final_file_references,
-        )
-        if cleanup_failures:
-            logger.warning(
-                "Skipped %d unsafe or conflicting committed storage cleanup(s)",
-                cleanup_failures,
-            )
+    async def _operation(active_engine: _ConnectionEngineAdapter) -> Any:
+        result = await operation(active_engine)
+        if isinstance(result, Response) and result.status_code >= 400:
+            raise _AbortWithResponse(result)
         return result
+
+    return await run_record_storage_transaction(engine, _operation)
 
 
 class _BatchRequestProxy:
@@ -1555,22 +1344,10 @@ async def api_create_record(
     request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Create a new record in a collection."""
     engine = get_engine()
-
-    collection = await resolve_collection(engine, collectionIdOrName)
-    if collection is None:
-        return _error_response(404, "Missing collection context.")
-
-    # _superusers records are managed via the admin auth API, not here
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot create _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
 
     data, files, parse_error = await _parse_record_request_body(request)
     if parse_error is not None:
@@ -1578,20 +1355,11 @@ async def api_create_record(
     if data is None:
         return _error_response(400, "Request body must be a JSON object.")
 
-    event = RecordRequestEvent(
-        app=request.app,
-        request=request,
-        collection=collection,
-        collection_id_or_name=collectionIdOrName,
-        auth=auth,
-        data=data,
-        files=files,
-        expand=expand,
-        fields=fields,
-        engine=engine,
-    )
+    collection: Any | None = None
 
     async def _default_create_handler(e: RecordRequestEvent) -> JSONResponse:
+        if collection is None:  # pragma: no cover - coordinator invariant
+            raise RuntimeError("Record collection was not resolved.")
         active_engine = e.engine or engine
         if not isinstance(e.data, dict):
             return _error_response(400, "Request body must be a JSON object.")
@@ -1683,7 +1451,28 @@ async def api_create_record(
         return JSONResponse(content=record, status_code=200)
 
     async def _run_create(active_engine: _ConnectionEngineAdapter) -> Any:
-        event.engine = active_engine
+        nonlocal collection
+        collection = await resolve_collection(active_engine, collectionIdOrName)
+        if collection is None:
+            return _error_response(404, "Missing collection context.")
+        if collection.name == "_superusers":
+            return _error_response(
+                400,
+                "You cannot create _superusers records via the records API. "
+                "Use the admin auth endpoints instead.",
+            )
+        event = RecordRequestEvent(
+            app=request.app,
+            request=request,
+            collection=collection,
+            collection_id_or_name=collectionIdOrName,
+            auth=auth,
+            data=data,
+            files=files,
+            expand=expand,
+            fields=fields,
+            engine=active_engine,
+        )
         return await _trigger_record_request_hook(
             request,
             HOOK_RECORD_CREATE_REQUEST,
@@ -1796,22 +1585,10 @@ async def api_update_record(
     request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Update an existing record."""
     engine = get_engine()
-
-    collection = await resolve_collection(engine, collectionIdOrName)
-    if collection is None:
-        return _error_response(404, "Missing collection context.")
-
-    # _superusers records are managed via the admin auth API, not here
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot update _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
 
     data, files, parse_error = await _parse_record_request_body(request)
     if parse_error is not None:
@@ -1819,21 +1596,11 @@ async def api_update_record(
     if data is None:
         return _error_response(400, "Request body must be a JSON object.")
 
-    event = RecordRequestEvent(
-        app=request.app,
-        request=request,
-        collection=collection,
-        collection_id_or_name=collectionIdOrName,
-        record_id=recordId,
-        auth=auth,
-        data=data,
-        files=files,
-        expand=expand,
-        fields=fields,
-        engine=engine,
-    )
+    collection: Any | None = None
 
     async def _default_update_handler(e: RecordRequestEvent) -> JSONResponse:
+        if collection is None:  # pragma: no cover - coordinator invariant
+            raise RuntimeError("Record collection was not resolved.")
         active_engine = e.engine or engine
         if not isinstance(e.data, dict):
             return _error_response(400, "Request body must be a JSON object.")
@@ -1923,7 +1690,29 @@ async def api_update_record(
         return JSONResponse(content=record, status_code=200)
 
     async def _run_update(active_engine: _ConnectionEngineAdapter) -> Any:
-        event.engine = active_engine
+        nonlocal collection
+        collection = await resolve_collection(active_engine, collectionIdOrName)
+        if collection is None:
+            return _error_response(404, "Missing collection context.")
+        if collection.name == "_superusers":
+            return _error_response(
+                400,
+                "You cannot update _superusers records via the records API. "
+                "Use the admin auth endpoints instead.",
+            )
+        event = RecordRequestEvent(
+            app=request.app,
+            request=request,
+            collection=collection,
+            collection_id_or_name=collectionIdOrName,
+            record_id=recordId,
+            auth=auth,
+            data=data,
+            files=files,
+            expand=expand,
+            fields=fields,
+            engine=active_engine,
+        )
         return await _trigger_record_request_hook(
             request,
             HOOK_RECORD_UPDATE_REQUEST,
@@ -1947,34 +1736,15 @@ async def api_delete_record(
     collectionIdOrName: str,
     recordId: str,
     request: Request,
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Delete a record."""
     engine = get_engine()
-
-    collection = await resolve_collection(engine, collectionIdOrName)
-    if collection is None:
-        return _error_response(404, "Missing collection context.")
-
-    # _superusers records are managed via the admin auth API, not here
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot delete _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
-
-    event = RecordRequestEvent(
-        app=request.app,
-        request=request,
-        collection=collection,
-        collection_id_or_name=collectionIdOrName,
-        record_id=recordId,
-        auth=auth,
-        engine=engine,
-    )
+    collection: Any | None = None
 
     async def _default_delete_handler(e: RecordRequestEvent) -> JSONResponse:
+        if collection is None:  # pragma: no cover - coordinator invariant
+            raise RuntimeError("Record collection was not resolved.")
         active_engine = e.engine or engine
         target_record_id = e.record_id or recordId
         auth_ctx, request_context = _prepare_rule_context(request, e.auth)
@@ -2011,7 +1781,25 @@ async def api_delete_record(
         return Response(status_code=204)
 
     async def _run_delete(active_engine: _ConnectionEngineAdapter) -> Any:
-        event.engine = active_engine
+        nonlocal collection
+        collection = await resolve_collection(active_engine, collectionIdOrName)
+        if collection is None:
+            return _error_response(404, "Missing collection context.")
+        if collection.name == "_superusers":
+            return _error_response(
+                400,
+                "You cannot delete _superusers records via the records API. "
+                "Use the admin auth endpoints instead.",
+            )
+        event = RecordRequestEvent(
+            app=request.app,
+            request=request,
+            collection=collection,
+            collection_id_or_name=collectionIdOrName,
+            record_id=recordId,
+            auth=auth,
+            engine=active_engine,
+        )
         return await _trigger_record_request_hook(
             request,
             HOOK_RECORD_DELETE_REQUEST,
@@ -2033,7 +1821,7 @@ async def api_delete_record(
 @router.post("/api/batch")
 async def api_batch_records(
     request: Request,
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Execute multiple record actions in a single transaction."""
     engine = get_engine()
@@ -2069,114 +1857,37 @@ async def api_batch_records(
             f"The allowed max number of batch requests is {max_requests}.",
         )
 
-    result_items: list[dict[str, Any]] = []
-    created_file_targets: set[tuple[str, str, str]] = set()
-    deferred_storage_deletes: list[
-        tuple[str, str, str, tuple[str, ...]]
-    ] = []
-    final_file_references: set[tuple[str, str, str]] = set()
-    transaction_body_finished = False
-    try:
-        from ppbase.services.file_storage import (
-            capture_storage_writes,
-            defer_storage_deletes,
-            flush_deferred_storage_deletes,
-            pin_storage_config,
-        )
-
-        with pin_storage_config():
-            try:
-                with (
-                    capture_storage_writes(created_file_targets),
-                    defer_storage_deletes(deferred_storage_deletes),
-                ):
-                    async with asyncio.timeout(timeout_seconds):
-                        async with engine.begin() as conn:
-                            batch_engine = _ConnectionEngineAdapter(conn)
-                            all_collections = await get_all_collections(batch_engine)
-
-                            for index, item in enumerate(requests_payload):
-                                response_or_error = await _execute_batch_request(
-                                    batch_engine,
-                                    request,
-                                    auth,
-                                    item,
-                                    files_by_request.get(index, {}),
-                                    all_collections,
-                                )
-                                if isinstance(response_or_error, JSONResponse):
-                                    raise _BatchRequestFailed(
-                                        index, _response_json_body(response_or_error)
-                                    )
-
-                                status, body = response_or_error
-                                result_items.append(
-                                    {
-                                        "status": status,
-                                        "body": body,
-                                    }
-                                )
-                            affected_records = _affected_storage_records(
-                                created_file_targets,
-                                deferred_storage_deletes,
-                            )
-                            if affected_records:
-                                final_file_references = (
-                                    await _final_batch_file_references(
-                                        batch_engine,
-                                        all_collections,
-                                        affected_records,
-                                    )
-                                )
-                            transaction_body_finished = True
-            except BaseException as exc:
-                if transaction_body_finished and isinstance(exc, Exception):
-                    durable_references = await _reconcile_storage_file_references(
-                        engine,
-                        _affected_storage_records(
-                            created_file_targets,
-                            deferred_storage_deletes,
-                        )
-                    )
-                    if durable_references is not None:
-                        _cleanup_unreferenced_created_files(
-                            created_file_targets,
-                            durable_references,
-                        )
-                    elif created_file_targets:
-                        logger.warning(
-                            "Preserving %d new batch storage file(s) because the "
-                            "database commit outcome could not be reconciled",
-                            len(created_file_targets),
-                        )
-                    if deferred_storage_deletes:
-                        logger.warning(
-                            "Preserving %d deferred batch storage deletion(s) "
-                            "after an ambiguous database commit",
-                            len(deferred_storage_deletes),
-                        )
-                elif transaction_body_finished:
-                    logger.warning(
-                        "Preserving batch storage changes because database commit "
-                        "was interrupted before its outcome could be reconciled"
-                    )
-                elif created_file_targets:
-                    _cleanup_created_record_files(created_file_targets)
-                raise
-
-            _cleanup_unreferenced_created_files(
-                created_file_targets,
-                final_file_references,
-            )
-            cleanup_failures = flush_deferred_storage_deletes(
-                deferred_storage_deletes,
-                preserved_files=final_file_references,
-            )
-            if cleanup_failures:
-                logger.warning(
-                    "Skipped %d unsafe or conflicting committed batch storage cleanup(s)",
-                    cleanup_failures,
+    async def _run_batch(
+        batch_engine: _ConnectionEngineAdapter,
+    ) -> list[dict[str, Any]]:
+        result_items: list[dict[str, Any]] = []
+        async with asyncio.timeout(timeout_seconds):
+            all_collections = await get_all_collections(batch_engine)
+            for index, item in enumerate(requests_payload):
+                response_or_error = await _execute_batch_request(
+                    batch_engine,
+                    request,
+                    auth,
+                    item,
+                    files_by_request.get(index, {}),
+                    all_collections,
                 )
+                if isinstance(response_or_error, JSONResponse):
+                    raise _BatchRequestFailed(
+                        index,
+                        _response_json_body(response_or_error),
+                    )
+
+                status, body = response_or_error
+                result_items.append({"status": status, "body": body})
+        return result_items
+
+    try:
+        result_items = await run_record_storage_transaction(
+            engine,
+            _run_batch,
+            barrier_timeout_seconds=timeout_seconds,
+        )
     except _BatchRequestFailed as exc:
         return _error_response(
             400,
@@ -2191,7 +1902,7 @@ async def api_batch_records(
                 },
             },
         )
-    except TimeoutError:
+    except (TimeoutError, WriteBarrierTimeoutError):
         return _error_response(
             400,
             "Batch transaction failed.",

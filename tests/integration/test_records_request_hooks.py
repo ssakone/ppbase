@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from ppbase.ext.registry import (
     HOOK_RECORD_UPDATE_REQUEST,
 )
 from ppbase.services import file_storage
+from ppbase.services.write_barrier import WriteBarrierLease, WriteBarrierMode
 
 
 class _FakeBeginContext:
@@ -44,7 +46,69 @@ def _build_records_app(extensions: ExtensionRegistry) -> FastAPI:
     app.include_router(records_api.router)
     app.state.extension_registry = extensions
     app.dependency_overrides[records_api.get_optional_auth] = lambda: None
+    app.dependency_overrides[records_api._get_mutation_auth] = lambda: None
     return app
+
+
+@pytest.fixture(autouse=True)
+def _adapt_fake_engines_to_storage_coordinator(monkeypatch):
+    """Keep hook unit tests focused while production uses the real barrier."""
+    real_coordinator = records_api.run_record_storage_transaction
+    active_lease: WriteBarrierLease | None = None
+
+    for name in (
+        "save_files",
+        "delete_files",
+        "delete_storage_dir_if_empty",
+    ):
+        original = getattr(file_storage, name)
+
+        def _with_active_lease(*args, _original=original, **kwargs):
+            kwargs.setdefault("lease", active_lease)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(file_storage, name, _with_active_lease)
+
+    async def _run(engine, operation, **kwargs):
+        nonlocal active_lease
+        if not isinstance(engine, _FakeEngine):
+            return await real_coordinator(engine, operation, **kwargs)
+        lease = WriteBarrierLease(
+            connection=None,  # type: ignore[arg-type]
+            mode=WriteBarrierMode.SHARED,
+            backend_pid=0,
+            barrier_key=0,
+        )
+        lease._active = True
+        lease._barrier_acquired = True
+        lease._owner_task = asyncio.current_task()
+        active_lease = lease
+        created: set[tuple[str, str, str]] = set()
+        deferred: list[tuple[str, str, str, tuple[str, ...]]] = []
+        try:
+            with (
+                file_storage.capture_storage_writes(created),
+                file_storage.defer_storage_deletes(deferred),
+            ):
+                async with engine.begin() as connection:
+                    adapter = records_api._ConnectionEngineAdapter(connection)
+                    result = await operation(adapter)
+        except BaseException:
+            for collection_id, record_id, filename in created:
+                file_storage.delete_files(collection_id, record_id, [filename])
+                file_storage.delete_storage_dir_if_empty(collection_id, record_id)
+            raise
+        finally:
+            if active_lease is lease:
+                active_lease = None
+        file_storage.flush_deferred_storage_deletes(
+            deferred,
+            preserved_files=set(),
+            lease=lease,
+        )
+        return result
+
+    monkeypatch.setattr(records_api, "run_record_storage_transaction", _run)
 
 
 @pytest.mark.asyncio

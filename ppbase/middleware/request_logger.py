@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 # Paths to skip logging (admin UI assets, health check, realtime SSE)
 _SKIP_PREFIXES = ("/_/", "/api/health", "/api/realtime")
 
+# Backup control and future transport endpoints must authenticate before any
+# request body is consumed. They are still logged, but never body-captured by
+# this outer middleware.
+_AUTH_BEFORE_BODY_PREFIXES = ("/api/backups", "/api/backup-staging")
+
 # Capture only small, text-like payloads to avoid large/binary blobs in logs.
 _MAX_CAPTURE_BYTES = 32 * 1024
 _CAPTURE_CONTENT_TYPES = (
@@ -178,7 +183,9 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
 
         content_length = _parse_content_length(request.headers.get("content-length"))
         request_content_type = request.headers.get("content-type")
-        should_capture_request = _should_capture_body(request_content_type, content_length)
+        should_capture_request = not any(
+            path.startswith(prefix) for prefix in _AUTH_BEFORE_BODY_PREFIXES
+        ) and _should_capture_body(request_content_type, content_length)
 
         request_body_bytes = await request.body() if should_capture_request else b""
         if should_capture_request:

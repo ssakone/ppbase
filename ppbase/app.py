@@ -53,7 +53,7 @@ async def _lifespan(app: FastAPI):
     from ppbase.ext.registry import HOOK_BOOTSTRAP, HOOK_SERVE, HOOK_TERMINATE
     from ppbase.services.database_preparation import prepare_database
     from ppbase.services.file_storage import (
-        configure_storage_runtime_from_settings_payload,
+        _configure_storage_runtime_from_settings_payload_unchecked,
     )
     from ppbase.services.process_control import schedule_process_restart
     from ppbase.services.realtime_service import SubscriptionManager, listen_for_db_events
@@ -128,7 +128,7 @@ async def _lifespan(app: FastAPI):
                 ParamRecord.key == "settings"
             )
             settings_row = (await session.execute(settings_stmt)).scalar_one_or_none()
-            configure_storage_runtime_from_settings_payload(
+            _configure_storage_runtime_from_settings_payload_unchecked(
                 settings_row if isinstance(settings_row, dict) else None
             )
 
@@ -319,9 +319,9 @@ def create_app(
 
             return await _run_http(0)
 
-    from ppbase.services.file_storage import set_storage_settings
+    from ppbase.services.file_storage import _set_storage_settings_unchecked
 
-    set_storage_settings(settings)
+    _set_storage_settings_unchecked(settings)
 
     # CORS
     from ppbase.middleware.cors import setup_cors

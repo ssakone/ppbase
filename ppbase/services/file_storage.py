@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import os
@@ -21,11 +22,19 @@ from typing import Any, Iterator
 
 from ppbase.config import Settings
 from ppbase.core.storage_safety import (
+    LOCAL_STORAGE_ID_ESCAPE_PREFIX,
     StorageSafetyError,
     is_remote_file_reference,
+    local_storage_id_name,
     validate_collection_id,
     validate_file_reference,
     validate_record_id,
+)
+from ppbase.services.write_barrier import (
+    WriteBarrierError,
+    WriteBarrierLease,
+    require_exclusive_write_barrier,
+    require_mutation_write_barrier,
 )
 
 _settings: Settings | None = None
@@ -41,31 +50,40 @@ _exact_storage_id_cache: OrderedDict[
     tuple[int, int, str],
     tuple[int, int, int, int, int],
 ] = OrderedDict()
-_storage_write_tracker: ContextVar[set[tuple[str, str, str]] | None] = ContextVar(
+@dataclass(frozen=True)
+class _TaskOwnedStorageContext:
+    """A ContextVar payload that cannot cross an asyncio task boundary."""
+
+    owner_task: asyncio.Task[Any] | None
+    value: Any
+
+
+_storage_write_tracker: ContextVar[_TaskOwnedStorageContext | None] = ContextVar(
     "ppbase_storage_write_tracker",
     default=None,
 )
-_storage_delete_tracker: ContextVar[
-    list[tuple[str, str, str, tuple[str, ...]]] | None
-] = ContextVar(
+_storage_delete_tracker: ContextVar[_TaskOwnedStorageContext | None] = ContextVar(
     "ppbase_storage_delete_tracker",
     default=None,
 )
-_storage_config_snapshot: ContextVar[Any] = ContextVar(
+_storage_config_snapshot: ContextVar[_TaskOwnedStorageContext | None] = ContextVar(
     "ppbase_storage_config_snapshot",
     default=None,
 )
 
 _SAFE_STEM_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_EXTENSION_PATTERN = re.compile(r"[^A-Za-z0-9]+")
-_POCKETBASE_STORAGE_ID_PATTERN = re.compile(r"^[_a-z0-9]+$")
-_LOCAL_ID_ESCAPE_PREFIX = "__ppbase_storage_id_v1__"
 _ALPHANUM = string.ascii_letters + string.digits
 _MAX_SAFE_STEM_LENGTH = 180
 _MAX_SAFE_EXTENSION_LENGTH = 16
 _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
 _EXACT_STORAGE_ID_CACHE_LIMIT = 8192
+
+# Compatibility alias for existing internal callers/tests; the algorithm now
+# lives in core storage safety so backup staging uses the exact same mapping.
+_LOCAL_ID_ESCAPE_PREFIX = LOCAL_STORAGE_ID_ESCAPE_PREFIX
+_local_storage_id_name = local_storage_id_name
 
 
 @dataclass(frozen=True)
@@ -133,10 +151,55 @@ def _get_settings() -> Settings:
     return _settings
 
 
-def set_storage_settings(settings: Settings | None) -> None:
-    """Bind storage helpers to the active app settings instance."""
+def _set_storage_settings_unchecked(settings: Settings | None) -> None:
+    """Bind settings during bootstrap/test setup before serving requests."""
     global _settings
     _settings = settings
+
+
+def set_storage_settings(
+    settings: Settings | None,
+    *,
+    lease: WriteBarrierLease | None = None,
+) -> None:
+    """Replace live storage settings beneath an exclusive barrier lease."""
+    _require_explicit_exclusive_lease(lease)
+    _set_storage_settings_unchecked(settings)
+
+
+def _current_asyncio_task() -> asyncio.Task[Any] | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _require_explicit_mutation_lease(
+    lease: WriteBarrierLease | None,
+) -> WriteBarrierLease:
+    if lease is None:
+        raise WriteBarrierError(
+            "An explicit shared PPBase write-barrier lease is required for "
+            "storage mutation."
+        )
+    return require_mutation_write_barrier(lease)
+
+
+def _require_explicit_exclusive_lease(
+    lease: WriteBarrierLease | None,
+) -> WriteBarrierLease:
+    if lease is None:
+        raise WriteBarrierError(
+            "An explicit exclusive PPBase write-barrier lease is required for "
+            "live storage configuration changes."
+        )
+    return require_exclusive_write_barrier(lease)
+
+
+def _task_owned_value(context: _TaskOwnedStorageContext | None) -> Any:
+    if context is None or context.owner_task is not _current_asyncio_task():
+        return None
+    return context.value
 
 
 def _s3_has_required_credentials(values: dict[str, Any]) -> bool:
@@ -147,12 +210,8 @@ def _s3_has_required_credentials(values: dict[str, Any]) -> bool:
     )
 
 
-def _resolve_storage_config() -> _StorageConfig:
-    snapshot = _storage_config_snapshot.get()
-    if isinstance(snapshot, _StorageConfig):
-        return snapshot
-    settings = _get_settings()
-    values: dict[str, Any] = {
+def _base_storage_values(settings: Any) -> dict[str, Any]:
+    return {
         "data_dir": str(getattr(settings, "data_dir", "./pb_data")),
         "storage_backend": str(getattr(settings, "storage_backend", "local") or "local"),
         "s3_endpoint": str(getattr(settings, "s3_endpoint", "") or "").strip(),
@@ -163,10 +222,8 @@ def _resolve_storage_config() -> _StorageConfig:
         "s3_force_path_style": bool(getattr(settings, "s3_force_path_style", False)),
     }
 
-    with _runtime_lock:
-        if isinstance(_runtime_storage_overrides, dict):
-            values.update(_runtime_storage_overrides)
 
+def _storage_config_from_values(values: dict[str, Any]) -> _StorageConfig:
     backend = str(values.get("storage_backend", "local") or "local").strip().lower()
     if backend not in {"local", "s3"}:
         backend = "local"
@@ -174,7 +231,7 @@ def _resolve_storage_config() -> _StorageConfig:
         backend = "local"
 
     return _StorageConfig(
-        data_dir=str(values.get("data_dir", getattr(settings, "data_dir", "./pb_data"))),
+        data_dir=str(values.get("data_dir", "./pb_data")),
         backend=backend,
         s3_endpoint=str(values.get("s3_endpoint", "") or "").strip(),
         s3_bucket=str(values.get("s3_bucket", "") or "").strip(),
@@ -185,11 +242,82 @@ def _resolve_storage_config() -> _StorageConfig:
     )
 
 
+def _storage_overrides_from_settings_payload(
+    settings_value: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(settings_value, dict):
+        return None
+    raw_s3 = settings_value.get("s3")
+    if not isinstance(raw_s3, dict):
+        return None
+
+    endpoint = str(raw_s3.get("endpoint", "") or "").strip()
+    bucket = str(raw_s3.get("bucket", "") or "").strip()
+    region = str(raw_s3.get("region", "") or "").strip()
+    access_key = str(raw_s3.get("accessKey", "") or "").strip()
+    secret_key = str(raw_s3.get("secret", "") or "").strip()
+    enabled_raw = raw_s3.get("enabled")
+    has_any_value = enabled_raw is not None or any(
+        [endpoint, bucket, region, access_key, secret_key]
+    )
+    if not has_any_value:
+        return None
+
+    use_s3 = (
+        bool(enabled_raw)
+        if enabled_raw is not None
+        else bool(bucket and access_key and secret_key)
+    )
+    return {
+        "storage_backend": "s3" if use_s3 else "local",
+        "s3_endpoint": endpoint,
+        "s3_bucket": bucket,
+        "s3_region": region,
+        "s3_access_key": access_key,
+        "s3_secret_key": secret_key,
+        "s3_force_path_style": bool(raw_s3.get("forcePathStyle", False)),
+    }
+
+
+def resolve_storage_config_from_settings_payload(
+    settings: Any,
+    settings_value: dict[str, Any] | None,
+) -> _StorageConfig:
+    """Purely resolve effective storage config from base and durable settings.
+
+    Unlike ``_resolve_storage_config``, this helper never reads or mutates the
+    process-global runtime override.  Backup can therefore compare a durable
+    ``_params.settings`` snapshot with its independently pinned live config.
+    """
+    values = _base_storage_values(settings)
+    overrides = _storage_overrides_from_settings_payload(settings_value)
+    if overrides is not None:
+        values.update(overrides)
+    return _storage_config_from_values(values)
+
+
+def _resolve_storage_config(settings: Any | None = None) -> _StorageConfig:
+    snapshot = _task_owned_value(_storage_config_snapshot.get())
+    if isinstance(snapshot, _StorageConfig):
+        return snapshot
+    if settings is None:
+        settings = _get_settings()
+    values = _base_storage_values(settings)
+
+    with _runtime_lock:
+        if isinstance(_runtime_storage_overrides, dict):
+            values.update(_runtime_storage_overrides)
+
+    return _storage_config_from_values(values)
+
+
 @contextmanager
-def pin_storage_config() -> Iterator[_StorageConfig]:
+def pin_storage_config(settings: Any | None = None) -> Iterator[_StorageConfig]:
     """Keep one immutable backend/config selection for a logical operation."""
-    config = _resolve_storage_config()
-    token = _storage_config_snapshot.set(config)
+    config = _resolve_storage_config(settings)
+    token = _storage_config_snapshot.set(
+        _TaskOwnedStorageContext(_current_asyncio_task(), config)
+    )
     try:
         yield config
     finally:
@@ -204,48 +332,43 @@ def _clear_s3_client_cache() -> None:
         _s3_client_cache_key = None
 
 
-def clear_runtime_storage_overrides() -> None:
-    """Clear runtime storage overrides (fallback to environment settings)."""
+def _clear_runtime_storage_overrides_unchecked() -> None:
+    """Reset overrides during bootstrap/test teardown with no live requests."""
     global _runtime_storage_overrides
     with _runtime_lock:
         _runtime_storage_overrides = None
     _clear_s3_client_cache()
 
 
-def configure_storage_runtime_from_settings_payload(
+def clear_runtime_storage_overrides(
+    *,
+    lease: WriteBarrierLease | None = None,
+) -> None:
+    """Clear live overrides while holding the exclusive storage barrier."""
+    _require_explicit_exclusive_lease(lease)
+    _clear_runtime_storage_overrides_unchecked()
+
+
+def _configure_storage_runtime_from_settings_payload_unchecked(
     settings_value: dict[str, Any] | None,
 ) -> None:
-    """Configure runtime storage backend overrides from settings payload."""
+    """Apply overrides during bootstrap or beneath the exclusive barrier."""
     global _runtime_storage_overrides
-
-    overrides: dict[str, Any] | None = None
-    if isinstance(settings_value, dict):
-        raw_s3 = settings_value.get("s3")
-        if isinstance(raw_s3, dict):
-            endpoint = str(raw_s3.get("endpoint", "") or "").strip()
-            bucket = str(raw_s3.get("bucket", "") or "").strip()
-            region = str(raw_s3.get("region", "") or "").strip()
-            access_key = str(raw_s3.get("accessKey", "") or "").strip()
-            secret_key = str(raw_s3.get("secret", "") or "").strip()
-            enabled_raw = raw_s3.get("enabled")
-            enabled = bool(enabled_raw) if enabled_raw is not None else False
-            has_any_value = any([endpoint, bucket, region, access_key, secret_key, enabled])
-
-            if has_any_value:
-                use_s3 = enabled or bool(bucket and access_key and secret_key)
-                overrides = {
-                    "storage_backend": "s3" if use_s3 else "local",
-                    "s3_endpoint": endpoint,
-                    "s3_bucket": bucket,
-                    "s3_region": region,
-                    "s3_access_key": access_key,
-                    "s3_secret_key": secret_key,
-                    "s3_force_path_style": bool(raw_s3.get("forcePathStyle", False)),
-                }
+    overrides = _storage_overrides_from_settings_payload(settings_value)
 
     with _runtime_lock:
         _runtime_storage_overrides = overrides
     _clear_s3_client_cache()
+
+
+def configure_storage_runtime_from_settings_payload(
+    settings_value: dict[str, Any] | None,
+    *,
+    lease: WriteBarrierLease | None = None,
+) -> None:
+    """Switch the live backend beneath an explicit exclusive barrier lease."""
+    _require_explicit_exclusive_lease(lease)
+    _configure_storage_runtime_from_settings_payload_unchecked(settings_value)
 
 
 def get_storage_backend() -> str:
@@ -258,7 +381,9 @@ def capture_storage_writes(
     targets: set[tuple[str, str, str]],
 ) -> Iterator[None]:
     """Capture exact successful file writes in the current async context."""
-    token = _storage_write_tracker.set(targets)
+    token = _storage_write_tracker.set(
+        _TaskOwnedStorageContext(_current_asyncio_task(), targets)
+    )
     try:
         yield
     finally:
@@ -270,8 +395,8 @@ def _track_storage_writes(
     record_id: str,
     filenames: list[str],
 ) -> None:
-    tracker = _storage_write_tracker.get()
-    if tracker is None:
+    tracker = _task_owned_value(_storage_write_tracker.get())
+    if not isinstance(tracker, set):
         return
     tracker.update(
         (collection_id, record_id, filename)
@@ -284,7 +409,9 @@ def defer_storage_deletes(
     actions: list[tuple[str, str, str, tuple[str, ...]]],
 ) -> Iterator[None]:
     """Defer destructive storage changes until a DB transaction commits."""
-    token = _storage_delete_tracker.set(actions)
+    token = _storage_delete_tracker.set(
+        _TaskOwnedStorageContext(_current_asyncio_task(), actions)
+    )
     try:
         yield
     finally:
@@ -295,8 +422,10 @@ def flush_deferred_storage_deletes(
     actions: list[tuple[str, str, str, tuple[str, ...]]],
     *,
     preserved_files: set[tuple[str, str, str]],
+    lease: WriteBarrierLease | None = None,
 ) -> int:
     """Apply committed deletions without removing final DB references."""
+    active_lease = _require_explicit_mutation_lease(lease)
     failures = 0
     for action, collection_id, record_id, filenames in actions:
         try:
@@ -307,7 +436,12 @@ def flush_deferred_storage_deletes(
                     if (collection_id, record_id, filename)
                     not in preserved_files
                 ]
-                delete_files(collection_id, record_id, deletable)
+                delete_files(
+                    collection_id,
+                    record_id,
+                    deletable,
+                    lease=active_lease,
+                )
             elif action == "all":
                 preserved_names = {
                     filename
@@ -320,6 +454,7 @@ def flush_deferred_storage_deletes(
                     collection_id,
                     record_id,
                     preserved_names,
+                    lease=active_lease,
                 )
             else:  # pragma: no cover - internal invariant
                 failures += 1
@@ -398,13 +533,6 @@ def _raise_for_unsafe_directory_error(exc: OSError) -> None:
         raise StorageSafetyError(
             "Symlinks and non-directory components are not allowed in storage paths."
         ) from exc
-
-
-def _local_storage_id_name(value: str) -> str:
-    """Project custom IDs injectively while retaining PocketBase's layout."""
-    if _POCKETBASE_STORAGE_ID_PATTERN.fullmatch(value):
-        return value
-    return _LOCAL_ID_ESCAPE_PREFIX + value.encode("utf-8").hex()
 
 
 def _directory_entry_stat_at(
@@ -527,7 +655,7 @@ def _open_storage_id_directory_at(
     create: bool,
 ) -> tuple[int, str] | None:
     """Open an encoded ID directory, scanning only for exact legacy fallback."""
-    physical_name = _local_storage_id_name(logical_id)
+    physical_name = local_storage_id_name(logical_id)
     physical_fd = _open_exact_storage_directory_at(
         parent_fd,
         physical_name,
@@ -1165,7 +1293,7 @@ def _write_file_atomically_at(
 
 
 def _select_local_storage_id_name_path(parent: Path, logical_id: str) -> str:
-    physical_name = _local_storage_id_name(logical_id)
+    physical_name = local_storage_id_name(logical_id)
     try:
         with os.scandir(parent) as entries:
             for entry in entries:
@@ -1634,9 +1762,11 @@ def write_local_storage_variant_bytes(
     filename: str,
     content: bytes,
     *,
+    lease: WriteBarrierLease | None = None,
     config: _StorageConfig | None = None,
 ) -> None:
     """Atomically publish a local derived file below a record directory."""
+    _require_explicit_mutation_lease(lease)
     config = config or _resolve_storage_config()
     if config.backend != "local":
         raise RuntimeError("Local storage variants require the local backend.")
@@ -1676,8 +1806,11 @@ def save_files(
     field_name: str,
     files: list[tuple[str, bytes]],
     max_select: int = 1,
+    *,
+    lease: WriteBarrierLease | None = None,
 ) -> list[str]:
     """Save uploaded files and return stored filenames."""
+    _require_explicit_mutation_lease(lease)
     _ = field_name
     if not files:
         return []
@@ -1753,8 +1886,15 @@ def save_files(
     return saved
 
 
-def delete_files(collection_id: str, record_id: str, filenames: list[str]) -> None:
+def delete_files(
+    collection_id: str,
+    record_id: str,
+    filenames: list[str],
+    *,
+    lease: WriteBarrierLease | None = None,
+) -> None:
     """Delete specific files from active backend."""
+    _require_explicit_mutation_lease(lease)
     if not filenames:
         return
 
@@ -1764,8 +1904,8 @@ def delete_files(collection_id: str, record_id: str, filenames: list[str]) -> No
     if not safe_filenames:
         return
 
-    deferred_actions = _storage_delete_tracker.get()
-    if deferred_actions is not None:
+    deferred_actions = _task_owned_value(_storage_delete_tracker.get())
+    if isinstance(deferred_actions, list):
         deferred_actions.append(
             (
                 "files",
@@ -1823,8 +1963,14 @@ def delete_files(collection_id: str, record_id: str, filenames: list[str]) -> No
         )
 
 
-def delete_storage_dir_if_empty(collection_id: str, record_id: str) -> bool:
+def delete_storage_dir_if_empty(
+    collection_id: str,
+    record_id: str,
+    *,
+    lease: WriteBarrierLease | None = None,
+) -> bool:
     """Remove an empty local record directory through its anchored parent FD."""
+    _require_explicit_mutation_lease(lease)
     config = _resolve_storage_config()
     if config.backend != "local":
         validate_collection_id(collection_id)
@@ -1854,8 +2000,11 @@ def delete_all_files_except(
     collection_id: str,
     record_id: str,
     preserved_filenames: set[str],
+    *,
+    lease: WriteBarrierLease | None = None,
 ) -> None:
     """Delete obsolete record storage while preserving final DB references."""
+    active_lease = _require_explicit_mutation_lease(lease)
     safe_collection_id = validate_collection_id(collection_id)
     safe_record_id = validate_record_id(record_id)
     safe_preserved: set[str] = set()
@@ -1864,7 +2013,11 @@ def delete_all_files_except(
             continue
         safe_preserved.add(validate_file_reference(filename))
     if not safe_preserved:
-        delete_all_files(safe_collection_id, safe_record_id)
+        delete_all_files(
+            safe_collection_id,
+            safe_record_id,
+            lease=active_lease,
+        )
         return
 
     config = _resolve_storage_config()
@@ -1888,12 +2041,18 @@ def delete_all_files_except(
         _remove_tree_contents_except_at(opened.record_fd, safe_preserved)
 
 
-def delete_all_files(collection_id: str, record_id: str) -> None:
+def delete_all_files(
+    collection_id: str,
+    record_id: str,
+    *,
+    lease: WriteBarrierLease | None = None,
+) -> None:
     """Delete all files of a record from active backend."""
+    _require_explicit_mutation_lease(lease)
     safe_collection_id = validate_collection_id(collection_id)
     safe_record_id = validate_record_id(record_id)
-    deferred_actions = _storage_delete_tracker.get()
-    if deferred_actions is not None:
+    deferred_actions = _task_owned_value(_storage_delete_tracker.get())
+    if isinstance(deferred_actions, list):
         deferred_actions.append(("all", safe_collection_id, safe_record_id, ()))
         return
 

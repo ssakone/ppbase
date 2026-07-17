@@ -36,12 +36,16 @@ from ppbase.services.auth_service import create_token, get_collection_token_conf
 from ppbase.services.file_storage import (
     StorageFileStream,
     open_file_stream,
+    pin_storage_config,
     read_local_storage_variant_bytes,
-    set_storage_settings,
     write_local_storage_variant_bytes,
 )
 from ppbase.services.record_service import check_record_rule
 from ppbase.services.rule_engine import check_rule
+from ppbase.services.write_barrier import (
+    WriteBarrierLease,
+    mutation_write_barrier_on_connection,
+)
 
 router = APIRouter()
 _THUMB_OPTION_PATTERN = re.compile(r"^(\d+)x(\d+)([tbf]?)$")
@@ -67,6 +71,10 @@ _SQL_KEYWORDS = {
     "union",
     "where",
 }
+
+
+class _ThumbnailGenerationRequiresBarrier(Exception):
+    """Restart a cache-miss request after acquiring the shared barrier."""
 
 
 def _not_found_error() -> HTTPException:
@@ -247,7 +255,7 @@ def _try_generate_thumb_bytes(
         return None
 
 
-def _resolve_thumb_bytes(
+async def _resolve_thumb_bytes(
     collection_id: str,
     record_id: str,
     filename: str,
@@ -255,6 +263,7 @@ def _resolve_thumb_bytes(
     thumb_option: str | None,
     source_loader: Callable[[], bytes | None],
     storage_config: Any,
+    lease: WriteBarrierLease | None,
 ) -> tuple[bytes, str, str] | None:
     """Return secure cached/generated thumbnail bytes and variant names."""
     if not thumb_option:
@@ -272,7 +281,8 @@ def _resolve_thumb_bytes(
     thumb_dir_name = f"thumbs_{filename}"
     thumb_filename = f"{thumb_option}_{filename}"
     try:
-        cached = read_local_storage_variant_bytes(
+        cached = await asyncio.to_thread(
+            read_local_storage_variant_bytes,
             collection_id,
             record_id,
             thumb_dir_name,
@@ -283,11 +293,17 @@ def _resolve_thumb_bytes(
         return None
     if cached is not None:
         return cached, thumb_dir_name, thumb_filename
+    if lease is None:
+        return None
 
-    source_bytes = source_loader()
+    source_bytes = await asyncio.to_thread(source_loader)
     if source_bytes is None:
         return None
-    generated = _try_generate_thumb_bytes(source_bytes, thumb_option)
+    generated = await asyncio.to_thread(
+        _try_generate_thumb_bytes,
+        source_bytes,
+        thumb_option,
+    )
     if generated is None:
         return None
     try:
@@ -297,6 +313,7 @@ def _resolve_thumb_bytes(
             thumb_dir_name,
             thumb_filename,
             generated,
+            lease=lease,
             config=storage_config,
         )
     except (OSError, StorageSafetyError):
@@ -966,7 +983,50 @@ async def serve_file(
     settings: Any = Depends(get_settings),
 ):
     """Serve a file from local or S3-compatible storage."""
-    set_storage_settings(settings)
+    try:
+        # Cached thumbnails and ordinary reads stay lock-free.  This first pass
+        # is strictly read-only: a cache miss restarts only after leaving the
+        # pinned configuration, so it can never become a writer using a backend
+        # selected before a concurrent exclusive local/S3 switch.
+        with pin_storage_config(settings) as storage_config:
+            return await _serve_file(
+                collection_id_or_name,
+                record_id,
+                filename,
+                request,
+                session,
+                initial_storage_config=storage_config,
+                thumbnail_write_lease=None,
+            )
+    except _ThumbnailGenerationRequiresBarrier:
+        connection = await session.connection()
+        async with mutation_write_barrier_on_connection(connection) as lease:
+            # Select and pin the writable backend only after the shared lock is
+            # held.  Re-run all record/source validation and reopen the source
+            # beneath this current configuration; no object from the first pass
+            # is reused after an intervening exclusive switch.
+            with pin_storage_config(settings) as storage_config:
+                return await _serve_file(
+                    collection_id_or_name,
+                    record_id,
+                    filename,
+                    request,
+                    session,
+                    initial_storage_config=storage_config,
+                    thumbnail_write_lease=lease,
+                )
+
+
+async def _serve_file(
+    collection_id_or_name: str,
+    record_id: str,
+    filename: str,
+    request: Request,
+    session: AsyncSession,
+    *,
+    initial_storage_config: Any,
+    thumbnail_write_lease: WriteBarrierLease | None,
+):
     collection = await resolve_collection(session, collection_id_or_name)
 
     row_result = await session.execute(
@@ -1017,6 +1077,7 @@ async def serve_file(
             storage_collection_id,
             storage_record_id,
             filename,
+            config=initial_storage_config,
         )
     except StorageSafetyError as exc:
         raise _not_found_error() from exc
@@ -1035,16 +1096,20 @@ async def serve_file(
     if source_path is not None:
         served_file_path = source_path
         try:
-            thumb_result = await asyncio.to_thread(
-                _resolve_thumb_bytes,
-                storage_collection_id,
-                storage_record_id,
-                filename,
-                field_def,
-                thumb_option,
-                lambda: bytes(opened_stream.stream.read()),
-                storage_config,
-            )
+            thumb_result = None
+            if thumb_option:
+                thumb_result = await _resolve_thumb_bytes(
+                    storage_collection_id,
+                    storage_record_id,
+                    filename,
+                    field_def,
+                    thumb_option,
+                    lambda: bytes(opened_stream.stream.read()),
+                    storage_config,
+                    thumbnail_write_lease,
+                )
+                if thumb_result is None and thumbnail_write_lease is None:
+                    raise _ThumbnailGenerationRequiresBarrier
         except BaseException as exc:
             opened_stream.close()
             if isinstance(exc, StorageSafetyError):

@@ -55,12 +55,43 @@ def _validate_lock_timeout(timeout_seconds: float) -> None:
         raise ValueError("Migration lock timeout must be a finite non-negative value.")
 
 
-async def _migration_lock_key(executor: Any) -> int:
-    """Return the database-scoped advisory-lock key used by every actor."""
+async def _invalidate_migration_lock_connection(
+    connection: AsyncConnection,
+) -> None:
+    """Terminate a suspect lock session despite repeated task cancellation."""
+    invalidation = asyncio.create_task(connection.invalidate())
+    while True:
+        try:
+            await asyncio.shield(invalidation)
+            break
+        except asyncio.CancelledError:
+            if invalidation.done():
+                break
+            continue
+        except Exception:
+            break
+
+    try:
+        invalidation.result()
+    except Exception:
+        logger.exception("Failed to invalidate migration-lock connection")
+
+
+async def migration_lock_key(executor: Any) -> int:
+    """Return the database-scoped advisory-lock key used by every actor.
+
+    PostgreSQL advisory locks are cluster-wide, so the key hashes the current
+    database name plus the stable ``ppbase:migrations`` namespace.  Backup
+    coordination also uses this public helper when it already owns a dedicated
+    connection; duplicating the derivation would risk two actors silently
+    locking different keys.
+    """
     result = await executor.execute(
         text(
-            "SELECT hashtextextended("
-            "current_database() || ':ppbase:migrations', :seed)"
+            "SELECT pg_catalog.hashtextextended("
+            "pg_catalog.concat("
+            "pg_catalog.current_database(), ':ppbase:migrations'"
+            "), :seed)"
         ),
         {"seed": _MIGRATION_LOCK_SEED},
     )
@@ -80,12 +111,12 @@ async def acquire_migration_transaction_lock(
     the session-level runner lock without requiring a second pool connection.
     """
     _validate_lock_timeout(timeout_seconds)
-    lock_key = await _migration_lock_key(session)
+    lock_key = await migration_lock_key(session)
     deadline = time.monotonic() + timeout_seconds
 
     while True:
         result = await session.execute(
-            text("SELECT pg_try_advisory_xact_lock(:key)"),
+            text("SELECT pg_catalog.pg_try_advisory_xact_lock(:key)"),
             {"key": lock_key},
         )
         if bool(result.scalar_one()):
@@ -976,6 +1007,98 @@ async def commit_migration_transaction(
 
 
 @asynccontextmanager
+async def migration_lock_on_connection(
+    connection: AsyncConnection,
+    *,
+    timeout_seconds: float = 30.0,
+) -> AsyncIterator[AsyncConnection]:
+    """Hold the migration lock on an already reserved PostgreSQL session.
+
+    The caller owns and must eventually close ``connection``.  It must be a
+    dedicated, transaction-free connection with backend-session affinity.
+    This variant lets coordinators acquire another advisory lock first and
+    then the migration lock without checking out a second pool connection.
+    """
+    _validate_lock_timeout(timeout_seconds)
+    if connection.closed or connection.invalidated:
+        raise MigrationLockError(
+            "The dedicated PostgreSQL migration-lock connection is not open."
+        )
+    if connection.in_transaction():
+        raise MigrationLockError(
+            "The dedicated PostgreSQL migration-lock connection must not have "
+            "an active transaction."
+        )
+
+    started_at = time.monotonic()
+    acquired = False
+    body_error: BaseException | None = None
+    unlock_error: BaseException | None = None
+
+    try:
+        lock_key = await migration_lock_key(connection)
+        # SELECT starts an implicit transaction.  Session-level locks survive
+        # commits, and callers receive a clean connection after acquisition.
+        await connection.commit()
+
+        deadline = started_at + timeout_seconds
+        while True:
+            result = await connection.execute(
+                text("SELECT pg_catalog.pg_try_advisory_lock(:key)"),
+                {"key": lock_key},
+            )
+            acquired = bool(result.scalar_one())
+            await connection.commit()
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise MigrationLockError(
+                    "Timed out waiting for the PPBase migration lock "
+                    f"after {timeout_seconds:g} seconds."
+                )
+            await asyncio.sleep(_MIGRATION_LOCK_POLL_SECONDS)
+
+        try:
+            yield connection
+        except BaseException as exc:
+            body_error = exc
+            raise
+    finally:
+        if acquired and not connection.closed:
+            try:
+                if connection.in_transaction():
+                    await connection.rollback()
+                result = await connection.execute(
+                    text("SELECT pg_catalog.pg_advisory_unlock(:key)"),
+                    {"key": lock_key},
+                )
+                unlocked = bool(result.scalar_one())
+                await connection.commit()
+                if not unlocked:
+                    raise MigrationLockError(
+                        "PostgreSQL reported that the PPBase migration lock "
+                        "was no longer owned by its reserved connection."
+                    )
+            except BaseException as exc:
+                unlock_error = exc
+                logger.exception("Failed to release the PPBase migration lock")
+                await _invalidate_migration_lock_connection(connection)
+        elif not connection.closed and not connection.invalidated:
+            # pg_try_advisory_lock may have succeeded server-side even when its
+            # result never reached this task. Returning that session to a pool
+            # would retain the session-level migration lock indefinitely.
+            await _invalidate_migration_lock_connection(connection)
+
+        if body_error is None and unlock_error is not None:
+            if isinstance(unlock_error, MigrationLockError):
+                raise unlock_error
+            raise MigrationLockError(
+                "The PostgreSQL session holding the PPBase migration lock was "
+                "lost while releasing it."
+            ) from unlock_error
+
+
+@asynccontextmanager
 async def migration_lock(
     engine: AsyncEngine,
     *,
@@ -1002,80 +1125,36 @@ async def migration_lock(
             "Timed out waiting for a database connection for the PPBase "
             f"migration lock after {timeout_seconds:g} seconds."
         ) from exc
-    acquired = False
     body_error: BaseException | None = None
-    unlock_error: BaseException | None = None
 
     try:
-        lock_key = await _migration_lock_key(connection)
-        # SELECT starts an implicit transaction; end it before the first
-        # per-file root transaction.  Session-level locks survive commits.
-        await connection.commit()
-
-        deadline = started_at + timeout_seconds
-        while True:
-            result = await connection.execute(
-                text("SELECT pg_try_advisory_lock(:key)"),
-                {"key": lock_key},
-            )
-            acquired = bool(result.scalar_one())
-            await connection.commit()
-            if acquired:
-                break
-            if time.monotonic() >= deadline:
-                raise MigrationLockError(
-                    "Timed out waiting for the PPBase migration lock "
-                    f"after {timeout_seconds:g} seconds."
-                )
-            await asyncio.sleep(_MIGRATION_LOCK_POLL_SECONDS)
-
         try:
-            yield connection
+            remaining = max(
+                0.0,
+                timeout_seconds - (time.monotonic() - started_at),
+            )
+            async with migration_lock_on_connection(
+                connection,
+                timeout_seconds=remaining,
+            ) as locked_connection:
+                yield locked_connection
         except BaseException as exc:
             body_error = exc
             raise
     finally:
-        if acquired and not connection.closed:
-            try:
-                # A cancelled or failed caller may have left a transaction
-                # open.  Roll it back before issuing the unlock query.
-                if connection.in_transaction():
-                    await connection.rollback()
-                result = await connection.execute(
-                    text("SELECT pg_advisory_unlock(:key)"),
-                    {"key": lock_key},
-                )
-                unlocked = bool(result.scalar_one())
-                await connection.commit()
-                if not unlocked:
-                    raise MigrationLockError(
-                        "PostgreSQL reported that the PPBase migration lock "
-                        "was no longer owned by its reserved connection."
-                    )
-            except BaseException as exc:
-                unlock_error = exc
-                logger.exception("Failed to release the PPBase migration lock")
-                try:
-                    await connection.invalidate()
-                except Exception:
-                    logger.exception("Failed to invalidate migration connection")
-
         close_error: BaseException | None = None
         try:
             await connection.close()
         except BaseException as exc:
             close_error = exc
-            if body_error is not None or unlock_error is not None:
+            if body_error is not None:
                 logger.exception(
                     "Failed to close migration connection while handling "
                     "another migration error"
                 )
 
-        if body_error is None:
-            if unlock_error is not None:
-                raise unlock_error
-            if close_error is not None:
-                raise close_error
+        if body_error is None and close_error is not None:
+            raise close_error
 
 
 async def apply_pending_on_connection(

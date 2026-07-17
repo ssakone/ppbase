@@ -19,6 +19,8 @@ MAX_STORAGE_FILENAME_BYTES = 255
 
 _WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _PATH_SEPARATORS = frozenset({"/", "\\"})
+_POCKETBASE_STORAGE_ID_PATTERN = re.compile(r"^[_a-z0-9]+$")
+LOCAL_STORAGE_ID_ESCAPE_PREFIX = "__ppbase_storage_id_v1__"
 
 
 class StorageSafetyError(ValueError):
@@ -89,6 +91,18 @@ def validate_record_id(value: Any) -> str:
         label="record_id",
         max_length=MAX_STORAGE_IDENTIFIER_LENGTH,
     )
+
+
+def local_storage_id_name(value: Any) -> str:
+    """Map one validated logical collection/record ID to its local name."""
+    identifier = _validate_single_component(
+        value,
+        label="storage_id",
+        max_length=MAX_STORAGE_IDENTIFIER_LENGTH,
+    )
+    if _POCKETBASE_STORAGE_ID_PATTERN.fullmatch(identifier):
+        return identifier
+    return LOCAL_STORAGE_ID_ESCAPE_PREFIX + identifier.encode("utf-8").hex()
 
 
 def validate_file_reference(value: Any) -> str:

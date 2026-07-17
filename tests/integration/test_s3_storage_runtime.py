@@ -8,6 +8,49 @@ import pytest
 from ppbase.config import Settings
 from ppbase.core.storage_safety import StorageSafetyError
 from ppbase.services import file_storage
+from ppbase.services.write_barrier import WriteBarrierLease, WriteBarrierMode
+
+
+@pytest.fixture(autouse=True)
+def _inject_explicit_storage_leases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise low-level backends beneath the guarded public facade."""
+    shared = WriteBarrierLease(
+        connection=None,  # type: ignore[arg-type]
+        mode=WriteBarrierMode.SHARED,
+        backend_pid=0,
+        barrier_key=0,
+    )
+    exclusive = WriteBarrierLease(
+        connection=None,  # type: ignore[arg-type]
+        mode=WriteBarrierMode.EXCLUSIVE,
+        backend_pid=0,
+        barrier_key=0,
+    )
+    for lease in (shared, exclusive):
+        lease._active = True
+        lease._barrier_acquired = True
+
+    for name in ("save_files", "delete_files", "delete_all_files"):
+        original = getattr(file_storage, name)
+
+        def _with_shared(*args, _original=original, **kwargs):
+            kwargs.setdefault("lease", shared)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(file_storage, name, _with_shared)
+
+    for name in (
+        "set_storage_settings",
+        "configure_storage_runtime_from_settings_payload",
+        "clear_runtime_storage_overrides",
+    ):
+        original = getattr(file_storage, name)
+
+        def _with_exclusive(*args, _original=original, **kwargs):
+            kwargs.setdefault("lease", exclusive)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(file_storage, name, _with_exclusive)
 
 
 class _FakeBody:
@@ -169,6 +212,44 @@ def test_empty_s3_settings_payload_falls_back_to_local_backend(tmp_path: Path) -
         local_candidate = tmp_path / "storage" / "_pbc_2287844090" / "record_id" / filename
         assert local_candidate.is_file()
         assert local_candidate.read_bytes() == b"local-bytes"
+    finally:
+        _cleanup_storage_runtime()
+
+
+def test_durable_storage_config_resolver_is_pure_and_honors_explicit_disable(
+    tmp_path: Path,
+) -> None:
+    live_settings = Settings(data_dir=str(tmp_path), storage_backend="local")
+    file_storage.set_storage_settings(live_settings)
+    file_storage.configure_storage_runtime_from_settings_payload(
+        {
+            "s3": {
+                "enabled": True,
+                "bucket": "live-bucket",
+                "accessKey": "live-access",
+                "secret": "live-secret",
+            }
+        }
+    )
+    assert file_storage.get_storage_backend() == "s3"
+
+    environment_settings = Settings(
+        data_dir=str(tmp_path),
+        storage_backend="s3",
+        s3_bucket="environment-bucket",
+        s3_access_key="environment-access",
+        s3_secret_key="environment-secret",
+    )
+    resolved = file_storage.resolve_storage_config_from_settings_payload(
+        environment_settings,
+        {"s3": {"enabled": False}},
+    )
+
+    try:
+        assert resolved.backend == "local"
+        assert resolved.data_dir == str(tmp_path)
+        assert environment_settings.storage_backend == "s3"
+        assert file_storage.get_storage_backend() == "s3"
     finally:
         _cleanup_storage_runtime()
 

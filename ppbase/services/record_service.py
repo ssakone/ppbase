@@ -32,6 +32,7 @@ from ppbase.models.record import (
     format_datetime,
 )
 from ppbase.services.filter_parser import parse_filter, parse_sort
+from ppbase.services.write_barrier import require_mutation_write_barrier
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,18 @@ def _cleanup_new_storage_files(
     )
 
     try:
-        delete_files(collection_id, record_id, filenames)
-        delete_storage_dir_if_empty(collection_id, record_id)
+        lease = require_mutation_write_barrier()
+        delete_files(
+            collection_id,
+            record_id,
+            filenames,
+            lease=lease,
+        )
+        delete_storage_dir_if_empty(
+            collection_id,
+            record_id,
+            lease=lease,
+        )
     except (OSError, StorageSafetyError):
         logger.warning("Skipped unsafe or failed cleanup of uncommitted files")
 
@@ -715,7 +726,12 @@ async def create_record(
             max_select = field_def.options.get("maxSelect", 1) or 1
             try:
                 saved_names = save_files(
-                    collection.id, record_id, field_name, file_list, max_select
+                    collection.id,
+                    record_id,
+                    field_name,
+                    file_list,
+                    max_select,
+                    lease=require_mutation_write_barrier(),
                 )
             except Exception:
                 _cleanup_new_storage_files(
@@ -1011,7 +1027,12 @@ async def update_record(
             max_select = field_def.options.get("maxSelect", 1) or 1
             try:
                 saved_names = save_files(
-                    collection.id, record_id, field_name, file_list, max_select
+                    collection.id,
+                    record_id,
+                    field_name,
+                    file_list,
+                    max_select,
+                    lease=require_mutation_write_barrier(),
                 )
             except Exception:
                 _cleanup_new_storage_files(
@@ -1150,7 +1171,12 @@ async def update_record(
     # Delete removed files from disk
     if files_to_delete:
         try:
-            delete_files(collection.id, record_id, files_to_delete)
+            delete_files(
+                collection.id,
+                record_id,
+                files_to_delete,
+                lease=require_mutation_write_barrier(),
+            )
         except StorageSafetyError:
             logger.warning("Skipped unsafe stored-file cleanup after record update")
 
@@ -1292,7 +1318,12 @@ async def delete_record(
     # orphans are intentionally left for a janitor rather than risking a
     # concurrent delete/recreate race.
     try:
-        delete_files(collection.id, record_id, files_to_delete)
+        delete_files(
+            collection.id,
+            record_id,
+            files_to_delete,
+            lease=require_mutation_write_barrier(),
+        )
     except StorageSafetyError:
         logger.warning("Skipped unsafe storage cleanup after record deletion")
 
