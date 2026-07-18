@@ -1597,7 +1597,7 @@ async def test_cancelled_execution_is_quarantined(
         lambda: None,
     )
     task = asyncio.create_task(
-        service.execute_staging_plan(
+        service._execute_staging_plan_under_lease(
             plan.plan_id,
             expected_plan_hash=plan.plan_hash,
         )
@@ -1648,7 +1648,7 @@ async def test_cancelled_quarantine_write_failure_releases_execution_lease(
     )
     monkeypatch.setattr(store, "finish", fail_quarantine)
     task = asyncio.create_task(
-        service.execute_staging_plan(
+        service._execute_staging_plan_under_lease(
             plan.plan_id,
             expected_plan_hash=plan.plan_hash,
         )
@@ -1700,7 +1700,7 @@ async def test_quarantine_persistence_failure_is_not_hidden(
     monkeypatch.setattr(store, "finish", fail_quarantine)
 
     with pytest.raises(BackupServiceError) as error:
-        await service.execute_staging_plan(
+        await service._execute_staging_plan_under_lease(
             plan.plan_id,
             expected_plan_hash=plan.plan_hash,
         )

@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     backup_restore_database_url: str = ""
     backup_target_owner: str = ""
     backup_allowed_extensions: list[str] = ["plpgsql=1.0"]
+    # ZIP transport is bounded independently from the ordinary API body
+    # setting because database backups are expected to be substantially larger.
+    backup_max_upload_bytes: int = 20 * 1024 * 1024 * 1024
+    backup_max_uncompressed_bytes: int = 100 * 1024 * 1024 * 1024
+    backup_max_resource_bytes: int = 20 * 1024 * 1024 * 1024
+    backup_max_archive_entries: int = 200_000
+    backup_max_central_directory_bytes: int = 64 * 1024 * 1024
+    backup_max_compression_ratio: int = 500
+    backup_transport_chunk_size: int = 1024 * 1024
+    backup_multipart_overhead_bytes: int = 1024 * 1024
 
     # ---- Auth ----
     jwt_secret: str = ""

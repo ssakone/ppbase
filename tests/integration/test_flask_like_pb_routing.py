@@ -110,11 +110,18 @@ def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> No
     def _fake_ensure_database_exists(db_url: str) -> None:
         captured["db_url"] = db_url
 
-    def _fake_uvicorn_run(app, host: str, port: int, log_level: str) -> None:
+    def _fake_uvicorn_run(
+        app,
+        host: str,
+        port: int,
+        log_level: str,
+        access_log: bool,
+    ) -> None:
         captured["app"] = app
         captured["host"] = host
         captured["port"] = port
         captured["log_level"] = log_level
+        captured["access_log"] = access_log
 
     monkeypatch.setattr(
         "ppbase.db.ensure_db.ensure_database_exists",
@@ -126,6 +133,7 @@ def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> No
 
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8091
+    assert captured["access_log"] is False
     assert app_pb.settings.host == "127.0.0.1"
     assert app_pb.settings.port == 8091
     app = app_pb.get_app()

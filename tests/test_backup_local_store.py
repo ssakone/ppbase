@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import os
 import stat
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -620,6 +622,646 @@ def test_publication_never_overwrites_an_existing_set(tmp_path: Path) -> None:
     assert [item.backup_id for item in store.list_sets()] == ["same-id"]
     with pytest.raises(BackupAlreadyExistsError):
         store.begin_set("same-id")
+
+
+def test_imported_set_preserves_the_exact_signed_envelope(tmp_path: Path) -> None:
+    identity = BackupIdentity.load_or_create(tmp_path / "control")
+    source = LocalBackupStore(tmp_path / "source", identity=identity)
+    source_builder = source.begin_set("transport-roundtrip")
+    source_builder.database_dump_path.write_bytes(b"PGDMP imported payload")
+    source_inspection = source.finalize_set(
+        source_builder.prepare(),
+        metadata={"app_name": "Transport Tests"},
+        created_at=FIXED_TIME,
+    )
+    manifest_bytes = (source_inspection.path / "manifest.json").read_bytes()
+    signature = (source_inspection.path / "manifest.sig").read_bytes()
+    signer_public_key = (source_inspection.path / "signer.pub").read_bytes()
+
+    target = LocalBackupStore(tmp_path / "target", identity=identity)
+    target_builder = target.begin_set("transport-roundtrip")
+    resource = source_inspection.manifest.resources[0]
+    target_builder.write_imported_resource(
+        resource,
+        io.BytesIO(b"PGDMP imported payload"),
+        chunk_size=3,
+    )
+    imported = target.finalize_imported_set(
+        target_builder.prepare(),
+        manifest_bytes=manifest_bytes,
+        signature=signature,
+        signer_public_key=signer_public_key,
+        expected_public_key=identity.public_key_bytes,
+    )
+
+    assert imported.manifest == source_inspection.manifest
+    assert (imported.path / "manifest.json").read_bytes() == manifest_bytes
+    assert (imported.path / "manifest.sig").read_bytes() == signature
+    assert (imported.path / "signer.pub").read_bytes() == signer_public_key
+    assert (imported.path / "SEALED").is_file()
+
+
+def test_imported_set_never_re_signs_an_unapproved_envelope(tmp_path: Path) -> None:
+    foreign_identity = BackupIdentity.load_or_create(tmp_path / "foreign-control")
+    foreign = LocalBackupStore(tmp_path / "foreign", identity=foreign_identity)
+    foreign_builder = foreign.begin_set("foreign-transport")
+    foreign_builder.database_dump_path.write_bytes(b"PGDMP foreign payload")
+    foreign_inspection = foreign.finalize_set(
+        foreign_builder.prepare(),
+        created_at=FIXED_TIME,
+    )
+
+    local = LocalBackupStore(tmp_path / "local")
+    local_builder = local.begin_set("foreign-transport")
+    local_builder.write_imported_resource(
+        foreign_inspection.manifest.resources[0],
+        io.BytesIO(b"PGDMP foreign payload"),
+    )
+
+    with pytest.raises(BackupIntegrityError, match="expected key"):
+        local.finalize_imported_set(
+            local_builder.prepare(),
+            manifest_bytes=(foreign_inspection.path / "manifest.json").read_bytes(),
+            signature=(foreign_inspection.path / "manifest.sig").read_bytes(),
+            signer_public_key=(foreign_inspection.path / "signer.pub").read_bytes(),
+            expected_public_key=local.identity.public_key_bytes,
+        )
+
+    assert not (local.sets_dir / "foreign-transport").exists()
+    assert local.list_sets() == []
+
+
+def test_delete_commit_is_not_ambiguous_when_tombstone_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    store.finalize_set(
+        _prepare_minimal_set(store, "delete-cleanup"),
+        created_at=FIXED_TIME,
+    )
+    real_remove = store._remove_owned_directory_at
+    cleanup_attempts = 0
+
+    def fail_once(
+        parent_fd: int,
+        name: str,
+        expected_identity: tuple[int, int],
+        *,
+        attachment_guard: Callable[[], None],
+    ) -> None:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise OSError("synthetic tombstone cleanup failure")
+        real_remove(
+            parent_fd,
+            name,
+            expected_identity,
+            attachment_guard=attachment_guard,
+        )
+
+    monkeypatch.setattr(store, "_remove_owned_directory_at", fail_once)
+
+    store.delete_set("delete-cleanup")
+
+    assert not (store.sets_dir / "delete-cleanup").exists()
+    tombstones = list(store.sets_dir.glob(".deleting-delete-cleanup-*"))
+    assert len(tombstones) == 1
+    assert store.list_sets() == []
+    assert not list(store.sets_dir.glob(".deleting-delete-cleanup-*"))
+
+
+@pytest.mark.parametrize("operation", ["list", "delete"])
+def test_deletion_reconciliation_never_follows_a_substituted_sets_directory(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    detached_sets = tmp_path / "detached-sets"
+    store.sets_dir.rename(detached_sets)
+
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    external_tombstone = outside / ".deleting-external"
+    external_tombstone.mkdir(mode=0o700)
+    sentinel = external_tombstone / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    store.sets_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(BackupStateError, match="sets directory"):
+        if operation == "list":
+            store.list_sets()
+        else:
+            store.delete_set("missing-backup")
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert external_tombstone.is_dir()
+
+
+def test_deletion_reconciliation_survives_substitution_before_recursive_remove(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    backup_id = "reconcile-substitution"
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, backup_id),
+        created_at=FIXED_TIME,
+    ).path
+    tombstone = store.sets_dir / f".deleting-{backup_id}-synthetic"
+    canonical.rename(tombstone)
+
+    detached_sets = tmp_path / "detached-sets"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    external_tombstone = outside / tombstone.name
+    external_tombstone.mkdir(mode=0o700)
+    sentinel = external_tombstone / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    substituted = False
+    real_open = os.open
+    real_rmtree = storage_module.shutil.rmtree
+
+    def substitute_sets_directory() -> None:
+        nonlocal substituted
+        if substituted:
+            return
+        store.sets_dir.rename(detached_sets)
+        store.sets_dir.symlink_to(outside, target_is_directory=True)
+        substituted = True
+
+    def open_after_substitution(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if (
+            str(path) == tombstone.name
+            and dir_fd is not None
+            and flags & getattr(os, "O_DIRECTORY", 0)
+        ):
+            substitute_sets_directory()
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def path_based_remove_after_substitution(path: str | Path) -> None:
+        if Path(path) == tombstone:
+            substitute_sets_directory()
+            real_rmtree(path)
+            return
+        real_rmtree(path)
+
+    monkeypatch.setattr(os, "open", open_after_substitution)
+    monkeypatch.setattr(
+        os,
+        "supports_dir_fd",
+        os.supports_dir_fd | {open_after_substitution},
+    )
+    monkeypatch.setattr(
+        storage_module.shutil,
+        "rmtree",
+        path_based_remove_after_substitution,
+    )
+
+    with pytest.raises(BackupStateError, match="sets directory"):
+        store.list_sets()
+
+    assert substituted is True
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert external_tombstone.is_dir()
+
+
+def test_deletion_reconciliation_removes_a_real_local_tombstone_by_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    backup_id = "reconcile-local"
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, backup_id),
+        created_at=FIXED_TIME,
+    ).path
+    tombstone = store.sets_dir / f".deleting-{backup_id}-synthetic"
+    canonical.rename(tombstone)
+
+    def reject_path_based_remove(_path: str | Path) -> None:
+        raise AssertionError("reconciliation must not use path-based rmtree")
+
+    monkeypatch.setattr(storage_module.shutil, "rmtree", reject_path_based_remove)
+
+    assert store.list_sets() == []
+    assert not tombstone.exists()
+
+
+def test_delete_commit_is_not_ambiguous_when_descriptor_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, "delete-close"),
+        created_at=FIXED_TIME,
+    ).path
+    real_close = os.close
+    detached_closes: list[int] = []
+    injected = False
+
+    def close_with_one_post_commit_error(descriptor: int) -> None:
+        nonlocal injected
+        if not canonical.exists():
+            detached_closes.append(descriptor)
+            real_close(descriptor)
+            if not injected:
+                injected = True
+                raise OSError("synthetic close after deletion commit")
+            return
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", close_with_one_post_commit_error)
+
+    store.delete_set("delete-close")
+
+    assert injected is True
+    assert not canonical.exists()
+    assert len(detached_closes) >= 2
+    for descriptor in detached_closes:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_delete_post_rename_error_commits_when_durable_rollback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, "delete-post-rename"),
+        created_at=FIXED_TIME,
+    ).path
+    real_fsync = os.fsync
+    real_rename = os.rename
+    post_rename_fsync_failed = False
+    rollback_attempted = False
+
+    def fail_first_post_rename_fsync(descriptor: int) -> None:
+        nonlocal post_rename_fsync_failed
+        if not canonical.exists() and not post_rename_fsync_failed:
+            post_rename_fsync_failed = True
+            raise OSError("synthetic post-rename fsync failure")
+        real_fsync(descriptor)
+
+    def fail_rollback_rename(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal rollback_attempted
+        if str(source).startswith(
+            (
+                ".deleting-delete-post-rename-",
+                ".delete-pending-delete-post-rename-",
+            )
+        ) and str(destination) == "delete-post-rename":
+            rollback_attempted = True
+            raise OSError("synthetic rollback rename failure")
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "fsync", fail_first_post_rename_fsync)
+    monkeypatch.setattr(os, "rename", fail_rollback_rename)
+
+    store.delete_set("delete-post-rename")
+
+    assert post_rename_fsync_failed is True
+    assert rollback_attempted is True
+    assert not canonical.exists()
+    assert store.list_sets() == []
+    assert not list(store.sets_dir.glob(".deleting-delete-post-rename-*"))
+
+
+def test_delete_post_rename_error_is_reported_after_durable_restoration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, "delete-restored"),
+        created_at=FIXED_TIME,
+    ).path
+    real_fsync = os.fsync
+    post_rename_fsync_failed = False
+
+    def fail_first_post_rename_fsync(descriptor: int) -> None:
+        nonlocal post_rename_fsync_failed
+        if not canonical.exists() and not post_rename_fsync_failed:
+            post_rename_fsync_failed = True
+            raise OSError("synthetic post-rename fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_post_rename_fsync)
+
+    with pytest.raises(BackupStateError, match="durably restored"):
+        store.delete_set("delete-restored")
+
+    assert post_rename_fsync_failed is True
+    assert (canonical / "SEALED").is_file()
+    assert [item.backup_id for item in store.list_sets()] == ["delete-restored"]
+    assert not list(store.sets_dir.glob(".delete-pending-delete-restored-*"))
+    assert not list(store.sets_dir.glob(".deleting-delete-restored-*"))
+    assert not list(store.sets_dir.glob(".delete-uncertain-delete-restored-*"))
+
+
+def test_delete_rename_error_after_effect_is_durably_restored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, "delete-rename-effect"),
+        created_at=FIXED_TIME,
+    ).path
+    real_rename = os.rename
+    injected = False
+
+    def rename_then_fail(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if str(source) == "delete-rename-effect" and not injected:
+            injected = True
+            raise OSError("synthetic rename error after effect")
+
+    monkeypatch.setattr(os, "rename", rename_then_fail)
+
+    with pytest.raises(BackupStateError, match="durably restored"):
+        store.delete_set("delete-rename-effect")
+
+    assert injected is True
+    assert (canonical / "SEALED").is_file()
+    assert [item.backup_id for item in store.list_sets()] == [
+        "delete-rename-effect"
+    ]
+    assert not list(store.sets_dir.glob(".delete-pending-delete-rename-effect-*"))
+    assert not list(store.sets_dir.glob(".deleting-delete-rename-effect-*"))
+    assert not list(
+        store.sets_dir.glob(".delete-uncertain-delete-rename-effect-*")
+    )
+
+
+def test_delete_unresolved_post_rename_error_is_never_reconciled_silently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, "delete-uncertain"),
+        created_at=FIXED_TIME,
+    ).path
+    real_fsync = os.fsync
+    real_rename = os.rename
+
+    def fail_every_post_rename_fsync(descriptor: int) -> None:
+        if not canonical.exists():
+            raise OSError("synthetic persistent post-rename fsync failure")
+        real_fsync(descriptor)
+
+    def fail_rollback_rename(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if str(source).startswith(
+            (
+                ".deleting-delete-uncertain-",
+                ".delete-pending-delete-uncertain-",
+            )
+        ) and str(destination) == "delete-uncertain":
+            raise OSError("synthetic persistent rollback failure")
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "fsync", fail_every_post_rename_fsync)
+    monkeypatch.setattr(os, "rename", fail_rollback_rename)
+
+    with pytest.raises(
+        storage_module.BackupDeletionUncertainError,
+        match="manual recovery",
+    ):
+        store.delete_set("delete-uncertain")
+
+    preserved = list(store.sets_dir.glob(".delete-uncertain-delete-uncertain-*"))
+    assert len(preserved) == 1
+    assert not canonical.exists()
+    assert not list(store.sets_dir.glob(".deleting-delete-uncertain-*"))
+    assert store.list_sets() == []
+    assert preserved[0].is_dir()
+
+
+def test_delete_recovery_never_replaces_a_substituted_canonical_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    canonical = store.finalize_set(
+        _prepare_minimal_set(store, "delete-substituted"),
+        created_at=FIXED_TIME,
+    ).path
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_text("keep", encoding="utf-8")
+    real_fsync = os.fsync
+    substituted = False
+
+    def substitute_before_post_rename_error(descriptor: int) -> None:
+        nonlocal substituted
+        if not canonical.exists() and not substituted:
+            canonical.symlink_to(outside, target_is_directory=True)
+            substituted = True
+            raise OSError("synthetic post-rename fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", substitute_before_post_rename_error)
+
+    with pytest.raises(storage_module.BackupDeletionUncertainError):
+        store.delete_set("delete-substituted")
+
+    assert substituted is True
+    assert canonical.is_symlink()
+    assert canonical.resolve() == outside.resolve()
+    assert (outside / "sentinel").read_text(encoding="utf-8") == "keep"
+    preserved = list(
+        store.sets_dir.glob(".delete-uncertain-delete-substituted-*")
+    )
+    assert len(preserved) == 1
+    assert store.list_sets() == []
+    assert preserved[0].is_dir()
+
+
+def test_delete_precommit_guard_failure_keeps_the_canonical_set(
+    tmp_path: Path,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    inspection = store.finalize_set(
+        _prepare_minimal_set(store, "delete-guard"),
+        created_at=FIXED_TIME,
+    )
+
+    def reject_commit() -> None:
+        raise BackupStateError("synthetic detached operation lease")
+
+    with pytest.raises(BackupStateError, match="detached operation"):
+        store.delete_set(
+            inspection.manifest.backup_id,
+            pre_commit_guard=reject_commit,
+        )
+
+    assert (inspection.path / "SEALED").is_file()
+    assert [item.backup_id for item in store.list_sets()] == ["delete-guard"]
+    assert not list(store.sets_dir.glob(".deleting-delete-guard-*"))
+
+
+def test_delete_fails_closed_when_sets_directory_is_detached_before_rename(
+    tmp_path: Path,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    backup_id = "delete-detached-sets"
+    store.finalize_set(
+        _prepare_minimal_set(store, backup_id),
+        created_at=FIXED_TIME,
+    )
+    detached_sets = tmp_path / "detached-sets"
+    replacement_marker = store.sets_dir / backup_id / "replacement"
+
+    def detach_sets() -> None:
+        store.sets_dir.rename(detached_sets)
+        store.sets_dir.mkdir(mode=0o700)
+        replacement_marker.parent.mkdir(mode=0o700)
+        replacement_marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(BackupStateError, match="sets directory"):
+        store.delete_set(backup_id, pre_commit_guard=detach_sets)
+
+    assert replacement_marker.read_text(encoding="utf-8") == "keep"
+    assert (detached_sets / backup_id / "SEALED").is_file()
+    assert not list(detached_sets.glob(f".deleting-{backup_id}-*"))
+
+
+def test_delete_preserves_uncertain_tombstone_when_sets_detaches_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    backup_id = "delete-detached-after-rename"
+    store.finalize_set(
+        _prepare_minimal_set(store, backup_id),
+        created_at=FIXED_TIME,
+    )
+    detached_sets = tmp_path / "detached-after-rename"
+    replacement_marker = store.sets_dir / backup_id / "replacement"
+    real_fsync = os.fsync
+    detached = False
+
+    def detach_sets_after_rename(descriptor: int) -> None:
+        nonlocal detached
+        if not (store.sets_dir / backup_id).exists() and not detached:
+            store.sets_dir.rename(detached_sets)
+            store.sets_dir.mkdir(mode=0o700)
+            replacement_marker.parent.mkdir(mode=0o700)
+            replacement_marker.write_text("keep", encoding="utf-8")
+            detached = True
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", detach_sets_after_rename)
+
+    with pytest.raises(storage_module.BackupDeletionUncertainError):
+        store.delete_set(backup_id)
+
+    assert detached is True
+    assert replacement_marker.read_text(encoding="utf-8") == "keep"
+    uncertain = list(
+        detached_sets.glob(f".delete-uncertain-{backup_id}-*")
+    )
+    assert len(uncertain) == 1
+    assert not list(detached_sets.glob(f".deleting-{backup_id}-*"))
+
+
+def test_delete_quarantines_restored_backup_when_fsync_detaches_sets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    backup_id = "delete-detached-fsync-error"
+    store.finalize_set(
+        _prepare_minimal_set(store, backup_id),
+        created_at=FIXED_TIME,
+    )
+    detached_sets = tmp_path / "detached-fsync-error"
+    replacement_marker = store.sets_dir / backup_id / "replacement"
+    real_fsync = os.fsync
+    detached = False
+
+    def detach_sets_and_fail_fsync(descriptor: int) -> None:
+        nonlocal detached
+        if not (store.sets_dir / backup_id).exists() and not detached:
+            store.sets_dir.rename(detached_sets)
+            store.sets_dir.mkdir(mode=0o700)
+            replacement_marker.parent.mkdir(mode=0o700)
+            replacement_marker.write_text("keep", encoding="utf-8")
+            detached = True
+            raise OSError("synthetic fsync error after sets detachment")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", detach_sets_and_fail_fsync)
+
+    with pytest.raises(storage_module.BackupDeletionUncertainError):
+        store.delete_set(backup_id)
+
+    assert detached is True
+    assert replacement_marker.read_text(encoding="utf-8") == "keep"
+    uncertain = list(
+        detached_sets.glob(f".delete-uncertain-{backup_id}-*")
+    )
+    assert len(uncertain) == 1
+    assert not (detached_sets / backup_id).exists()
+
+
+def test_delete_never_follows_a_set_symlink(tmp_path: Path) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_text("keep", encoding="utf-8")
+    (store.sets_dir / "symlink-set").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(BackupIntegrityError, match="unsafe"):
+        store.delete_set("symlink-set")
+
+    assert (outside / "sentinel").read_text(encoding="utf-8") == "keep"
 
 
 def test_listing_ignores_partial_and_unsealed_directories(tmp_path: Path) -> None:

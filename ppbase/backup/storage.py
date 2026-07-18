@@ -13,10 +13,14 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
+from ppbase.backup.control import (
+    ControlPlaneRoot,
+    ControlPlaneSafetyError,
+    verify_directory_attached_at,
+)
 from ppbase.backup.identity import (
     ED25519_PUBLIC_KEY_SIZE,
     ED25519_SIGNATURE_SIZE,
@@ -166,6 +170,131 @@ def _directory_entry_stat_at(parent_fd: int, name: str) -> os.stat_result | None
             "cannot enumerate restored business-file directory"
         ) from exc
     return None
+
+
+def _remove_directory_contents_at(directory_fd: int) -> None:
+    """Remove a directory tree relative to a pinned descriptor, never a path."""
+    before = os.fstat(directory_fd)
+    if not stat.S_ISDIR(before.st_mode):
+        raise BackupStateError("backup cleanup target is not a directory")
+    expected_identity = (before.st_dev, before.st_ino)
+    try:
+        with os.scandir(directory_fd) as iterator:
+            names = sorted(entry.name for entry in iterator)
+    except OSError as exc:
+        raise BackupStateError(
+            "backup cleanup directory cannot be enumerated safely"
+        ) from exc
+
+    for name in names:
+        try:
+            entry_info = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise BackupStateError(
+                "backup cleanup entry cannot be inspected safely"
+            ) from exc
+
+        if stat.S_ISDIR(entry_info.st_mode):
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(
+                    name,
+                    _directory_open_flags(),
+                    dir_fd=directory_fd,
+                )
+                opened = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not _same_file_identity(entry_info, opened)
+                ):
+                    raise BackupStateError(
+                        "backup cleanup directory changed while opening"
+                    )
+                _remove_directory_contents_at(child_fd)
+                after = os.fstat(child_fd)
+                visible = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(after.st_mode)
+                    or not _same_file_identity(opened, after)
+                    or stat.S_ISLNK(visible.st_mode)
+                    or not stat.S_ISDIR(visible.st_mode)
+                    or not _same_file_identity(opened, visible)
+                ):
+                    raise BackupStateError(
+                        "backup cleanup directory changed before removal"
+                    )
+            except BackupError:
+                raise
+            except OSError as exc:
+                raise BackupStateError(
+                    "backup cleanup directory could not be removed safely"
+                ) from exc
+            finally:
+                if child_fd is not None:
+                    os.close(child_fd)
+            try:
+                current = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISLNK(current.st_mode)
+                    or not stat.S_ISDIR(current.st_mode)
+                    or not _same_file_identity(entry_info, current)
+                ):
+                    raise BackupStateError(
+                        "backup cleanup directory changed before removal"
+                    )
+                os.rmdir(name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except BackupError:
+                raise
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise BackupStateError(
+                    "backup cleanup directory could not be removed safely"
+                ) from exc
+            continue
+
+        try:
+            current = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not _same_file_identity(entry_info, current):
+                raise BackupStateError(
+                    "backup cleanup entry changed before removal"
+                )
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except BackupError:
+            raise
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise BackupStateError(
+                "backup cleanup entry could not be removed safely"
+            ) from exc
+
+    after = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(after.st_mode)
+        or (after.st_dev, after.st_ino) != expected_identity
+    ):
+        raise BackupStateError("backup cleanup directory changed during removal")
 
 
 def _open_exact_restored_directory_at(parent_fd: int, name: str) -> int | None:
@@ -1358,6 +1487,42 @@ class BackupSealGate:
             self._committed = True
 
 
+class BackupDeleteCancelledError(BackupStateError):
+    """Raised only when cancellation wins before atomic backup detachment."""
+
+
+class BackupDeletionUncertainError(BackupStateError):
+    """Raised when deletion cannot be reported with an unambiguous outcome."""
+
+
+class _BackupSetsAttachmentError(BackupStateError):
+    """The descriptor-anchored backup set namespace was detached."""
+
+
+class BackupDeleteGate:
+    """Make cancellation and durable backup detachment mutually exclusive."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._committed = False
+
+    def cancel(self) -> bool:
+        """Prevent detachment, or report that its commit point completed."""
+        with self._lock:
+            if self._committed:
+                return False
+            self._cancelled = True
+            return True
+
+    def detach(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._cancelled:
+                raise BackupDeleteCancelledError("backup deletion was cancelled")
+            callback()
+            self._committed = True
+
+
 class BackupSetBuilder:
     """Single-use builder for the write-barrier-protected phase."""
 
@@ -1430,6 +1595,146 @@ class BackupSetBuilder:
         _copy_regular_file(Path(source), destination)
         _fsync_directory(secret_parent)
         self._jwt_secret_copied = True
+
+    def write_imported_resource(
+        self,
+        resource: BackupResource,
+        source: BinaryIO,
+        *,
+        chunk_size: int = _COPY_BUFFER_SIZE,
+    ) -> None:
+        """Write one already-declared ZIP resource into this hidden partial set."""
+        self._require_building()
+        if not isinstance(resource, BackupResource):
+            raise BackupIntegrityError("imported resource descriptor is invalid")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise BackupStateError("import chunk size must be a positive integer")
+
+        parts = PurePosixPath(resource.path).parts
+        if not parts or parts[0] != RESOURCES_DIRNAME or len(parts) < 2:
+            raise BackupIntegrityError("imported resource path is outside resources/")
+
+        root_fd: int | None = None
+        current_fd: int | None = None
+        destination_fd: int | None = None
+        destination_created = False
+        destination_name: str | None = None
+        resource_committed = False
+        try:
+            root_fd = os.open(self.path, _directory_open_flags())
+            current_fd = root_fd
+            root_fd = None
+
+            for component in parts[:-1]:
+                _validate_source_component(component)
+                try:
+                    expected = os.stat(
+                        component,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    os.fsync(current_fd)
+                    expected = os.stat(
+                        component,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(
+                    expected.st_mode
+                ):
+                    raise BackupIntegrityError(
+                        "imported resource path contains an unsafe directory"
+                    )
+                child_fd: int | None = None
+                try:
+                    child_fd = os.open(
+                        component,
+                        _directory_open_flags(),
+                        dir_fd=current_fd,
+                    )
+                    opened = os.fstat(child_fd)
+                    if not _same_file_identity(expected, opened):
+                        raise BackupIntegrityError(
+                            "imported resource directory changed while opening"
+                        )
+                    os.fchmod(child_fd, 0o700)
+                    if stat.S_IMODE(os.fstat(child_fd).st_mode) != 0o700:
+                        raise BackupIntegrityError(
+                            "imported resource directory must have mode 0700"
+                        )
+                except BaseException:
+                    if child_fd is not None:
+                        os.close(child_fd)
+                    raise
+                os.close(current_fd)
+                current_fd = child_fd
+
+            destination_name = parts[-1]
+            _validate_source_component(destination_name)
+            destination_fd = os.open(
+                destination_name,
+                _open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
+                0o600,
+                dir_fd=current_fd,
+            )
+            destination_created = True
+            os.fchmod(destination_fd, 0o600)
+
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise BackupIntegrityError(
+                        "imported resource stream returned non-bytes data"
+                    )
+                payload = bytes(chunk)
+                size += len(payload)
+                if size > resource.size:
+                    raise BackupIntegrityError(
+                        "imported resource exceeds its signed size"
+                    )
+                digest.update(payload)
+                _write_all(destination_fd, payload)
+
+            if size != resource.size or not secrets.compare_digest(
+                digest.hexdigest(),
+                resource.sha256,
+            ):
+                raise BackupIntegrityError(
+                    "imported resource differs from the signed manifest"
+                )
+            os.fsync(destination_fd)
+            os.fsync(current_fd)
+            resource_committed = True
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupStateError(
+                "imported backup resource could not be written safely"
+            ) from exc
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if (
+                destination_created
+                and not resource_committed
+                and current_fd is not None
+                and destination_name is not None
+            ):
+                try:
+                    os.unlink(destination_name, dir_fd=current_fd)
+                    os.fsync(current_fd)
+                except (FileNotFoundError, OSError):
+                    pass
+            if current_fd is not None:
+                os.close(current_fd)
+            if root_fd is not None:
+                os.close(root_fd)
 
     def prepare(self) -> PreparedBackupSet:
         """Hash and fsync every resource without signing or sealing the set."""
@@ -1873,9 +2178,645 @@ class LocalBackupStore:
                 ) from exc
             raise
 
+    def finalize_imported_set(
+        self,
+        prepared: PreparedBackupSet,
+        *,
+        manifest_bytes: bytes,
+        signature: bytes,
+        signer_public_key: bytes,
+        expected_public_key: bytes,
+        seal_gate: BackupSealGate | None = None,
+        identity_guard: Callable[[], None] | None = None,
+    ) -> BackupInspection:
+        """Publish an exact, already-signed transport envelope without re-signing."""
+        self._require_open()
+        prepared_identity = self._validate_prepared_location(prepared)
+        final_path: Path | None = None
+        final_identity: tuple[int, int] | None = None
+        sealed_committed = False
+        effective_identity_guard = identity_guard or self._identity_guard
+        try:
+            if effective_identity_guard is not None:
+                effective_identity_guard()
+            if not isinstance(manifest_bytes, bytes) or len(manifest_bytes) > _MAX_MANIFEST_BYTES:
+                raise BackupIntegrityError("imported manifest exceeds its size limit")
+            if not isinstance(signature, bytes) or len(signature) != ED25519_SIGNATURE_SIZE:
+                raise BackupIntegrityError("imported Ed25519 signature is invalid")
+            if (
+                not isinstance(signer_public_key, bytes)
+                or len(signer_public_key) != ED25519_PUBLIC_KEY_SIZE
+            ):
+                raise BackupIntegrityError("imported Ed25519 public key is invalid")
+            if (
+                not isinstance(expected_public_key, bytes)
+                or len(expected_public_key) != ED25519_PUBLIC_KEY_SIZE
+                or not secrets.compare_digest(
+                    signer_public_key,
+                    expected_public_key,
+                )
+            ):
+                raise BackupIntegrityError(
+                    "backup signer does not match the expected key"
+                )
+
+            manifest = BackupManifest.from_bytes(manifest_bytes)
+            if manifest.backup_id != prepared.backup_id:
+                raise BackupIntegrityError(
+                    "imported manifest backup_id does not match its destination"
+                )
+            fingerprint = verify_manifest_signature(
+                manifest_bytes,
+                signature,
+                signer_public_key,
+            )
+            if not secrets.compare_digest(
+                fingerprint,
+                manifest.signer_fingerprint_sha256,
+            ):
+                raise BackupIntegrityError(
+                    "imported manifest signer fingerprint is inconsistent"
+                )
+
+            current_resources = _scan_resource_tree(
+                prepared.path / RESOURCES_DIRNAME,
+                repair_permissions=False,
+            )
+            if (
+                current_resources != prepared.resources
+                or current_resources != manifest.resources
+            ):
+                raise BackupIntegrityError(
+                    "imported resources differ from the signed manifest"
+                )
+
+            if effective_identity_guard is not None:
+                effective_identity_guard()
+            _write_exclusive(prepared.path / MANIFEST_FILENAME, manifest_bytes)
+            _write_exclusive(prepared.path / SIGNATURE_FILENAME, signature)
+            _write_exclusive(
+                prepared.path / SIGNER_PUBLIC_KEY_FILENAME,
+                signer_public_key,
+            )
+            _fsync_directory(prepared.path)
+
+            final_path, final_identity = self._publish_unsealed(prepared)
+            inspection = self._inspect_set_path(
+                prepared.backup_id,
+                final_path,
+                expected_public_key=expected_public_key,
+                verify_resources=True,
+                sealed=False,
+            )
+
+            def seal() -> None:
+                self._publish_seal(
+                    final_path,
+                    pre_commit_guard=effective_identity_guard,
+                )
+
+            if seal_gate is None:
+                seal()
+            else:
+                seal_gate.publish(seal)
+            sealed_committed = True
+            return inspection
+        except BaseException as exc:
+            if sealed_committed:
+                raise
+            cleanup_failed = False
+            if final_path is not None and final_identity is not None:
+                try:
+                    self._remove_owned_directory(final_path, final_identity)
+                except Exception:
+                    cleanup_failed = True
+            try:
+                self._remove_owned_directory(prepared.path, prepared_identity)
+            except Exception:
+                cleanup_failed = True
+            if cleanup_failed:
+                raise BackupStateError(
+                    "failed imported backup could not be cleaned safely"
+                ) from exc
+            raise
+
+    def delete_set(
+        self,
+        backup_id: str,
+        *,
+        pre_commit_guard: Callable[[], None] | None = None,
+        delete_gate: BackupDeleteGate | None = None,
+    ) -> None:
+        """Atomically detach one sealed set, then clean its hidden tombstone."""
+        self._require_open()
+        selected_id = validate_backup_id(backup_id)
+        self._reconcile_deleting_sets()
+        if self._identity_guard is not None:
+            self._identity_guard()
+        storage_root: ControlPlaneRoot | None = None
+        sets_fd: int | None = None
+        selected_fd: int | None = None
+        tombstone_name: str | None = None
+        committed_tombstone_name: str | None = None
+        selected_identity: tuple[int, int] | None = None
+        placeholder_created = False
+        committed = False
+        try:
+            try:
+                storage_root = ControlPlaneRoot.open(
+                    self.root,
+                    create_missing=False,
+                )
+                sets_fd = storage_root.open_private_directory(
+                    "sets",
+                    label="The backup sets directory",
+                    create_missing=False,
+                )
+            except ControlPlaneSafetyError as exc:
+                raise BackupStateError(
+                    "backup sets directory is detached or unsafe"
+                ) from exc
+
+            def verify_sets_attached() -> None:
+                if storage_root is None or sets_fd is None:
+                    raise _BackupSetsAttachmentError(
+                        "backup sets directory is detached or unsafe"
+                    )
+                try:
+                    storage_root.verify_attached()
+                    verify_directory_attached_at(
+                        storage_root.fileno(),
+                        "sets",
+                        sets_fd,
+                        label="The backup sets directory",
+                    )
+                    storage_root.verify_attached()
+                except ControlPlaneSafetyError as exc:
+                    raise _BackupSetsAttachmentError(
+                        "backup sets directory is detached or unsafe"
+                    ) from exc
+
+            verify_sets_attached()
+            selected_info = os.stat(
+                selected_id,
+                dir_fd=sets_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(selected_info.st_mode)
+                or not stat.S_ISDIR(selected_info.st_mode)
+                or stat.S_IMODE(selected_info.st_mode) != 0o700
+            ):
+                raise BackupIntegrityError("backup set is missing or unsafe")
+            selected_fd = os.open(
+                selected_id,
+                _directory_open_flags(),
+                dir_fd=sets_fd,
+            )
+            opened_selected = os.fstat(selected_fd)
+            if not _same_file_identity(selected_info, opened_selected):
+                raise BackupIntegrityError("backup set changed while opening")
+            seal_info = os.stat(
+                SEALED_FILENAME,
+                dir_fd=selected_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(seal_info.st_mode)
+                or not stat.S_ISREG(seal_info.st_mode)
+                or stat.S_IMODE(seal_info.st_mode) != 0o600
+                or seal_info.st_size != 0
+            ):
+                raise BackupIntegrityError("backup set has no valid seal")
+            selected_identity = (
+                opened_selected.st_dev,
+                opened_selected.st_ino,
+            )
+
+            for _ in range(32):
+                candidate_name = (
+                    f".delete-pending-{selected_id}-{secrets.token_hex(16)}"
+                )
+                try:
+                    os.mkdir(candidate_name, mode=0o700, dir_fd=sets_fd)
+                except FileExistsError:
+                    continue
+                tombstone_name = candidate_name
+                placeholder_created = True
+                break
+            if tombstone_name is None:
+                raise BackupStateError(
+                    "cannot allocate a backup deletion tombstone"
+                )
+            committed_tombstone_name = tombstone_name.replace(
+                ".delete-pending-",
+                ".deleting-",
+                1,
+            )
+            os.fsync(sets_fd)
+
+            def entry_state(name: str) -> str:
+                info = os.stat(
+                    name,
+                    dir_fd=sets_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    stat.S_ISDIR(info.st_mode)
+                    and (info.st_dev, info.st_ino) == selected_identity
+                ):
+                    return "selected"
+                return "other"
+
+            def entry_state_or_missing(name: str) -> str:
+                try:
+                    return entry_state(name)
+                except FileNotFoundError:
+                    return "missing"
+
+            def durable_state_after_failed_detach() -> str:
+                canonical_state = entry_state_or_missing(selected_id)
+                pending_state = entry_state_or_missing(tombstone_name)
+                if canonical_state == "selected" and pending_state == "missing":
+                    os.fsync(sets_fd)
+                    verify_sets_attached()
+                    return "restored"
+                if canonical_state == "missing" and pending_state == "selected":
+                    os.fsync(sets_fd)
+                    verify_sets_attached()
+                    return "committed"
+                raise BackupStateError(
+                    "backup deletion recovery found an unsafe directory state"
+                )
+
+            def uncertain_tombstone_name() -> str:
+                if tombstone_name.startswith(".delete-pending-"):
+                    return tombstone_name.replace(
+                        ".delete-pending-",
+                        ".delete-uncertain-",
+                        1,
+                    )
+                if tombstone_name.startswith(".deleting-"):
+                    return tombstone_name.replace(
+                        ".deleting-",
+                        ".delete-uncertain-",
+                        1,
+                    )
+                return tombstone_name
+
+            def preserve_uncertain_detach() -> str:
+                nonlocal tombstone_name
+                uncertain_name = uncertain_tombstone_name()
+                try:
+                    pending_state = entry_state_or_missing(tombstone_name)
+                except OSError:
+                    pending_state = "unknown"
+                if pending_state == "selected":
+                    try:
+                        os.rename(
+                            tombstone_name,
+                            uncertain_name,
+                            src_dir_fd=sets_fd,
+                            dst_dir_fd=sets_fd,
+                        )
+                    except OSError:
+                        pass
+                    try:
+                        if entry_state_or_missing(uncertain_name) == "selected":
+                            tombstone_name = uncertain_name
+                    except OSError:
+                        pass
+                    try:
+                        os.fsync(sets_fd)
+                    except OSError:
+                        pass
+                    return tombstone_name
+
+                try:
+                    canonical_state = entry_state_or_missing(selected_id)
+                except OSError:
+                    canonical_state = "unknown"
+                if canonical_state == "selected":
+                    return selected_id
+                return tombstone_name
+
+            def quarantine_restored_detach() -> str:
+                nonlocal tombstone_name
+                uncertain_name = uncertain_tombstone_name()
+                try:
+                    if entry_state_or_missing(selected_id) == "selected":
+                        os.rename(
+                            selected_id,
+                            uncertain_name,
+                            src_dir_fd=sets_fd,
+                            dst_dir_fd=sets_fd,
+                        )
+                except OSError:
+                    pass
+                try:
+                    if entry_state_or_missing(uncertain_name) == "selected":
+                        tombstone_name = uncertain_name
+                except OSError:
+                    pass
+                try:
+                    os.fsync(sets_fd)
+                except OSError:
+                    pass
+                return tombstone_name
+
+            def require_committed_sets_attached() -> None:
+                try:
+                    verify_sets_attached()
+                except BackupStateError as attachment_error:
+                    recovery_name = preserve_uncertain_detach()
+                    raise BackupDeletionUncertainError(
+                        "backup deletion committed through a detached storage "
+                        "root; preserve "
+                        f"{recovery_name!r} for manual recovery"
+                    ) from attachment_error
+
+            def promote_committed_tombstone() -> None:
+                nonlocal tombstone_name
+                try:
+                    os.rename(
+                        tombstone_name,
+                        committed_tombstone_name,
+                        src_dir_fd=sets_fd,
+                        dst_dir_fd=sets_fd,
+                    )
+                except OSError:
+                    pass
+                try:
+                    if (
+                        entry_state_or_missing(committed_tombstone_name)
+                        == "selected"
+                    ):
+                        tombstone_name = committed_tombstone_name
+                    elif entry_state_or_missing(tombstone_name) != "selected":
+                        return
+                except OSError:
+                    return
+                try:
+                    os.fsync(sets_fd)
+                except OSError:
+                    # The canonical-name detachment was already fsynced. This
+                    # rename only makes later best-effort cleanup discoverable.
+                    pass
+
+            def detach() -> None:
+                nonlocal committed, placeholder_created
+                if self._identity_guard is not None:
+                    self._identity_guard()
+                if pre_commit_guard is not None:
+                    pre_commit_guard()
+                verify_sets_attached()
+                try:
+                    os.rename(
+                        selected_id,
+                        tombstone_name,
+                        src_dir_fd=sets_fd,
+                        dst_dir_fd=sets_fd,
+                    )
+                    if entry_state(tombstone_name) != "selected":
+                        raise BackupStateError(
+                            "backup deletion target changed during atomic detach"
+                        )
+                    placeholder_created = False
+                    os.fsync(sets_fd)
+                    verify_sets_attached()
+                except BaseException as detach_error:
+                    try:
+                        canonical_state = entry_state_or_missing(selected_id)
+                        pending_state = entry_state_or_missing(tombstone_name)
+                    except BaseException as state_error:
+                        recovery_name = preserve_uncertain_detach()
+                        raise BackupDeletionUncertainError(
+                            "backup deletion could not establish a durable "
+                            "delete or restoration; preserve "
+                            f"{recovery_name!r} for manual recovery"
+                        ) from state_error
+
+                    if (
+                        isinstance(detach_error, _BackupSetsAttachmentError)
+                        and canonical_state == "missing"
+                        and pending_state == "selected"
+                    ):
+                        placeholder_created = False
+                        recovery_name = preserve_uncertain_detach()
+                        raise BackupDeletionUncertainError(
+                            "backup deletion lost its storage attachment after "
+                            "the atomic rename; preserve "
+                            f"{recovery_name!r} for manual recovery"
+                        ) from detach_error
+
+                    if canonical_state == "selected" and pending_state != "selected":
+                        if isinstance(detach_error, BackupError):
+                            raise detach_error
+                        if isinstance(detach_error, Exception):
+                            raise BackupStateError(
+                                "backup deletion failed before atomic detach"
+                            ) from detach_error
+                        raise detach_error
+
+                    if pending_state != "selected":
+                        recovery_name = preserve_uncertain_detach()
+                        raise BackupDeletionUncertainError(
+                            "backup deletion could not establish a durable "
+                            "delete or restoration; preserve "
+                            f"{recovery_name!r} for manual recovery"
+                        ) from detach_error
+
+                    if canonical_state != "missing":
+                        recovery_name = preserve_uncertain_detach()
+                        raise BackupDeletionUncertainError(
+                            "backup deletion could not establish a durable "
+                            "delete or restoration; preserve "
+                            f"{recovery_name!r} for manual recovery"
+                        ) from detach_error
+
+                    placeholder_created = False
+                    try:
+                        os.rename(
+                            tombstone_name,
+                            selected_id,
+                            src_dir_fd=sets_fd,
+                            dst_dir_fd=sets_fd,
+                        )
+                    except OSError:
+                        pass
+                    try:
+                        recovery_state = durable_state_after_failed_detach()
+                    except BaseException as recovery_error:
+                        recovery_name = (
+                            quarantine_restored_detach()
+                            if isinstance(
+                                recovery_error,
+                                _BackupSetsAttachmentError,
+                            )
+                            else preserve_uncertain_detach()
+                        )
+                        raise BackupDeletionUncertainError(
+                            "backup deletion could not establish a durable "
+                            "delete or restoration; preserve "
+                            f"{recovery_name!r} for manual recovery"
+                        ) from recovery_error
+                    if recovery_state == "restored":
+                        if isinstance(detach_error, BackupError):
+                            raise detach_error
+                        if isinstance(detach_error, Exception):
+                            raise BackupStateError(
+                                "backup deletion failed after rename and was "
+                                "durably restored"
+                            ) from detach_error
+                        raise detach_error
+                    committed = True
+                else:
+                    committed = True
+                promote_committed_tombstone()
+                require_committed_sets_attached()
+
+            if delete_gate is None:
+                detach()
+            else:
+                delete_gate.detach(detach)
+            require_committed_sets_attached()
+            if (
+                not committed
+                or tombstone_name is None
+                or selected_identity is None
+            ):
+                raise BackupStateError(
+                    "backup deletion did not reach its commit point"
+                )
+            try:
+                self._remove_owned_directory_at(
+                    sets_fd,
+                    tombstone_name,
+                    selected_identity,
+                    attachment_guard=verify_sets_attached,
+                )
+            except Exception:
+                # The durable rename is the deletion commit point. A later
+                # listing reconciles the private tombstone without making
+                # success ambiguous.
+                pass
+        except FileNotFoundError as exc:
+            raise BackupNotFoundError(
+                f"sealed backup set not found: {selected_id}"
+            ) from exc
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupStateError("backup set could not be detached safely") from exc
+        finally:
+            if placeholder_created and sets_fd is not None and tombstone_name:
+                try:
+                    os.rmdir(tombstone_name, dir_fd=sets_fd)
+                    os.fsync(sets_fd)
+                except OSError:
+                    pass
+            if selected_fd is not None:
+                try:
+                    os.close(selected_fd)
+                except OSError:
+                    pass
+            if sets_fd is not None:
+                try:
+                    os.close(sets_fd)
+                except OSError:
+                    pass
+            if storage_root is not None:
+                storage_root.close()
+
+    def _reconcile_deleting_sets(self) -> None:
+        storage_root: ControlPlaneRoot | None = None
+        sets_fd: int | None = None
+        try:
+            storage_root = ControlPlaneRoot.open(
+                self.root,
+                create_missing=False,
+            )
+            sets_fd = storage_root.open_private_directory(
+                "sets",
+                label="The backup sets directory",
+                create_missing=False,
+            )
+
+            def verify_sets_attached() -> None:
+                if storage_root is None or sets_fd is None:
+                    raise _BackupSetsAttachmentError(
+                        "backup sets directory is detached or unsafe"
+                    )
+                try:
+                    storage_root.verify_attached()
+                    verify_directory_attached_at(
+                        storage_root.fileno(),
+                        "sets",
+                        sets_fd,
+                        label="The backup sets directory",
+                    )
+                    storage_root.verify_attached()
+                except ControlPlaneSafetyError as exc:
+                    raise _BackupSetsAttachmentError(
+                        "backup sets directory is detached or unsafe"
+                    ) from exc
+
+            verify_sets_attached()
+            with os.scandir(sets_fd) as iterator:
+                names = sorted(
+                    entry.name
+                    for entry in iterator
+                    if entry.name.startswith(".deleting-")
+                )
+            for name in names:
+                try:
+                    info = os.stat(
+                        name,
+                        dir_fd=sets_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or not stat.S_ISDIR(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                ):
+                    continue
+                try:
+                    self._remove_owned_directory_at(
+                        sets_fd,
+                        name,
+                        (info.st_dev, info.st_ino),
+                        attachment_guard=verify_sets_attached,
+                    )
+                except BackupStateError:
+                    verify_sets_attached()
+                    continue
+            verify_sets_attached()
+        except _BackupSetsAttachmentError:
+            raise
+        except ControlPlaneSafetyError as exc:
+            raise BackupStateError(
+                "backup sets directory is detached or unsafe"
+            ) from exc
+        except OSError as exc:
+            raise BackupStateError(
+                "backup deletion tombstones cannot be reconciled safely"
+            ) from exc
+        finally:
+            if sets_fd is not None:
+                try:
+                    os.close(sets_fd)
+                except OSError:
+                    pass
+            if storage_root is not None:
+                storage_root.close()
+
     def list_sets(self) -> list[BackupSetSummary]:
         """List structurally authenticated sealed sets, never partial sets."""
         self._require_open()
+        self._reconcile_deleting_sets()
         if self._identity_guard is not None:
             self._identity_guard()
         summaries: list[BackupSetSummary] = []
@@ -1911,6 +2852,8 @@ class LocalBackupStore:
                         signer_fingerprint_sha256=None,
                         resource_count=None,
                         total_size=None,
+                        app_name=None,
+                        manifest=None,
                         integrity_status="invalid",
                         error_code="integrity_failed",
                     )
@@ -1924,6 +2867,11 @@ class LocalBackupStore:
                     signer_fingerprint_sha256=manifest.signer_fingerprint_sha256,
                     resource_count=len(manifest.resources),
                     total_size=manifest.total_size,
+                    app_name=(
+                        str(manifest.metadata.get("app_name", "") or "")
+                        or None
+                    ),
+                    manifest=manifest,
                     integrity_status="valid",
                     error_code=None,
                 )
@@ -2278,6 +3226,108 @@ class LocalBackupStore:
         if stat.S_IMODE(info.st_mode) != 0o700:
             raise BackupStateError("prepared backup directory must have mode 0700")
         return info.st_dev, info.st_ino
+
+    @staticmethod
+    def _remove_owned_directory_at(
+        parent_fd: int,
+        name: str,
+        expected_identity: tuple[int, int],
+        *,
+        attachment_guard: Callable[[], None],
+    ) -> None:
+        attachment_guard()
+        try:
+            expected = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            attachment_guard()
+            return
+        except OSError as exc:
+            raise BackupStateError(
+                "failed backup directory could not be inspected safely"
+            ) from exc
+        if (
+            stat.S_ISLNK(expected.st_mode)
+            or not stat.S_ISDIR(expected.st_mode)
+            or (expected.st_dev, expected.st_ino) != expected_identity
+        ):
+            raise BackupStateError(
+                "failed backup directory changed before cleanup"
+            )
+
+        directory_fd: int | None = None
+        try:
+            directory_fd = os.open(
+                name,
+                _directory_open_flags(),
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not _same_file_identity(expected, opened)
+            ):
+                raise BackupStateError(
+                    "failed backup directory changed while opening"
+                )
+            attachment_guard()
+            _remove_directory_contents_at(directory_fd)
+            after = os.fstat(directory_fd)
+            visible = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(after.st_mode)
+                or not _same_file_identity(opened, after)
+                or stat.S_ISLNK(visible.st_mode)
+                or not stat.S_ISDIR(visible.st_mode)
+                or not _same_file_identity(opened, visible)
+            ):
+                raise BackupStateError(
+                    "failed backup directory changed before cleanup"
+                )
+            attachment_guard()
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupStateError(
+                "failed backup directory could not be removed safely"
+            ) from exc
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+        try:
+            current = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != expected_identity
+            ):
+                raise BackupStateError(
+                    "failed backup directory changed before cleanup"
+                )
+            attachment_guard()
+            os.rmdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            attachment_guard()
+        except BackupError:
+            raise
+        except FileNotFoundError:
+            attachment_guard()
+        except OSError as exc:
+            raise BackupStateError(
+                "failed backup directory could not be removed safely"
+            ) from exc
 
     @staticmethod
     def _remove_owned_directory(

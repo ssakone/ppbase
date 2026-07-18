@@ -610,6 +610,9 @@ class FlaskLikePB:
             host=effective_host,
             port=effective_port,
             log_level=self.settings.log_level.lower(),
+            # RequestLoggerMiddleware is the canonical access logger and
+            # redacts sensitive query values (notably backup file tokens).
+            access_log=False,
         )
 
     def route(

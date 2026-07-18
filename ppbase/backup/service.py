@@ -9,10 +9,11 @@ import ipaddress
 import os
 import stat
 import socket
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import secrets
-from typing import Any, Callable, TypeVar
+from typing import Any, BinaryIO, Callable, TypeVar
 
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
@@ -32,6 +33,12 @@ from ppbase.backup.models import (
     BackupIntegrityError,
     BackupNotFoundError,
     canonical_json_bytes,
+)
+from ppbase.backup.operations import (
+    BackupOperationCoordinator,
+    BackupOperationError,
+    BackupOperationLease,
+    BackupOperationSafetyError,
 )
 from ppbase.backup.plans import StagingPlan, StagingPlanError, StagingPlanStore
 from ppbase.backup.postgres import (
@@ -55,14 +62,31 @@ from ppbase.backup.storage import (
     JWT_SECRET_RESOURCE,
     AnchoredStagingDataDir,
     AuthenticatedBackupInspection,
+    BackupDeleteCancelledError,
+    BackupDeletionUncertainError,
+    BackupDeleteGate,
     BackupSealCancelledError,
     BackupSealGate,
     LocalBackupStore,
+)
+from ppbase.backup.transport import (
+    BackupTransportError,
+    BackupTransportLimits,
+    PinnedBackupZip,
+    PreparedBackupImport,
+    backup_transport_filename,
+    backup_transport_size,
+    materialize_backup_zip,
+    prepare_backup_zip_import,
+    validate_backup_transport_filename,
 )
 from ppbase.backup.validation import (
     generate_clone_jwt_secret,
     rotate_clone_database_secrets,
     validate_staged_database,
+)
+from ppbase.services.async_utils import (
+    to_thread_quiescent as _to_thread_quiescent,
 )
 from ppbase.services.file_storage import (
     open_file_stream,
@@ -200,35 +224,6 @@ class _RestoreDestinationPreflight:
     warnings: tuple[str, ...]
 
 
-async def _to_thread_quiescent(
-    function: Callable[..., _T],
-    /,
-    *args: Any,
-    cancel_cleanup: Callable[[_T], None] | None = None,
-    **kwargs: Any,
-) -> _T:
-    """Wait for a blocking worker to stop before propagating cancellation."""
-    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                break
-        try:
-            completed = worker.result()
-        except BaseException:
-            pass
-        else:
-            if cancel_cleanup is not None:
-                cancel_cleanup(completed)
-        raise
-
-
 async def _to_thread_cleanup_quiescent(
     function: Callable[..., _T],
     /,
@@ -277,6 +272,20 @@ async def _cancel_task_quiescent(task: asyncio.Task[Any]) -> None:
             pass
 
 
+async def _thread_result_while_resolving_cancellation(
+    function: Callable[..., _T],
+    /,
+    *args: Any,
+) -> _T:
+    """Finish one gate decision off-loop despite repeated cancellation."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    while True:
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+
+
 async def _finalize_backup_atomically(
     function: Callable[..., _T],
     /,
@@ -296,7 +305,9 @@ async def _finalize_backup_atomically(
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError as cancellation:
-        sealing_prevented = seal_gate.cancel()
+        sealing_prevented = await _thread_result_while_resolving_cancellation(
+            seal_gate.cancel
+        )
         while not worker.done():
             try:
                 await asyncio.shield(worker)
@@ -316,6 +327,50 @@ async def _finalize_backup_atomically(
         if sealing_prevented:  # pragma: no cover - gate invariant
             raise cancellation
         return result
+
+
+async def _delete_backup_atomically(
+    function: Callable[..., None],
+    /,
+    *args: Any,
+    delete_gate: BackupDeleteGate,
+    **kwargs: Any,
+) -> None:
+    """Choose cancellation or a completed durable delete, never both."""
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            function,
+            *args,
+            delete_gate=delete_gate,
+            **kwargs,
+        )
+    )
+    try:
+        await asyncio.shield(worker)
+        return
+    except asyncio.CancelledError as cancellation:
+        deletion_prevented = await _thread_result_while_resolving_cancellation(
+            delete_gate.cancel
+        )
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            worker.result()
+        except BaseException as worker_error:
+            if deletion_prevented and isinstance(
+                worker_error,
+                BackupDeleteCancelledError,
+            ):
+                raise cancellation
+            raise
+        if deletion_prevented:  # pragma: no cover - gate invariant
+            raise cancellation
+        return
 
 
 class BackupServiceError(RuntimeError):
@@ -372,6 +427,7 @@ class NativeBackupService:
                 "The native backup control plane is missing or unsafe.",
             ) from exc
         try:
+            self.operations = BackupOperationCoordinator(self.control_root)
             self.plans = StagingPlanStore(self.control_root, self.staging_root)
             self.identity = self._load_identity()
             self.store = LocalBackupStore(
@@ -381,6 +437,13 @@ class NativeBackupService:
         except BackupServiceError:
             self.close()
             raise
+        except BackupOperationError as exc:
+            self.close()
+            raise BackupServiceError(
+                500,
+                exc.code,
+                "The native backup operation coordinator is missing or unsafe.",
+            ) from exc
         except StagingPlanError as exc:
             self.close()
             raise BackupServiceError(
@@ -406,6 +469,7 @@ class NativeBackupService:
         store = getattr(self, "store", None)
         identity = getattr(self, "identity", None)
         plans = getattr(self, "plans", None)
+        operations = getattr(self, "operations", None)
         control_root = getattr(self, "control_root", None)
         try:
             if store is not None:
@@ -419,8 +483,12 @@ class NativeBackupService:
                     if plans is not None:
                         plans.close()
                 finally:
-                    if control_root is not None:
-                        control_root.close()
+                    try:
+                        if operations is not None:
+                            operations.close()
+                    finally:
+                        if control_root is not None:
+                            control_root.close()
 
     def __enter__(self) -> "NativeBackupService":
         self._require_control_identity_attached()
@@ -445,10 +513,51 @@ class NativeBackupService:
         self._require_control_identity_attached()
         return result
 
+    @contextmanager
+    def mutation_operation(self) -> Any:
+        """Return the single cross-worker mutation context for API streaming."""
+        self._require_control_identity_attached()
+        try:
+            with self.operations.global_exclusive() as lease:
+                yield lease
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+
     async def create_local_backup(
         self,
         *,
         actor_id: str | None = None,
+        transport_filename: str | None = None,
+    ) -> dict[str, Any]:
+        if transport_filename == "":
+            transport_filename = None
+        if transport_filename is not None:
+            try:
+                transport_filename = validate_backup_transport_filename(
+                    transport_filename
+                )
+            except ValueError as exc:
+                raise BackupServiceError(
+                    422,
+                    "backup_filename_invalid",
+                    "The requested backup filename must be a safe .zip basename.",
+                ) from exc
+        try:
+            with self.operations.global_exclusive() as operation_lease:
+                return await self._create_local_backup_under_lease(
+                    actor_id=actor_id,
+                    transport_filename=transport_filename,
+                    operation_lease=operation_lease,
+                )
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+
+    async def _create_local_backup_under_lease(
+        self,
+        *,
+        actor_id: str | None = None,
+        transport_filename: str | None = None,
+        operation_lease: BackupOperationLease,
     ) -> dict[str, Any]:
         self._require_control_identity_attached()
         dump_url = self._dump_configuration()
@@ -482,6 +591,7 @@ class NativeBackupService:
         source_file_references: tuple[LocalFileReference, ...] | None = None
         dump_version = ""
         restore_version = ""
+        source_app_name = "PPBase"
         preflight_warnings: list[str] = []
         try:
             async with backup_write_barrier(
@@ -512,6 +622,14 @@ class NativeBackupService:
                                 )
                             )
                         ).scalar_one_or_none()
+                        if isinstance(durable_settings, dict):
+                            durable_meta = durable_settings.get("meta")
+                            if isinstance(durable_meta, dict):
+                                candidate_app_name = str(
+                                    durable_meta.get("appName", "") or ""
+                                ).strip()
+                                if candidate_app_name:
+                                    source_app_name = candidate_app_name[:200]
                         durable_storage_config = (
                             resolve_storage_config_from_settings_payload(
                                 self.settings,
@@ -652,6 +770,7 @@ class NativeBackupService:
             )
         metadata = {
             "ppbase_version": __version__,
+            "app_name": source_app_name,
             "storage_backend": "local",
             "database_contract": contract.to_dict(),
             "database_summary": source_summary,
@@ -672,13 +791,17 @@ class NativeBackupService:
             "created_by": actor_id,
             "preflight_warnings": preflight_warnings,
         }
+        if transport_filename is not None:
+            metadata["transport"] = {"filename": transport_filename}
         try:
             inspection = await _finalize_backup_atomically(
                 self.store.finalize_set,
                 prepared,
                 seal_gate=BackupSealGate(),
                 metadata=metadata,
-                identity_guard=self._require_control_identity_attached,
+                identity_guard=lambda: self._operation_commit_guard(
+                    operation_lease
+                ),
             )
         except BackupError as exc:
             raise self._map_error(exc, operation="seal") from exc
@@ -692,10 +815,22 @@ class NativeBackupService:
             return [
                 {
                     "id": item.backup_id,
+                    "key": item.backup_id,
                     "createdAt": item.created_at,
+                    "modified": item.created_at,
                     "signerFingerprintSha256": item.signer_fingerprint_sha256,
                     "resourceCount": item.resource_count,
                     "totalSize": item.total_size,
+                    "size": (
+                        backup_transport_size(item.manifest)
+                        if item.manifest is not None
+                        else None
+                    ),
+                    "filename": (
+                        backup_transport_filename(item.manifest)
+                        if item.manifest is not None
+                        else None
+                    ),
                     "status": (
                         "sealed"
                         if item.integrity_status == "valid"
@@ -710,9 +845,21 @@ class NativeBackupService:
             raise self._map_error(exc, operation="list") from exc
 
     async def inspect_local_backup(self, backup_id: str) -> dict[str, Any]:
+        try:
+            with self.operations.backup_shared(backup_id) as backup_lease:
+                result = await self._inspect_local_backup_under_lease(backup_id)
+                self._operation_commit_guard(backup_lease)
+                return result
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+
+    async def _inspect_local_backup_under_lease(
+        self,
+        backup_id: str,
+    ) -> dict[str, Any]:
         self._require_control_identity_attached()
         try:
-            inspection = await asyncio.to_thread(
+            inspection = await _to_thread_quiescent(
                 self.store.inspect_set,
                 backup_id,
                 expected_public_key=self.identity.public_key_bytes,
@@ -723,12 +870,186 @@ class NativeBackupService:
             raise self._map_error(exc, operation="inspect") from exc
         return self._inspection_dict(inspection)
 
+    async def materialize_local_backup_zip(
+        self,
+        backup_id: str,
+    ) -> PinnedBackupZip:
+        self._require_control_identity_attached()
+        leases = ExitStack()
+        try:
+            backup_lease = leases.enter_context(
+                self.operations.backup_shared(backup_id)
+            )
+            materialization_lease = leases.enter_context(
+                self.operations.backup_materialization_exclusive(backup_id)
+            )
+            pinned = await _to_thread_quiescent(
+                materialize_backup_zip,
+                self.store,
+                backup_id,
+                expected_public_key=self.identity.public_key_bytes,
+                chunk_size=int(self.settings.backup_transport_chunk_size),
+                cancel_cleanup=lambda archive: archive.close(),
+            )
+            try:
+                self._operation_commit_guard(materialization_lease)
+                self._operation_commit_guard(backup_lease)
+                retained_leases = leases.pop_all()
+                try:
+                    pinned.add_close_callback(retained_leases.close)
+                except BaseException:
+                    retained_leases.close()
+                    raise
+            except BaseException:
+                pinned.close()
+                raise
+            return pinned
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+        except BackupTransportError as exc:
+            raise self._map_transport_error(exc) from exc
+        except BackupError as exc:
+            raise self._map_error(exc, operation="download") from exc
+        finally:
+            leases.close()
+
+    async def upload_local_backup(
+        self,
+        source: BinaryIO,
+        *,
+        operation_lease: BackupOperationLease | None = None,
+    ) -> dict[str, Any]:
+        if operation_lease is None:
+            try:
+                with self.operations.global_exclusive() as owned_lease:
+                    return await self._upload_local_backup_under_lease(
+                        source,
+                        operation_lease=owned_lease,
+                    )
+            except BackupOperationError as exc:
+                raise self._map_operation_error(exc) from exc
+        return await self._upload_local_backup_under_lease(
+            source,
+            operation_lease=operation_lease,
+        )
+
+    async def _upload_local_backup_under_lease(
+        self,
+        source: BinaryIO,
+        *,
+        operation_lease: BackupOperationLease,
+    ) -> dict[str, Any]:
+        if operation_lease.scope != "global" or operation_lease.mode != "exclusive":
+            raise BackupServiceError(
+                500,
+                "backup_operation_control_invalid",
+                "Upload requires the global native backup mutation lease.",
+            )
+        operation_lease.verify_attached()
+        self._require_control_identity_attached()
+        try:
+            limits = BackupTransportLimits.from_settings(self.settings)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BackupServiceError(
+                500,
+                "backup_transport_limits_invalid",
+                "The native backup ZIP limits are invalid.",
+            ) from exc
+
+        prepared_import: PreparedBackupImport | None = None
+        finalized = False
+        try:
+            prepared_import = await _to_thread_quiescent(
+                prepare_backup_zip_import,
+                self.store,
+                source,
+                expected_public_key=self.identity.public_key_bytes,
+                limits=limits,
+                cancel_cleanup=lambda prepared: prepared.abort(),
+            )
+            operation_lease.verify_attached()
+            self._require_control_identity_attached()
+            with self.operations.backup_exclusive(
+                prepared_import.prepared.backup_id
+            ) as backup_lease:
+                inspection = await _finalize_backup_atomically(
+                    self.store.finalize_imported_set,
+                    prepared_import.prepared,
+                    manifest_bytes=prepared_import.manifest_bytes,
+                    signature=prepared_import.signature,
+                    signer_public_key=prepared_import.signer_public_key,
+                    expected_public_key=self.identity.public_key_bytes,
+                    seal_gate=BackupSealGate(),
+                    identity_guard=lambda: self._operation_commit_guard(
+                        operation_lease,
+                        backup_lease,
+                    ),
+                )
+            finalized = True
+            return self._inspection_dict(inspection)
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+        except BackupTransportError as exc:
+            raise self._map_transport_error(exc) from exc
+        except BackupError as exc:
+            raise self._map_error(exc, operation="upload") from exc
+        finally:
+            if prepared_import is not None and not finalized:
+                try:
+                    await _to_thread_cleanup_quiescent(prepared_import.abort)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as cleanup_error:
+                    raise BackupServiceError(
+                        500,
+                        "backup_upload_partial_cleanup_failed",
+                        "The rejected upload could not be removed safely.",
+                    ) from cleanup_error
+
+    async def delete_local_backup(self, backup_id: str) -> None:
+        self._require_control_identity_attached()
+        try:
+            with self.operations.global_exclusive() as operation_lease:
+                with self.operations.backup_exclusive(backup_id) as backup_lease:
+                    await _delete_backup_atomically(
+                        self.store.delete_set,
+                        backup_id,
+                        delete_gate=BackupDeleteGate(),
+                        pre_commit_guard=lambda: self._operation_commit_guard(
+                            operation_lease,
+                            backup_lease,
+                        ),
+                    )
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+        except BackupError as exc:
+            raise self._map_error(exc, operation="delete") from exc
+
     async def create_staging_plan(
         self,
         backup_id: str,
         *,
         jwt_secret_mode: str,
         actor_id: str | None,
+    ) -> dict[str, Any]:
+        try:
+            with self.operations.backup_shared(backup_id) as backup_lease:
+                return await self._create_staging_plan_under_lease(
+                    backup_id,
+                    jwt_secret_mode=jwt_secret_mode,
+                    actor_id=actor_id,
+                    backup_lease=backup_lease,
+                )
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+
+    async def _create_staging_plan_under_lease(
+        self,
+        backup_id: str,
+        *,
+        jwt_secret_mode: str,
+        actor_id: str | None,
+        backup_lease: BackupOperationLease,
     ) -> dict[str, Any]:
         self._require_control_identity_attached()
         try:
@@ -767,7 +1088,9 @@ class NativeBackupService:
                 ),
                 jwt_secret_mode=jwt_secret_mode,
                 actor_id=actor_id,
-                pre_commit_guard=self._require_control_identity_attached,
+                pre_commit_guard=lambda: self._operation_commit_guard(
+                    backup_lease
+                ),
             )
         except StagingPlanError as exc:
             raise BackupServiceError(
@@ -798,6 +1121,37 @@ class NativeBackupService:
     ) -> dict[str, Any]:
         self._require_control_identity_attached()
         try:
+            planned = self.plans.inspect(plan_id)
+        except StagingPlanError as exc:
+            raise BackupServiceError(
+                409,
+                "staging_plan_not_executable",
+                str(exc),
+            ) from exc
+        try:
+            with self.operations.global_exclusive() as operation_lease:
+                with self.operations.backup_shared(
+                    planned.backup_id
+                ) as backup_lease:
+                    return await self._execute_staging_plan_under_lease(
+                        plan_id,
+                        expected_plan_hash=expected_plan_hash,
+                        operation_leases=(operation_lease, backup_lease),
+                    )
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+
+    async def _execute_staging_plan_under_lease(
+        self,
+        plan_id: str,
+        *,
+        expected_plan_hash: str,
+        operation_leases: tuple[BackupOperationLease, ...] = (),
+    ) -> dict[str, Any]:
+        self._require_control_identity_attached()
+        if operation_leases:
+            self._operation_commit_guard(*operation_leases)
+        try:
             plan = self.plans.begin_execution(
                 plan_id,
                 expected_plan_hash=expected_plan_hash,
@@ -818,13 +1172,20 @@ class NativeBackupService:
 
         try:
             result = await self._execute_started_plan(plan)
-            self._require_control_identity_attached()
+            if operation_leases:
+                self._operation_commit_guard(*operation_leases)
+                terminal_guard: Callable[[], None] = lambda: (
+                    self._operation_commit_guard(*operation_leases)
+                )
+            else:
+                self._require_control_identity_attached()
+                terminal_guard = self._require_control_identity_attached
             return self.plans.finish(
                 plan.plan_id,
                 status="validated",
                 expected_attempt_id=attempt_id,
                 data=result,
-                pre_commit_guard=self._require_control_identity_attached,
+                pre_commit_guard=terminal_guard,
             ).as_dict()
         except BaseException as exc:
             failure_code = (
@@ -1151,6 +1512,16 @@ class NativeBackupService:
                 "The local backup signing identity is detached or unsafe.",
             ) from exc
         self._require_control_root_attached()
+
+    def _operation_commit_guard(
+        self,
+        *leases: BackupOperationLease,
+    ) -> None:
+        for lease in leases:
+            lease.verify_attached()
+        self._require_control_identity_attached()
+        for lease in leases:
+            lease.verify_attached()
 
     def _validate_roots(self) -> None:
         active_data_dir = Path(self.settings.data_dir).expanduser().resolve(
@@ -1608,7 +1979,7 @@ class NativeBackupService:
     ) -> AuthenticatedBackupInspection:
         self._require_control_identity_attached()
         try:
-            inspection = await asyncio.to_thread(
+            inspection = await _to_thread_quiescent(
                 self.store.authenticate_set,
                 backup_id,
                 approved_public_key=self.identity.public_key_bytes,
@@ -1713,7 +2084,9 @@ class NativeBackupService:
         ).decode("ascii").rstrip("=")
         return {
             "id": manifest.backup_id,
+            "key": manifest.backup_id,
             "createdAt": manifest.created_at,
+            "modified": manifest.created_at,
             "status": "sealed",
             "authenticated": True,
             "trustStatus": "trusted_local",
@@ -1722,6 +2095,8 @@ class NativeBackupService:
             "resourcesVerified": inspection.resources_verified,
             "resourceCount": len(manifest.resources),
             "totalSize": manifest.total_size,
+            "size": backup_transport_size(manifest),
+            "filename": backup_transport_filename(manifest),
             "metadata": dict(manifest.metadata),
             "resources": [
                 {
@@ -1732,6 +2107,39 @@ class NativeBackupService:
                 for resource in manifest.resources
             ],
         }
+
+    @staticmethod
+    def _map_operation_error(exc: BackupOperationError) -> BackupServiceError:
+        status_code = 500 if isinstance(exc, BackupOperationSafetyError) else 409
+        return BackupServiceError(
+            status_code,
+            exc.code,
+            str(exc),
+        )
+
+    @staticmethod
+    def _map_transport_error(exc: BackupTransportError) -> BackupServiceError:
+        if exc.code == "pocketbase_backup_unsupported":
+            status_code = 422
+        elif exc.code == "backup_signer_untrusted":
+            status_code = 409
+        elif exc.code in {
+            "backup_upload_too_large",
+            "backup_zip_too_many_entries",
+            "backup_zip_central_directory_too_large",
+            "backup_zip_resource_too_large",
+            "backup_zip_uncompressed_too_large",
+            "backup_zip_ratio_exceeded",
+            "backup_zip_metadata_too_large",
+        }:
+            status_code = 413
+        else:
+            status_code = 400
+        return BackupServiceError(
+            status_code,
+            exc.code,
+            str(exc),
+        )
 
     def _map_error(self, exc: Exception, *, operation: str) -> BackupServiceError:
         if isinstance(exc, BackupServiceError):
@@ -1755,6 +2163,13 @@ class NativeBackupService:
                 409,
                 f"postgres_{operation}_contract_failed",
                 f"The PostgreSQL {operation} contract was not satisfied.",
+            )
+        if isinstance(exc, BackupDeletionUncertainError):
+            return BackupServiceError(
+                500,
+                "backup_delete_outcome_uncertain",
+                "The backup deletion outcome is uncertain and requires manual "
+                "recovery.",
             )
         if isinstance(exc, BackupError):
             return BackupServiceError(

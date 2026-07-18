@@ -831,9 +831,9 @@ describe('Auth Collection Flows', () => {
 
     const methods = await pb.collection(authCollection.name).listAuthMethods();
 
-    expect(methods.usernamePassword).toBe(false); // PPBase uses email
-    expect(methods.emailPassword).toBe(true);
-    expect(methods.authProviders).toBeInstanceOf(Array);
+    expect(methods.password.enabled).toBe(true);
+    expect(methods.password.identityFields).toContain('email');
+    expect(methods.oauth2.providers).toBeInstanceOf(Array);
     expect(methods.otp).toBeDefined();
     expect(methods.mfa).toBeDefined();
   });
@@ -980,7 +980,6 @@ describe('Auth Collection Flows', () => {
 
       const methods = await pb.collection(collection.name).listAuthMethods();
       expect(methods.password.enabled).toBe(false);
-      expect(methods.emailPassword).toBe(false);
 
       await expect(
         pb.collection(collection.name).authWithPassword(email, password)

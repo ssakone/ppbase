@@ -480,6 +480,8 @@ class BackupSetSummary:
     signer_fingerprint_sha256: str | None
     resource_count: int | None
     total_size: int | None
+    app_name: str | None
+    manifest: BackupManifest | None
     integrity_status: str
     error_code: str | None
 

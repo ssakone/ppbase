@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -76,6 +77,35 @@ def _redact_sensitive(data: Any) -> Any:
     if isinstance(data, list):
         return [_redact_sensitive(item) for item in data]
     return data
+
+
+def _redact_url_query(url: str) -> str:
+    """Redact sensitive query values before persisting a request URL."""
+    try:
+        parts = urlsplit(url)
+        if parts.username is not None or parts.password is not None:
+            return "[REDACTED URL CREDENTIALS]"
+        if not parts.query:
+            # URL fragments are never part of an HTTP request target.  Keeping
+            # them would also let a malformed raw query hide additional fields
+            # from ``parse_qsl`` (for example ``?page=2#x&token=...``).
+            return urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, "", "")
+            )
+        redacted_query = urlencode(
+            [
+                (key, "[REDACTED]" if _is_sensitive_key(key) else value)
+                for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            ],
+            doseq=True,
+        )
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, redacted_query, "")
+        )
+    except Exception:
+        # Logging must never break a completed request. If parsing or encoding
+        # fails, retaining any portion could persist an unrecognized secret.
+        return "[REDACTED MALFORMED URL]"
 
 
 def _parse_content_length(raw: str | None) -> int | None:
@@ -251,12 +281,16 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
             }
 
         entry = {
-            "url": str(request.url),
+            "url": _redact_url_query(str(request.url)),
             "method": request.method,
             "status": response.status_code,
             "exec_time": elapsed_ms,
             "remote_ip": request.client.host if request.client else None,
-            "referer": request.headers.get("referer"),
+            "referer": (
+                _redact_url_query(request.headers["referer"])
+                if request.headers.get("referer")
+                else None
+            ),
             "user_agent": request.headers.get("user-agent"),
             "request_body": request_payload,
             "response_body": response_payload,

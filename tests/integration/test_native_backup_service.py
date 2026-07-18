@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, suppress
+import io
 import json
 import os
 from pathlib import Path
@@ -739,6 +740,23 @@ async def test_local_backup_roundtrip_dr_and_clone_to_new_targets_only(
     assert durable_race_error.value.code == "storage_runtime_not_reconciled"
     assert not list((Path(settings.backup_root) / "sets").glob(".partial-*"))
 
+    pinned_transport = await service.materialize_local_backup_zip(backup_id)
+    transport_bytes = b"".join(pinned_transport.iter_bytes(4096))
+    assert transport_bytes.startswith(b"PK\x03\x04")
+    await service.delete_local_backup(backup_id)
+    assert backup_id not in {
+        item["id"] for item in await service.list_local_backups()
+    }
+    with service.mutation_operation() as operation_lease:
+        uploaded = await service.upload_local_backup(
+            io.BytesIO(transport_bytes),
+            operation_lease=operation_lease,
+        )
+    assert uploaded["id"] == backup_id
+    assert uploaded["trustStatus"] == "trusted_local"
+    assert (await service.inspect_local_backup(backup_id))["resourcesVerified"] is True
+
     assert active_data_dir.exists()
     assert active_before == b"native backup file payload"
+    service.close()
     await source_engine.dispose()

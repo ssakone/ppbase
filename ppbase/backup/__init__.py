@@ -33,6 +33,7 @@ from ppbase.backup.models import (
 from ppbase.backup.storage import (
     JWT_SECRET_RESOURCE,
     AuthenticatedBackupInspection,
+    BackupDeletionUncertainError,
     BackupSetBuilder,
     LocalBackupStore,
     PinnedBackupArchive,
@@ -48,6 +49,7 @@ __all__ = [
     "MANIFEST_SIGNATURE_DOMAIN",
     "AuthenticatedBackupInspection",
     "BackupAlreadyExistsError",
+    "BackupDeletionUncertainError",
     "BackupError",
     "BackupIdentity",
     "BackupIdentityError",
