@@ -98,6 +98,9 @@ async def validate_staged_database(
     *,
     expected_database: str | None = None,
     expected_owner: str | None = None,
+    expected_restore_role: str | None = None,
+    expected_runtime_role: str | None = None,
+    expected_dump_role: str | None = None,
     expected_contract: DatabaseContract | None = None,
 ) -> StagedDatabaseValidation:
     """Validate system tables, collection relations, and migration metadata."""
@@ -146,6 +149,9 @@ async def validate_staged_database(
             await _validate_database_acl(
                 connection,
                 expected_owner=expected_owner or actual_contract.database_owner,
+                expected_restore_role=expected_restore_role,
+                expected_runtime_role=expected_runtime_role,
+                expected_dump_role=expected_dump_role,
             )
         )
 
@@ -629,6 +635,9 @@ async def _validate_database_acl(
     connection: AsyncConnection,
     *,
     expected_owner: str,
+    expected_restore_role: str | None,
+    expected_runtime_role: str | None,
+    expected_dump_role: str | None,
 ) -> list[ValidationIssue]:
     rows = (
         await connection.execute(
@@ -637,18 +646,18 @@ async def _validate_database_acl(
                 SELECT
                     CASE
                         WHEN expanded.grantee = 0 THEN 'PUBLIC'
-                        ELSE pg_get_userbyid(expanded.grantee)
+                        ELSE pg_catalog.pg_get_userbyid(expanded.grantee)
                     END AS grantee,
                     expanded.privilege_type,
                     expanded.is_grantable,
-                    pg_get_userbyid(d.datdba) AS database_owner,
+                    pg_catalog.pg_get_userbyid(d.datdba) AS database_owner,
                     session_user AS restore_role
-                FROM pg_database AS d
-                CROSS JOIN LATERAL aclexplode(COALESCE(
+                FROM pg_catalog.pg_database AS d
+                CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
                     d.datacl,
-                    acldefault('d', d.datdba)
+                    pg_catalog.acldefault('d', d.datdba)
                 )) AS expanded
-                WHERE d.datname = current_database()
+                WHERE d.datname = pg_catalog.current_database()
                 ORDER BY grantee, expanded.privilege_type
                 """
             )
@@ -664,7 +673,7 @@ async def _validate_database_acl(
         ]
 
     actual_owner = str(rows[0]["database_owner"])
-    restore_role = str(rows[0]["restore_role"])
+    restore_role = expected_restore_role or str(rows[0]["restore_role"])
     if actual_owner != expected_owner:
         issues.append(
             ValidationIssue(
@@ -686,6 +695,10 @@ async def _validate_database_acl(
         expected_owner: {"CONNECT", "CREATE", "TEMPORARY"},
         restore_role: {"CONNECT", "TEMPORARY"},
     }
+    if expected_runtime_role is not None:
+        expected_privileges[expected_runtime_role] = {"CONNECT", "TEMPORARY"}
+    if expected_dump_role is not None:
+        expected_privileges[expected_dump_role] = {"CONNECT"}
     if privileges.get("PUBLIC", set()):
         issues.append(
             ValidationIssue(
@@ -693,9 +706,12 @@ async def _validate_database_acl(
                 "PUBLIC retains privileges on the restored database",
             )
         )
-    unexpected_grantees = sorted(
-        set(privileges) - {"PUBLIC", expected_owner, restore_role}
-    )
+    expected_grantees = {"PUBLIC", expected_owner, restore_role}
+    if expected_runtime_role is not None:
+        expected_grantees.add(expected_runtime_role)
+    if expected_dump_role is not None:
+        expected_grantees.add(expected_dump_role)
+    unexpected_grantees = sorted(set(privileges) - expected_grantees)
     if unexpected_grantees:
         issues.append(
             ValidationIssue(
@@ -716,6 +732,23 @@ async def _validate_database_acl(
             ValidationIssue(
                 "database_acl_mismatch",
                 "restore role has database privilege grant options",
+            )
+        )
+    if expected_runtime_role is not None and grantable.get(
+        expected_runtime_role,
+        set(),
+    ):
+        issues.append(
+            ValidationIssue(
+                "database_acl_mismatch",
+                "runtime role has database privilege grant options",
+            )
+        )
+    if expected_dump_role is not None and grantable.get(expected_dump_role, set()):
+        issues.append(
+            ValidationIssue(
+                "database_acl_mismatch",
+                "dump role has database privilege grant options",
             )
         )
     return issues

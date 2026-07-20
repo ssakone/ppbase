@@ -36,6 +36,9 @@ _VERSION_RE = re.compile(r"\b(\d+)(?:\.(\d+))?(?:\.\d+)*\b")
 _TRUE_VALUES = frozenset({"1", "on", "t", "true", "yes"})
 _SECURE_LOCAL_SEARCH_PATH_SQL = "SET LOCAL search_path = pg_catalog, pg_temp"
 _SECURE_SESSION_SEARCH_PATH_SQL = "SET search_path = pg_catalog, pg_temp"
+LEGACY_RUNTIME_SUPERUSER_WARNING = (
+    "legacy_runtime_superuser: PostgreSQL superuser runtime"
+)
 _LIBPQ_QUERY_PARAMETERS = frozenset(
     {
         "application_name",
@@ -1393,6 +1396,7 @@ async def preflight_database_contract(
     *,
     creator_role: str,
     restore_role: str,
+    runtime_role: str,
     target_owner: str,
     allowed_extensions: Mapping[str, str] | None = None,
 ) -> PreflightReport:
@@ -1400,8 +1404,9 @@ async def preflight_database_contract(
     await set_backup_control_search_path(connection)
     creator = validate_postgres_identifier(creator_role, label="creator role")
     restore = validate_postgres_identifier(restore_role, label="restore role")
+    runtime = validate_postgres_identifier(runtime_role, label="runtime role")
     owner = _validate_target_owner(target_owner)
-    _require_distinct_roles(creator, restore, owner)
+    _require_distinct_roles(creator, restore, runtime, owner)
     allowlist = dict(allowed_extensions or {})
     errors: list[str] = []
     warnings: list[str] = []
@@ -1449,6 +1454,7 @@ async def preflight_database_contract(
         connection,
         creator=creator,
         restore=restore,
+        runtime=runtime,
         owner=owner,
     )
     errors.extend(role_report.errors)
@@ -1522,6 +1528,8 @@ async def create_target_database(
     *,
     target_owner: str,
     restore_role: str,
+    runtime_role: str,
+    dump_role: str | None = None,
     contract: DatabaseContract,
     expected_server_identity: Mapping[str, Any],
     psql: str = "psql",
@@ -1533,12 +1541,22 @@ async def create_target_database(
     target = validate_postgres_identifier(target_database, label="target database")
     owner = _validate_target_owner(target_owner)
     restore = validate_postgres_identifier(restore_role, label="restore role")
+    runtime = validate_postgres_identifier(runtime_role, label="runtime role")
+    dump = (
+        validate_postgres_identifier(dump_role, label="dump role")
+        if dump_role is not None
+        else None
+    )
     connection = sqlalchemy_url_to_libpq(creator_database_url)
     creator = validate_postgres_identifier(
         connection.username,
         label="creator role",
     )
-    _require_distinct_roles(creator, restore, owner)
+    _require_distinct_roles(creator, restore, runtime, owner)
+    if dump is not None and dump in {creator, restore, runtime, owner}:
+        raise PostgresContractError(
+            "dump, creator, restore, runtime, and target owner roles must be distinct"
+        )
     if target == connection.database:
         raise PostgresContractError(
             "target database must differ from the creator maintenance database"
@@ -1551,6 +1569,7 @@ async def create_target_database(
         target=target,
         creator=creator,
         restore=restore,
+        runtime=runtime,
         owner=owner,
         maintenance_database=connection.database,
         expected_server_identity=expected_server_identity,
@@ -1573,6 +1592,7 @@ async def create_target_database(
                     target=target,
                     creator=creator,
                     restore=restore,
+                    runtime=runtime,
                     owner=owner,
                 ),
             ),
@@ -1586,18 +1606,21 @@ async def create_target_database(
             if line.strip()
         ]
         values = output_lines[-1].split("|") if output_lines else []
-        if len(values) != 9:
+        if len(values) != 12:
             raise PostgresContractError(
-                "could not verify creator/restore/owner role contract"
+                "could not verify creator/restore/runtime/owner role contract"
             )
         (
             effective_creator,
             target_exists,
             creator_ok,
             restore_ok,
+            runtime_ok,
+            _runtime_superuser,
             owner_ok,
             creator_member,
             restore_member,
+            runtime_member,
             forbidden_membership,
             unexpected_membership,
         ) = values
@@ -1619,6 +1642,11 @@ async def create_target_database(
                 "restore role must be LOGIN NOINHERIT without CREATEDB or "
                 "elevated attributes"
             )
+        if not _parse_psql_bool(runtime_ok):
+            raise PostgresContractError(
+                "runtime role must be LOGIN and either a strict INHERIT role "
+                "or a PostgreSQL superuser"
+            )
         if not _parse_psql_bool(owner_ok):
             raise PostgresContractError(
                 "target owner must be NOLOGIN without elevated cluster attributes"
@@ -1630,14 +1658,20 @@ async def create_target_database(
                 "creator and restore roles must have direct SET-only, "
                 "non-admin, non-inherited membership in the target owner"
             )
+        if not _parse_psql_bool(runtime_member):
+            raise PostgresContractError(
+                "runtime role must have direct inherited, non-admin "
+                "membership in the target owner"
+            )
         if _parse_psql_bool(forbidden_membership):
             raise PostgresContractError(
-                "creator or restore role has a forbidden server-file/program role"
+                "creator, restore, or runtime role has a forbidden "
+                "server-file/program role"
             )
         if _parse_psql_bool(unexpected_membership):
             raise PostgresContractError(
-                "creator/restore/owner membership graph extends beyond the "
-                "target owner"
+                "creator/restore/runtime/owner membership graph extends beyond "
+                "the target owner"
             )
 
         marker_comment = f"ppbase-restore-marker:{secrets.token_hex(32)}"
@@ -1652,7 +1686,9 @@ async def create_target_database(
                     target,
                     owner,
                     restore,
+                    runtime,
                     marker_comment,
+                    dump=dump,
                 ),
             ),
             env,
@@ -1667,11 +1703,123 @@ async def create_target_database(
     )
 
 
+async def grant_dump_role_read_access(
+    connection: AsyncConnection,
+    *,
+    target_owner: str,
+    dump_role: str,
+) -> None:
+    """Grant only the object reads needed by pg_dump on one restored database."""
+    owner = _validate_target_owner(target_owner)
+    dump = validate_postgres_identifier(dump_role, label="dump role")
+    if owner == dump:
+        raise PostgresContractError("dump role and target owner must be distinct")
+    await set_backup_control_search_path(connection)
+    await connection.execute(text(f"SET LOCAL ROLE {_quote_identifier(owner)}"))
+    dump_identifier = _quote_identifier(dump)
+    large_object_oids = (
+        await connection.execute(
+            text(
+                "SELECT large_object.oid "
+                "FROM pg_catalog.pg_largeobject_metadata AS large_object "
+                "ORDER BY large_object.oid"
+            )
+        )
+    ).scalars().all()
+    for raw_oid in large_object_oids:
+        await connection.execute(
+            text(
+                f"GRANT SELECT ON LARGE OBJECT {int(raw_oid)} TO {dump_identifier}"
+            )
+        )
+    schemas = (
+        await connection.execute(
+            text(
+                "SELECT n.nspname "
+                "FROM pg_catalog.pg_namespace AS n "
+                "WHERE n.nspname <> 'information_schema' "
+                "AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' "
+                "ORDER BY n.nspname"
+            )
+        )
+    ).scalars().all()
+    for raw_schema in schemas:
+        schema_identifier = _quote_catalog_identifier(
+            str(raw_schema),
+            label="schema",
+        )
+        owner_identifier = _quote_identifier(owner)
+        statements = (
+            f"GRANT USAGE ON SCHEMA {schema_identifier} TO {dump_identifier}",
+            f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema_identifier} TO {dump_identifier}",
+            f"GRANT SELECT ON ALL SEQUENCES IN SCHEMA {schema_identifier} TO {dump_identifier}",
+            f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner_identifier} IN SCHEMA {schema_identifier} "
+            f"GRANT SELECT ON TABLES TO {dump_identifier}",
+            f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner_identifier} IN SCHEMA {schema_identifier} "
+            f"GRANT SELECT ON SEQUENCES TO {dump_identifier}",
+        )
+        for statement in statements:
+            await connection.execute(text(statement))
+
+
+async def grant_dump_role_runtime_default_privileges(
+    connection: AsyncConnection,
+    *,
+    runtime_role: str,
+    dump_role: str,
+) -> None:
+    """Install dump defaults for objects later created by the runtime login."""
+    runtime = validate_postgres_identifier(runtime_role, label="runtime role")
+    dump = validate_postgres_identifier(dump_role, label="dump role")
+    if runtime == dump:
+        raise PostgresContractError("dump role and runtime role must be distinct")
+    await set_backup_control_search_path(connection)
+    effective = str(
+        (await connection.execute(text("SELECT current_user"))).scalar_one()
+    )
+    if effective != runtime:
+        raise PostgresContractError(
+            "runtime default privileges require a runtime-authenticated connection"
+        )
+    schemas = (
+        await connection.execute(
+            text(
+                "SELECT n.nspname FROM pg_catalog.pg_namespace AS n "
+                "WHERE n.nspname <> 'information_schema' "
+                "AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' "
+                "ORDER BY n.nspname"
+            )
+        )
+    ).scalars().all()
+    runtime_identifier = _quote_identifier(runtime)
+    dump_identifier = _quote_identifier(dump)
+    for raw_schema in schemas:
+        schema_identifier = _quote_catalog_identifier(
+            str(raw_schema),
+            label="schema",
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {runtime_identifier} "
+                f"IN SCHEMA {schema_identifier} "
+                f"GRANT SELECT ON TABLES TO {dump_identifier}"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {runtime_identifier} "
+                f"IN SCHEMA {schema_identifier} "
+                f"GRANT SELECT ON SEQUENCES TO {dump_identifier}"
+            )
+        )
+
+
 async def _preflight_target_roles(
     connection: AsyncConnection,
     *,
     creator: str,
     restore: str,
+    runtime: str,
     owner: str,
 ) -> PreflightReport:
     row = (
@@ -1681,20 +1829,34 @@ async def _preflight_target_roles(
                     target="__ppbase_preflight_nonexistent__",
                     creator=creator,
                     restore=restore,
+                    runtime=runtime,
                     owner=owner,
                 )
             )
         )
     ).mappings().one()
     errors: list[str] = []
+    warnings: list[str] = []
     if str(row["effective_creator"]) != creator:
         errors.append("preflight connection is not authenticated as creator role")
     if not bool(row["creator_ok"]):
-        errors.append("creator role attributes do not match the native restore contract")
+        errors.append(
+            "creator role attributes do not match the native restore contract"
+        )
     if not bool(row["restore_ok"]):
-        errors.append("restore role attributes do not match the native restore contract")
+        errors.append(
+            "restore role attributes do not match the native restore contract"
+        )
+    if not bool(row["runtime_ok"]):
+        errors.append(
+            "runtime role attributes do not match the native restore contract"
+        )
+    elif bool(row["runtime_superuser"]):
+        warnings.append(LEGACY_RUNTIME_SUPERUSER_WARNING)
     if not bool(row["owner_ok"]):
-        errors.append("target owner attributes do not match the native restore contract")
+        errors.append(
+            "target owner attributes do not match the native restore contract"
+        )
     if not bool(row["creator_member"]):
         errors.append(
             "creator role lacks direct SET-only, non-admin, non-inherited "
@@ -1705,13 +1867,21 @@ async def _preflight_target_roles(
             "restore role lacks direct SET-only, non-admin, non-inherited "
             "membership in target owner"
         )
+    if not bool(row["runtime_member"]):
+        errors.append(
+            "runtime role lacks direct inherited, non-admin membership in "
+            "target owner"
+        )
     if bool(row["forbidden_membership"]):
-        errors.append("creator/restore role has server-file or program privileges")
+        errors.append(
+            "creator/restore/runtime role has server-file or program privileges"
+        )
     if bool(row["unexpected_membership"]):
         errors.append(
-            "creator/restore/owner membership graph extends beyond the target owner"
+            "creator/restore/runtime/owner membership graph extends beyond the "
+            "target owner"
         )
-    return PreflightReport(errors=tuple(errors))
+    return PreflightReport(errors=tuple(errors), warnings=tuple(warnings))
 
 
 async def _preflight_locale(
@@ -1879,11 +2049,13 @@ def _role_and_target_check_sql(
     target: str,
     creator: str,
     restore: str,
+    runtime: str,
     owner: str,
 ) -> str:
     target_literal = _sql_literal(target)
     creator_literal = _sql_literal(creator)
     restore_literal = _sql_literal(restore)
+    runtime_literal = _sql_literal(runtime)
     owner_literal = _sql_literal(owner)
     return f"""
         SELECT
@@ -1907,6 +2079,24 @@ def _role_and_target_check_sql(
                   AND NOT rolsuper AND NOT rolcreaterole
                   AND NOT rolreplication AND NOT rolbypassrls
             ) AS restore_ok,
+            EXISTS (
+                SELECT 1 FROM pg_catalog.pg_roles
+                WHERE rolname = {runtime_literal}
+                  AND rolcanlogin
+                  AND (
+                      rolsuper
+                      OR (
+                          NOT rolcreatedb AND rolinherit
+                          AND NOT rolcreaterole AND NOT rolreplication
+                          AND NOT rolbypassrls
+                      )
+                  )
+            ) AS runtime_ok,
+            EXISTS (
+                SELECT 1 FROM pg_catalog.pg_roles
+                WHERE rolname = {runtime_literal}
+                  AND rolsuper
+            ) AS runtime_superuser,
             EXISTS (
                 SELECT 1 FROM pg_catalog.pg_roles
                 WHERE rolname = {owner_literal}
@@ -1994,13 +2184,53 @@ def _role_and_target_check_sql(
             ) AS restore_member,
             EXISTS (
                 SELECT 1
-                FROM (VALUES ({creator_literal}), ({restore_literal})) AS r(role_name)
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS member_role
+                  ON member_role.oid = membership.member
+                JOIN pg_catalog.pg_roles AS granted_role
+                  ON granted_role.oid = membership.roleid
+                WHERE member_role.rolname = {runtime_literal}
+                  AND granted_role.rolname = {owner_literal}
+                  AND NOT membership.admin_option
+                  AND COALESCE(
+                      (pg_catalog.to_jsonb(membership)->>'inherit_option')::boolean,
+                      member_role.rolinherit
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS member_role
+                  ON member_role.oid = membership.member
+                JOIN pg_catalog.pg_roles AS granted_role
+                  ON granted_role.oid = membership.roleid
+                WHERE member_role.rolname = {runtime_literal}
+                  AND granted_role.rolname = {owner_literal}
+                  AND (
+                      membership.admin_option
+                      OR NOT COALESCE(
+                          (pg_catalog.to_jsonb(membership)->>'inherit_option')::boolean,
+                          member_role.rolinherit
+                      )
+                  )
+            ) AS runtime_member,
+            EXISTS (
+                SELECT 1
+                FROM (VALUES ({creator_literal}), ({restore_literal}),
+                             ({runtime_literal})) AS r(role_name)
                 CROSS JOIN (
                     VALUES ('pg_read_server_files'),
                            ('pg_write_server_files'),
                            ('pg_execute_server_program')
                 ) AS f(role_name)
-                WHERE COALESCE(pg_catalog.pg_has_role(
+                WHERE (
+                    r.role_name <> {runtime_literal}
+                    OR NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_roles AS runtime_role
+                        WHERE runtime_role.rolname = {runtime_literal}
+                          AND runtime_role.rolsuper
+                    )
+                )
+                  AND COALESCE(pg_catalog.pg_has_role(
                     (
                         SELECT oid FROM pg_catalog.pg_roles
                         WHERE rolname = r.role_name
@@ -2021,22 +2251,36 @@ def _role_and_target_check_sql(
                   ON granted_role.oid = membership.roleid
                 WHERE (
                     member_role.rolname IN (
-                        {creator_literal}, {restore_literal}, {owner_literal}
+                        {creator_literal}, {restore_literal}, {runtime_literal},
+                        {owner_literal}
                     )
                     OR granted_role.rolname IN (
-                        {creator_literal}, {restore_literal}, {owner_literal}
+                        {creator_literal}, {restore_literal}, {runtime_literal},
+                        {owner_literal}
                     )
                 ) AND NOT (
-                    member_role.rolname IN ({creator_literal}, {restore_literal})
-                    AND granted_role.rolname = {owner_literal}
-                    AND NOT membership.admin_option
-                    AND COALESCE(
-                        (pg_catalog.to_jsonb(membership)->>'set_option')::boolean,
-                        true
-                    )
-                    AND NOT COALESCE(
-                        (pg_catalog.to_jsonb(membership)->>'inherit_option')::boolean,
-                        member_role.rolinherit
+                    (
+                        member_role.rolname IN (
+                            {creator_literal}, {restore_literal}
+                        )
+                        AND granted_role.rolname = {owner_literal}
+                        AND NOT membership.admin_option
+                        AND COALESCE(
+                            (pg_catalog.to_jsonb(membership)->>'set_option')::boolean,
+                            true
+                        )
+                        AND NOT COALESCE(
+                            (pg_catalog.to_jsonb(membership)->>'inherit_option')::boolean,
+                            member_role.rolinherit
+                        )
+                    ) OR (
+                        member_role.rolname = {runtime_literal}
+                        AND granted_role.rolname = {owner_literal}
+                        AND NOT membership.admin_option
+                        AND COALESCE(
+                            (pg_catalog.to_jsonb(membership)->>'inherit_option')::boolean,
+                            member_role.rolinherit
+                        )
                     )
                 )
             ) AS unexpected_membership
@@ -2048,6 +2292,7 @@ def _create_target_precondition_sql(
     target: str,
     creator: str,
     restore: str,
+    runtime: str,
     owner: str,
     maintenance_database: str,
     expected_server_identity: Mapping[str, Any],
@@ -2087,6 +2332,7 @@ def _create_target_precondition_sql(
         target=target,
         creator=creator,
         restore=restore,
+        runtime=runtime,
         owner=owner,
     )
     creator_literal = _sql_literal(creator)
@@ -2132,9 +2378,11 @@ def _create_target_precondition_sql(
                OR role_check.target_exists
                OR NOT role_check.creator_ok
                OR NOT role_check.restore_ok
+               OR NOT role_check.runtime_ok
                OR NOT role_check.owner_ok
                OR NOT role_check.creator_member
                OR NOT role_check.restore_member
+               OR NOT role_check.runtime_member
                OR role_check.forbidden_membership
                OR role_check.unexpected_membership
             THEN
@@ -2174,12 +2422,22 @@ def _normalize_database_acl_sql(
     target: str,
     owner: str,
     restore: str,
+    runtime: str,
     marker_comment: str,
+    *,
+    dump: str | None = None,
 ) -> str:
     """Bind the new target before admitting the restore login."""
     target_identifier = _quote_identifier(target)
     owner_identifier = _quote_identifier(owner)
     restore_identifier = _quote_identifier(restore)
+    runtime_identifier = _quote_identifier(runtime)
+    dump_grant = (
+        f"GRANT CONNECT ON DATABASE {target_identifier} "
+        f"TO {_quote_identifier(dump)};"
+        if dump is not None
+        else ""
+    )
     marker_literal = _sql_literal(marker_comment)
     return " ".join(
         (
@@ -2188,6 +2446,9 @@ def _normalize_database_acl_sql(
             f"REVOKE ALL ON DATABASE {target_identifier} FROM PUBLIC;",
             f"GRANT CONNECT, TEMPORARY ON DATABASE {target_identifier} "
             f"TO {restore_identifier};",
+            f"GRANT CONNECT, TEMPORARY ON DATABASE {target_identifier} "
+            f"TO {runtime_identifier};",
+            dump_grant,
             f"COMMENT ON DATABASE {target_identifier} IS {marker_literal};",
             f"ALTER DATABASE {target_identifier} ALLOW_CONNECTIONS true;",
             "COMMIT",
@@ -2337,10 +2598,16 @@ def _require_expected_major(
         )
 
 
-def _require_distinct_roles(creator: str, restore: str, owner: str) -> None:
-    if len({creator, restore, owner}) != 3:
+def _require_distinct_roles(
+    creator: str,
+    restore: str,
+    runtime: str,
+    owner: str,
+) -> None:
+    if len({creator, restore, runtime, owner}) != 4:
         raise PostgresContractError(
-            "creator login, restore login, and target owner must be distinct roles"
+            "creator login, restore login, runtime login, and target owner must "
+            "be distinct roles"
         )
 
 
@@ -2406,6 +2673,13 @@ def _escape_pgpass_field(value: str) -> str:
 def _quote_identifier(value: str) -> str:
     validate_postgres_identifier(value)
     return f'"{value}"'
+
+
+def _quote_catalog_identifier(value: str, *, label: str = "identifier") -> str:
+    """Quote an identifier read from PostgreSQL without narrowing its syntax."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise PostgresContractError(f"{label} returned by PostgreSQL is invalid")
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _sql_literal(value: str) -> str:

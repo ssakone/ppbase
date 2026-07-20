@@ -82,6 +82,11 @@ def _redact_sensitive(data: Any) -> Any:
 def _redact_url_query(url: str) -> str:
     """Redact sensitive query values before persisting a request URL."""
     try:
+        # Snapshot the underlying builtin string without dispatching to
+        # methods overridden by a ``str`` subclass.  ``urllib.parse`` calls
+        # methods such as ``lstrip()`` on its input, which could otherwise be
+        # made to parse different content than the value eventually stored.
+        url = str.__str__(url)
         parts = urlsplit(url)
         if parts.username is not None or parts.password is not None:
             return "[REDACTED URL CREDENTIALS]"

@@ -39,6 +39,11 @@ from ppbase.backup.storage import (
     PinnedBackupArchive,
     PreparedBackupSet,
 )
+from ppbase.backup.trust import (
+    BackupTrustError,
+    BackupTrustStore,
+    TrustedBackupSigner,
+)
 
 
 __all__ = [
@@ -63,10 +68,13 @@ __all__ = [
     "BackupSetBuilder",
     "BackupSetSummary",
     "BackupStateError",
+    "BackupTrustError",
+    "BackupTrustStore",
     "BackupUnsafeSourceError",
     "LocalBackupStore",
     "PinnedBackupArchive",
     "PreparedBackupSet",
+    "TrustedBackupSigner",
     "canonical_json_bytes",
     "public_key_fingerprint",
     "verify_manifest_signature",

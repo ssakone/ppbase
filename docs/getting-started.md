@@ -3,7 +3,8 @@
 ## Prerequisites
 
 - Python 3.11+
-- Docker (for the managed PostgreSQL container)
+- A reachable PostgreSQL server
+- Docker only if using the optional managed local PostgreSQL container
 - Node.js 18+ (only if rebuilding the Admin UI)
 
 ## Installation
@@ -23,7 +24,8 @@ pip install -e ".[dev]"
 
 ## Start the database
 
-PPBase ships with a `db` CLI sub-command that manages a local Docker container running PostgreSQL 17 on port **5433**:
+PPBase ships with an optional `db` CLI sub-command that manages a local Docker
+container running PostgreSQL 17 on port **5433**:
 
 ```bash
 python -m ppbase db start    # create & start (first run pulls the image)
@@ -34,17 +36,45 @@ python -m ppbase db restart  # restart
 
 > **Custom PostgreSQL?** Set `PPBASE_DATABASE_URL` to your connection string and skip this step.
 
+Docker is not required by PPBase itself or by native backup/restore. A normal
+PostgreSQL service plus matching `pg_dump`, `pg_restore`, and `psql` tools is
+sufficient.
+
+### Initialize a fresh PostgreSQL project
+
+For a PostgreSQL cluster where the application database and limited roles do
+not exist yet, use the autonomous onboarding command. The bootstrap DSN is
+ephemeral and is never written to the generated file:
+
+```bash
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
+  ppbase init postgres --plan --name myapp --output-env ./ppbase.env
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
+  ppbase init postgres --execute --name myapp --output-env ./ppbase.env
+```
+
+The execute command creates the `myapp` database, its limited runtime role,
+the native backup roles and a mode-`0600` env file. It also creates PPBase's
+default `pb_data`, backup, control, staging and durable target directories as
+private `0700` directories. Repeating the same command with the same env file
+is a no-op and preserves its credentials and inode. Use the advanced path
+flags only when the deployment cannot use the PPBase defaults, and expose the
+same custom paths through their `PPBASE_*` variables when starting the service.
+
+For an application database/runtime that already exists, keep using
+`ppbase backup provision`; it applies only the backup role contract.
+
 ## Create your first admin
 
 ```bash
-python -m ppbase create-admin --email admin@example.com --password secret123
+ppbase create-admin --email admin@example.com --password secret123
 ```
 
 ## Run the server
 
 ```bash
 # Foreground (dev)
-python -m ppbase serve
+ppbase serve
 
 # Foreground with custom public + migrations directories
 python -m ppbase serve --publicDir ./public --migrationsDir ./pb_migrations
@@ -74,6 +104,17 @@ Or using the shell helper:
 ```
 
 Open **http://127.0.0.1:8090/_/** in your browser to access the Admin UI.
+
+When deploying directly from a source clone, build the assets once after clone
+and rebuild them after Admin UI changes before restarting PPBase:
+
+```bash
+cd admin-ui
+npm ci
+npm run build
+```
+
+Installed wheels include their packaged Admin UI assets.
 
 ### SMTP test (admin)
 

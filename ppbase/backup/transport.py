@@ -423,7 +423,7 @@ def materialize_backup_zip(
     store: LocalBackupStore,
     backup_id: str,
     *,
-    expected_public_key: bytes,
+    expected_public_key: bytes | None,
     chunk_size: int,
 ) -> PinnedBackupZip:
     """Build a complete verified ZIP without persisting it canonically."""
@@ -1023,7 +1023,7 @@ def prepare_backup_zip_import(
     store: LocalBackupStore,
     source: BinaryIO,
     *,
-    expected_public_key: bytes,
+    expected_public_key: bytes | None,
     limits: BackupTransportLimits,
 ) -> PreparedBackupImport:
     """Validate and extract one ZIP into a hidden store-owned partial set."""
@@ -1151,7 +1151,7 @@ def prepare_backup_zip_import(
                     )
                 resource_infos[resource.path] = (resource, info)
 
-            if not secrets.compare_digest(
+            if expected_public_key is not None and not secrets.compare_digest(
                 signer_public_key,
                 expected_public_key,
             ):

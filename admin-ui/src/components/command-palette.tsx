@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type ElementType, type KeyboardEvent } fr
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Activity,
+  ArchiveRestore,
   ChevronRight,
   Database,
   GitBranch,
@@ -109,6 +110,16 @@ export function CommandPalette() {
         icon: Activity,
         prefetch: 'logs',
         run: go('/logs'),
+      },
+      {
+        id: 'go-backups',
+        label: 'Go to Backups',
+        hint: 'Settings',
+        group: 'Navigation',
+        keywords: ['backup', 'restore', 'disaster recovery', 'clone'],
+        icon: ArchiveRestore,
+        prefetch: 'backups',
+        run: go('/settings/backups'),
       },
       {
         id: 'go-settings',

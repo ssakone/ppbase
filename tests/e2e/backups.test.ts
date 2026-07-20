@@ -8,14 +8,28 @@ import { getAdminPb, getFreshPb } from './helpers'
 
 const runConfiguredLifecycle = process.env.PPBASE_BACKUP_E2E === '1' ? it : it.skip
 
-// Partial transport compatibility only: restore() and the Dashboard workflow
-// are intentionally not delivered in this tranche.
-describe('Partial PocketBase BackupService v0.27 transport compatibility', () => {
+describe('PocketBase BackupService v0.27 compatibility', () => {
   it('builds the exact tokenized PPBase download URL', () => {
     const pb = getFreshPb()
     const url = pb.backups.getDownloadURL('file token/+', 'backup key.zip')
 
     expect(url).toContain('/api/backups/backup%20key.zip?token=file%20token%2F%2B')
+  })
+
+  it('routes restore() to the PocketBase-compatible PPBase endpoint', async () => {
+    const pb = getFreshPb()
+    let requestPath = ''
+    let requestOptions: Record<string, unknown> | undefined
+    pb.send = (async (path: string, options?: Record<string, unknown>) => {
+      requestPath = path
+      requestOptions = options
+      return undefined
+    }) as typeof pb.send
+
+    await pb.backups.restore('backup key.zip')
+
+    expect(requestPath).toBe('/api/backups/backup%20key.zip/restore')
+    expect(requestOptions?.method).toBe('POST')
   })
 
   describe('configured native-backup server', () => {
@@ -41,10 +55,14 @@ describe('Partial PocketBase BackupService v0.27 transport compatibility', () =>
         const createdList = await pb.backups.getFullList()
         const created = createdList.find(item => !beforeKeys.has(item.key))
         expect(created).toBeTruthy()
-        expect(created?.key).toBeTruthy()
+        expect(created?.key).toBe(requestedName)
         expect(typeof created?.size).toBe('number')
         expect(created!.size).toBeGreaterThan(0)
         expect(typeof created?.modified).toBe('string')
+
+        await expect(pb.backups.create(requestedName)).rejects.toMatchObject({
+          status: 409,
+        })
 
         const token = await pb.files.getToken()
         const downloadURL = pb.backups.getDownloadURL(token, created!.key)

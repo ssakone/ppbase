@@ -21,7 +21,16 @@ export function Layout() {
     }
 
     const warmRoutes = () => {
-      prefetchRoutes(['dashboard', 'collections', 'records', 'migrations', 'hooks', 'logs', 'settings'])
+      prefetchRoutes([
+        'dashboard',
+        'collections',
+        'records',
+        'migrations',
+        'hooks',
+        'logs',
+        'backups',
+        'settings',
+      ])
     }
 
     if (typeof window === 'undefined') {
@@ -54,6 +63,7 @@ export function Layout() {
     if (location.pathname === '/migrations') return 'Migrations'
     if (location.pathname === '/hooks') return 'Hooks'
     if (location.pathname === '/logs') return 'Logs'
+    if (location.pathname === '/settings/backups') return 'Backups'
     if (location.pathname === '/settings') return 'Settings'
     return 'PPBase'
   })()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import stat
 from collections.abc import Callable
@@ -1324,6 +1325,33 @@ def test_jwt_secret_copy_refuses_a_symlink(tmp_path: Path) -> None:
         builder.copy_jwt_secret(linked_secret)
 
 
+def test_explicit_jwt_secret_is_written_as_a_private_signed_resource(
+    tmp_path: Path,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    builder = store.begin_set("explicit-jwt-secret")
+    _write_dump(builder)
+
+    builder.write_jwt_secret("explicit-runtime-secret")
+    inspection = store.finalize_set(
+        builder.prepare(),
+        metadata={"jwt_secret": {"mode": "included_resource"}},
+        created_at=FIXED_TIME,
+    )
+
+    resource = next(
+        item for item in inspection.manifest.resources
+        if item.path == JWT_SECRET_RESOURCE
+    )
+    secret_path = inspection.path / JWT_SECRET_RESOURCE
+    assert secret_path.read_bytes() == b"explicit-runtime-secret\n"
+    assert resource.size == len(b"explicit-runtime-secret\n")
+    assert _mode(secret_path) == 0o600
+
+    with pytest.raises(BackupStateError, match="already copied"):
+        builder.write_jwt_secret("another-secret")
+
+
 def test_absent_storage_source_produces_an_empty_files_resource(tmp_path: Path) -> None:
     store = LocalBackupStore(tmp_path / "backups")
     missing_storage = tmp_path / "data" / "storage"
@@ -1708,6 +1736,57 @@ def test_anchored_staging_clone_secret_is_exclusive_and_never_replaced(
 
     assert secret_path.read_bytes() == b"first clone secret\n"
     assert _mode(secret_path) == 0o600
+
+
+def test_existing_staging_target_is_reopened_and_secret_hashed_by_descriptor(
+    tmp_path: Path,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    staging_root = tmp_path / "restore-staging"
+    staging_root.mkdir(mode=0o700)
+    os.chmod(staging_root, 0o700)
+    relative = Path("plan-reopen") / "data"
+    secret = b"validated staged secret\n"
+
+    with store.open_staging_data_dir(staging_root, relative) as created:
+        (created.path / "storage").mkdir(mode=0o700)
+        os.chmod(created.path / "storage", 0o700)
+        created.write_secret(secret)
+
+    with store.open_existing_staging_data_dir(staging_root, relative) as reopened:
+        assert reopened.path == staging_root / relative
+        assert reopened.read_secret_sha256() == hashlib.sha256(
+            secret.strip()
+        ).hexdigest()
+        reopened.verify_attached()
+
+
+def test_existing_staging_target_never_follows_substituted_symlink(
+    tmp_path: Path,
+) -> None:
+    store = LocalBackupStore(tmp_path / "backups")
+    staging_root = tmp_path / "restore-staging"
+    staging_root.mkdir(mode=0o700)
+    os.chmod(staging_root, 0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    os.chmod(outside, 0o700)
+    (outside / ".jwt_secret").write_text("outside-secret\n", encoding="utf-8")
+    os.chmod(outside / ".jwt_secret", 0o600)
+    plan = staging_root / "plan-substituted"
+    plan.mkdir(mode=0o700)
+    os.chmod(plan, 0o700)
+    (plan / "data").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(BackupStateError):
+        store.open_existing_staging_data_dir(
+            staging_root,
+            Path("plan-substituted") / "data",
+        )
+
+    assert (outside / ".jwt_secret").read_text(encoding="utf-8") == (
+        "outside-secret\n"
+    )
 
 
 def test_anchored_jwt_install_never_unlinks_an_existing_secret(

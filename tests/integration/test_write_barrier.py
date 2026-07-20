@@ -26,7 +26,9 @@ from ppbase.services import (
 from ppbase.services.migration_runner import migration_lock
 from ppbase.services.write_barrier import (
     WriteBarrierConnectionLostError,
+    WriteBarrierError,
     WriteBarrierTimeoutError,
+    acquire_retained_backup_write_barrier,
     assert_write_barrier_held,
     backup_write_barrier,
     mutation_write_barrier,
@@ -547,7 +549,6 @@ async def test_backup_lock_order_avoids_deadlock_with_pool_size_one(
             mutation_entered.set()
 
     backup_task: asyncio.Task[None] | None = None
-    mutation_task: asyncio.Task[None] | None = None
     try:
         # An existing migration may finish without joining the new barrier.
         # The backup takes the barrier first and then waits for this lock.
@@ -585,6 +586,134 @@ async def test_backup_lock_order_avoids_deadlock_with_pool_size_one(
             observer_engine,
         ):
             await engine.dispose()
+
+
+async def test_retained_cutover_barrier_blocks_mutations_until_explicit_release(
+    write_barrier_url: str,
+) -> None:
+    cutover_engine = create_async_engine(
+        write_barrier_url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.2,
+    )
+    mutation_engine = create_async_engine(
+        write_barrier_url,
+        pool_size=1,
+        max_overflow=0,
+    )
+    mutation_entered = asyncio.Event()
+    guard = None
+    mutation_task: asyncio.Task[None] | None = None
+
+    async def mutate() -> None:
+        async with mutation_write_barrier(
+            mutation_engine,
+            timeout_seconds=3,
+        ):
+            mutation_entered.set()
+
+    try:
+        guard = await acquire_retained_backup_write_barrier(
+            cutover_engine,
+            timeout_seconds=3,
+        )
+        assert guard.active is True
+        await guard.verify_held()
+
+        with pytest.raises(WriteBarrierError, match="mutations are fenced"):
+            await mutate()
+        assert mutation_entered.is_set() is False
+
+        # Exec failure callbacks arrive from the restart thread and marshal
+        # release onto a fresh task on this loop.
+        await asyncio.create_task(guard.close())
+        assert guard.active is False
+        await mutate()
+        assert mutation_entered.is_set() is True
+    finally:
+        if guard is not None and guard.active:
+            await guard.close()
+        await cutover_engine.dispose()
+        await mutation_engine.dispose()
+
+
+async def test_queued_mutation_rechecks_process_fence_after_cutover_session_loss(
+    write_barrier_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cutover_engine = create_async_engine(
+        write_barrier_url,
+        pool_size=1,
+        max_overflow=0,
+    )
+    mutation_engine = create_async_engine(
+        write_barrier_url,
+        pool_size=1,
+        max_overflow=0,
+    )
+    observer_engine = create_async_engine(write_barrier_url, poolclass=NullPool)
+    mutation_open_started = asyncio.Event()
+    allow_mutation_open = asyncio.Event()
+    mutation_entered = asyncio.Event()
+    original_open_lease = write_barrier_module._open_lease
+
+    async def delayed_mutation_open(engine, **kwargs):
+        if engine is mutation_engine:
+            mutation_open_started.set()
+            await allow_mutation_open.wait()
+        return await original_open_lease(engine, **kwargs)
+
+    monkeypatch.setattr(
+        write_barrier_module,
+        "_open_lease",
+        delayed_mutation_open,
+    )
+
+    async def mutate() -> None:
+        async with mutation_write_barrier(
+            mutation_engine,
+            timeout_seconds=3,
+        ):
+            mutation_entered.set()
+
+    guard = None
+    mutation_task = asyncio.create_task(mutate())
+    try:
+        await asyncio.wait_for(mutation_open_started.wait(), timeout=2)
+        guard = await acquire_retained_backup_write_barrier(
+            cutover_engine,
+            timeout_seconds=3,
+        )
+        allow_mutation_open.set()
+
+        async with observer_engine.begin() as observer:
+            terminated = bool(
+                (
+                    await observer.execute(
+                        text("SELECT pg_catalog.pg_terminate_backend(:pid)"),
+                        {"pid": guard.lease.backend_pid},
+                    )
+                ).scalar_one()
+            )
+        assert terminated is True
+
+        with pytest.raises(WriteBarrierError, match="mutations are fenced"):
+            await asyncio.wait_for(mutation_task, timeout=3)
+        assert mutation_entered.is_set() is False
+    finally:
+        allow_mutation_open.set()
+        if not mutation_task.done():
+            mutation_task.cancel()
+            await asyncio.gather(mutation_task, return_exceptions=True)
+        if guard is not None:
+            try:
+                await guard.close()
+            except WriteBarrierError:
+                pass
+        await observer_engine.dispose()
+        await mutation_engine.dispose()
+        await cutover_engine.dispose()
 
 
 async def test_exclusive_timeout_releases_partial_lease(

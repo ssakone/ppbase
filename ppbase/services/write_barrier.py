@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -63,6 +64,33 @@ class WriteBarrierMode(str, Enum):
 
 _WRITE_BARRIER_SEED = 0x505042415345  # "PPBASE"
 _WRITE_BARRIER_POLL_SECONDS = 0.05
+_cutover_fence_lock = threading.Lock()
+_cutover_fence_count = 0
+
+
+def _activate_process_cutover_fence() -> None:
+    global _cutover_fence_count
+    with _cutover_fence_lock:
+        _cutover_fence_count += 1
+
+
+def _release_process_cutover_fence() -> None:
+    global _cutover_fence_count
+    with _cutover_fence_lock:
+        _cutover_fence_count = max(0, _cutover_fence_count - 1)
+
+
+def _process_cutover_is_fenced() -> bool:
+    with _cutover_fence_lock:
+        return _cutover_fence_count > 0
+
+
+def _reject_process_cutover_mutation() -> None:
+    if _process_cutover_is_fenced():
+        raise WriteBarrierError(
+            "DB/file mutations are fenced while backup activation replaces "
+            "the current PPBase process."
+        )
 
 
 @dataclass(slots=True)
@@ -106,6 +134,114 @@ class WriteBarrierLease:
         except RuntimeError:
             current_task = None
         return self._owner_task is current_task
+
+
+@dataclass(slots=True)
+class RetainedBackupWriteBarrier:
+    """An exclusive barrier that may outlive the request task that acquired it.
+
+    Cutover is the one backup operation whose commit point is immediately
+    followed by an in-place ``exec``.  A normal async context manager would
+    release its PostgreSQL session when the request returns, leaving a window
+    where DB/file mutations could commit against the old runtime after the new
+    target had already been published.  This explicitly retained form keeps
+    the exclusive write barrier and migration lock on one connection until
+    either ``exec`` replaces the process or the durable activation rollback is
+    complete.
+
+    The guard is loop-affine because the SQLAlchemy async connection is.  It
+    deliberately does not install a ContextVar lease: cutover code must not do
+    ordinary storage work while all mutation writers are excluded.
+    """
+
+    lease: WriteBarrierLease
+    _migration_context: Any = field(repr=False)
+    _loop: asyncio.AbstractEventLoop = field(repr=False)
+    _close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _process_fence_active: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def active(self) -> bool:
+        return (
+            not self._closed
+            and self.lease._barrier_acquired
+            and not self.lease.connection.closed
+            and not self.lease.connection.invalidated
+        )
+
+    async def verify_held(self) -> None:
+        """Prove that the original backend still owns the exclusive lock."""
+        if asyncio.get_running_loop() is not self._loop or self._closed:
+            raise WriteBarrierConnectionLostError(
+                "The retained PostgreSQL write barrier is no longer available."
+            )
+        owner = asyncio.current_task()
+        if owner is None:  # pragma: no cover - async runtime invariant
+            raise WriteBarrierConnectionLostError(
+                "The retained PostgreSQL write barrier has no owning task."
+            )
+        previous_owner = self.lease._owner_task
+        previous_active = self.lease._active
+        self.lease._owner_task = owner
+        self.lease._active = True
+        try:
+            await assert_write_barrier_held(self.lease)
+            # Verification SELECTs must not leave the cutover connection idle
+            # in transaction during the restart delay. Both advisory locks are
+            # session-level and survive this commit.
+            await self.lease.connection.commit()
+        except WriteBarrierError:
+            raise
+        except Exception as exc:
+            await _cleanup_connection(self.lease.connection)
+            raise WriteBarrierConnectionLostError(
+                "Could not finish verification of the retained write barrier."
+            ) from exc
+        finally:
+            self.lease._active = previous_active
+            self.lease._owner_task = previous_owner
+
+    async def close(self) -> None:
+        """Release both session locks and close their dedicated connection."""
+        if asyncio.get_running_loop() is not self._loop:
+            raise WriteBarrierError(
+                "The retained write barrier must be released on its owning loop."
+            )
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.lease._active = False
+            self.lease._owner_task = None
+
+            first_error: BaseException | None = None
+            try:
+                await self._migration_context.__aexit__(None, None, None)
+            except BaseException as exc:
+                first_error = exc
+            try:
+                await _release_lease(self.lease)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            try:
+                await self.lease.connection.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            finally:
+                if self._process_fence_active:
+                    self._process_fence_active = False
+                    _release_process_cutover_fence()
+
+            if first_error is not None:
+                if isinstance(first_error, WriteBarrierError):
+                    raise first_error
+                raise WriteBarrierConnectionLostError(
+                    "The retained PostgreSQL write barrier could not be released "
+                    "cleanly."
+                ) from first_error
 
 
 _current_write_barrier: ContextVar[WriteBarrierLease | None] = ContextVar(
@@ -573,6 +709,7 @@ async def mutation_write_barrier(
     merely because this primitive exists; their DB/file mutation entry points
     must join this same context before they are considered coordinated.
     """
+    _reject_process_cutover_mutation()
     current = current_write_barrier_lease()
     if current is not None:
         if current.mode is not WriteBarrierMode.SHARED:
@@ -593,6 +730,11 @@ async def mutation_write_barrier(
         mode=WriteBarrierMode.SHARED,
         timeout_seconds=timeout_seconds,
     ) as lease:
+        # The mutation may have passed the admission check just before a
+        # cutover acquired the exclusive PostgreSQL lock and raised the
+        # process fence. Recheck after the shared lock is actually granted so
+        # a lost cutover session cannot wake an already queued writer.
+        _reject_process_cutover_mutation()
         yield lease
 
 
@@ -608,6 +750,7 @@ async def mutation_write_barrier_on_connection(
     that already checked out the only pool connection. The context neither
     commits nor rolls back nor closes the supplied connection.
     """
+    _reject_process_cutover_mutation()
     current = current_write_barrier_lease()
     if current is not None:
         if current.mode is not WriteBarrierMode.SHARED:
@@ -629,6 +772,7 @@ async def mutation_write_barrier_on_connection(
         timeout_seconds=timeout_seconds,
     )
     async with _active_lease(lease):
+        _reject_process_cutover_mutation()
         yield lease
 
 
@@ -678,6 +822,85 @@ async def backup_write_barrier(
                 "The PostgreSQL session holding the ordered backup locks was "
                 "lost."
             ) from exc
+
+
+async def acquire_retained_backup_write_barrier(
+    engine: AsyncEngine,
+    *,
+    timeout_seconds: float = 30.0,
+) -> RetainedBackupWriteBarrier:
+    """Acquire the ordered backup locks for transfer across request teardown.
+
+    Acquisition is identical to :func:`backup_write_barrier`: the exclusive
+    DB/file barrier is acquired first and the migration lock second, both on
+    one dedicated connection.  Unlike the context-manager form, the caller
+    must explicitly close the returned guard after it has durably abandoned a
+    cutover.  A successful ``exec`` closes the non-inheritable descriptors as
+    the old process image disappears.
+    """
+    if current_write_barrier_lease() is not None:
+        raise WriteBarrierError(
+            "The retained backup barrier cannot be nested or promoted from "
+            "a shared mutation lease."
+        )
+    _validate_timeout(timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    lease = await _open_lease(
+        engine,
+        mode=WriteBarrierMode.EXCLUSIVE,
+        timeout_seconds=timeout_seconds,
+    )
+    migration_context = migration_lock_on_connection(
+        lease.connection,
+        timeout_seconds=_remaining(deadline),
+    )
+    try:
+        await migration_context.__aenter__()
+    except BaseException as exc:
+        release_error: BaseException | None = None
+        try:
+            await _release_lease(lease)
+        except BaseException as cleanup_exc:
+            release_error = cleanup_exc
+        try:
+            await lease.connection.close()
+        except BaseException as cleanup_exc:
+            if release_error is None:
+                release_error = cleanup_exc
+        if release_error is not None:
+            logger.exception(
+                "Failed to release a partially acquired retained write barrier",
+                exc_info=release_error,
+            )
+        if isinstance(exc, MigrationLockError):
+            if "Timed out" in str(exc):
+                raise WriteBarrierTimeoutError(
+                    "Timed out waiting for the PPBase migration lock."
+                ) from exc
+            raise WriteBarrierConnectionLostError(
+                "The PostgreSQL session holding the ordered cutover locks was "
+                "lost."
+            ) from exc
+        raise
+
+    retained = RetainedBackupWriteBarrier(
+        lease=lease,
+        _migration_context=migration_context,
+        _loop=asyncio.get_running_loop(),
+    )
+    try:
+        await retained.verify_held()
+    except BaseException:
+        try:
+            await retained.close()
+        except BaseException:
+            logger.exception(
+                "Failed to close an unverified retained write barrier"
+            )
+        raise
+    _activate_process_cutover_fence()
+    retained._process_fence_active = True
+    return retained
 
 
 @asynccontextmanager

@@ -38,6 +38,8 @@ _PLAN_DOMAIN = b"PPBASE-RESTORE-STAGING-PLAN-V1\0"
 _TERMINAL_STATUS_FILENAME = "terminal.json"
 _TERMINAL_TEMP_PREFIX = ".terminal-"
 _TERMINAL_TEMP_SUFFIX = ".tmp"
+_ABANDONED_FILENAME = "ABANDONED"
+_ABANDONED_TEMP_PREFIX = ".abandoned-"
 _MAX_TERMINAL_TEMP_FILES = 32
 _MAX_PLAN_JSON_BYTES = 64 * 1024
 JwtSecretMode = Literal["disaster_recovery", "clone"]
@@ -374,6 +376,84 @@ def _publish_plan_seal_at(
         raise
 
 
+def _publish_abandoned_at(
+    parent_fd: int,
+    payload: bytes,
+    *,
+    pre_commit_guard: Callable[[], None] | None = None,
+) -> None:
+    """Publish one immutable abandonment marker without replacement."""
+    if len(payload) > _MAX_PLAN_JSON_BYTES:
+        raise StagingPlanError("Staging plan JSON exceeds its size limit.")
+    temporary_name = f"{_ABANDONED_TEMP_PREFIX}{secrets.token_hex(8)}.tmp"
+    temporary_exists = False
+    marker_linked = False
+    expected: os.stat_result | None = None
+    try:
+        _write_exclusive_at(parent_fd, temporary_name, payload)
+        temporary_exists = True
+        expected = os.stat(
+            temporary_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(expected.st_mode)
+            or expected.st_uid != os.geteuid()
+            or expected.st_nlink != 1
+            or stat.S_IMODE(expected.st_mode) != 0o600
+        ):
+            raise StagingPlanError("The staging abandonment marker is unsafe.")
+        _fsync_directory(parent_fd)
+        if pre_commit_guard is not None:
+            pre_commit_guard()
+        os.link(
+            temporary_name,
+            _ABANDONED_FILENAME,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        marker_linked = True
+        published = os.stat(
+            _ABANDONED_FILENAME,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not _same_file_identity(expected, published):
+            raise StagingPlanError(
+                "The staging abandonment marker changed during publication."
+            )
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_exists = False
+        _fsync_directory(parent_fd)
+    except BaseException as exc:
+        cleanup_failed = False
+        if marker_linked and expected is not None:
+            try:
+                _remove_owned_regular_file_at(
+                    parent_fd,
+                    _ABANDONED_FILENAME,
+                    expected,
+                )
+            except BaseException:
+                cleanup_failed = True
+        if temporary_exists and expected is not None:
+            try:
+                _remove_owned_regular_file_at(
+                    parent_fd,
+                    temporary_name,
+                    expected,
+                )
+            except BaseException:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise StagingPlanError(
+                "Staging plan abandonment failed and could not be rolled back safely."
+            ) from exc
+        raise
+
+
 def _read_json_at(
     parent_fd: int,
     name: str,
@@ -529,6 +609,7 @@ class StagingPlanStore:
         self,
         control_dir: str | Path | ControlPlaneRoot,
         staging_root: str | Path,
+        target_root: str | Path | None = None,
     ):
         if isinstance(control_dir, ControlPlaneRoot):
             self._control_root = control_dir
@@ -541,6 +622,11 @@ class StagingPlanStore:
             self._owns_control_root = True
         self.control_dir = self._control_root.path
         self.staging_root = Path(staging_root).expanduser().resolve(strict=False)
+        self.target_root = (
+            Path(target_root).expanduser().resolve(strict=False)
+            if target_root is not None
+            else self.staging_root
+        )
         self.plans_dir = self.control_dir / "plans"
         self._execution_leases: dict[str, _ExecutionLease] = {}
 
@@ -664,10 +750,11 @@ class StagingPlanStore:
 
         plan_id = secrets.token_hex(16)
         target_database = f"ppbase_stage_{plan_id[:24]}"
-        target_data_dir = self.staging_root / plan_id / "data"
+        format_version = 2 if self.target_root != self.staging_root else 1
+        target_data_dir = self.target_root / plan_id / "data"
         created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         immutable = {
-            "formatVersion": 1,
+            "formatVersion": format_version,
             "id": plan_id,
             "backupId": validated_backup_id,
             "manifestSha256": manifest_sha256,
@@ -758,12 +845,62 @@ class StagingPlanStore:
             finally:
                 os.close(plan_fd)
 
+    def validated_references(self, backup_id: str) -> tuple[StagingPlan, ...]:
+        """Return sealed validated plans that still depend on one backup."""
+        try:
+            selected_backup_id = validate_backup_id(backup_id)
+        except BackupManifestError as exc:
+            raise StagingPlanError("The backup ID is invalid.") from exc
+
+        references: list[StagingPlan] = []
+        with self._open_plans_directory() as plans_fd:
+            try:
+                with os.scandir(plans_fd) as entries:
+                    names = sorted(
+                        entry.name
+                        for entry in entries
+                        if _ID_RE.fullmatch(entry.name)
+                    )
+            except OSError as exc:
+                raise StagingPlanError(
+                    "Staging plans cannot be enumerated safely."
+                ) from exc
+
+            for plan_id in names:
+                plan_fd = self._open_plan_directory(plans_fd, plan_id)
+                try:
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        plan_fd,
+                    )
+                    # Failed creation may deliberately leave a forensic random
+                    # directory. Only a published SEALED plan is authoritative.
+                    if not _is_private_regular_file_at(plan_fd, "SEALED"):
+                        continue
+                    plan = self._inspect_open_plan(plan_id, plan_fd)
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        plan_fd,
+                    )
+                    if (
+                        plan.backup_id == selected_backup_id
+                        and plan.status == "validated"
+                    ):
+                        references.append(plan)
+                finally:
+                    os.close(plan_fd)
+            self._verify_plans_attachment(plans_fd)
+        return tuple(references)
+
     def _inspect_open_plan(self, plan_id: str, plan_fd: int) -> StagingPlan:
         if not _is_private_regular_file_at(plan_fd, "SEALED"):
             raise StagingPlanError("The staging plan is not sealed.")
         payload = _read_json_at(plan_fd, "plan.json")
         terminal_exists = _path_exists_at(plan_fd, _TERMINAL_STATUS_FILENAME)
         running_exists = _path_exists_at(plan_fd, "RUNNING")
+        abandoned_exists = _path_exists_at(plan_fd, _ABANDONED_FILENAME)
         expected_fields = {
             "formatVersion",
             "id",
@@ -811,9 +948,10 @@ class StagingPlanStore:
                     plan_fd,
                     _TERMINAL_STATUS_FILENAME,
                 )
+        format_version = payload.get("formatVersion")
         if (
-            isinstance(payload.get("formatVersion"), bool)
-            or payload.get("formatVersion") != 1
+            isinstance(format_version, bool)
+            or format_version not in {1, 2}
             or payload.get("id") != plan_id
         ):
             raise StagingPlanError("The staging plan identity is invalid.")
@@ -832,7 +970,9 @@ class StagingPlanStore:
         ):
             raise StagingPlanError("The staging destination fingerprint is invalid.")
         expected_database = f"ppbase_stage_{plan_id[:24]}"
-        expected_data_dir = self.staging_root / plan_id / "data"
+        expected_data_dir = (
+            self.staging_root if format_version == 1 else self.target_root
+        ) / plan_id / "data"
         if payload.get("targetDatabase") != expected_database:
             raise StagingPlanError("The staging database target is not derived from its ID.")
         if Path(str(payload.get("targetDataDir", ""))) != expected_data_dir:
@@ -883,6 +1023,49 @@ class StagingPlanStore:
         if not running_exists and not terminal_exists and status_value != "planned":
             raise StagingPlanError("An unstarted staging plan must remain planned.")
 
+        if abandoned_exists:
+            abandoned = _read_json_at(
+                plan_fd,
+                _ABANDONED_FILENAME,
+                require_canonical=True,
+            )
+            if set(abandoned) != {
+                "planHash",
+                "previousStatus",
+                "abandonedAt",
+                "actorId",
+            }:
+                raise StagingPlanError(
+                    "The staging abandonment marker has invalid fields."
+                )
+            if abandoned.get("planHash") != declared_hash:
+                raise StagingPlanError(
+                    "The staging abandonment marker does not match the plan."
+                )
+            if abandoned.get("previousStatus") != status_value:
+                raise StagingPlanError(
+                    "The staging abandonment marker has an invalid prior status."
+                )
+            if status_value == "running":
+                raise StagingPlanError(
+                    "A running staging plan cannot be abandoned."
+                )
+            if not isinstance(abandoned.get("abandonedAt"), str) or not str(
+                abandoned["abandonedAt"]
+            ).endswith("Z"):
+                raise StagingPlanError(
+                    "The staging abandonment timestamp is invalid."
+                )
+            if abandoned.get("actorId") is not None and not isinstance(
+                abandoned.get("actorId"),
+                str,
+            ):
+                raise StagingPlanError(
+                    "The staging abandonment actor is invalid."
+                )
+            status_value = "abandoned"
+            status = abandoned
+
         return StagingPlan(
             plan_id=str(payload.get("id", "")),
             backup_id=str(payload.get("backupId", "")),
@@ -903,6 +1086,91 @@ class StagingPlanStore:
             status=status_value,
             status_data={key: value for key, value in status.items() if key != "status"},
         )
+
+    def abandon(
+        self,
+        plan_id: str,
+        *,
+        expected_plan_hash: str,
+        actor_id: str | None,
+        pre_commit_guard: Callable[[], None] | None = None,
+    ) -> StagingPlan:
+        """Durably make a non-running plan non-activatable and releasable."""
+        if not _SHA256_RE.fullmatch(str(expected_plan_hash or "")):
+            raise StagingPlanError("The supplied planHash is invalid.")
+        if actor_id is not None and not isinstance(actor_id, str):
+            raise StagingPlanError("The actor ID is invalid.")
+
+        with self._open_plans_directory() as plans_fd:
+            plan_fd = self._open_plan_directory(plans_fd, plan_id)
+            try:
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                plan = self._inspect_open_plan(plan_id, plan_fd)
+                if plan.plan_hash != expected_plan_hash:
+                    raise StagingPlanError(
+                        "The supplied planHash does not match the plan."
+                    )
+                if plan.status == "abandoned":
+                    return plan
+                if plan.status == "running":
+                    raise StagingPlanError(
+                        "A running staging plan cannot be abandoned."
+                    )
+                payload = _canonical_json_bytes(
+                    {
+                        "planHash": plan.plan_hash,
+                        "previousStatus": plan.status,
+                        "abandonedAt": datetime.now(timezone.utc)
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                        "actorId": actor_id,
+                    }
+                )
+
+                def abandonment_commit_guard() -> None:
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        plan_fd,
+                    )
+                    if pre_commit_guard is not None:
+                        pre_commit_guard()
+                    self._verify_plan_attachment_chain(
+                        plans_fd,
+                        plan_id,
+                        plan_fd,
+                    )
+
+                try:
+                    _publish_abandoned_at(
+                        plan_fd,
+                        payload,
+                        pre_commit_guard=abandonment_commit_guard,
+                    )
+                except FileExistsError:
+                    pass
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                result = self._inspect_open_plan(plan_id, plan_fd)
+                if result.status != "abandoned":
+                    raise StagingPlanError(
+                        "The staging plan abandonment did not reach its commit point."
+                    )
+                self._verify_plan_attachment_chain(
+                    plans_fd,
+                    plan_id,
+                    plan_fd,
+                )
+                return result
+            finally:
+                os.close(plan_fd)
 
     def begin_execution(self, plan_id: str, *, expected_plan_hash: str) -> StagingPlan:
         attempt_id = secrets.token_hex(16)

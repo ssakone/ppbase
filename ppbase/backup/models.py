@@ -484,6 +484,7 @@ class BackupSetSummary:
     manifest: BackupManifest | None
     integrity_status: str
     error_code: str | None
+    signer_public_key: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)

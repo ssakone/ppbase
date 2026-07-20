@@ -491,6 +491,48 @@ def _open_new_private_directory_at(
             os.close(descriptor)
 
 
+def _open_existing_private_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    display_path: Path,
+) -> tuple[int, tuple[int, int]]:
+    """Open one existing 0700 staging component without following symlinks."""
+    descriptor: int | None = None
+    try:
+        expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(expected.st_mode)
+            or stat.S_ISLNK(expected.st_mode)
+            or stat.S_IMODE(expected.st_mode) != 0o700
+        ):
+            raise BackupStateError(
+                f"restore staging directory is unsafe: {display_path}"
+            )
+        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or not _same_file_identity(expected, opened)
+        ):
+            raise BackupStateError(
+                f"restore staging directory changed while opening: {display_path}"
+            )
+        result = descriptor, (opened.st_dev, opened.st_ino)
+        descriptor = None
+        return result
+    except BackupError:
+        raise
+    except OSError as exc:
+        raise BackupStateError(
+            f"cannot open restore staging directory safely: {display_path}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _verify_anchored_directory_chain(
     staging_root: Path,
     root_identity: tuple[int, int],
@@ -1426,6 +1468,48 @@ class AnchoredStagingDataDir:
         self.verify_attached()
         return self.path / parts[0]
 
+    def read_secret_sha256(self, *, name: str = ".jwt_secret") -> str:
+        """Hash one pinned UTF-8 secret without resolving a filesystem path."""
+        parts = _validated_relative_directory_parts(name)
+        if len(parts) != 1:
+            raise BackupStateError("staging secret name must be one path component")
+        self.verify_attached()
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                parts[0],
+                _open_flags(os.O_RDONLY),
+                dir_fd=self._data_fd,
+            )
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size <= 0
+                or info.st_size > 4096
+            ):
+                raise BackupStateError("staging JWT secret is unsafe")
+            payload = os.read(descriptor, 4097)
+            if not payload or len(payload) > 4096:
+                raise BackupStateError("staging JWT secret has an invalid size")
+            try:
+                normalized = payload.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                raise BackupStateError("staging JWT secret is not UTF-8") from exc
+            if not normalized:
+                raise BackupStateError("staging JWT secret is empty")
+            return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupStateError("staging JWT secret cannot be read safely") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            self.verify_attached()
+
     def close(self) -> None:
         """Release the capability; restored directories remain quarantined."""
         if self._closed:
@@ -1595,6 +1679,100 @@ class BackupSetBuilder:
         _copy_regular_file(Path(source), destination)
         _fsync_directory(secret_parent)
         self._jwt_secret_copied = True
+
+    def write_jwt_secret(self, secret: str) -> None:
+        """Persist an explicitly configured JWT secret as a signed resource."""
+        if self._jwt_secret_copied:
+            raise BackupStateError("JWT secret was already copied")
+        self._require_building()
+        if not isinstance(secret, str):
+            raise BackupStateError("JWT secret must be text")
+        if not secret or secret != secret.strip() or "\x00" in secret:
+            raise BackupStateError(
+                "JWT secret must be non-empty and have no surrounding whitespace"
+            )
+        try:
+            payload = secret.encode("utf-8") + b"\n"
+        except UnicodeEncodeError as exc:
+            raise BackupStateError("JWT secret is not valid UTF-8 text") from exc
+        if len(payload) > 4096:
+            raise BackupStateError("JWT secret exceeds its 4096-byte limit")
+
+        root_fd: int | None = None
+        resources_fd: int | None = None
+        secrets_fd: int | None = None
+        secrets_created = False
+        try:
+            root_fd = os.open(self.path, _directory_open_flags())
+            resources_info = os.stat(
+                RESOURCES_DIRNAME,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            resources_fd = os.open(
+                RESOURCES_DIRNAME,
+                _directory_open_flags(),
+                dir_fd=root_fd,
+            )
+            opened_resources = os.fstat(resources_fd)
+            if (
+                not stat.S_ISDIR(resources_info.st_mode)
+                or stat.S_ISLNK(resources_info.st_mode)
+                or stat.S_IMODE(resources_info.st_mode) != 0o700
+                or resources_info.st_uid != os.geteuid()
+                or not _same_file_identity(resources_info, opened_resources)
+            ):
+                raise BackupStateError("backup resources directory is unsafe")
+
+            try:
+                os.mkdir("secrets", mode=0o700, dir_fd=resources_fd)
+                secrets_created = True
+                os.fsync(resources_fd)
+            except FileExistsError:
+                pass
+            secrets_info = os.stat(
+                "secrets",
+                dir_fd=resources_fd,
+                follow_symlinks=False,
+            )
+            secrets_fd = os.open(
+                "secrets",
+                _directory_open_flags(),
+                dir_fd=resources_fd,
+            )
+            opened_secrets = os.fstat(secrets_fd)
+            if (
+                not stat.S_ISDIR(secrets_info.st_mode)
+                or stat.S_ISLNK(secrets_info.st_mode)
+                or stat.S_IMODE(secrets_info.st_mode) != 0o700
+                or secrets_info.st_uid != os.geteuid()
+                or not _same_file_identity(secrets_info, opened_secrets)
+            ):
+                raise BackupStateError("backup secrets directory is unsafe")
+
+            _write_exclusive_at(secrets_fd, "jwt_secret", payload)
+            os.fsync(resources_fd)
+            os.fsync(root_fd)
+            self._jwt_secret_copied = True
+        except BackupError:
+            raise
+        except OSError as exc:
+            raise BackupStateError(
+                "JWT secret could not be written safely"
+            ) from exc
+        finally:
+            if secrets_fd is not None:
+                os.close(secrets_fd)
+            if secrets_created and resources_fd is not None and not self._jwt_secret_copied:
+                try:
+                    os.rmdir("secrets", dir_fd=resources_fd)
+                    os.fsync(resources_fd)
+                except OSError:
+                    pass
+            if resources_fd is not None:
+                os.close(resources_fd)
+            if root_fd is not None:
+                os.close(root_fd)
 
     def write_imported_resource(
         self,
@@ -1865,6 +2043,75 @@ class LocalBackupStore:
                     parent_source_fd = current_fd
                 display_path = display_path / part
                 child_fd, child_identity = _open_new_private_directory_at(
+                    current_fd,
+                    part,
+                    display_path=display_path,
+                )
+                opened_fds.add(child_fd)
+                component_identities.append(
+                    (part, child_identity[0], child_identity[1])
+                )
+                current_fd = child_fd
+
+            if parent_source_fd is None:
+                raise BackupStateError("staging target has no parent directory")
+            parent_fd = os.dup(parent_source_fd)
+            opened_fds.add(parent_fd)
+            data_fd = current_fd
+            keep = {root_fd, parent_fd, data_fd}
+            for descriptor in tuple(opened_fds - keep):
+                os.close(descriptor)
+                opened_fds.remove(descriptor)
+
+            target = AnchoredStagingDataDir(
+                path=root_path.joinpath(*parts),
+                _store=self,
+                _staging_root=root_path,
+                _root_identity=root_identity,
+                _component_identities=tuple(component_identities),
+                _root_fd=root_fd,
+                _parent_fd=parent_fd,
+                _data_fd=data_fd,
+                _store_token=self._capability_token,
+            )
+            opened_fds.clear()
+            root_fd = None
+            try:
+                target.verify_attached()
+            except BaseException:
+                target.close()
+                raise
+            return target
+        finally:
+            for descriptor in opened_fds:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def open_existing_staging_data_dir(
+        self,
+        staging_root: str | Path,
+        relative_target: str | Path,
+    ) -> AnchoredStagingDataDir:
+        """Pin an already validated staging ``data_dir`` without path traversal."""
+        self._require_open()
+        root_path = Path(staging_root)
+        parts = _validated_relative_directory_parts(relative_target)
+        root_fd: int | None = None
+        opened_fds: set[int] = set()
+        try:
+            root_fd, root_identity = _open_private_staging_root(root_path)
+            opened_fds.add(root_fd)
+            current_fd = root_fd
+            component_identities: list[tuple[str, int, int]] = []
+            parent_source_fd: int | None = None
+            display_path = root_path
+            for index, part in enumerate(parts):
+                if index == len(parts) - 1:
+                    parent_source_fd = current_fd
+                display_path = display_path / part
+                child_fd, child_identity = _open_existing_private_directory_at(
                     current_fd,
                     part,
                     display_path=display_path,
@@ -2841,7 +3088,7 @@ class LocalBackupStore:
             try:
                 inspection = self.inspect_set(
                     backup_id,
-                    expected_public_key=self.identity.public_key_bytes,
+                    expected_public_key=None,
                     verify_resources=False,
                 )
             except (BackupError, OSError):
@@ -2850,6 +3097,7 @@ class LocalBackupStore:
                         backup_id=backup_id,
                         created_at=None,
                         signer_fingerprint_sha256=None,
+                        signer_public_key=None,
                         resource_count=None,
                         total_size=None,
                         app_name=None,
@@ -2865,6 +3113,7 @@ class LocalBackupStore:
                     backup_id=manifest.backup_id,
                     created_at=manifest.created_at,
                     signer_fingerprint_sha256=manifest.signer_fingerprint_sha256,
+                    signer_public_key=inspection.signer_public_key,
                     resource_count=len(manifest.resources),
                     total_size=manifest.total_size,
                     app_name=(

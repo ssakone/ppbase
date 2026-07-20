@@ -49,6 +49,11 @@ const SettingsPage = lazy(async () => {
   return { default: module.SettingsPage }
 })
 
+const BackupsPage = lazy(async () => {
+  const module = await import('@/routes/settings/backups')
+  return { default: module.BackupsPage }
+})
+
 const HooksPage = lazy(async () => {
   const module = await import('@/routes/hooks')
   return { default: module.HooksPage }
@@ -116,6 +121,7 @@ export default function App() {
                   <Route path="/hooks" element={withSuspense(<HooksPage />)} />
                   <Route path="/logs" element={withSuspense(<LogsPage />)} />
                   <Route path="/settings" element={withSuspense(<SettingsPage />)} />
+                  <Route path="/settings/backups" element={withSuspense(<BackupsPage />)} />
                 </Route>
                 <Route path="*" element={<Navigate to="/dashboard" replace />} />
               </Routes>

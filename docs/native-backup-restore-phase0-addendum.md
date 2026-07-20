@@ -1,5 +1,9 @@
 # Backup/restore natif — complément Phase 0
 
+> **Document historique.** Il décrit les contrats de la Phase 0 et est remplacé
+> par [Native Backup & Restore](./native-backup-restore.md) pour le comportement
+> livré, l'exploitation et le format de transport actuels.
+
 Ce complément fixe les contrats volontairement laissés ouverts par le rapport
 Phase 0. La première capacité livrée est appelée **restore de
 staging/validation** : elle ne remplace jamais la base PostgreSQL ni le
@@ -128,11 +132,11 @@ Les ressources sont stagées, hashées et fsyncées. Elles ne deviennent visible
 qu'après création sans overwrite du marqueur final `SEALED`. Ce répertoire est
 le stockage canonique, pas le format transporté par le navigateur.
 
-La phase transport suivante utilisera une enveloppe streamée
-`.ppbase-backup` contenant le même manifeste, la signature et les ressources.
-Elle peut être produite et consommée sans matérialiser un second ZIP géant
-permanent. L'endpoint d'upload authentifiera avant lecture, puis appliquera des
-limites déclarées, par ressource et globales. B reconstruira et vérifiera les
+Le transport désormais livré utilise un ZIP standard `.zip` généré en flux à
+partir du set canonique, contenant le même manifeste, la signature et les
+ressources. Il est produit et consommé sans conserver un second ZIP géant côté
+serveur. L'endpoint d'upload authentifie avant lecture, puis applique les
+limites déclarées, par ressource et globales. B reconstruit et vérifie les
 ressources canoniques avant de sceller son backup set local.
 
 Scénario produit sans terminal de cette phase suivante :

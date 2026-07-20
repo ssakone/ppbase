@@ -141,6 +141,36 @@ def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> No
     assert app.state.settings.port == 8091
 
 
+def test_flask_like_start_never_creates_database_during_rollback(
+    monkeypatch,
+) -> None:
+    app_pb = PPBase()
+    started: list[bool] = []
+
+    monkeypatch.setattr(
+        "ppbase.backup.activation.begin_activation_startup",
+        lambda _settings: {
+            "activationId": "a" * 32,
+            "status": "rollback_pending",
+            "selectedTarget": "previous",
+        },
+    )
+    monkeypatch.setattr(
+        "ppbase.db.ensure_db.ensure_database_exists",
+        lambda _database_url: pytest.fail(
+            "rollback startup must not create or preflight-mutate a database"
+        ),
+    )
+    monkeypatch.setattr(
+        "uvicorn.run",
+        lambda *_args, **_kwargs: started.append(True),
+    )
+
+    app_pb.start(host="127.0.0.1", port=8092)
+
+    assert started == [True]
+
+
 @pytest.mark.asyncio
 async def test_route_can_use_require_auth_dependency_helpers() -> None:
     app_pb = PPBase()

@@ -6,7 +6,18 @@ import { cn } from '@/lib/utils'
 import { prefetchRoute } from '@/lib/route-prefetch'
 import { navigateWithTransition } from '@/lib/navigation'
 import { useHealth } from '@/hooks/use-health'
-import { LayoutGrid, GitBranch, Settings, LogOut, Activity, Users2, Home, Command, Zap } from 'lucide-react'
+import {
+  Activity,
+  ArchiveRestore,
+  Command,
+  GitBranch,
+  Home,
+  LayoutGrid,
+  LogOut,
+  Settings,
+  Users2,
+  Zap,
+} from 'lucide-react'
 import {
   Tooltip,
   TooltipContent,
@@ -31,13 +42,14 @@ export function SidebarIconStrip() {
     if (section === 'migrations') return location.pathname === '/migrations'
     if (section === 'hooks') return location.pathname === '/hooks'
     if (section === 'logs') return location.pathname === '/logs'
+    if (section === 'backups') return location.pathname === '/settings/backups'
     if (section === 'settings') return location.pathname === '/settings'
     return false
   }
 
   const handleNav = (
     path: string,
-    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'settings',
+    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'backups' | 'settings',
   ) => {
     if (section) setActiveSection(section)
     setSidebarOpen(false)
@@ -180,6 +192,21 @@ export function SidebarIconStrip() {
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" className="text-sm">Logs</TooltipContent>
+        </Tooltip>
+
+        {/* Backups */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className={cn(btnClass, isActive('backups') && activeClass)}
+              onClick={() => handleNav('/settings/backups', 'backups')}
+              onMouseEnter={() => prefetchRoute('backups')}
+              onFocus={() => prefetchRoute('backups')}
+            >
+              <ArchiveRestore className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-sm">Backups</TooltipContent>
         </Tooltip>
 
         {/* Settings */}

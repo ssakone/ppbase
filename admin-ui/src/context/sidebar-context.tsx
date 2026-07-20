@@ -5,7 +5,14 @@ const DEFAULT_WIDTH = 340
 const MIN_WIDTH = 220
 const MAX_WIDTH = 520
 
-type SidebarSection = 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'settings'
+type SidebarSection =
+  | 'dashboard'
+  | 'collections'
+  | 'migrations'
+  | 'hooks'
+  | 'logs'
+  | 'backups'
+  | 'settings'
 
 interface SidebarContextType {
   activeSection: SidebarSection

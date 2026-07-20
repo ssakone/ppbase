@@ -496,7 +496,7 @@ def test_native_backup_service_constructor_failure_closes_control_fds(
     captured: dict[str, ControlPlaneRoot] = {}
 
     class FailingPlanStore:
-        def __init__(self, control_root, _staging_root):
+        def __init__(self, control_root, _staging_root, _target_root):
             captured["root"] = control_root
             raise RuntimeError("synthetic plan-store failure")
 
@@ -821,6 +821,79 @@ def test_staging_plan_is_server_generated_hashed_and_single_use(tmp_path: Path) 
         store.finish(
             plan.plan_id,
             status="quarantined",
+            expected_attempt_id=running.status_data["attemptId"],
+        )
+
+
+def test_validated_references_returns_only_activatable_plans_for_backup(
+    tmp_path: Path,
+) -> None:
+    store = StagingPlanStore(tmp_path / "control", tmp_path / "staging")
+
+    def finish(backup_id: str, status: str):
+        plan = store.create(
+            backup_id=backup_id,
+            manifest_sha256="a" * 64,
+            destination_fingerprint_sha256=_DESTINATION_FINGERPRINT,
+            jwt_secret_mode="clone",
+            actor_id=None,
+        )
+        running = store.begin_execution(
+            plan.plan_id,
+            expected_plan_hash=plan.plan_hash,
+        )
+        return store.finish(
+            plan.plan_id,
+            status=status,
+            expected_attempt_id=running.status_data["attemptId"],
+        )
+
+    selected = finish("backup_1", "validated")
+    finish("backup_1", "failed")
+    finish("backup_2", "validated")
+    partial = tmp_path / "control" / "plans" / ("f" * 32)
+    partial.mkdir(mode=0o700)
+
+    references = store.validated_references("backup_1")
+
+    assert [plan.plan_id for plan in references] == [selected.plan_id]
+    assert references[0].backup_id == "backup_1"
+
+    abandoned = store.abandon(
+        selected.plan_id,
+        expected_plan_hash=selected.plan_hash,
+        actor_id="admin_1",
+    )
+    assert abandoned.status == "abandoned"
+    assert abandoned.status_data["previousStatus"] == "validated"
+    assert store.abandon(
+        selected.plan_id,
+        expected_plan_hash=selected.plan_hash,
+        actor_id="admin_1",
+    ).status == "abandoned"
+    assert store.validated_references("backup_1") == ()
+
+
+def test_running_staging_plan_cannot_be_abandoned(tmp_path: Path) -> None:
+    store = StagingPlanStore(tmp_path / "control", tmp_path / "staging")
+    plan = store.create(
+        backup_id="backup_1",
+        manifest_sha256="a" * 64,
+        destination_fingerprint_sha256=_DESTINATION_FINGERPRINT,
+        jwt_secret_mode="clone",
+        actor_id=None,
+    )
+    running = store.begin_execution(plan.plan_id, expected_plan_hash=plan.plan_hash)
+    try:
+        with pytest.raises(StagingPlanError, match="running.*cannot be abandoned"):
+            store.abandon(
+                plan.plan_id,
+                expected_plan_hash=plan.plan_hash,
+                actor_id=None,
+            )
+    finally:
+        store.abandon_execution(
+            plan.plan_id,
             expected_attempt_id=running.status_data["attemptId"],
         )
 

@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     backup_root: str = "./pb_backups"
     backup_control_dir: str = "./pb_backup_control"
     backup_staging_root: str = "./pb_restore_staging"
+    # Durable isolated restore targets. When empty, PPBase derives a sibling
+    # path from ``backup_staging_root`` for backwards-compatible local setups.
+    backup_target_root: str = ""
     backup_barrier_timeout: float = 300.0
     backup_pg_dump_path: str = "pg_dump"
     backup_pg_restore_path: str = "pg_restore"
@@ -75,6 +78,9 @@ class Settings(BaseSettings):
     backup_max_compression_ratio: int = 500
     backup_transport_chunk_size: int = 1024 * 1024
     backup_multipart_overhead_bytes: int = 1024 * 1024
+    # Maximum wall-clock time allowed for the restored process to reach the
+    # durable healthy activation state before an automatic rollback restart.
+    backup_activation_health_timeout: float = 120.0
 
     # ---- Auth ----
     jwt_secret: str = ""

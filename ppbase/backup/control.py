@@ -77,6 +77,7 @@ def _open_control_root(
     path: Path,
     *,
     create_missing: bool,
+    require_private_final: bool = True,
 ) -> tuple[tuple[int, ...], tuple[str, ...]]:
     """Open a real private control root without following path symlinks."""
     _require_descriptor_confinement()
@@ -155,7 +156,7 @@ def _open_control_root(
                     opened = os.fstat(child_fd)
                     fsync_directory(child_fd)
                     fsync_directory(current_fd)
-                if index == len(components) - 1 and (
+                if require_private_final and index == len(components) - 1 and (
                     opened.st_uid != os.geteuid()
                     or stat.S_IMODE(opened.st_mode) != 0o700
                 ):
@@ -303,6 +304,7 @@ class ControlPlaneRoot:
     path: Path
     _chain_descriptors: tuple[int, ...]
     _entry_names: tuple[str, ...]
+    _require_private: bool = True
 
     @classmethod
     def open(
@@ -310,16 +312,19 @@ class ControlPlaneRoot:
         path: str | Path,
         *,
         create_missing: bool = True,
+        require_private: bool = True,
     ) -> "ControlPlaneRoot":
         absolute = absolute_path_without_symlink_resolution(path)
         chain_descriptors, entry_names = _open_control_root(
             absolute,
             create_missing=create_missing,
+            require_private_final=require_private,
         )
         root = cls(
             path=absolute,
             _chain_descriptors=chain_descriptors,
             _entry_names=entry_names,
+            _require_private=require_private,
         )
         try:
             root.verify_attached()
@@ -353,7 +358,10 @@ class ControlPlaneRoot:
                         if index == len(self._entry_names) - 1
                         else "The backup control ancestry"
                     ),
-                    require_private=index == len(self._entry_names) - 1,
+                    require_private=(
+                        self._require_private
+                        and index == len(self._entry_names) - 1
+                    ),
                 )
                 _assert_safe_ancestor(parent_fd)
         except ControlPlaneSafetyError:

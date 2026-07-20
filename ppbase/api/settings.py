@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from ppbase.api.deps import get_session, require_admin
+from ppbase.backup.automation import BackupCronError, BackupCronSchedule
 from ppbase.core.id_generator import generate_id
 from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import ParamRecord
@@ -391,6 +392,42 @@ async def update_settings(
                 "data": {},
             },
         )
+
+    backups_update = body.get("backups")
+    if isinstance(backups_update, dict):
+        if "cron" in backups_update:
+            cron = str(backups_update.get("cron", "") or "").strip()
+            if cron:
+                try:
+                    BackupCronSchedule.parse(cron)
+                except BackupCronError as exc:
+                    raise _error_response(
+                        400,
+                        "Invalid automatic backup schedule.",
+                        {
+                            "backups.cron": {
+                                "code": "validation_invalid_value",
+                                "message": str(exc),
+                            }
+                        },
+                    ) from exc
+        if "cronMaxKeep" in backups_update:
+            raw_max_keep = backups_update.get("cronMaxKeep")
+            if (
+                isinstance(raw_max_keep, bool)
+                or not isinstance(raw_max_keep, int)
+                or not 0 <= raw_max_keep <= 10_000
+            ):
+                raise _error_response(
+                    400,
+                    "Invalid automatic backup retention.",
+                    {
+                        "backups.cronMaxKeep": {
+                            "code": "validation_invalid_value",
+                            "message": "cronMaxKeep must be an integer between 0 and 10000.",
+                        }
+                    },
+                )
 
     engine = get_engine()
     commit_started = False
