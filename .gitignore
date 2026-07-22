@@ -28,6 +28,12 @@ env/
 .ppbase.log
 pb_migrations/
 pb_data/
+/pb_backups/
+/pb_backup_control/
+/pb_restore_staging/
+/pb_restore_staging_targets/
+signing-ed25519.key
+.signing-ed25519.*
 
 # Testing
 .pytest_cache/
@@ -37,6 +43,7 @@ htmlcov/
 
 # Environment
 .env
+*.env
 .env.local
 .env.*.local
 

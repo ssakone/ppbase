@@ -137,6 +137,150 @@ export interface HealthStatus {
   }
 }
 
+export type BackupTrustStatus =
+  | 'trusted_local'
+  | 'trusted_external'
+  | 'authenticated_untrusted'
+  | 'revoked'
+  | 'invalid'
+  | 'unknown'
+
+export type BackupIntegrityStatus = 'valid' | 'invalid' | 'unchecked' | string
+
+export interface BackupListItem {
+  id: string
+  key: string
+  filename?: string | null
+  size?: number | null
+  totalSize?: number | null
+  createdAt?: string | null
+  modified?: string | null
+  status?: string
+  integrityStatus?: BackupIntegrityStatus
+  authenticated?: boolean
+  trustStatus?: BackupTrustStatus
+  signerFingerprintSha256?: string | null
+  resourceCount?: number | null
+  errorCode?: string | null
+}
+
+export interface BackupResource {
+  path: string
+  size: number
+  sha256: string
+}
+
+export interface BackupInspection extends BackupListItem {
+  signerPublicKey?: string
+  resourcesVerified?: boolean
+  metadata?: Record<string, unknown>
+  resources?: BackupResource[]
+  resourceOffset?: number
+  resourceLimit?: number
+  resourcesReturned?: number
+  hasMoreResources?: boolean
+}
+
+export interface BackupIdentity {
+  algorithm: 'Ed25519' | string
+  publicKey: string
+  fingerprintSha256: string
+}
+
+export interface BackupReadinessCheck {
+  configured: boolean
+  missing: string[]
+}
+
+export interface BackupReadinessWarning {
+  code: string
+  name: string
+  detail: string
+}
+
+export interface BackupReadiness {
+  create: BackupReadinessCheck
+  restore: BackupReadinessCheck
+  activation: BackupReadinessCheck
+  postgresqlTools: BackupReadinessCheck
+  storage: BackupReadinessCheck
+  controlPlane: BackupReadinessCheck
+  storageBackend: string
+  warnings?: BackupReadinessWarning[]
+  onboarding: {
+    recommended: 'production'
+    productionCommand: string
+    localCommand: string
+    doctorCommand: string
+  }
+}
+
+export interface BackupTrustEntry {
+  fingerprintSha256: string
+  publicKey?: string
+  label?: string | null
+  approvedAt?: string | null
+  approvedBy?: string | null
+  actorId?: string | null
+  status?: string
+  trustStatus?: string
+}
+
+export type JwtSecretMode = 'disaster_recovery' | 'clone'
+
+export interface BackupStagingPlan {
+  id: string
+  backupId: string
+  manifestSha256: string
+  destinationFingerprintSha256?: string
+  targetDatabase?: string
+  targetDataDir?: string
+  jwtSecretMode: JwtSecretMode
+  createdAt?: string
+  actorId?: string | null
+  planHash: string
+  status: string
+  preflightWarnings?: string[]
+  validation?: Record<string, unknown>
+  migrationsApplied?: string[]
+  cloneRotation?: Record<string, unknown>
+  failureCode?: string
+  activationPerformed?: boolean
+  [key: string]: unknown
+}
+
+export interface BackupActivationStart {
+  activationId: string
+  resumeToken: string
+  planId: string
+  planHash: string
+  backupId: string
+  jwtSecretMode: JwtSecretMode
+  status: string
+  phase?: string
+}
+
+export interface BackupActivation {
+  id?: string
+  activationId?: string
+  backupId?: string
+  planId?: string
+  planHash?: string
+  jwtSecretMode?: JwtSecretMode
+  status: string
+  phase?: string
+  message?: string
+  startedAt?: string
+  updatedAt?: string
+  completedAt?: string
+  health?: Record<string, unknown>
+  rollback?: Record<string, unknown>
+  errorCode?: string
+  failureCode?: string
+  actionRequired?: string
+  [key: string]: unknown
+}
+
 export interface OAuth2ProviderConfig {
   name: string
   clientId: string

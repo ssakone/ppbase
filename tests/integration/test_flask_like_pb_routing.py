@@ -110,11 +110,18 @@ def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> No
     def _fake_ensure_database_exists(db_url: str) -> None:
         captured["db_url"] = db_url
 
-    def _fake_uvicorn_run(app, host: str, port: int, log_level: str) -> None:
+    def _fake_uvicorn_run(
+        app,
+        host: str,
+        port: int,
+        log_level: str,
+        access_log: bool,
+    ) -> None:
         captured["app"] = app
         captured["host"] = host
         captured["port"] = port
         captured["log_level"] = log_level
+        captured["access_log"] = access_log
 
     monkeypatch.setattr(
         "ppbase.db.ensure_db.ensure_database_exists",
@@ -126,11 +133,42 @@ def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> No
 
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8091
+    assert captured["access_log"] is False
     assert app_pb.settings.host == "127.0.0.1"
     assert app_pb.settings.port == 8091
     app = app_pb.get_app()
     assert app.state.settings.host == "127.0.0.1"
     assert app.state.settings.port == 8091
+
+
+def test_flask_like_start_never_creates_database_during_rollback(
+    monkeypatch,
+) -> None:
+    app_pb = PPBase()
+    started: list[bool] = []
+
+    monkeypatch.setattr(
+        "ppbase.backup.activation.begin_activation_startup",
+        lambda _settings: {
+            "activationId": "a" * 32,
+            "status": "rollback_pending",
+            "selectedTarget": "previous",
+        },
+    )
+    monkeypatch.setattr(
+        "ppbase.db.ensure_db.ensure_database_exists",
+        lambda _database_url: pytest.fail(
+            "rollback startup must not create or preflight-mutate a database"
+        ),
+    )
+    monkeypatch.setattr(
+        "uvicorn.run",
+        lambda *_args, **_kwargs: started.append(True),
+    )
+
+    app_pb.start(host="127.0.0.1", port=8092)
+
+    assert started == [True]
 
 
 @pytest.mark.asyncio

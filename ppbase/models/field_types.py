@@ -20,6 +20,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ppbase.core.storage_safety import (
+    StorageSafetyError,
+    is_remote_file_reference,
+    validate_file_reference,
+)
+
 
 # ---------------------------------------------------------------------------
 # Field type enum
@@ -407,8 +413,22 @@ def _validate_file(field: FieldDefinition, value: Any) -> str | list[str]:
             return [str(v) for v in raw if v]
         return [str(raw)] if raw else []
 
+    def validate_references(values: list[str]) -> list[str]:
+        for filename in values:
+            if is_remote_file_reference(filename):
+                continue
+            try:
+                validate_file_reference(filename)
+            except StorageSafetyError as exc:
+                raise FieldValidationError(
+                    field.name,
+                    "validation_invalid_filename",
+                    "Must be a valid stored filename.",
+                ) from exc
+        return values
+
     if is_multi:
-        val_list = file_list(value)
+        val_list = validate_references(file_list(value))
 
         if field.required and not val_list:
             raise FieldValidationError(
@@ -422,7 +442,7 @@ def _validate_file(field: FieldDefinition, value: Any) -> str | list[str]:
             )
         return val_list
     else:
-        values = file_list(value)
+        values = validate_references(file_list(value))
         val = values[-1] if values else ""
         if field.required and not val:
             raise FieldValidationError(

@@ -6,6 +6,7 @@ export type PrefetchKey =
   | 'hooks'
   | 'logs'
   | 'settings'
+  | 'backups'
 
 const prefetchLoaders: Record<PrefetchKey, () => Promise<unknown>> = {
   dashboard: () => import('@/routes/dashboard'),
@@ -15,6 +16,7 @@ const prefetchLoaders: Record<PrefetchKey, () => Promise<unknown>> = {
   hooks: () => import('@/routes/hooks'),
   logs: () => import('@/routes/logs'),
   settings: () => import('@/routes/settings'),
+  backups: () => import('@/routes/settings/backups'),
 }
 
 const loaded = new Set<PrefetchKey>()

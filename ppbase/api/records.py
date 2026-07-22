@@ -12,18 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import Headers, QueryParams, URL
 
-from ppbase.api.deps import get_optional_auth
+from ppbase.api.deps import get_optional_auth, get_session
 from ppbase.db.engine import get_engine
 from ppbase.ext.events import RecordRequestEvent
 from ppbase.ext.registry import (
@@ -46,9 +46,15 @@ from ppbase.services.record_service import (
     resolve_collection,
     update_record,
 )
+from ppbase.services.record_storage_coordinator import (
+    ConnectionEngineAdapter as _ConnectionEngineAdapter,
+    run_record_storage_transaction,
+)
 from ppbase.services.rule_engine import check_rule
+from ppbase.services.write_barrier import WriteBarrierTimeoutError
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +159,20 @@ _BATCH_RECORD_RE = re.compile(r"^/api/collections/([^/]+)/records/([^/]+)/?$")
 _BATCH_FILE_KEY_RE = re.compile(r"^requests(?:\.|\[)(\d+)\]?\.([A-Za-z0-9_]+)$")
 
 
+async def _get_mutation_auth(
+    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any] | None:
+    """Authenticate, then release the cached request connection.
+
+    Mutation coordination reserves one dedicated connection for both the
+    session-level barrier and all record SQL. Returning the read-only auth
+    transaction to the pool first is required for ``pool_size=1``.
+    """
+    await session.rollback()
+    return auth
+
+
 class _BatchRequestFailed(Exception):
     """Signals a failed nested request inside ``/api/batch``."""
 
@@ -162,27 +182,27 @@ class _BatchRequestFailed(Exception):
         self.response = response
 
 
-class _ConnectionEngineAdapter:
-    """Minimal async-engine adapter that pins all work to one connection."""
-
-    def __init__(self, conn: AsyncConnection):
-        self._conn = conn
-
-    @asynccontextmanager
-    async def connect(self) -> AsyncIterator[AsyncConnection]:
-        yield self._conn
-
-    @asynccontextmanager
-    async def begin(self) -> AsyncIterator[AsyncConnection]:
-        yield self._conn
-
-
 class _AbortWithResponse(Exception):
     """Rollback marker carrying an HTTP response."""
 
-    def __init__(self, response: JSONResponse):
+    def __init__(self, response: Response):
         super().__init__("Abort request with HTTP response.")
         self.response = response
+
+
+async def _run_storage_transaction(
+    engine: Any,
+    operation: Callable[[_ConnectionEngineAdapter], Awaitable[Any]],
+) -> Any:
+    """Coordinate DB commit, hooks, and exact file compensation."""
+
+    async def _operation(active_engine: _ConnectionEngineAdapter) -> Any:
+        result = await operation(active_engine)
+        if isinstance(result, Response) and result.status_code >= 400:
+            raise _AbortWithResponse(result)
+        return result
+
+    return await run_record_storage_transaction(engine, _operation)
 
 
 class _BatchRequestProxy:
@@ -1058,7 +1078,7 @@ async def _execute_batch_request(
     batch_request: Any,
     request_files: dict[str, list[tuple[str, bytes]]],
     all_collections: list[Any],
-) -> tuple[int, Any, tuple[str, str] | None] | JSONResponse:
+) -> tuple[int, Any] | JSONResponse:
     if not isinstance(batch_request, dict):
         return _error_response(400, "Invalid batch request.")
 
@@ -1108,12 +1128,7 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        created_target: tuple[str, str] | None = None
-        if status == 200 and isinstance(response_body, dict):
-            created_id = str(response_body.get("id", "")).strip()
-            if created_id:
-                created_target = (collection.id, created_id)
-        return status, response_body, created_target
+        return status, response_body
     if action == "update" and record_id is not None:
         result = await _apply_batch_update(
             engine,
@@ -1129,7 +1144,7 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        return status, response_body, None
+        return status, response_body
     if action == "delete" and record_id is not None:
         result = await _apply_batch_delete(
             engine,
@@ -1143,9 +1158,29 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        return status, response_body, None
+        return status, response_body
     if action == "upsert":
-        upsert_id = str(body.get("id", "")).strip()
+        from ppbase.core.storage_safety import (
+            StorageSafetyError,
+            validate_record_id,
+        )
+
+        raw_upsert_id = body.get("id")
+        upsert_id = ""
+        if raw_upsert_id is not None and raw_upsert_id != "":
+            try:
+                upsert_id = validate_record_id(raw_upsert_id)
+            except StorageSafetyError:
+                return _error_response(
+                    400,
+                    "Failed to create or update record.",
+                    {
+                        "id": {
+                            "code": "validation_invalid_record_id",
+                            "message": "Must be a valid record ID.",
+                        }
+                    },
+                )
         if upsert_id:
             existing = await get_record(engine, collection, upsert_id)
             if existing is not None:
@@ -1174,7 +1209,7 @@ async def _execute_batch_request(
                 if isinstance(result, JSONResponse):
                     return result
                 status, response_body = result
-                return status, response_body, None
+                return status, response_body
 
         create_payload = dict(body)
         if upsert_id:
@@ -1199,14 +1234,7 @@ async def _execute_batch_request(
         if isinstance(result, JSONResponse):
             return result
         status, response_body = result
-        created_target: tuple[str, str] | None = None
-        if status == 200 and upsert_id:
-            created_target = (collection.id, upsert_id)
-        elif status == 200 and isinstance(response_body, dict):
-            created_id = str(response_body.get("id", "")).strip()
-            if created_id:
-                created_target = (collection.id, created_id)
-        return status, response_body, created_target
+        return status, response_body
 
     return _error_response(400, "Invalid batch request.")
 
@@ -1316,22 +1344,10 @@ async def api_create_record(
     request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Create a new record in a collection."""
     engine = get_engine()
-
-    collection = await resolve_collection(engine, collectionIdOrName)
-    if collection is None:
-        return _error_response(404, "Missing collection context.")
-
-    # _superusers records are managed via the admin auth API, not here
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot create _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
 
     data, files, parse_error = await _parse_record_request_body(request)
     if parse_error is not None:
@@ -1339,20 +1355,11 @@ async def api_create_record(
     if data is None:
         return _error_response(400, "Request body must be a JSON object.")
 
-    event = RecordRequestEvent(
-        app=request.app,
-        request=request,
-        collection=collection,
-        collection_id_or_name=collectionIdOrName,
-        auth=auth,
-        data=data,
-        files=files,
-        expand=expand,
-        fields=fields,
-        engine=engine,
-    )
+    collection: Any | None = None
 
     async def _default_create_handler(e: RecordRequestEvent) -> JSONResponse:
+        if collection is None:  # pragma: no cover - coordinator invariant
+            raise RuntimeError("Record collection was not resolved.")
         active_engine = e.engine or engine
         if not isinstance(e.data, dict):
             return _error_response(400, "Request body must be a JSON object.")
@@ -1443,15 +1450,38 @@ async def api_create_record(
 
         return JSONResponse(content=record, status_code=200)
 
-    try:
-        async with engine.begin() as conn:
-            event.engine = _ConnectionEngineAdapter(conn)
-            return await _trigger_record_request_hook(
-                request,
-                HOOK_RECORD_CREATE_REQUEST,
-                event,
-                _default_create_handler,
+    async def _run_create(active_engine: _ConnectionEngineAdapter) -> Any:
+        nonlocal collection
+        collection = await resolve_collection(active_engine, collectionIdOrName)
+        if collection is None:
+            return _error_response(404, "Missing collection context.")
+        if collection.name == "_superusers":
+            return _error_response(
+                400,
+                "You cannot create _superusers records via the records API. "
+                "Use the admin auth endpoints instead.",
             )
+        event = RecordRequestEvent(
+            app=request.app,
+            request=request,
+            collection=collection,
+            collection_id_or_name=collectionIdOrName,
+            auth=auth,
+            data=data,
+            files=files,
+            expand=expand,
+            fields=fields,
+            engine=active_engine,
+        )
+        return await _trigger_record_request_hook(
+            request,
+            HOOK_RECORD_CREATE_REQUEST,
+            event,
+            _default_create_handler,
+        )
+
+    try:
+        return await _run_storage_transaction(engine, _run_create)
     except _AbortWithResponse as abort:
         return abort.response
 
@@ -1555,22 +1585,10 @@ async def api_update_record(
     request: Request,
     expand: str | None = Query(None),
     fields: str | None = Query(None),
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Update an existing record."""
     engine = get_engine()
-
-    collection = await resolve_collection(engine, collectionIdOrName)
-    if collection is None:
-        return _error_response(404, "Missing collection context.")
-
-    # _superusers records are managed via the admin auth API, not here
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot update _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
 
     data, files, parse_error = await _parse_record_request_body(request)
     if parse_error is not None:
@@ -1578,21 +1596,11 @@ async def api_update_record(
     if data is None:
         return _error_response(400, "Request body must be a JSON object.")
 
-    event = RecordRequestEvent(
-        app=request.app,
-        request=request,
-        collection=collection,
-        collection_id_or_name=collectionIdOrName,
-        record_id=recordId,
-        auth=auth,
-        data=data,
-        files=files,
-        expand=expand,
-        fields=fields,
-        engine=engine,
-    )
+    collection: Any | None = None
 
     async def _default_update_handler(e: RecordRequestEvent) -> JSONResponse:
+        if collection is None:  # pragma: no cover - coordinator invariant
+            raise RuntimeError("Record collection was not resolved.")
         active_engine = e.engine or engine
         if not isinstance(e.data, dict):
             return _error_response(400, "Request body must be a JSON object.")
@@ -1681,15 +1689,39 @@ async def api_update_record(
 
         return JSONResponse(content=record, status_code=200)
 
-    try:
-        async with engine.begin() as conn:
-            event.engine = _ConnectionEngineAdapter(conn)
-            return await _trigger_record_request_hook(
-                request,
-                HOOK_RECORD_UPDATE_REQUEST,
-                event,
-                _default_update_handler,
+    async def _run_update(active_engine: _ConnectionEngineAdapter) -> Any:
+        nonlocal collection
+        collection = await resolve_collection(active_engine, collectionIdOrName)
+        if collection is None:
+            return _error_response(404, "Missing collection context.")
+        if collection.name == "_superusers":
+            return _error_response(
+                400,
+                "You cannot update _superusers records via the records API. "
+                "Use the admin auth endpoints instead.",
             )
+        event = RecordRequestEvent(
+            app=request.app,
+            request=request,
+            collection=collection,
+            collection_id_or_name=collectionIdOrName,
+            record_id=recordId,
+            auth=auth,
+            data=data,
+            files=files,
+            expand=expand,
+            fields=fields,
+            engine=active_engine,
+        )
+        return await _trigger_record_request_hook(
+            request,
+            HOOK_RECORD_UPDATE_REQUEST,
+            event,
+            _default_update_handler,
+        )
+
+    try:
+        return await _run_storage_transaction(engine, _run_update)
     except _AbortWithResponse as abort:
         return abort.response
 
@@ -1704,34 +1736,15 @@ async def api_delete_record(
     collectionIdOrName: str,
     recordId: str,
     request: Request,
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Delete a record."""
     engine = get_engine()
-
-    collection = await resolve_collection(engine, collectionIdOrName)
-    if collection is None:
-        return _error_response(404, "Missing collection context.")
-
-    # _superusers records are managed via the admin auth API, not here
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot delete _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
-
-    event = RecordRequestEvent(
-        app=request.app,
-        request=request,
-        collection=collection,
-        collection_id_or_name=collectionIdOrName,
-        record_id=recordId,
-        auth=auth,
-        engine=engine,
-    )
+    collection: Any | None = None
 
     async def _default_delete_handler(e: RecordRequestEvent) -> JSONResponse:
+        if collection is None:  # pragma: no cover - coordinator invariant
+            raise RuntimeError("Record collection was not resolved.")
         active_engine = e.engine or engine
         target_record_id = e.record_id or recordId
         auth_ctx, request_context = _prepare_rule_context(request, e.auth)
@@ -1767,15 +1780,35 @@ async def api_delete_record(
 
         return Response(status_code=204)
 
-    try:
-        async with engine.begin() as conn:
-            event.engine = _ConnectionEngineAdapter(conn)
-            return await _trigger_record_request_hook(
-                request,
-                HOOK_RECORD_DELETE_REQUEST,
-                event,
-                _default_delete_handler,
+    async def _run_delete(active_engine: _ConnectionEngineAdapter) -> Any:
+        nonlocal collection
+        collection = await resolve_collection(active_engine, collectionIdOrName)
+        if collection is None:
+            return _error_response(404, "Missing collection context.")
+        if collection.name == "_superusers":
+            return _error_response(
+                400,
+                "You cannot delete _superusers records via the records API. "
+                "Use the admin auth endpoints instead.",
             )
+        event = RecordRequestEvent(
+            app=request.app,
+            request=request,
+            collection=collection,
+            collection_id_or_name=collectionIdOrName,
+            record_id=recordId,
+            auth=auth,
+            engine=active_engine,
+        )
+        return await _trigger_record_request_hook(
+            request,
+            HOOK_RECORD_DELETE_REQUEST,
+            event,
+            _default_delete_handler,
+        )
+
+    try:
+        return await _run_storage_transaction(engine, _run_delete)
     except _AbortWithResponse as abort:
         return abort.response
 
@@ -1788,7 +1821,7 @@ async def api_delete_record(
 @router.post("/api/batch")
 async def api_batch_records(
     request: Request,
-    auth: dict[str, Any] | None = Depends(get_optional_auth),
+    auth: dict[str, Any] | None = Depends(_get_mutation_auth),
 ) -> JSONResponse:
     """Execute multiple record actions in a single transaction."""
     engine = get_engine()
@@ -1824,43 +1857,38 @@ async def api_batch_records(
             f"The allowed max number of batch requests is {max_requests}.",
         )
 
-    result_items: list[dict[str, Any]] = []
-    created_targets: set[tuple[str, str]] = set()
-    try:
+    async def _run_batch(
+        batch_engine: _ConnectionEngineAdapter,
+    ) -> list[dict[str, Any]]:
+        result_items: list[dict[str, Any]] = []
         async with asyncio.timeout(timeout_seconds):
-            async with engine.begin() as conn:
-                batch_engine = _ConnectionEngineAdapter(conn)
-                all_collections = await get_all_collections(batch_engine)
-
-                for index, item in enumerate(requests_payload):
-                    response_or_error = await _execute_batch_request(
-                        batch_engine,
-                        request,
-                        auth,
-                        item,
-                        files_by_request.get(index, {}),
-                        all_collections,
+            all_collections = await get_all_collections(batch_engine)
+            for index, item in enumerate(requests_payload):
+                response_or_error = await _execute_batch_request(
+                    batch_engine,
+                    request,
+                    auth,
+                    item,
+                    files_by_request.get(index, {}),
+                    all_collections,
+                )
+                if isinstance(response_or_error, JSONResponse):
+                    raise _BatchRequestFailed(
+                        index,
+                        _response_json_body(response_or_error),
                     )
-                    if isinstance(response_or_error, JSONResponse):
-                        raise _BatchRequestFailed(
-                            index, _response_json_body(response_or_error)
-                        )
 
-                    status, body, created_target = response_or_error
-                    if created_target is not None:
-                        created_targets.add(created_target)
-                    result_items.append(
-                        {
-                            "status": status,
-                            "body": body,
-                        }
-                    )
+                status, body = response_or_error
+                result_items.append({"status": status, "body": body})
+        return result_items
+
+    try:
+        result_items = await run_record_storage_transaction(
+            engine,
+            _run_batch,
+            barrier_timeout_seconds=timeout_seconds,
+        )
     except _BatchRequestFailed as exc:
-        if created_targets:
-            from ppbase.services.file_storage import delete_all_files
-
-            for collection_id, record_id in created_targets:
-                delete_all_files(collection_id, record_id)
         return _error_response(
             400,
             "Batch transaction failed.",
@@ -1874,12 +1902,7 @@ async def api_batch_records(
                 },
             },
         )
-    except TimeoutError:
-        if created_targets:
-            from ppbase.services.file_storage import delete_all_files
-
-            for collection_id, record_id in created_targets:
-                delete_all_files(collection_id, record_id)
+    except (TimeoutError, WriteBarrierTimeoutError):
         return _error_response(
             400,
             "Batch transaction failed.",
@@ -1890,5 +1913,4 @@ async def api_batch_records(
                 },
             },
         )
-
     return JSONResponse(content=result_items, status_code=200)

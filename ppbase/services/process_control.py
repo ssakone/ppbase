@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,77 @@ logger = logging.getLogger(__name__)
 _RESTART_CMD_ENV = "PBBASE_RESTART_CMD"
 _restart_lock = threading.Lock()
 _restart_scheduled = False
+_restart_reservation: "ProcessRestartReservation | None" = None
+_activation_watchdog_lock = threading.Lock()
+_activation_watchdog_keys: set[tuple[str, str]] = set()
+
+
+class ProcessRestartReservation:
+    """Single-flight restart slot reserved before a durable cutover commit."""
+
+    def __init__(self) -> None:
+        self._active = True
+        self._claimed = False
+
+    def release(self) -> None:
+        """Return an unconsumed slot; consumed reservations are a no-op."""
+        global _restart_reservation, _restart_scheduled
+        with _restart_lock:
+            if not self._active or _restart_reservation is not self:
+                return
+            self._active = False
+            self._claimed = False
+            _restart_reservation = None
+            _restart_scheduled = False
+
+
+def reserve_process_restart() -> ProcessRestartReservation | None:
+    """Reserve restart single-flight before publishing activation state."""
+    global _restart_reservation, _restart_scheduled
+    with _restart_lock:
+        if _restart_scheduled:
+            return None
+        reservation = ProcessRestartReservation()
+        _restart_reservation = reservation
+        _restart_scheduled = True
+        return reservation
+
+
+def _claim_restart_reservation(
+    reservation: ProcessRestartReservation,
+) -> bool:
+    with _restart_lock:
+        if (
+            not reservation._active
+            or reservation._claimed
+            or not _restart_scheduled
+            or _restart_reservation is not reservation
+        ):
+            return False
+        reservation._claimed = True
+        return True
+
+
+def _detach_restart_reservation(
+    reservation: ProcessRestartReservation,
+) -> None:
+    """Transfer a successfully started reservation to the restart worker."""
+    global _restart_reservation
+    with _restart_lock:
+        reservation._active = False
+        reservation._claimed = False
+        if _restart_reservation is reservation:
+            _restart_reservation = None
+
+
+def _clear_restart_scheduled() -> None:
+    global _restart_reservation, _restart_scheduled
+    with _restart_lock:
+        if _restart_reservation is not None:
+            _restart_reservation._active = False
+            _restart_reservation._claimed = False
+        _restart_reservation = None
+        _restart_scheduled = False
 
 
 def _normalize_command(value: object) -> list[str] | None:
@@ -69,24 +141,93 @@ def is_restart_scheduled() -> bool:
         return _restart_scheduled
 
 
-def schedule_process_restart(reason: str, *, delay_seconds: float = 0.35) -> bool:
+def _validated_restart_command(command: Sequence[str] | None) -> list[str] | None:
+    if command is None:
+        return get_restart_command()
+    if isinstance(command, (str, bytes)):
+        return None
+    normalized = [str(item) for item in command]
+    if not normalized or any(not item or "\x00" in item for item in normalized):
+        return None
+    return normalized
+
+
+def _restart_environment(overrides: Mapping[str, str] | None) -> dict[str, str]:
+    env = os.environ.copy()
+    for key, value in (overrides or {}).items():
+        normalized_key = str(key)
+        normalized_value = str(value)
+        if (
+            not normalized_key
+            or "=" in normalized_key
+            or "\x00" in normalized_key
+            or "\x00" in normalized_value
+        ):
+            raise ValueError("restart environment contains an unsafe entry")
+        env[normalized_key] = normalized_value
+    return env
+
+
+def restart_process_now(
+    reason: str,
+    *,
+    command: Sequence[str] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+) -> None:
+    """Replace this process immediately with a validated restart command."""
+    selected = _validated_restart_command(command)
+    if not selected:
+        raise RuntimeError("PPBase has no valid restart command")
+    env = _restart_environment(env_overrides)
+    logger.warning("Restarting PPBase process immediately: %s", reason)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os.execvpe(selected[0], selected, env)
+
+
+def schedule_process_restart(
+    reason: str,
+    *,
+    delay_seconds: float = 0.35,
+    command: Sequence[str] | None = None,
+    env_overrides: Mapping[str, str] | None = None,
+    on_failure: Callable[[BaseException], None] | None = None,
+    reservation: ProcessRestartReservation | None = None,
+    before_exec: Callable[[], None] | None = None,
+) -> bool:
     """Schedule an in-place process restart using ``os.execvpe``.
 
     Returns ``True`` when a restart was scheduled, otherwise ``False`` if
     restart is unsupported or already pending.
     """
-    command = get_restart_command()
-    if not command:
+    selected = _validated_restart_command(command)
+    if not selected:
         logger.warning("Cannot restart PPBase automatically: no restart command configured")
         return False
 
-    with _restart_lock:
-        global _restart_scheduled
-        if _restart_scheduled:
+    if reservation is not None:
+        if not _claim_restart_reservation(reservation):
             return False
-        _restart_scheduled = True
+    else:
+        with _restart_lock:
+            global _restart_scheduled
+            if _restart_scheduled:
+                return False
+            _restart_scheduled = True
 
-    env = os.environ.copy()
+    try:
+        env = _restart_environment(env_overrides)
+    except ValueError:
+        logger.exception("Cannot restart PPBase with an invalid environment")
+        if reservation is None:
+            _clear_restart_scheduled()
+        return False
 
     def _restart_worker() -> None:
         logger.warning("Restarting PPBase process: %s", reason)
@@ -100,16 +241,141 @@ def schedule_process_restart(reason: str, *, delay_seconds: float = 0.35) -> boo
                 sys.stderr.flush()
             except Exception:
                 pass
-            os.execvpe(command[0], command, env)
-        except Exception:
+            # This must be the final fallible callback before exec. In
+            # particular, potentially blocking stream flushes happen first so
+            # they cannot widen the verified cutover interval.
+            if before_exec is not None:
+                before_exec()
+            os.execvpe(selected[0], selected, env)
+        except Exception as exc:
             logger.exception("Failed to restart PPBase process")
-            with _restart_lock:
-                global _restart_scheduled
-                _restart_scheduled = False
+            failure_settled = True
+            try:
+                if on_failure is not None:
+                    try:
+                        on_failure(exc)
+                    except Exception:
+                        failure_settled = False
+                        logger.exception(
+                            "Failed to persist the rejected process restart outcome"
+                        )
+            finally:
+                if failure_settled:
+                    _clear_restart_scheduled()
 
-    thread = threading.Thread(target=_restart_worker, name="ppbase-restart", daemon=True)
-    thread.start()
+    try:
+        thread = threading.Thread(
+            target=_restart_worker,
+            name="ppbase-restart",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        if reservation is None:
+            _clear_restart_scheduled()
+        logger.exception("Failed to start the PPBase restart worker")
+        return False
+    if reservation is not None:
+        _detach_restart_reservation(reservation)
     return True
+
+
+def schedule_backup_activation_watchdog(
+    *,
+    control_dir: str,
+    activation_id: str,
+    timeout_seconds: float,
+) -> threading.Thread | None:
+    """Rollback a restored target that never reaches its health commit point.
+
+    The watchdog is a daemon thread rather than an asyncio task so it still
+    fires when synchronous startup hooks or another event-loop stall prevent
+    the lifespan from progressing. The activation journal remains the source
+    of truth: the thread only acts while the exact activation is still in the
+    durable ``starting`` state.
+    """
+    normalized_id = str(activation_id or "").strip()
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+    if not normalized_id or not timeout > 0 or timeout == float("inf"):
+        return None
+
+    try:
+        selected_control = Path(control_dir).expanduser()
+        if not selected_control.is_absolute():
+            selected_control = Path(
+                os.path.abspath(os.fspath(selected_control))
+            )
+        watchdog_key = (os.fspath(selected_control), normalized_id)
+    except (OSError, TypeError, ValueError):
+        return None
+
+    with _activation_watchdog_lock:
+        if watchdog_key in _activation_watchdog_keys:
+            return None
+        _activation_watchdog_keys.add(watchdog_key)
+
+    def _watch() -> None:
+        restart_spec: tuple[list[str], dict[str, str]] | None = None
+        try:
+            time.sleep(timeout)
+            from ppbase.backup.activation import (
+                BackupActivationStore,
+                activation_restart_spec,
+            )
+            from ppbase.backup.control import ControlPlaneRoot
+
+            root = ControlPlaneRoot.open(
+                selected_control,
+                create_missing=False,
+            )
+            store = BackupActivationStore(root)
+            try:
+                state = store.inspect(normalized_id)
+                if (
+                    state.get("status") != "starting"
+                    or state.get("selectedTarget") != "target"
+                ):
+                    return
+                state = store.mark_rollback_pending(
+                    normalized_id,
+                    error_code="activation_health_timeout",
+                )
+                restart_spec = activation_restart_spec(state)
+            finally:
+                store.close()
+                root.close()
+        except Exception:
+            logger.exception(
+                "Backup activation health watchdog could not schedule rollback"
+            )
+        finally:
+            with _activation_watchdog_lock:
+                _activation_watchdog_keys.discard(watchdog_key)
+
+        if restart_spec is None:
+            return
+        command, environment = restart_spec
+        try:
+            restart_process_now(
+                "Backup activation health check timed out; rolling back",
+                command=command,
+                env_overrides=environment,
+            )
+        except Exception:
+            logger.exception(
+                "Backup activation health watchdog failed to restart the previous target"
+            )
+
+    thread = threading.Thread(
+        target=_watch,
+        name=f"ppbase-backup-health-{normalized_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def serialize_restart_state() -> dict[str, Any]:
