@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     model_config = {
         "env_prefix": "PPBASE_",
         "env_file": ".env",
+        # Ignore non-settings/internal env vars that may coexist in the shell.
+        "extra": "ignore",
     }
 
     def get_jwt_secret(self) -> str:

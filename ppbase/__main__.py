@@ -154,7 +154,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     """Start the PPBase server (foreground or daemon)."""
     from ppbase import pb
 
-    os.environ["PPBASE_RESTART_CMD"] = json.dumps(
+    os.environ["PBBASE_RESTART_CMD"] = json.dumps(
         [sys.executable, "-m", "ppbase", *sys.argv[1:]]
     )
 

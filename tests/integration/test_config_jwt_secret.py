@@ -3,6 +3,12 @@ from __future__ import annotations
 from ppbase.config import Settings
 
 
+def test_settings_ignore_internal_restart_env_var(monkeypatch) -> None:
+    monkeypatch.setenv("PPBASE_RESTART_CMD", "1")
+    settings = Settings()
+    assert settings.port == 8090
+
+
 def test_project_local_jwt_secret_is_persisted_in_data_dir(tmp_path) -> None:
     Settings._resolved_jwt_secret.clear()
 

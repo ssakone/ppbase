@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   useHooks,
   useUpdateHook,
@@ -35,6 +35,8 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { HookState } from '@/api/types'
+
+type ActionState = 'restart' | 'rescan' | 'refresh' | null
 
 function StatusBadge({ status }: { status: HookState['status'] }) {
   switch (status) {
@@ -233,7 +235,7 @@ function HookCard({
 }
 
 export function HooksPage() {
-  const { data, isLoading, isError, refetch } = useHooks()
+  const { data, isLoading, isError, isFetching, refetch } = useHooks()
   const updateHook = useUpdateHook()
   const rescanMutation = useRescanHooks()
   const reloadMutation = useReloadHook()
@@ -242,6 +244,7 @@ export function HooksPage() {
 
   const [togglingId, setTogglingId] = useState<string | null>(null)
   const [reloadingId, setReloadingId] = useState<string | null>(null)
+  const [activeAction, setActiveAction] = useState<ActionState>(null)
 
   const hooks = data?.items ?? []
   const hooksDir = data?.hooksDir ?? './pb_hooks'
@@ -251,6 +254,20 @@ export function HooksPage() {
     canRestart: false,
     restartPending: false,
   }
+
+  useEffect(() => {
+    if (!runtime.restartPending) {
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      void refetch()
+    }, 1500)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [runtime.restartPending, refetch])
 
   const handleToggle = async (hookId: string, enabled: boolean) => {
     setTogglingId(hookId)
@@ -277,8 +294,10 @@ export function HooksPage() {
   }
 
   const handleRescan = async () => {
+    setActiveAction('rescan')
     try {
       const result = await rescanMutation.mutateAsync()
+      await refetch()
       if (result.reloaded.length > 0) {
         toast.success(
           runtime.autoRestartOnChange
@@ -290,6 +309,8 @@ export function HooksPage() {
       }
     } catch {
       toast.error('Failed to rescan hooks directory')
+    } finally {
+      setActiveAction(null)
     }
   }
 
@@ -307,11 +328,24 @@ export function HooksPage() {
   }
 
   const handleRestart = async () => {
+    setActiveAction('restart')
     try {
       await restartMutation.mutateAsync()
-      toast.success('PPBase restart scheduled')
+      await refetch()
+      toast.success('PPBase restart scheduled. The app will restart shortly.')
     } catch {
       toast.error('Failed to schedule PPBase restart')
+    } finally {
+      setActiveAction(null)
+    }
+  }
+
+  const handleRefresh = async () => {
+    setActiveAction('refresh')
+    try {
+      await refetch()
+    } finally {
+      setActiveAction(null)
     }
   }
 
@@ -330,30 +364,46 @@ export function HooksPage() {
               size="sm"
               onClick={handleRestart}
               disabled={!runtime.canRestart || runtime.restartPending || restartMutation.isPending}
+              className="min-w-[148px] justify-center"
             >
               {restartMutation.isPending || runtime.restartPending ? (
                 <LoadingSpinner size="sm" className="mr-1.5" />
               ) : (
                 <Power className="h-4 w-4 mr-1.5" />
               )}
-              {runtime.restartPending ? 'Restart pending' : 'Restart app'}
+              {restartMutation.isPending
+                ? 'Scheduling...'
+                : runtime.restartPending
+                  ? 'Restart pending'
+                  : 'Restart app'}
             </Button>
             <Button
               variant="outline"
               size="sm"
               onClick={handleRescan}
               disabled={rescanMutation.isPending}
+              className="min-w-[132px] justify-center"
             >
               {rescanMutation.isPending ? (
                 <LoadingSpinner size="sm" className="mr-1.5" />
               ) : (
                 <FolderSearch className="h-4 w-4 mr-1.5" />
               )}
-              Rescan
+              {rescanMutation.isPending ? 'Scanning...' : 'Rescan'}
             </Button>
-            <Button variant="outline" size="sm" onClick={() => refetch()}>
-              <RefreshCw className="h-4 w-4 mr-1.5" />
-              Refresh
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleRefresh}
+              disabled={activeAction === 'refresh' || isFetching}
+              className="min-w-[124px] justify-center"
+            >
+              {activeAction === 'refresh' || isFetching ? (
+                <LoadingSpinner size="sm" className="mr-1.5" />
+              ) : (
+                <RefreshCw className="h-4 w-4 mr-1.5" />
+              )}
+              {activeAction === 'refresh' || isFetching ? 'Refreshing...' : 'Refresh'}
             </Button>
           </div>
         }
@@ -375,6 +425,38 @@ export function HooksPage() {
           </div>
         ) : (
           <>
+            {(activeAction !== null || runtime.restartPending || isFetching) && (
+              <div className="rounded-lg border bg-slate-50 px-4 py-3">
+                <div className="flex items-start gap-3">
+                  <LoadingSpinner size="sm" className="mt-0.5 shrink-0" />
+                  <div className="space-y-1">
+                    <p className="text-sm font-medium text-slate-900">
+                      {runtime.restartPending
+                        ? 'Restart scheduled'
+                        : activeAction === 'restart'
+                          ? 'Scheduling app restart'
+                          : activeAction === 'rescan'
+                            ? 'Scanning hooks directory'
+                            : activeAction === 'refresh'
+                              ? 'Refreshing hook state'
+                              : 'Updating hook status'}
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      {runtime.restartPending
+                        ? 'PPBase accepted the restart request. This page will refresh automatically while waiting for the process state to change.'
+                        : activeAction === 'restart'
+                          ? 'Sending the restart request to PPBase.'
+                          : activeAction === 'rescan'
+                            ? 'Checking the hooks directory and reloading updated hook files.'
+                            : activeAction === 'refresh'
+                              ? 'Fetching the latest hook and runtime state.'
+                              : 'Synchronizing the latest runtime information.'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="rounded-lg border bg-white px-4 py-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div className="space-y-1">
                 <p className="text-sm font-medium text-slate-900">Runtime behavior</p>

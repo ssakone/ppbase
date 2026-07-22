@@ -58,7 +58,11 @@ export function useUpdateHooksRuntime() {
 }
 
 export function useRestartPPBase() {
+  const queryClient = useQueryClient()
   return useMutation({
     mutationFn: restartPPBase,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hooks'] })
+    },
   })
 }
