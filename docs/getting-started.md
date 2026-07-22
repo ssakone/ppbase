@@ -3,7 +3,8 @@
 ## Prerequisites
 
 - Python 3.11+
-- Docker (for the managed PostgreSQL container)
+- A reachable PostgreSQL server
+- Docker only if using the optional managed local PostgreSQL container
 - Node.js 18+ (only if rebuilding the Admin UI)
 
 ## Installation
@@ -23,7 +24,8 @@ pip install -e ".[dev]"
 
 ## Start the database
 
-PPBase ships with a `db` CLI sub-command that manages a local Docker container running PostgreSQL 17 on port **5433**:
+PPBase ships with an optional `db` CLI sub-command that manages a local Docker
+container running PostgreSQL 17 on port **5433**:
 
 ```bash
 python -m ppbase db start    # create & start (first run pulls the image)
@@ -34,17 +36,45 @@ python -m ppbase db restart  # restart
 
 > **Custom PostgreSQL?** Set `PPBASE_DATABASE_URL` to your connection string and skip this step.
 
+Docker is not required by PPBase itself or by native backup/restore. A normal
+PostgreSQL service plus matching `pg_dump`, `pg_restore`, and `psql` tools is
+sufficient.
+
+### Initialize a fresh PostgreSQL project
+
+For a PostgreSQL cluster where the application database and limited roles do
+not exist yet, use the autonomous onboarding command. The bootstrap DSN is
+ephemeral and is never written to the generated file:
+
+```bash
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
+  ppbase init postgres --plan --name myapp --output-env ./ppbase.env
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
+  ppbase init postgres --execute --name myapp --output-env ./ppbase.env
+```
+
+The execute command creates the `myapp` database, its limited runtime role,
+the native backup roles and a mode-`0600` env file. It also creates PPBase's
+default `pb_data`, backup, control, staging and durable target directories as
+private `0700` directories. Repeating the same command with the same env file
+is a no-op and preserves its credentials and inode. Use the advanced path
+flags only when the deployment cannot use the PPBase defaults, and expose the
+same custom paths through their `PPBASE_*` variables when starting the service.
+
+For an application database/runtime that already exists, keep using
+`ppbase backup provision`; it applies only the backup role contract.
+
 ## Create your first admin
 
 ```bash
-python -m ppbase create-admin --email admin@example.com --password secret123
+ppbase create-admin --email admin@example.com --password secret123
 ```
 
 ## Run the server
 
 ```bash
 # Foreground (dev)
-python -m ppbase serve
+ppbase serve
 
 # Foreground with custom public + migrations directories
 python -m ppbase serve --publicDir ./public --migrationsDir ./pb_migrations
@@ -74,6 +104,17 @@ Or using the shell helper:
 ```
 
 Open **http://127.0.0.1:8090/_/** in your browser to access the Admin UI.
+
+When deploying directly from a source clone, build the assets once after clone
+and rebuild them after Admin UI changes before restarting PPBase:
+
+```bash
+cd admin-ui
+npm ci
+npm run build
+```
+
+Installed wheels include their packaged Admin UI assets.
 
 ### SMTP test (admin)
 
@@ -144,6 +185,7 @@ curl http://127.0.0.1:8090/hello
 ```
 my_project/
 ├── main.py            ← entry-point
+├── pb_migrations/     ← this application's versioned migrations
 ├── hooks/
 │   ├── users.py       ← user-related hooks
 │   ├── posts.py       ← post hooks
@@ -151,7 +193,7 @@ my_project/
 ├── routes/
 │   ├── blog.py        ← blog API routes
 │   └── metrics.py     ← internal metrics
-└── ppbase/            ← ppbase package (git submodule or pip-installed)
+└── requirements.txt   ← includes the pip-installed ppbase package
 ```
 
 ```python
@@ -210,6 +252,56 @@ if __name__ == "__main__":
 ```
 
 `pb.configure()` raises `RuntimeError` if called after the app is materialised.
+
+## Migrations
+
+PPBase bootstraps its internal schema and the default `users` collection, then
+applies pending Python files from `migrations_dir` before it starts accepting
+traffic. Each file is committed independently with its `_migrations` history
+row, and PostgreSQL advisory locking prevents duplicate application when two
+instances start together. Dashboard/API producers acquire the same lock before
+publishing a generated migration and committing their schema change.
+
+```bash
+python -m ppbase migrate create add_posts
+python -m ppbase migrate status
+python -m ppbase migrate up
+python -m ppbase migrate down 1
+python -m ppbase migrate snapshot
+```
+
+`migrate status` is read-only. On a blank database it reports every local file
+as pending without creating PPBase tables or the default users collection.
+
+Snapshots replay in PocketBase-style extend mode and topologically order
+dependent PostgreSQL views. Because PPBase records a snapshot as an already
+applied baseline on its source database, the generated `down()` intentionally
+does nothing: it cannot know which collections or data existed before the
+snapshot. Use PostgreSQL backups for data recovery.
+
+The migration directory belongs to the consuming application. Commit your
+backend's `pb_migrations/` (or custom directory) to that backend's repository
+so deployments receive and apply the same history. PPBase's own source checkout
+ignores its root `pb_migrations/` because that directory is only local runtime
+data for framework development; it is not bundled in the PyPI package.
+
+PocketBase uses “automigrate” for migration-file generation after Dashboard
+collection changes. PPBase now exposes the two concerns separately:
+
+- `apply_migrations_on_start`: apply pending files during startup;
+- `generate_migrations`: generate files for Dashboard/API collection changes.
+
+For backwards compatibility, either unset option inherits the legacy
+`auto_migrate` value.
+
+Generated files and PostgreSQL cannot share one physical transaction. PPBase
+publishes the file first as durable intent while holding the shared migration
+lock, then commits DDL, metadata, and history together. After a crash, an
+uncommitted file can remain pending and be applied on the next run. A lost
+COMMIT acknowledgement is checked against `_migrations` only after reacquiring
+that same runner lock; unverifiable outcomes preserve the file and require
+`migrate status` before retrying. Disabling `generate_migrations` suppresses
+only the file: physical collection-schema mutations still take the lock.
 
 ## Verify the app boots
 

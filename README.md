@@ -9,7 +9,10 @@ PPBase gives you an instant REST API with dynamic collections, admin authenticat
 ### 1. Prerequisites
 
 - Python 3.11+
-- Docker (for PostgreSQL)
+- A reachable PostgreSQL server
+- Matching `pg_dump`, `pg_restore`, and `psql` client tools when using native backup/restore
+- Docker is optional and used only by the bundled local PostgreSQL helper and tests
+- Node.js 18+ only when building the Admin UI from a source clone
 
 ### 2. Install
 
@@ -20,13 +23,38 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-### 3. Start PostgreSQL
+When running directly from a source clone, build the Admin UI once after clone
+and again after frontend changes so `/_/` serves the current Dashboard:
+
+```bash
+cd admin-ui
+npm ci
+npm run build
+cd ..
+```
+
+### 3. Connect PostgreSQL
 
 ```bash
 python -m ppbase db start
 ```
 
-This creates a Docker container (`ppbase-pg`) running PostgreSQL 17 on port 5433.
+This optional convenience command creates a Docker container (`ppbase-pg`)
+running PostgreSQL 17 on port 5433. PPBase itself, including native
+backup/restore, does not depend on Docker; set `PPBASE_DATABASE_URL` to use an
+existing PostgreSQL server instead.
+
+For an external fresh PostgreSQL cluster, PPBase can create the complete
+limited application/backup contract without manual SQL:
+
+```bash
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase init postgres --plan --name myapp --output-env ./ppbase.env
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase init postgres --execute --name myapp --output-env ./ppbase.env
+```
+
+The installed `ppbase` console command and `python -m ppbase` are equivalent.
 
 ### 4. Start the server
 
@@ -58,9 +86,56 @@ python -m ppbase db stop            # stop container
 python -m ppbase db restart         # restart container
 python -m ppbase db status          # check container status
 
+# Fresh external PostgreSQL project
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase init postgres --plan --name <project> --output-env ./ppbase.env
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase init postgres --execute --name <project> --output-env ./ppbase.env
+
+# Existing database backup contract / live readiness
+ppbase backup provision --plan --db "$PPBASE_DATABASE_URL" --dir "$PPBASE_DATA_DIR"
+PPBASE_BACKUP_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase backup provision --execute --db "$PPBASE_DATABASE_URL" --dir "$PPBASE_DATA_DIR" --output-env ./ppbase-backup.env
+ppbase backup doctor --db "$PPBASE_DATABASE_URL" --dir "$PPBASE_DATA_DIR" --server http://127.0.0.1:8090
+
 # Admin
 python -m ppbase create-admin --email <email> --password <pass>
+
+# Application migrations
+python -m ppbase migrate status
+python -m ppbase migrate up
+python -m ppbase migrate down 1
+python -m ppbase migrate create add_posts
+python -m ppbase migrate snapshot
 ```
+
+For an existing deployment, review the read-only provisioning plan before
+executing it. Supply the privileged bootstrap DSN only to the execute process:
+
+```bash
+ppbase backup provision --plan \
+  --db "$PPBASE_DATABASE_URL" \
+  --dir "$PPBASE_DATA_DIR"
+
+PPBASE_BACKUP_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://bootstrap:...@db/postgres' \
+  ppbase backup provision --execute \
+  --db "$PPBASE_DATABASE_URL" \
+  --dir "$PPBASE_DATA_DIR" \
+  --output-env ./ppbase-backup.env
+```
+
+The bootstrap DSN is ephemeral and is not written to the mode-`0600` output
+file. Load that output file persistently in the PPBase service environment and
+restart the service before running `backup doctor --server`. Do not commit it.
+A legacy superuser application role is accepted unchanged with the non-blocking
+`legacy_runtime_superuser` warning; dedicated backup roles remain limited.
+
+The `--db` and `--dir` values must be the exact database and `data_dir` used by
+`serve`. If PostgreSQL references local files absent from `<data_dir>/storage`,
+backup creation fails safely instead of publishing an incomplete archive.
+Restore is a staged whole-target operation: it validates a new database and a
+new `data_dir`, then switches both together. It does not merge records or files
+into the active target. See [Native Backup & Restore](docs/native-backup-restore.md).
 
 A shell script (`ppctl.sh`) is also available:
 
@@ -155,7 +230,39 @@ HTTP Request -> FastAPI
 - **Hybrid SQLAlchemy**: ORM for system tables, Core for dynamic collection tables
 - **Physical columns**: Each field type maps to a real PostgreSQL column (not JSONB)
 - **Filter parser**: Lark EBNF grammar translates PocketBase filter syntax to parameterized SQL
-- **No migration system**: `_collections` table is the source of truth; DDL is applied directly
+- **PocketBase-style migrations**: native Python files update collection metadata
+  and PostgreSQL DDL together
+- **Atomic PostgreSQL execution**: one transaction per migration file, tracked in
+  `_migrations`, with an advisory lock shared by runners and Dashboard producers
+
+## Application-owned migrations
+
+PPBase is the migration engine. Each application using the PyPI package owns
+and versions its configured migration directory (usually `pb_migrations/`).
+Those files are applied after PPBase bootstraps its internal schema and the
+stable `users` collection, and before HTTP traffic, realtime listeners, or
+serve hooks start.
+
+The `pb_migrations/` directory at the root of the PPBase source repository is
+intentionally ignored because it is only local framework-development runtime
+data. This does **not** mean consumer projects should ignore their own
+migrations; application migrations belong in the consumer project's VCS.
+
+PostgreSQL DDL, collection metadata, and migration history are atomic inside
+each file. The migration filesystem is a separate durability domain: generated
+files are published as durable intent before the database commit, under the
+same advisory lock. A crash may therefore leave a pending file that the next
+runner applies. After a COMMIT error PPBase reacquires the runner lock before
+checking `_migrations` or deleting rolled-back intent, and preserves the file
+when the outcome cannot be proven; it does not claim a distributed PostgreSQL +
+filesystem transaction. Schema mutations take the lock even when Dashboard
+migration-file generation is disabled.
+
+`migrate snapshot` follows PocketBase's extend-mode idea: it updates existing
+collections, creates missing ones, and orders dependent views. Its `down()` is
+intentionally a safe no-op because the pre-snapshot state is unknowable; a
+schema snapshot is not a database/data backup. `migrate status` is read-only and
+does not bootstrap a blank database.
 
 ## Configuration
 
@@ -166,6 +273,11 @@ All settings use the `PPBASE_` environment variable prefix:
 | `PPBASE_DATABASE_URL` | `postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase` | PostgreSQL connection |
 | `PPBASE_PORT` | `8090` | Server port |
 | `PPBASE_HOST` | `0.0.0.0` | Bind address |
+| `PPBASE_MIGRATIONS_DIR` | `./pb_migrations` | Consumer application's migration directory |
+| `PPBASE_AUTO_MIGRATE` | `true` | Legacy fallback for startup application and file generation |
+| `PPBASE_APPLY_MIGRATIONS_ON_START` | inherits legacy setting | Apply pending files before serving traffic |
+| `PPBASE_GENERATE_MIGRATIONS` | inherits legacy setting | Generate files after Dashboard collection changes |
+| `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | Seconds to wait for another instance's migration lock |
 
 ## Development
 
@@ -263,7 +375,7 @@ The hook target format is strict: `module:function`. The function receives `pb`.
 - **Pydantic** -- request/response validation
 - **PyJWT** -- admin authentication tokens
 - **Lark** -- PocketBase filter syntax parser
-- **PostgreSQL 17** -- database (via Docker)
+- **PostgreSQL** -- database; Docker is optional for local development
 
 ## License
 

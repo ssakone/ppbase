@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Paths to skip logging (admin UI assets, health check, realtime SSE)
 _SKIP_PREFIXES = ("/_/", "/api/health", "/api/realtime")
+
+# Backup control and future transport endpoints must authenticate before any
+# request body is consumed. They are still logged, but never body-captured by
+# this outer middleware.
+_AUTH_BEFORE_BODY_PREFIXES = ("/api/backups", "/api/backup-staging")
 
 # Capture only small, text-like payloads to avoid large/binary blobs in logs.
 _MAX_CAPTURE_BYTES = 32 * 1024
@@ -71,6 +77,40 @@ def _redact_sensitive(data: Any) -> Any:
     if isinstance(data, list):
         return [_redact_sensitive(item) for item in data]
     return data
+
+
+def _redact_url_query(url: str) -> str:
+    """Redact sensitive query values before persisting a request URL."""
+    try:
+        # Snapshot the underlying builtin string without dispatching to
+        # methods overridden by a ``str`` subclass.  ``urllib.parse`` calls
+        # methods such as ``lstrip()`` on its input, which could otherwise be
+        # made to parse different content than the value eventually stored.
+        url = str.__str__(url)
+        parts = urlsplit(url)
+        if parts.username is not None or parts.password is not None:
+            return "[REDACTED URL CREDENTIALS]"
+        if not parts.query:
+            # URL fragments are never part of an HTTP request target.  Keeping
+            # them would also let a malformed raw query hide additional fields
+            # from ``parse_qsl`` (for example ``?page=2#x&token=...``).
+            return urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, "", "")
+            )
+        redacted_query = urlencode(
+            [
+                (key, "[REDACTED]" if _is_sensitive_key(key) else value)
+                for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            ],
+            doseq=True,
+        )
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, redacted_query, "")
+        )
+    except Exception:
+        # Logging must never break a completed request. If parsing or encoding
+        # fails, retaining any portion could persist an unrecognized secret.
+        return "[REDACTED MALFORMED URL]"
 
 
 def _parse_content_length(raw: str | None) -> int | None:
@@ -178,7 +218,9 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
 
         content_length = _parse_content_length(request.headers.get("content-length"))
         request_content_type = request.headers.get("content-type")
-        should_capture_request = _should_capture_body(request_content_type, content_length)
+        should_capture_request = not any(
+            path.startswith(prefix) for prefix in _AUTH_BEFORE_BODY_PREFIXES
+        ) and _should_capture_body(request_content_type, content_length)
 
         request_body_bytes = await request.body() if should_capture_request else b""
         if should_capture_request:
@@ -244,12 +286,16 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
             }
 
         entry = {
-            "url": str(request.url),
+            "url": _redact_url_query(str(request.url)),
             "method": request.method,
             "status": response.status_code,
             "exec_time": elapsed_ms,
             "remote_ip": request.client.host if request.client else None,
-            "referer": request.headers.get("referer"),
+            "referer": (
+                _redact_url_query(request.headers["referer"])
+                if request.headers.get("referer")
+                else None
+            ),
             "user_agent": request.headers.get("user-agent"),
             "request_body": request_payload,
             "response_body": response_payload,

@@ -61,6 +61,10 @@ async def test_serve_file_download_query_param_controls_content_disposition(
         inline_response = await app_client.get(file_path)
         assert inline_response.status_code == 200, inline_response.text
         assert inline_response.content == b"hello file body"
+        etag = inline_response.headers.get("etag", "")
+        last_modified = inline_response.headers.get("last-modified", "")
+        assert etag.startswith('"') and etag.endswith('"')
+        assert last_modified
         inline_cd = inline_response.headers.get("content-disposition", "")
         assert "attachment" not in inline_cd.lower()
 
@@ -90,6 +94,43 @@ async def test_serve_file_download_query_param_controls_content_disposition(
             "content-disposition", ""
         )
         assert "attachment" not in explicit_inline_cd.lower()
+
+        range_response = await app_client.get(
+            file_path,
+            headers={"Range": "bytes=1-4"},
+        )
+        assert range_response.status_code == 206, range_response.text
+        assert range_response.content == b"ello"
+        assert range_response.headers["content-range"] == "bytes 1-4/15"
+        assert range_response.headers["accept-ranges"] == "bytes"
+
+        matching_if_range_response = await app_client.get(
+            file_path,
+            headers={"Range": "bytes=1-4", "If-Range": etag},
+        )
+        assert matching_if_range_response.status_code == 206
+        assert matching_if_range_response.content == b"ello"
+
+        stale_if_range_response = await app_client.get(
+            file_path,
+            headers={"Range": "bytes=1-4", "If-Range": '"stale"'},
+        )
+        assert stale_if_range_response.status_code == 200
+        assert stale_if_range_response.content == b"hello file body"
+
+        suffix_range_response = await app_client.get(
+            file_path,
+            headers={"Range": "bytes=-4"},
+        )
+        assert suffix_range_response.status_code == 206
+        assert suffix_range_response.content == b"body"
+
+        invalid_range_response = await app_client.get(
+            file_path,
+            headers={"Range": "bytes=999-1000"},
+        )
+        assert invalid_range_response.status_code == 416
+        assert invalid_range_response.headers["content-range"] == "bytes */15"
 
         thumb_fallback_response = await app_client.get(
             file_path, params={"thumb": "100x100"}

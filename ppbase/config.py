@@ -45,6 +45,43 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_force_path_style: bool = False
 
+    # ---- Native backup / restore staging ----
+    # Canonical sets and control-plane state intentionally live outside the
+    # restored business ``data_dir``. Only ``data_dir/storage`` is copied.
+    backup_root: str = "./pb_backups"
+    backup_control_dir: str = "./pb_backup_control"
+    backup_staging_root: str = "./pb_restore_staging"
+    # Durable isolated restore targets. When empty, PPBase derives a sibling
+    # path from ``backup_staging_root`` for backwards-compatible local setups.
+    backup_target_root: str = ""
+    backup_barrier_timeout: float = 300.0
+    backup_pg_dump_path: str = "pg_dump"
+    backup_pg_restore_path: str = "pg_restore"
+    backup_psql_path: str = "psql"
+    # Read-only source login used only by pg_dump and its privilege preflight.
+    # It must be distinct from the writable PPBase runtime login.
+    backup_dump_database_url: str = ""
+    # Restore staging uses separate cluster roles. The creator DSN is used
+    # only against a maintenance DB for CREATE DATABASE; the restore DSN has
+    # no CREATEDB and connects to the newly generated target.
+    backup_creator_database_url: str = ""
+    backup_restore_database_url: str = ""
+    backup_target_owner: str = ""
+    backup_allowed_extensions: list[str] = ["plpgsql=1.0"]
+    # ZIP transport is bounded independently from the ordinary API body
+    # setting because database backups are expected to be substantially larger.
+    backup_max_upload_bytes: int = 20 * 1024 * 1024 * 1024
+    backup_max_uncompressed_bytes: int = 100 * 1024 * 1024 * 1024
+    backup_max_resource_bytes: int = 20 * 1024 * 1024 * 1024
+    backup_max_archive_entries: int = 200_000
+    backup_max_central_directory_bytes: int = 64 * 1024 * 1024
+    backup_max_compression_ratio: int = 500
+    backup_transport_chunk_size: int = 1024 * 1024
+    backup_multipart_overhead_bytes: int = 1024 * 1024
+    # Maximum wall-clock time allowed for the restored process to reach the
+    # durable healthy activation state before an automatic rollback restart.
+    backup_activation_health_timeout: float = 120.0
+
     # ---- Auth ----
     jwt_secret: str = ""
     admin_token_duration: int = 1_209_600  # 14 days in seconds
@@ -75,7 +112,14 @@ class Settings(BaseSettings):
     origins: list[str] = ["*"]
 
     # ---- Migrations ----
+    # ``auto_migrate`` is the legacy PPBase switch that historically
+    # controlled both startup application and Dashboard file generation.
+    # The two optional settings below separate those concerns while keeping
+    # existing deployments backwards compatible when they are unset.
     auto_migrate: bool = True
+    apply_migrations_on_start: bool | None = None
+    generate_migrations: bool | None = None
+    migration_lock_timeout: float = 30.0
     migrations_dir: str = "./pb_migrations"
 
     # ---- Hooks ----
@@ -140,3 +184,15 @@ class Settings(BaseSettings):
 
         Settings._resolved_jwt_secret[cache_key] = generated
         return generated
+
+    def should_apply_migrations(self) -> bool:
+        """Return whether pending migration files run during startup."""
+        if self.apply_migrations_on_start is not None:
+            return self.apply_migrations_on_start
+        return self.auto_migrate
+
+    def should_generate_migrations(self) -> bool:
+        """Return whether collection changes generate migration files."""
+        if self.generate_migrations is not None:
+            return self.generate_migrations
+        return self.auto_migrate

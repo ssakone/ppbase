@@ -10,8 +10,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from ppbase.api.deps import require_admin
-from ppbase.db.engine import get_async_session, get_engine
+from ppbase.api.deps import get_session, require_admin
+from ppbase.db.engine import get_engine
 from ppbase.models.collection import (
     CollectionCreate,
     CollectionImportPayload,
@@ -29,24 +29,32 @@ router = APIRouter(prefix="/collections", tags=["collections"])
 # ---------------------------------------------------------------------------
 
 
-async def _get_session() -> Any:
-    """Yield an async session from the engine module."""
-    async for session in get_async_session():
-        yield session
-
-
 def _get_engine() -> AsyncEngine:
     return get_engine()
 
 
 def _get_migration_kwargs(request: Request) -> dict[str, Any]:
-    """Extract auto_migrate and migrations_dir from app settings."""
+    """Extract migration-generation settings for collection mutations."""
     settings = getattr(request.app.state, "settings", None)
     if settings is None:
-        return {"auto_migrate": False, "migrations_dir": None}
+        return {
+            "auto_migrate": False,
+            "migrations_dir": None,
+            "migration_lock_timeout": 30.0,
+        }
+    should_generate = getattr(settings, "should_generate_migrations", None)
     return {
-        "auto_migrate": getattr(settings, "auto_migrate", False),
+        "auto_migrate": (
+            should_generate()
+            if callable(should_generate)
+            else getattr(settings, "auto_migrate", False)
+        ),
         "migrations_dir": getattr(settings, "migrations_dir", None),
+        "migration_lock_timeout": getattr(
+            settings,
+            "migration_lock_timeout",
+            30.0,
+        ),
     }
 
 
@@ -280,7 +288,7 @@ async def list_collections(
     filter: str = Query(default="", alias="filter"),
     fields: str | None = Query(default=None),
     skipTotal: bool = Query(default=False),
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """List all collections with pagination."""
@@ -301,7 +309,7 @@ async def list_collections(
 async def create_collection(
     request: Request,
     data: CollectionCreate,
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     engine: AsyncEngine = Depends(_get_engine),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -333,11 +341,11 @@ async def create_collection(
 
 @router.get("/meta/tables")
 async def list_database_tables(
-    engine: AsyncEngine = Depends(_get_engine),
+    session: AsyncSession = Depends(get_session),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> list[dict]:
     """Return all database tables and their columns for SQL editor autocomplete."""
-    return await get_database_tables(engine)
+    return await get_database_tables(session)
 
 
 @router.get("/meta/scaffolds")
@@ -351,7 +359,7 @@ async def get_collection_scaffolds(
 @router.get("/{idOrName}")
 async def view_collection(
     idOrName: str,
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     """View a single collection by ID or name."""
@@ -374,7 +382,7 @@ async def update_collection(
     request: Request,
     idOrName: str,
     data: CollectionUpdate,
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     engine: AsyncEngine = Depends(_get_engine),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -408,7 +416,7 @@ async def update_collection(
 async def delete_collection(
     request: Request,
     idOrName: str,
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     engine: AsyncEngine = Depends(_get_engine),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> None:
@@ -441,7 +449,7 @@ async def delete_collection(
 async def import_collections(
     request: Request,
     payload: CollectionImportPayload,
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     engine: AsyncEngine = Depends(_get_engine),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> None:
@@ -469,7 +477,7 @@ async def import_collections(
 @router.delete("/{idOrName}/truncate", status_code=204)
 async def truncate_collection(
     idOrName: str,
-    session: AsyncSession = Depends(_get_session),
+    session: AsyncSession = Depends(get_session),
     engine: AsyncEngine = Depends(_get_engine),
     _admin: dict[str, Any] = Depends(require_admin),
 ) -> None:

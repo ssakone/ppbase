@@ -9,29 +9,56 @@ tables are created.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import TypeAlias
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from ppbase.core.id_generator import generate_id
 from ppbase.db.schema_manager import create_collection_table
 from ppbase.db.system_tables import CollectionRecord
-from ppbase.services.auth_service import (
-    generate_default_auth_options,
-    generate_token_key,
-)
+from ppbase.services.auth_service import generate_default_auth_options
 
 logger = logging.getLogger(__name__)
+
+DatabaseBind: TypeAlias = AsyncEngine | AsyncConnection | AsyncSession
 
 
 # ---------------------------------------------------------------------------
 # Helper: check if a physical table exists
 # ---------------------------------------------------------------------------
 
-async def _table_exists(engine: AsyncEngine, table_name: str) -> bool:
+@asynccontextmanager
+async def _bind_connection(
+    bind: DatabaseBind,
+    *,
+    transactional: bool = False,
+) -> AsyncIterator[AsyncConnection]:
+    """Yield a connection without nesting a supplied transaction.
+
+    Sessions and connections are borrowed from their caller and are therefore
+    never committed or closed here. The engine fallback preserves the public
+    helpers' standalone behavior for existing callers.
+    """
+    if isinstance(bind, AsyncSession):
+        yield await bind.connection()
+        return
+
+    if isinstance(bind, AsyncConnection):
+        yield bind
+        return
+
+    context = bind.begin() if transactional else bind.connect()
+    async with context as connection:
+        yield connection
+
+
+async def _table_exists(bind: DatabaseBind, table_name: str) -> bool:
     """Check whether a table exists in the public schema."""
-    async with engine.connect() as conn:
+    async with _bind_connection(bind) as conn:
         result = await conn.execute(
             text(
                 "SELECT 1 FROM information_schema.tables "
@@ -42,9 +69,13 @@ async def _table_exists(engine: AsyncEngine, table_name: str) -> bool:
         return result.first() is not None
 
 
-async def _column_exists(engine: AsyncEngine, table_name: str, column_name: str) -> bool:
+async def _column_exists(
+    bind: DatabaseBind,
+    table_name: str,
+    column_name: str,
+) -> bool:
     """Check whether a column exists in the public schema."""
-    async with engine.connect() as conn:
+    async with _bind_connection(bind) as conn:
         result = await conn.execute(
             text(
                 "SELECT 1 FROM information_schema.columns "
@@ -63,11 +94,13 @@ async def _column_exists(engine: AsyncEngine, table_name: str, column_name: str)
 
 async def bootstrap_system_collections(
     session: AsyncSession,
-    engine: AsyncEngine,
+    engine: DatabaseBind,
 ) -> None:
     """Ensure all system collections exist in ``_collections``.
 
-    Called once at startup inside an active transaction.
+    Called once at startup inside an active transaction. ``engine`` is retained
+    for API compatibility, while all metadata checks and DDL reuse ``session``
+    so the caller owns the single bootstrap transaction.
     """
     await ensure_superusers_collection(session)
     await ensure_external_auths_collection(session, engine)
@@ -75,28 +108,34 @@ async def bootstrap_system_collections(
     await ensure_otps_collection(session, engine)
     await ensure_auth_origins_collection(session, engine)
     await ensure_users_collection(session, engine)
-    await ensure_request_logs_columns(engine)
+    await ensure_request_logs_columns(session)
 
 
 # ---------------------------------------------------------------------------
 # _requests schema backfill
 # ---------------------------------------------------------------------------
 
-async def ensure_request_logs_columns(engine: AsyncEngine) -> None:
+async def ensure_request_logs_columns(engine: DatabaseBind) -> None:
     """Backfill optional payload columns for the ``_requests`` table."""
-    if not await _table_exists(engine, "_requests"):
-        return
+    async with _bind_connection(engine, transactional=True) as conn:
+        if not await _table_exists(conn, "_requests"):
+            return
 
-    async with engine.begin() as conn:
-        if not await _column_exists(engine, "_requests", "request_body"):
+        if not await _column_exists(conn, "_requests", "request_body"):
             await conn.execute(
-                text('ALTER TABLE "_requests" ADD COLUMN "request_body" JSONB NULL')
+                text(
+                    'ALTER TABLE "_requests" '
+                    'ADD COLUMN IF NOT EXISTS "request_body" JSONB NULL'
+                )
             )
             logger.info("Added _requests.request_body column")
 
-        if not await _column_exists(engine, "_requests", "response_body"):
+        if not await _column_exists(conn, "_requests", "response_body"):
             await conn.execute(
-                text('ALTER TABLE "_requests" ADD COLUMN "response_body" JSONB NULL')
+                text(
+                    'ALTER TABLE "_requests" '
+                    'ADD COLUMN IF NOT EXISTS "response_body" JSONB NULL'
+                )
             )
             logger.info("Added _requests.response_body column")
 
@@ -152,17 +191,23 @@ async def ensure_superusers_collection(session: AsyncSession) -> None:
 
 async def ensure_external_auths_collection(
     session: AsyncSession,
-    engine: AsyncEngine,
+    engine: DatabaseBind,
 ) -> None:
     """Create the ``_externalAuths`` system collection.
 
-    Handles migration from the old ``_external_auths`` name by renaming
-    both the collection record and the physical table.
+    Handles migration from the old collection-record name
+    ``_external_auths``. The physical snake_case table is an ORM system table
+    still used by OAuth and must never be renamed; the dynamic camelCase table
+    is created separately for the PocketBase-compatible collection metadata.
     """
+    bind: DatabaseBind = session
+
     # Check for new name first
     stmt = select(CollectionRecord).where(CollectionRecord.name == "_externalAuths")
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        if not await _table_exists(bind, "_externalAuths"):
+            await create_collection_table(bind, existing)
         return
 
     # Check for old name and migrate
@@ -174,12 +219,11 @@ async def ensure_external_auths_collection(
         old_record.name = "_externalAuths"
         old_record.updated = datetime.now(timezone.utc)
         await session.flush()
-        # Rename the physical table if it exists
-        if await _table_exists(engine, "_external_auths"):
-            async with engine.begin() as conn:
-                await conn.execute(
-                    text('ALTER TABLE "_external_auths" RENAME TO "_externalAuths"')
-                )
+        # ``_external_auths`` remains the ORM table used by oauth2_service.
+        # Only the collection metadata name changes; create its distinct
+        # PocketBase-compatible dynamic table when missing.
+        if not await _table_exists(bind, "_externalAuths"):
+            await create_collection_table(bind, old_record)
         logger.info("Migrated _external_auths -> _externalAuths")
         return
 
@@ -213,8 +257,8 @@ async def ensure_external_auths_collection(
     session.add(record)
     await session.flush()
 
-    if not await _table_exists(engine, "_externalAuths"):
-        await create_collection_table(engine, record)
+    if not await _table_exists(bind, "_externalAuths"):
+        await create_collection_table(bind, record)
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +267,15 @@ async def ensure_external_auths_collection(
 
 async def ensure_mfas_collection(
     session: AsyncSession,
-    engine: AsyncEngine,
+    engine: DatabaseBind,
 ) -> None:
     """Create the ``_mfas`` system collection for multi-factor auth records."""
+    bind: DatabaseBind = session
     stmt = select(CollectionRecord).where(CollectionRecord.name == "_mfas")
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        if not await _table_exists(bind, "_mfas"):
+            await create_collection_table(bind, existing)
         return
 
     owner_rule = (
@@ -264,8 +311,8 @@ async def ensure_mfas_collection(
     session.add(record)
     await session.flush()
 
-    if not await _table_exists(engine, "_mfas"):
-        await create_collection_table(engine, record)
+    if not await _table_exists(bind, "_mfas"):
+        await create_collection_table(bind, record)
 
 
 # ---------------------------------------------------------------------------
@@ -274,12 +321,15 @@ async def ensure_mfas_collection(
 
 async def ensure_otps_collection(
     session: AsyncSession,
-    engine: AsyncEngine,
+    engine: DatabaseBind,
 ) -> None:
     """Create the ``_otps`` system collection for one-time password records."""
+    bind: DatabaseBind = session
     stmt = select(CollectionRecord).where(CollectionRecord.name == "_otps")
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        if not await _table_exists(bind, "_otps"):
+            await create_collection_table(bind, existing)
         return
 
     owner_rule = (
@@ -316,8 +366,8 @@ async def ensure_otps_collection(
     session.add(record)
     await session.flush()
 
-    if not await _table_exists(engine, "_otps"):
-        await create_collection_table(engine, record)
+    if not await _table_exists(bind, "_otps"):
+        await create_collection_table(bind, record)
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +376,15 @@ async def ensure_otps_collection(
 
 async def ensure_auth_origins_collection(
     session: AsyncSession,
-    engine: AsyncEngine,
+    engine: DatabaseBind,
 ) -> None:
     """Create the ``_authOrigins`` system collection for tracking auth origins."""
+    bind: DatabaseBind = session
     stmt = select(CollectionRecord).where(CollectionRecord.name == "_authOrigins")
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        if not await _table_exists(bind, "_authOrigins"):
+            await create_collection_table(bind, existing)
         return
 
     owner_rule = (
@@ -367,8 +420,8 @@ async def ensure_auth_origins_collection(
     session.add(record)
     await session.flush()
 
-    if not await _table_exists(engine, "_authOrigins"):
-        await create_collection_table(engine, record)
+    if not await _table_exists(bind, "_authOrigins"):
+        await create_collection_table(bind, record)
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +430,19 @@ async def ensure_auth_origins_collection(
 
 async def ensure_users_collection(
     session: AsyncSession,
-    engine: AsyncEngine,
+    engine: DatabaseBind,
 ) -> None:
     """Create the default ``users`` auth collection.
 
     This is a non-system collection (users can customize it) with a fixed ID
     so that client SDKs can rely on it.
     """
+    bind: DatabaseBind = session
     stmt = select(CollectionRecord).where(CollectionRecord.name == "users")
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        if not await _table_exists(bind, "users"):
+            await create_collection_table(bind, existing)
         return
 
     auth_opts = generate_default_auth_options(is_superusers=False)
@@ -434,5 +490,5 @@ async def ensure_users_collection(
     session.add(record)
     await session.flush()
 
-    if not await _table_exists(engine, "users"):
-        await create_collection_table(engine, record)
+    if not await _table_exists(bind, "users"):
+        await create_collection_table(bind, record)

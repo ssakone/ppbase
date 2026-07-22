@@ -16,13 +16,20 @@ import smtplib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from ppbase.api.deps import get_session, require_admin
+from ppbase.backup.automation import BackupCronError, BackupCronSchedule
 from ppbase.core.id_generator import generate_id
+from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import ParamRecord
 from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
+from ppbase.services.write_barrier import (
+    WriteBarrierLease,
+    assert_write_barrier_held,
+    storage_runtime_switch_barrier,
+)
 
 router = APIRouter()
 
@@ -171,9 +178,17 @@ def _smtp_config_from_settings(settings_value: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def _apply_runtime_settings_to_app(request: Request, settings_value: dict[str, Any]) -> None:
+def _apply_runtime_settings_to_app(
+    request: Request,
+    settings_value: dict[str, Any],
+    *,
+    lease: WriteBarrierLease,
+) -> None:
     """Apply runtime overrides that should react immediately to settings PATCH."""
-    configure_storage_runtime_from_settings_payload(settings_value)
+    configure_storage_runtime_from_settings_payload(
+        settings_value,
+        lease=lease,
+    )
 
     runtime_settings = getattr(request.app.state, "settings", None)
     if runtime_settings is None:
@@ -197,6 +212,88 @@ def _apply_runtime_settings_to_app(request: Request, settings_value: dict[str, A
     setattr(runtime_settings, "s3_access_key", access_key)
     setattr(runtime_settings, "s3_secret_key", secret_key)
     setattr(runtime_settings, "s3_force_path_style", bool(s3.get("forcePathStyle", False)))
+
+
+def _invalidate_runtime_settings_caches(request: Request) -> None:
+    """Notify runtime consumers that the durable settings value changed."""
+    current_version = int(
+        getattr(request.app.state, "rate_limit_settings_version", 0) or 0
+    )
+    request.app.state.rate_limit_settings_version = current_version + 1
+
+
+async def _apply_runtime_settings_under_barrier(
+    request: Request,
+    settings_value: dict[str, Any],
+    *,
+    lease: WriteBarrierLease,
+) -> None:
+    """Apply one durable settings snapshot while proving lock ownership."""
+    await assert_write_barrier_held(lease)
+    _apply_runtime_settings_to_app(
+        request,
+        settings_value,
+        lease=lease,
+    )
+    await assert_write_barrier_held(lease)
+    _invalidate_runtime_settings_caches(request)
+
+
+async def _commit_settings_update(writer: AsyncSession) -> None:
+    """Commit hook kept separate so ambiguous outcomes can be tested."""
+    await writer.commit()
+
+
+async def _reconcile_storage_runtime_from_durable_settings(
+    request: Request,
+    engine: AsyncEngine,
+) -> dict[str, Any]:
+    """Reload and apply the authoritative settings below a fresh barrier.
+
+    This is the recovery path for every exception after the settings commit
+    starts.  In particular, a cancelled/failed commit may have reached
+    PostgreSQL even though its acknowledgement never reached this task.  The
+    in-memory local/S3 choice must therefore be derived from a new durable
+    read, never from the attempted request payload.
+    """
+    async with storage_runtime_switch_barrier(engine) as lease:
+        async with AsyncSession(
+            bind=lease.connection,
+            expire_on_commit=False,
+        ) as reader:
+            row = await _get_or_create_settings(reader)
+            durable = row.value or dict(_DEFAULT_SETTINGS)
+            # Finish the read transaction (and persist defaults if the row was
+            # missing) before changing the live runtime.
+            await reader.commit()
+
+        await _apply_runtime_settings_under_barrier(
+            request,
+            durable,
+            lease=lease,
+        )
+
+    return durable
+
+
+async def _reconcile_storage_runtime_uncancellable(
+    request: Request,
+    engine: AsyncEngine,
+) -> dict[str, Any]:
+    """Complete durable reconciliation even if the request task is cancelled."""
+    reconciliation = asyncio.create_task(
+        _reconcile_storage_runtime_from_durable_settings(request, engine)
+    )
+    while True:
+        try:
+            return await asyncio.shield(reconciliation)
+        except asyncio.CancelledError:
+            # Cancellation of the request must still be propagated by the
+            # caller, but only after the independent reconciliation task has
+            # made DB and runtime agree again.  A cancelled reconciliation
+            # task itself remains an error via ``result()``.
+            if reconciliation.done():
+                return reconciliation.result()
 
 
 def _test_email_subject(template: str, app_name: str) -> str:
@@ -282,6 +379,9 @@ async def update_settings(
     session: AsyncSession = Depends(get_session),
 ):
     """Partially update the application settings."""
+    # ``require_admin`` used this cached session for token verification. Return
+    # its read transaction before reserving the one barrier connection.
+    await session.rollback()
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(
@@ -293,17 +393,73 @@ async def update_settings(
             },
         )
 
-    row = await _get_or_create_settings(session)
-    current = row.value or dict(_DEFAULT_SETTINGS)
-    merged = _deep_merge(current, body)
-    row.value = merged
-    await session.flush()
-    await session.commit()
+    backups_update = body.get("backups")
+    if isinstance(backups_update, dict):
+        if "cron" in backups_update:
+            cron = str(backups_update.get("cron", "") or "").strip()
+            if cron:
+                try:
+                    BackupCronSchedule.parse(cron)
+                except BackupCronError as exc:
+                    raise _error_response(
+                        400,
+                        "Invalid automatic backup schedule.",
+                        {
+                            "backups.cron": {
+                                "code": "validation_invalid_value",
+                                "message": str(exc),
+                            }
+                        },
+                    ) from exc
+        if "cronMaxKeep" in backups_update:
+            raw_max_keep = backups_update.get("cronMaxKeep")
+            if (
+                isinstance(raw_max_keep, bool)
+                or not isinstance(raw_max_keep, int)
+                or not 0 <= raw_max_keep <= 10_000
+            ):
+                raise _error_response(
+                    400,
+                    "Invalid automatic backup retention.",
+                    {
+                        "backups.cronMaxKeep": {
+                            "code": "validation_invalid_value",
+                            "message": "cronMaxKeep must be an integer between 0 and 10000.",
+                        }
+                    },
+                )
 
-    _apply_runtime_settings_to_app(request, merged)
+    engine = get_engine()
+    commit_started = False
+    try:
+        async with storage_runtime_switch_barrier(engine) as lease:
+            async with AsyncSession(
+                bind=lease.connection,
+                expire_on_commit=False,
+            ) as writer:
+                row = await _get_or_create_settings(writer)
+                current = row.value or dict(_DEFAULT_SETTINGS)
+                merged = _deep_merge(current, body)
+                row.value = merged
+                # From this point onward every failure has an ambiguous
+                # durable outcome.  PostgreSQL may have committed even when
+                # cancellation or a lost connection hides the acknowledgement.
+                commit_started = True
+                await _commit_settings_update(writer)
 
-    current_version = int(getattr(request.app.state, "rate_limit_settings_version", 0) or 0)
-    request.app.state.rate_limit_settings_version = current_version + 1
+            # The persisted backend selection and the live storage runtime
+            # switch are one coordinated mutation from the backup's point of
+            # view.  Returning happens only after the barrier exits cleanly.
+            await _apply_runtime_settings_under_barrier(
+                request,
+                merged,
+                lease=lease,
+            )
+    except BaseException:
+        if commit_started:
+            await _reconcile_storage_runtime_uncancellable(request, engine)
+        raise
+
     return merged
 
 

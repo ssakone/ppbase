@@ -100,3 +100,54 @@ def test_single_file_append_modifier_normalizes_to_plain_filename() -> None:
 
     assert appended == ["old.jpg", "new.jpg"]
     assert validate_field_value(field, appended) == "new.jpg"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["../secret.txt", "..\\secret.txt", "/absolute.txt", "C:\\secret.txt"],
+)
+def test_single_file_field_rejects_path_references(value: str) -> None:
+    field = FieldDefinition(
+        name="photo",
+        type=FieldType.FILE,
+        options={"maxSelect": 1},
+    )
+
+    with pytest.raises(FieldValidationError) as exc:
+        validate_field_value(field, value)
+
+    assert exc.value.field_name == "photo"
+    assert exc.value.code == "validation_invalid_filename"
+
+
+def test_multi_file_field_rejects_one_unsafe_reference() -> None:
+    field = FieldDefinition(
+        name="documents",
+        type=FieldType.FILE,
+        options={"maxSelect": 5},
+    )
+
+    with pytest.raises(FieldValidationError) as exc:
+        validate_field_value(field, ["safe.txt", "../secret.txt"])
+
+    assert exc.value.field_name == "documents"
+    assert exc.value.code == "validation_invalid_filename"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "photo_52iWbGinWd.jpg",
+        "LICENSE",
+        "résumé_final.txt",
+        "https://example.com/avatar.png",
+    ],
+)
+def test_file_field_accepts_compatible_references(value: str) -> None:
+    field = FieldDefinition(
+        name="document",
+        type=FieldType.FILE,
+        options={"maxSelect": 1},
+    )
+
+    assert validate_field_value(field, value) == value

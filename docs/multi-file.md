@@ -410,5 +410,8 @@ app = pb.get_app()  # expose the ASGI app for uvicorn --reload
 ```
 
 ```bash
-uvicorn main:app --reload --port 8090
+uvicorn main:app --reload --port 8090 --no-access-log
 ```
+
+Keep Uvicorn's access log disabled: PPBase records requests through its own
+middleware, which redacts sensitive query parameters such as file tokens.

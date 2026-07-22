@@ -589,7 +589,15 @@ class FlaskLikePB:
         """Start the server with uvicorn (blocking)."""
         import uvicorn
 
+        from ppbase.backup.activation import begin_activation_startup
         from ppbase.db.ensure_db import ensure_database_exists
+        from ppbase.services.process_control import (
+            schedule_backup_activation_watchdog,
+        )
+
+        # Restore activation is a durable runtime overlay.  It must select the
+        # staged or rollback target before even the friendly database probe.
+        activation_state = begin_activation_startup(self.settings)
 
         effective_host = str(host or self.settings.host)
         effective_port = int(port or self.settings.port)
@@ -599,7 +607,29 @@ class FlaskLikePB:
         self.settings.host = effective_host
         self.settings.port = effective_port
 
-        ensure_database_exists(self.settings.database_url)
+        is_initial_activation_target = bool(
+            activation_state is not None
+            and activation_state.get("status") == "starting"
+            and activation_state.get("selectedTarget") == "target"
+        )
+        is_activation_rollback = bool(
+            activation_state is not None
+            and activation_state.get("status") == "rollback_pending"
+            and activation_state.get("selectedTarget") == "previous"
+        )
+        if is_initial_activation_target:
+            schedule_backup_activation_watchdog(
+                control_dir=self.settings.backup_control_dir,
+                activation_id=str(activation_state.get("activationId", "")),
+                timeout_seconds=float(
+                    self.settings.backup_activation_health_timeout
+                ),
+            )
+        # The lifespan owns the first target connection so every failure can
+        # durably select and restart the previous target.  Ordinary startups
+        # retain the friendly preflight/create behavior.
+        if not is_initial_activation_target and not is_activation_rollback:
+            ensure_database_exists(self.settings.database_url)
         app = self.get_app()
         app_settings = getattr(app.state, "settings", None)
         if app_settings is not None:
@@ -610,6 +640,9 @@ class FlaskLikePB:
             host=effective_host,
             port=effective_port,
             log_level=self.settings.log_level.lower(),
+            # RequestLoggerMiddleware is the canonical access logger and
+            # redacts sensitive query values (notably backup file tokens).
+            access_log=False,
         )
 
     def route(

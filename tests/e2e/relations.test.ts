@@ -50,8 +50,8 @@ describe('Relations & Expand', () => {
       });
 
       expect(expanded.expand).toBeTruthy();
-      expect(expanded.expand.author).toBeTruthy();
-      expect(expanded.expand.author.name).toBe('John Doe');
+      expect(expanded.expand!.author).toBeTruthy();
+      expect(expanded.expand!.author.name).toBe('John Doe');
     } finally {
       await postsCleanup();
       await authorCleanup();
@@ -106,10 +106,10 @@ describe('Relations & Expand', () => {
         expand: 'author.company',
       });
 
-      expect(expanded.expand.author).toBeTruthy();
-      expect(expanded.expand.author.name).toBe('Jane Smith');
-      expect(expanded.expand.author.expand.company).toBeTruthy();
-      expect(expanded.expand.author.expand.company.name).toBe('Acme Corp');
+      expect(expanded.expand!.author).toBeTruthy();
+      expect(expanded.expand!.author.name).toBe('Jane Smith');
+      expect(expanded.expand!.author.expand.company).toBeTruthy();
+      expect(expanded.expand!.author.expand.company.name).toBe('Acme Corp');
     } finally {
       await postsCleanup();
       await authorCleanup();
@@ -147,10 +147,10 @@ describe('Relations & Expand', () => {
         expand: 'tags',
       });
 
-      expect(expanded.expand.tags).toBeInstanceOf(Array);
-      expect(expanded.expand.tags.length).toBe(2);
-      expect(expanded.expand.tags[0].name).toBeTruthy();
-      expect(expanded.expand.tags[1].name).toBeTruthy();
+      expect(expanded.expand!.tags).toBeInstanceOf(Array);
+      expect(expanded.expand!.tags.length).toBe(2);
+      expect(expanded.expand!.tags[0].name).toBeTruthy();
+      expect(expanded.expand!.tags[1].name).toBeTruthy();
     } finally {
       await postsCleanup();
       await tagsCleanup();
@@ -194,7 +194,7 @@ describe('Relations & Expand', () => {
       expect(list.items.length).toBeGreaterThanOrEqual(2);
       list.items.forEach(item => {
         if (item.author) {
-          expect(item.expand.author.name).toBe('List Author');
+          expect(item.expand!.author.name).toBe('List Author');
         }
       });
     } finally {

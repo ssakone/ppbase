@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from ppbase.api.deps import get_session, require_admin
 from ppbase.db.engine import get_engine
-from ppbase.db.system_tables import CollectionRecord, MigrationRecord
+from ppbase.db.system_tables import MigrationRecord
 
 router = APIRouter(prefix="/migrations", tags=["migrations"])
 
@@ -122,15 +122,23 @@ async def apply_migrations(
     _admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
     """Apply all pending migrations."""
-    from ppbase.services.migration_runner import apply_all_pending
+    from ppbase.services.database_preparation import prepare_database
 
     migrations_dir = _get_migrations_dir(request)
+    settings = request.app.state.settings
 
     try:
-        applied = await apply_all_pending(session, engine, migrations_dir)
-        await session.commit()
-    except Exception as exc:
+        # Admin authentication used this request session for read-only work.
+        # End that transaction before reserving the migration connection so a
+        # pool configured with a single connection cannot deadlock itself.
         await session.rollback()
+        applied = await prepare_database(
+            engine,
+            migrations_dir,
+            apply_migrations=True,
+            lock_timeout_seconds=getattr(settings, "migration_lock_timeout", 30.0),
+        )
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail={
@@ -155,30 +163,21 @@ async def revert_migrations(
     _admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
     """Revert the last N applied migration(s)."""
-    from ppbase.services.migration_runner import (
-        get_applied_migrations,
-        revert_migration,
-    )
+    from ppbase.services.database_preparation import prepare_database_and_revert
 
     count = body.count if body else 1
     migrations_dir = _get_migrations_dir(request)
+    settings = request.app.state.settings
 
     try:
-        # Get applied migrations in reverse order (most recent first)
-        applied_records = await get_applied_migrations(session)
-        # Sort by applied timestamp descending to revert most recent first
-        applied_records.sort(key=lambda r: r.applied, reverse=True)
-
-        to_revert = applied_records[:count]
-        reverted = []
-
-        for record in to_revert:
-            await revert_migration(session, engine, record.file, migrations_dir)
-            reverted.append(record.file)
-
-        await session.commit()
-    except Exception as exc:
         await session.rollback()
+        reverted = await prepare_database_and_revert(
+            engine,
+            migrations_dir,
+            count=count,
+            lock_timeout_seconds=getattr(settings, "migration_lock_timeout", 30.0),
+        )
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail={
@@ -223,7 +222,9 @@ async def migration_status(
     return {
         "applied": status["applied_count"],
         "pending": status["pending_count"],
+        "orphaned": status["orphaned_count"],
         "total": status["total"],
+        "initialized": status["initialized"],
         "lastApplied": last_applied,
     }
 
@@ -232,33 +233,22 @@ async def migration_status(
 async def generate_snapshot(
     request: Request,
     session: AsyncSession = Depends(get_session),
+    engine: AsyncEngine = Depends(_dep_engine),
     _admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Generate snapshot migrations for the current collection state."""
-    from ppbase.services.migration_generator import generate_create_migration
+    """Generate one sanitized snapshot for the current collection state."""
+    from ppbase.services.migration_snapshot import create_migration_snapshot
 
     migrations_dir = _get_migrations_dir(request)
-
-    # Ensure migrations directory exists
-    migrations_dir.mkdir(parents=True, exist_ok=True)
+    settings = request.app.state.settings
 
     try:
-        # Fetch all collections
-        result = await session.execute(
-            select(CollectionRecord).order_by(CollectionRecord.name)
+        await session.rollback()
+        filepath = await create_migration_snapshot(
+            engine,
+            migrations_dir,
+            lock_timeout_seconds=getattr(settings, "migration_lock_timeout", 30.0),
         )
-        collections = result.scalars().all()
-
-        generated = []
-        for collection in collections:
-            filepath = generate_create_migration(collection, migrations_dir)
-            filename = Path(filepath).name
-            generated.append(filename)
-            # Record as applied so it doesn't re-run on startup
-            record = MigrationRecord(file=filename)
-            session.add(record)
-
-        await session.commit()
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -269,7 +259,4 @@ async def generate_snapshot(
             },
         )
 
-    return {
-        "generated": generated,
-        "count": len(generated),
-    }
+    return {"generated": [Path(filepath).name], "count": 1}
