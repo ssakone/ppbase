@@ -54,3 +54,9 @@ htmlcov/
 admin-ui/node_modules/
 admin-ui/dist/
 ppbase/admin/dist/
+
+# Generated only inside platform-wheel builds. Keep source locks/placeholders,
+# never host-specific PostgreSQL binaries or generated provenance in git.
+ppbase/_vendor/postgresql/bin/
+ppbase/_vendor/postgresql/PROVENANCE.json
+ppbase/_vendor/postgresql/licenses/*.txt

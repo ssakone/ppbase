@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+cat >&2 <<'EOF'
+Local token publication is disabled.
 
-echo "==> Building ppbase v${VERSION}..."
-rm -rf dist/ppbase-"${VERSION}"*
-python -m build
-
-echo "==> Publishing ppbase v${VERSION} to PyPI..."
-if [ -z "${PIPY:-}" ]; then
-  echo "Error: PIPY environment variable not set (PyPI API token)" >&2
-  exit 1
-fi
-
-python -m twine upload dist/ppbase-"${VERSION}"* -u __token__ -p "$PIPY"
-
-echo "==> Done! https://pypi.org/project/ppbase/${VERSION}/"
+Publish PPBase by publishing a GitHub Release whose tag is exactly `vX.Y.Z`,
+where `X.Y.Z` matches pyproject.toml. The "Build and publish PPBase platform
+wheels" workflow then builds and verifies all four wheels and authenticates to
+PyPI with Trusted Publishing. It also publishes one source guard so unsupported
+platforms fail on the current version instead of falling back to an old wheel.
+Publishing from one developer machine would create an incomplete platform
+release and is intentionally unsupported.
+EOF
+exit 1

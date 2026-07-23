@@ -3,24 +3,43 @@
 ## Prerequisites
 
 - Python 3.11+
-- A reachable PostgreSQL server
+- A reachable PostgreSQL 16 or 17 server
 - Docker only if using the optional managed local PostgreSQL container
 - Node.js 18+ (only if rebuilding the Admin UI)
 
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/ppbase.git
-cd ppbase
-
-# Create virtual environment
 python -m venv .venv
 source .venv/bin/activate        # bash / zsh
 source .venv/bin/activate.fish   # fish
+pip install ppbase
+```
+
+There is one PyPI project and version named `ppbase`. On supported targets,
+`pip` selects the native wheel for Linux glibc 2.28+ (x86_64/ARM64) or macOS
+15+ (Intel/Apple Silicon) automatically. Alpine/musl, Windows and macOS 14 or
+older are not supported by this release. Each wheel contains `pg_dump`,
+`pg_restore`, `psql`, their required shared libraries, licenses and provenance;
+users never select a platform package. A source guard on the same current
+release makes unsupported targets fail explicitly rather than fall back to an
+older universal PPBase wheel.
+
+For framework development from a source checkout:
+
+```bash
+git clone https://github.com/yourname/ppbase.git
+cd ppbase
+python -m venv .venv
+source .venv/bin/activate
 
 # Install package + dev extras
 pip install -e ".[dev]"
 ```
+
+Generated PostgreSQL binaries are intentionally absent from editable source
+trees. Install matching clients on the development host or run the release
+vendor build before testing native backup/restore from such a checkout.
 
 ## Start the database
 
@@ -36,15 +55,18 @@ python -m ppbase db restart  # restart
 
 > **Custom PostgreSQL?** Set `PPBASE_DATABASE_URL` to your connection string and skip this step.
 
-Docker is not required by PPBase itself or by native backup/restore. A normal
-PostgreSQL service plus matching `pg_dump`, `pg_restore`, and `psql` tools is
-sufficient.
+Docker is not required by PPBase itself or by native backup/restore. Official
+PyPI wheels carry their own PostgreSQL client tools.
 
-### Initialize a fresh PostgreSQL project
+### Optional: initialize a fresh PostgreSQL project
 
-For a PostgreSQL cluster where the application database and limited roles do
-not exist yet, use the autonomous onboarding command. The bootstrap DSN is
-ephemeral and is never written to the generated file:
+This step is optional. PPBase native backup and restore use
+`PPBASE_DATABASE_URL` with no extra provisioning. Restore additionally verifies
+that the runtime owns the active database and `public` (or is a superuser) and
+that the live server can restart. Use the autonomous onboarding command only
+when you want a fresh application database and its limited runtime role created
+for you. Its bootstrap DSN must be a PostgreSQL superuser, is ephemeral, and is
+never written to the generated file:
 
 ```bash
 PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
@@ -53,16 +75,16 @@ PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@d
   ppbase init postgres --execute --name myapp --output-env ./ppbase.env
 ```
 
-The execute command creates the `myapp` database, its limited runtime role,
-the native backup roles and a mode-`0600` env file. It also creates PPBase's
-default `pb_data`, backup, control, staging and durable target directories as
-private `0700` directories. Repeating the same command with the same env file
-is a no-op and preserves its credentials and inode. Use the advanced path
-flags only when the deployment cannot use the PPBase defaults, and expose the
-same custom paths through their `PPBASE_*` variables when starting the service.
+The execute command creates only the `myapp` database, its limited runtime role
+and a mode-`0600` env file containing `PPBASE_DATABASE_URL`. It also creates
+PPBase's default `pb_data`, backup and control directories as private `0700`
+directories. Repeating the same command with the same env file is a no-op and
+preserves its credentials and inode. Use the advanced path flags only when the
+deployment cannot use the PPBase defaults, and expose the same custom paths
+through their `PPBASE_*` variables when starting the service.
 
-For an application database/runtime that already exists, keep using
-`ppbase backup provision`; it applies only the backup role contract.
+For an application database/runtime that already exists, you can optionally run
+`ppbase backup provision` to add a dedicated least-privilege dump role.
 
 ## Create your first admin
 

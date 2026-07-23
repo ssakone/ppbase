@@ -142,6 +142,10 @@ class ExtensionRegistry:
     def frozen(self) -> bool:
         return self._frozen
 
+    @property
+    def route_count(self) -> int:
+        return len(self._routes)
+
     def freeze(self) -> None:
         self._frozen = True
 
@@ -321,10 +325,11 @@ class ExtensionRegistry:
     def get_hook(self, name: str) -> Hook:
         return self.hooks.get(name)
 
-    def mount_routes(self, app: FastAPI) -> None:
-        if not self._routes:
+    def mount_routes(self, app: FastAPI, *, start_index: int = 0) -> None:
+        routes = self._routes[start_index:]
+        if not routes:
             return
-        collisions = self._detect_route_collisions(app)
+        collisions = self._detect_route_collisions(app, routes)
         if collisions:
             details = "\n".join(f"- {item}" for item in collisions)
             raise RuntimeError(
@@ -333,7 +338,7 @@ class ExtensionRegistry:
             )
 
         router = APIRouter()
-        for route in sorted(self._routes, key=lambda item: item.order):
+        for route in sorted(routes, key=lambda item: item.order):
             route_class = type(
                 f"PPBaseExtensionAPIRoute_{route.order}",
                 (ExtensionAPIRoute,),
@@ -352,7 +357,11 @@ class ExtensionRegistry:
             )
         app.include_router(router)
 
-    def _detect_route_collisions(self, app: FastAPI) -> list[str]:
+    def _detect_route_collisions(
+        self,
+        app: FastAPI,
+        routes: Sequence[RouteDef] | None = None,
+    ) -> list[str]:
         existing: dict[tuple[str, str], str] = {}
         for route in app.router.routes:
             methods = getattr(route, "methods", None)
@@ -365,7 +374,7 @@ class ExtensionRegistry:
 
         collisions: list[str] = []
         extension_seen: dict[tuple[str, str], str] = {}
-        for route in self._routes:
+        for route in self._routes if routes is None else routes:
             endpoint_name = getattr(route.endpoint, "__name__", "<handler>")
             for method in route.methods:
                 key = (method, route.path)

@@ -45,15 +45,10 @@ api_router.include_router(settings_router, prefix="/settings", tags=["settings"]
 api_router.include_router(files_router, prefix="/files", tags=["files"])
 api_router.include_router(logs_router, tags=["logs"])
 
-# Native backup creation and restore staging/validation. These routes never
-# replace the active database or active data directory.
+# Native backup creation and destructive restore in the active targets.
 from ppbase.api.backups import router as backups_router
-from ppbase.api.backups import staging_router as backup_staging_router
-from ppbase.api.backups import activation_router as backup_activation_router
 
 api_router.include_router(backups_router)
-api_router.include_router(backup_staging_router)
-api_router.include_router(backup_activation_router)
 
 # Hooks management router -- import gracefully.
 try:

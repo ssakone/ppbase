@@ -7,7 +7,6 @@ import http.client
 import json
 import os
 import secrets
-import shutil
 import stat
 import urllib.error
 import urllib.parse
@@ -32,10 +31,15 @@ from ppbase.backup.control import (
 from ppbase.backup.postgres import (
     PostgresBackupError,
     detect_postgres_tool_version,
+    preflight_destructive_restore_role,
     preflight_dump_role,
     set_backup_control_search_path,
     sqlalchemy_url_to_libpq,
     validate_postgres_identifier,
+)
+from ppbase.backup.tools import (
+    PostgresToolResolutionError,
+    resolve_postgres_tool,
 )
 from ppbase.services.process_control import can_self_restart
 
@@ -46,25 +50,10 @@ DOCTOR_EXIT_NOT_READY = 2
 DOCTOR_EXIT_ERROR = 3
 INIT_PROJECT_MAX_LENGTH = 48
 INIT_MARKER_VERSION = "ppbase-init:v1"
-INIT_SECRET_KEYS = frozenset(
-    {
-        "PPBASE_DATABASE_URL",
-        "PPBASE_BACKUP_DUMP_DATABASE_URL",
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL",
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL",
-        "PPBASE_BACKUP_TARGET_OWNER",
-    }
-)
-BACKUP_PROVISION_SECRET_KEYS = frozenset(
-    {
-        "PPBASE_BACKUP_DUMP_DATABASE_URL",
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL",
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL",
-        "PPBASE_BACKUP_TARGET_OWNER",
-    }
-)
-LEGACY_RUNTIME_SUPERUSER_CODE = "legacy_runtime_superuser"
-LEGACY_RUNTIME_SUPERUSER_DETAIL = "PostgreSQL superuser runtime"
+INIT_SECRET_KEYS = frozenset({"PPBASE_DATABASE_URL"})
+DUMP_PROVISION_SECRET_KEYS = frozenset({"PPBASE_BACKUP_DUMP_DATABASE_URL"})
+RUNTIME_SUPERUSER_CODE = "runtime_superuser"
+RUNTIME_SUPERUSER_DETAIL = "PostgreSQL superuser runtime"
 
 
 class BackupProvisionError(RuntimeError):
@@ -72,36 +61,18 @@ class BackupProvisionError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class RoleNames:
-    runtime: str
-    dump: str
-    creator: str
-    restore: str
-    owner: str
-
-    def as_dict(self) -> dict[str, str]:
-        return {
-            "runtime": self.runtime,
-            "dump": self.dump,
-            "creator": self.creator,
-            "restore": self.restore,
-            "owner": self.owner,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class PostgresInitSpec:
-    """Deterministic database and role names for one PPBase project."""
+    """Deterministic database and runtime role for one PPBase project."""
 
     project: str
     database: str
-    roles: RoleNames
+    runtime_role: str
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "project": self.project,
             "database": self.database,
-            "roles": self.roles.as_dict(),
+            "roles": {"runtime": self.runtime_role},
         }
 
 
@@ -112,21 +83,17 @@ class PostgresInitLayout:
     data_dir: Path
     backup_root: Path
     control_dir: Path
-    staging_root: Path
-    target_root: Path
 
     def as_dict(self) -> dict[str, str]:
         return {
             "dataDir": str(self.data_dir),
             "backupRoot": str(self.backup_root),
             "controlDir": str(self.control_dir),
-            "stagingRoot": str(self.staging_root),
-            "targetRoot": str(self.target_root),
         }
 
 
 def resolve_postgres_init_spec(name: str) -> PostgresInitSpec:
-    """Resolve one conservative project name into the complete role topology."""
+    """Resolve one conservative project name into its database/runtime role."""
     project = validate_postgres_identifier(name, label="project name")
     if len(project) > INIT_PROJECT_MAX_LENGTH:
         raise BackupProvisionError(
@@ -138,21 +105,15 @@ def resolve_postgres_init_spec(name: str) -> PostgresInitSpec:
         "template1",
     }:
         raise BackupProvisionError("project name is reserved by PostgreSQL")
-    roles = RoleNames(
-        runtime=project,
-        dump=validate_postgres_identifier(f"{project}_backup_dump"),
-        creator=validate_postgres_identifier(f"{project}_backup_creator"),
-        restore=validate_postgres_identifier(f"{project}_backup_restore"),
-        owner=validate_postgres_identifier(f"{project}_backup_owner"),
+    return PostgresInitSpec(
+        project=project,
+        database=project,
+        runtime_role=project,
     )
-    return PostgresInitSpec(project=project, database=project, roles=roles)
 
 
-def _postgres_init_role_marker(spec: PostgresInitSpec, role: str) -> str:
-    role_kind = next(
-        kind for kind, configured in spec.roles.as_dict().items() if configured == role
-    )
-    return f"{INIT_MARKER_VERSION}:{spec.project}:role:{role_kind}"
+def _postgres_init_role_marker(spec: PostgresInitSpec) -> str:
+    return f"{INIT_MARKER_VERSION}:{spec.project}:role:runtime"
 
 
 def _postgres_init_database_marker(spec: PostgresInitSpec) -> str:
@@ -160,20 +121,13 @@ def _postgres_init_database_marker(spec: PostgresInitSpec) -> str:
 
 
 def resolve_postgres_init_layout(settings: Any) -> PostgresInitLayout:
-    """Resolve and globally validate the default/advanced filesystem layout."""
-    staging = absolute_path_without_symlink_resolution(settings.backup_staging_root)
-    target_value = str(getattr(settings, "backup_target_root", "") or "").strip()
-    target = absolute_path_without_symlink_resolution(
-        target_value or f"{staging}_targets"
-    )
+    """Resolve and globally validate the three active filesystem roots."""
     layout = PostgresInitLayout(
         data_dir=absolute_path_without_symlink_resolution(settings.data_dir),
         backup_root=absolute_path_without_symlink_resolution(settings.backup_root),
         control_dir=absolute_path_without_symlink_resolution(
             settings.backup_control_dir
         ),
-        staging_root=staging,
-        target_root=target,
     )
     paths = list(layout.as_dict().items())
     for index, (left_name, left_value) in enumerate(paths):
@@ -242,77 +196,44 @@ def _configured_role(url: str, fallback: str) -> str:
     )
 
 
-def resolve_role_names(settings: Any) -> RoleNames:
+def resolve_dump_role_name(settings: Any) -> str:
+    """Resolve the sole optional role managed by ``backup provision``."""
     runtime = validate_postgres_identifier(
         sqlalchemy_url_to_libpq(settings.database_url).username,
         label="runtime role",
     )
-    roles = RoleNames(
-        runtime=runtime,
-        dump=_configured_role(
-            str(getattr(settings, "backup_dump_database_url", "") or ""),
-            "ppbase_backup_dump",
-        ),
-        creator=_configured_role(
-            str(getattr(settings, "backup_creator_database_url", "") or ""),
-            "ppbase_backup_creator",
-        ),
-        restore=_configured_role(
-            str(getattr(settings, "backup_restore_database_url", "") or ""),
-            "ppbase_backup_restore",
-        ),
-        owner=validate_postgres_identifier(
-            str(getattr(settings, "backup_target_owner", "") or "")
-            or "ppbase_backup_owner",
-            label="target owner",
-        ),
+    dump = _configured_role(
+        str(getattr(settings, "backup_dump_database_url", "") or ""),
+        "ppbase_backup_dump",
     )
-    if len(set(roles.as_dict().values())) != 5:
+    if dump == runtime:
         raise BackupProvisionError(
-            "runtime, dump, creator, restore, and target owner roles must be distinct"
+            "backup provision is only for a separate dump role; "
+            "the normal backup path already uses PPBASE_DATABASE_URL"
         )
-    return roles
+    return dump
 
 
-def _role_specs(roles: RoleNames) -> dict[str, dict[str, bool]]:
-    return {
-        roles.dump: {"login": True, "createdb": False, "inherit": False},
-        roles.creator: {"login": True, "createdb": True, "inherit": False},
-        roles.restore: {"login": True, "createdb": False, "inherit": False},
-        roles.owner: {"login": False, "createdb": False, "inherit": False},
-    }
-
-
-def _init_role_specs(roles: RoleNames) -> dict[str, dict[str, bool]]:
-    return {
-        roles.runtime: {"login": True, "createdb": False, "inherit": True},
-        **_role_specs(roles),
-    }
-
-
-async def _read_role_rows(
+async def _read_role_row(
     connection: AsyncConnection,
-    roles: RoleNames,
-) -> dict[str, Mapping[str, Any]]:
-    rows = (
+    role: str,
+) -> Mapping[str, Any] | None:
+    return (
         await connection.execute(
             text(
                 "SELECT r.rolname, r.rolcanlogin, r.rolcreatedb, r.rolinherit, "
                 "r.rolsuper, r.rolcreaterole, r.rolreplication, r.rolbypassrls, "
                 "pg_catalog.shobj_description(r.oid, 'pg_authid') AS marker "
-                "FROM pg_catalog.pg_roles AS r "
-                "WHERE r.rolname = ANY(CAST(:roles AS text[])) "
-                "ORDER BY r.rolname"
+                "FROM pg_catalog.pg_roles AS r WHERE r.rolname = :role"
             ),
-            {"roles": list(roles.as_dict().values())},
+            {"role": role},
         )
-    ).mappings().all()
-    return {str(row["rolname"]): row for row in rows}
+    ).mappings().one_or_none()
 
 
-async def _read_memberships(
+async def _read_role_memberships(
     connection: AsyncConnection,
-    roles: RoleNames,
+    role: str,
 ) -> list[Mapping[str, Any]]:
     return list(
         (
@@ -329,13 +250,11 @@ async def _read_memberships(
                     "ON member_role.oid = membership.member "
                     "JOIN pg_catalog.pg_roles AS granted_role "
                     "ON granted_role.oid = membership.roleid "
-                    "WHERE member_role.rolname = ANY(CAST(:roles AS text[])) "
-                    "OR granted_role.rolname = ANY(CAST(:roles AS text[])) "
+                    "WHERE member_role.rolname = :role "
+                    "OR granted_role.rolname = :role "
                     "ORDER BY member, granted"
                 ),
-                {
-                    "roles": list(roles.as_dict().values()),
-                },
+                {"role": role},
             )
         ).mappings().all()
     )
@@ -343,45 +262,28 @@ async def _read_memberships(
 
 def _membership_collisions(
     rows: list[Mapping[str, Any]],
-    roles: RoleNames,
+    role: str,
 ) -> list[dict[str, str]]:
-    expected = {
-        roles.creator: (roles.owner, False),
-        roles.restore: (roles.owner, False),
-        roles.runtime: (roles.owner, True),
-    }
     collisions: list[dict[str, str]] = []
-    managed = set(roles.as_dict().values())
     for row in rows:
         member = str(row["member"])
         granted = str(row["granted"])
-        if member in expected:
-            expected_granted, expected_inherit = expected[member]
-            valid = (
-                granted == expected_granted
-                and not bool(row["admin_option"])
-                and bool(row["set_option"])
-                and bool(row["inherit_option"]) == expected_inherit
-            )
-            if not valid:
-                collisions.append(
-                    {"role": member, "reason": f"unexpected membership in {granted}"}
-                )
-        elif member in {roles.dump, roles.owner} or granted in managed:
-            collisions.append(
-                {"role": member, "reason": f"unexpected membership in {granted}"}
-            )
-    # Missing expected memberships are planned grants, not collisions.
+        collisions.append(
+            {
+                "role": role,
+                "reason": f"unexpected membership {member} -> {granted}",
+            }
+        )
     return collisions
 
 
-async def _require_safe_memberships(
+async def _require_no_role_memberships(
     connection: AsyncConnection,
-    roles: RoleNames,
+    role: str,
 ) -> None:
     collisions = _membership_collisions(
-        await _read_memberships(connection, roles),
-        roles,
+        await _read_role_memberships(connection, role),
+        role,
     )
     if collisions:
         rendered = "; ".join(
@@ -410,33 +312,309 @@ def _role_collision(
     return "role attributes differ: " + ", ".join(mismatched) if mismatched else None
 
 
-def _runtime_role_assessment(
-    row: Mapping[str, Any],
-    *,
-    role: str,
-) -> tuple[str | None, dict[str, str] | None]:
-    """Keep the ordinary runtime strict while tolerating legacy superusers."""
-    if bool(row["rolsuper"]):
-        if not bool(row["rolcanlogin"]):
-            return "role attributes differ: rolcanlogin", None
-        return None, {
-            "code": LEGACY_RUNTIME_SUPERUSER_CODE,
-            "detail": LEGACY_RUNTIME_SUPERUSER_DETAIL,
-            "role": role,
-        }
-    return (
-        _role_collision(
-            row,
-            {"login": True, "createdb": False, "inherit": True},
-        ),
-        None,
-    )
+async def _dump_role_confinement_violations(
+    connection: AsyncConnection,
+    dump_role: str,
+) -> list[str]:
+    """Return capabilities that exceed the dedicated public-read contract."""
+    rows = (
+        await connection.execute(
+            text(
+                r"""
+                WITH target AS (
+                    SELECT r.oid
+                    FROM pg_catalog.pg_roles AS r
+                    WHERE r.rolname = :role
+                ),
+                violations AS (
+                    SELECT 'owns database'::text AS kind,
+                           pg_catalog.quote_ident(d.datname) AS object
+                    FROM pg_catalog.pg_database AS d
+                    CROSS JOIN target
+                    WHERE d.datdba = target.oid
+
+                    UNION ALL
+                    SELECT 'database privilege',
+                           pg_catalog.quote_ident(d.datname) || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_database AS d
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(d.datacl) AS acl
+                    WHERE acl.grantee = target.oid
+                      AND NOT (
+                          d.datname = pg_catalog.current_database()
+                          AND acl.privilege_type = 'CONNECT'
+                          AND NOT acl.is_grantable
+                      )
+
+                    UNION ALL
+                    SELECT 'effective database privilege',
+                           pg_catalog.quote_ident(d.datname) || ' ' || privilege.name
+                    FROM pg_catalog.pg_database AS d
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL unnest(
+                        ARRAY['CONNECT', 'CREATE', 'TEMPORARY']::text[]
+                    ) AS privilege(name)
+                    WHERE pg_catalog.has_database_privilege(
+                              target.oid, d.oid, privilege.name
+                          )
+                      AND NOT (
+                          privilege.name = 'CONNECT'
+                          AND d.datname = pg_catalog.current_database()
+                      )
+
+                    UNION ALL
+                    SELECT 'owns schema', pg_catalog.quote_ident(n.nspname)
+                    FROM pg_catalog.pg_namespace AS n
+                    CROSS JOIN target
+                    WHERE n.nspowner = target.oid
+
+                    UNION ALL
+                    SELECT 'schema privilege',
+                           pg_catalog.quote_ident(n.nspname) || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_namespace AS n
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS acl
+                    WHERE acl.grantee = target.oid
+                      AND NOT (
+                          n.nspname = 'public'
+                          AND acl.privilege_type = 'USAGE'
+                          AND NOT acl.is_grantable
+                      )
+
+                    UNION ALL
+                    SELECT 'effective public routine execute',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(p.proname) ||
+                           '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')'
+                    FROM pg_catalog.pg_proc AS p
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+                    CROSS JOIN target
+                    WHERE n.nspname = 'public'
+                      AND pg_catalog.has_function_privilege(
+                          target.oid, p.oid, 'EXECUTE'
+                      )
+
+                    UNION ALL
+                    SELECT 'effective non-public schema access',
+                           pg_catalog.quote_ident(n.nspname)
+                    FROM pg_catalog.pg_namespace AS n
+                    CROSS JOIN target
+                    WHERE n.nspname <> 'public'
+                      AND n.nspname <> 'information_schema'
+                      AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+                      AND (
+                          pg_catalog.has_schema_privilege(target.oid, n.oid, 'USAGE')
+                          OR pg_catalog.has_schema_privilege(target.oid, n.oid, 'CREATE')
+                      )
+
+                    UNION ALL
+                    SELECT 'owns relation',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(c.relname)
+                    FROM pg_catalog.pg_class AS c
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                    CROSS JOIN target
+                    WHERE c.relowner = target.oid
+
+                    UNION ALL
+                    SELECT 'relation privilege',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(c.relname) || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_class AS c
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
+                    WHERE acl.grantee = target.oid
+                      AND NOT (
+                          n.nspname = 'public'
+                          AND acl.privilege_type = 'SELECT'
+                          AND NOT acl.is_grantable
+                      )
+
+                    UNION ALL
+                    SELECT 'column privilege',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(c.relname) || '.' ||
+                           pg_catalog.quote_ident(a.attname) || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_attribute AS a
+                    JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
+                    WHERE acl.grantee = target.oid
+
+                    UNION ALL
+                    SELECT 'effective public table write',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(c.relname) || ' ' || privilege.name
+                    FROM pg_catalog.pg_class AS c
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL unnest(
+                        CASE
+                            WHEN pg_catalog.current_setting(
+                                'server_version_num'
+                            )::integer >= 170000
+                            THEN ARRAY[
+                                'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE',
+                                'REFERENCES', 'TRIGGER', 'MAINTAIN'
+                            ]::text[]
+                            ELSE ARRAY[
+                                'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE',
+                                'REFERENCES', 'TRIGGER'
+                            ]::text[]
+                        END
+                    ) AS privilege(name)
+                    WHERE n.nspname = 'public'
+                      AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                      AND pg_catalog.has_table_privilege(
+                          target.oid, c.oid, privilege.name
+                      )
+
+                    UNION ALL
+                    SELECT 'effective public sequence write',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(c.relname) || ' ' || privilege.name
+                    FROM pg_catalog.pg_class AS c
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL unnest(
+                        ARRAY['USAGE', 'UPDATE']::text[]
+                    ) AS privilege(name)
+                    WHERE n.nspname = 'public'
+                      AND c.relkind = 'S'
+                      AND pg_catalog.has_sequence_privilege(
+                          target.oid, c.oid, privilege.name
+                      )
+
+                    UNION ALL
+                    SELECT 'effective database create',
+                           pg_catalog.quote_ident(pg_catalog.current_database())
+                    FROM target
+                    WHERE pg_catalog.has_database_privilege(
+                        target.oid, pg_catalog.current_database(), 'CREATE'
+                    )
+
+                    UNION ALL
+                    SELECT 'effective public schema create',
+                           pg_catalog.quote_ident('public')
+                    FROM pg_catalog.pg_namespace AS n
+                    CROSS JOIN target
+                    WHERE n.nspname = 'public'
+                      AND pg_catalog.has_schema_privilege(
+                          target.oid, n.oid, 'CREATE'
+                      )
+
+                    UNION ALL
+                    SELECT 'owns routine',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(p.proname)
+                    FROM pg_catalog.pg_proc AS p
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+                    CROSS JOIN target
+                    WHERE p.proowner = target.oid
+
+                    UNION ALL
+                    SELECT 'routine privilege',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(p.proname) || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_proc AS p
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) AS acl
+                    WHERE acl.grantee = target.oid
+
+                    UNION ALL
+                    SELECT 'owns type',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(t.typname)
+                    FROM pg_catalog.pg_type AS t
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = t.typnamespace
+                    CROSS JOIN target
+                    WHERE t.typowner = target.oid
+                      AND t.typtype <> 'p'
+
+                    UNION ALL
+                    SELECT 'type privilege',
+                           pg_catalog.quote_ident(n.nspname) || '.' ||
+                           pg_catalog.quote_ident(t.typname) || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_type AS t
+                    JOIN pg_catalog.pg_namespace AS n ON n.oid = t.typnamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(t.typacl) AS acl
+                    WHERE acl.grantee = target.oid
+
+                    UNION ALL
+                    SELECT 'default privilege',
+                           COALESCE(pg_catalog.quote_ident(n.nspname), '<all schemas>') ||
+                           ' ' || da.defaclobjtype::text || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_default_acl AS da
+                    LEFT JOIN pg_catalog.pg_namespace AS n
+                           ON n.oid = da.defaclnamespace
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(da.defaclacl) AS acl
+                    WHERE acl.grantee = target.oid
+                      AND NOT (
+                          n.nspname = 'public'
+                          AND da.defaclobjtype IN ('r', 'S')
+                          AND acl.privilege_type = 'SELECT'
+                          AND NOT acl.is_grantable
+                      )
+
+                    UNION ALL
+                    SELECT 'owns large object', lom.oid::text
+                    FROM pg_catalog.pg_largeobject_metadata AS lom
+                    CROSS JOIN target
+                    WHERE lom.lomowner = target.oid
+
+                    UNION ALL
+                    SELECT 'large object privilege',
+                           lom.oid::text || ' ' || acl.privilege_type
+                    FROM pg_catalog.pg_largeobject_metadata AS lom
+                    CROSS JOIN target
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(lom.lomacl) AS acl
+                    WHERE acl.grantee = target.oid
+                )
+                SELECT kind, object
+                FROM violations
+                ORDER BY kind, object
+                LIMIT 50
+                """
+            ),
+            {"role": dump_role},
+        )
+    ).mappings().all()
+    return [f"{row['kind']}: {row['object']}" for row in rows]
+
+
+_REPAIRABLE_DUMP_CONFINEMENT_PREFIXES = (
+    "database privilege:",
+    "effective database privilege:",
+    "effective database create:",
+    "effective public schema create:",
+    "effective public table write:",
+    "effective public sequence write:",
+    "effective public routine execute:",
+)
+
+
+def _repairable_dump_confinement_violation(violation: str) -> bool:
+    return violation.startswith(_REPAIRABLE_DUMP_CONFINEMENT_PREFIXES)
 
 
 async def build_provision_plan(settings: Any) -> dict[str, Any]:
-    """Inspect with the runtime connection inside a read-only transaction."""
-    roles = resolve_role_names(settings)
+    """Plan optional hardening with one read-only dump role.
+
+    The normal backup and destructive-restore path needs no provisioning. This
+    command exists only for operators that want pg_dump to authenticate as a
+    separate least-privilege login.
+    """
+    dump_role = resolve_dump_role_name(settings)
     runtime_url = str(settings.database_url)
+    runtime_role = validate_postgres_identifier(
+        sqlalchemy_url_to_libpq(runtime_url).username,
+        label="runtime role",
+    )
     engine = create_async_engine(runtime_url, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
@@ -453,12 +631,24 @@ async def build_provision_plan(settings: Any) -> dict[str, Any]:
                             "SELECT current_user AS role, "
                             "pg_catalog.current_database() AS database, "
                             "pg_catalog.current_setting('server_version_num')::integer "
-                            "AS server_version_num"
+                            "AS server_version_num, r.rolsuper AS runtime_superuser "
+                            "FROM pg_catalog.pg_roles AS r "
+                            "WHERE r.rolname = current_user"
                         )
                     )
                 ).mappings().one()
-                rows = await _read_role_rows(connection, roles)
-                memberships = await _read_memberships(connection, roles)
+                dump_row = await _read_role_row(connection, dump_role)
+                memberships = await _read_role_memberships(connection, dump_role)
+                confinement_violations = (
+                    await _dump_role_confinement_violations(connection, dump_role)
+                    if dump_row is not None
+                    else []
+                )
+                confinement_violations = [
+                    violation
+                    for violation in confinement_violations
+                    if not _repairable_dump_confinement_violation(violation)
+                ]
                 rls_count = int(
                     (
                         await connection.execute(
@@ -466,8 +656,7 @@ async def build_provision_plan(settings: Any) -> dict[str, Any]:
                                 "SELECT count(*) FROM pg_catalog.pg_class AS c "
                                 "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
                                 "WHERE c.relkind IN ('r', 'p') AND c.relrowsecurity "
-                                "AND n.nspname <> 'information_schema' "
-                                "AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'"
+                                "AND n.nspname = 'public'"
                             )
                         )
                     ).scalar_one()
@@ -475,48 +664,63 @@ async def build_provision_plan(settings: Any) -> dict[str, Any]:
     finally:
         await engine.dispose()
 
-    if str(identity["role"]) != roles.runtime:
+    if str(identity["role"]) != runtime_role:
         raise BackupProvisionError("runtime DSN authenticated as an unexpected role")
-    if rls_count:
-        raise BackupProvisionError(
-            "row-level-security tables are unsupported for the strict dump role"
-        )
 
     actions: list[dict[str, Any]] = []
     warnings: list[dict[str, str]] = []
-    collisions: list[dict[str, str]] = _membership_collisions(
-        memberships,
-        roles,
+    collisions: list[dict[str, str]] = []
+    if bool(identity["runtime_superuser"]):
+        warnings.append(
+            {
+                "code": RUNTIME_SUPERUSER_CODE,
+                "detail": RUNTIME_SUPERUSER_DETAIL,
+                "role": str(identity["role"]),
+            }
+        )
+    if memberships:
+        rendered = ", ".join(
+            f"{row['member']} -> {row['granted']}" for row in memberships
+        )
+        collisions.append(
+            {
+                "role": dump_role,
+                "reason": f"dump role has unexpected memberships: {rendered}",
+            }
+        )
+    collisions.extend(
+        {"role": dump_role, "reason": violation}
+        for violation in confinement_violations
     )
-    runtime_collision, runtime_warning = _runtime_role_assessment(
-        rows[roles.runtime],
-        role=roles.runtime,
-    )
-    if runtime_collision:
-        collisions.append({"role": roles.runtime, "reason": runtime_collision})
-    if runtime_warning:
-        warnings.append(runtime_warning)
-    for role, spec in _role_specs(roles).items():
-        row = rows.get(role)
-        if row is None:
-            actions.append({"action": "create_role", "role": role})
-            continue
-        collision = _role_collision(row, spec)
+    if rls_count:
+        collisions.append(
+            {
+                "role": dump_role,
+                "reason": (
+                    "row-level-security tables require PPBASE_DATABASE_URL "
+                    "for complete dumps"
+                ),
+            }
+        )
+    dump_spec = {"login": True, "createdb": False, "inherit": False}
+    if dump_row is None:
+        actions.append({"action": "create_dump_role", "role": dump_role})
+    else:
+        collision = _role_collision(dump_row, dump_spec)
         if collision:
-            collisions.append({"role": role, "reason": collision})
+            collisions.append({"role": dump_role, "reason": collision})
         else:
-            actions.append({"action": "noop_role", "role": role})
+            actions.append({"action": "reuse_dump_role", "role": dump_role})
     actions.extend(
         (
-            {"action": "grant_owner_memberships", "role": roles.owner},
-            {"action": "normalize_database_acl", "database": str(identity["database"])},
-            {"action": "grant_dump_read_access", "role": roles.dump},
-            {"action": "write_runtime_secrets", "required": True},
+            {"action": "normalize_public_database_acl", "role": dump_role},
+            {"action": "grant_dump_read_access", "role": dump_role},
+            {"action": "write_dump_credential", "required": True},
         )
     )
     return {
         "formatVersion": 1,
-        "mode": "production",
+        "mode": "optional_dump_hardening",
         "readOnly": True,
         "runtime": {
             "url": _redacted_url(runtime_url),
@@ -524,7 +728,10 @@ async def build_provision_plan(settings: Any) -> dict[str, Any]:
             "database": str(identity["database"]),
             "serverVersionNum": int(identity["server_version_num"]),
         },
-        "roles": roles.as_dict(),
+        "roles": {
+            "runtime": str(identity["role"]),
+            "dump": dump_role,
+        },
         "actions": actions,
         "collisions": collisions,
         "warnings": warnings,
@@ -543,11 +750,7 @@ async def _ensure_role(
     *,
     password: str | None,
 ) -> bool:
-    rows = await _read_role_rows(
-        connection,
-        RoleNames(role, role, role, role, role),
-    )
-    row = rows.get(role)
+    row = await _read_role_row(connection, role)
     if row is not None:
         collision = _role_collision(row, spec)
         if collision:
@@ -577,48 +780,29 @@ async def _grant_source_dump_access(
     future_owners: tuple[str, ...] = (),
 ) -> None:
     dump = _quote_identifier(dump_role)
-    schemas = (
-        await connection.execute(
-            text(
-                "SELECT n.nspname FROM pg_catalog.pg_namespace AS n "
-                "WHERE n.nspname <> 'information_schema' "
-                "AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' ORDER BY n.nspname"
-            )
-        )
-    ).scalars().all()
-    for raw_schema in schemas:
-        schema = _quote_identifier(str(raw_schema))
-        await connection.execute(text(f"GRANT USAGE ON SCHEMA {schema} TO {dump}"))
-        await connection.execute(
-            text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {dump}")
-        )
-        await connection.execute(
-            text(f"GRANT SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {dump}")
-        )
+    schema = _quote_identifier("public")
+    await connection.execute(text(f"GRANT USAGE ON SCHEMA {schema} TO {dump}"))
+    await connection.execute(
+        text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {dump}")
+    )
+    await connection.execute(
+        text(f"GRANT SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {dump}")
+    )
     owner_rows = (
         await connection.execute(
             text(
-                "SELECT DISTINCT pg_catalog.pg_get_userbyid(c.relowner) AS owner, "
-                "n.nspname AS schema FROM pg_catalog.pg_class AS c "
+                "SELECT DISTINCT pg_catalog.pg_get_userbyid(c.relowner) AS owner "
+                "FROM pg_catalog.pg_class AS c "
                 "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
                 "WHERE c.relkind IN ('r','p','S','v','m','f') "
-                "AND n.nspname <> 'information_schema' "
-                "AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\' "
-                "ORDER BY owner, schema"
+                "AND n.nspname = 'public' ORDER BY owner"
             )
         )
     ).mappings().all()
-    owner_schemas = {
-        (str(row["owner"]), str(row["schema"])) for row in owner_rows
-    }
-    owner_schemas.update(
-        (owner, str(schema))
-        for owner in future_owners
-        for schema in schemas
-    )
-    for owner_name, schema_name in sorted(owner_schemas):
+    owners = {str(row["owner"]) for row in owner_rows}
+    owners.update(future_owners)
+    for owner_name in sorted(owners):
         owner = _quote_identifier(owner_name)
-        schema = _quote_identifier(schema_name)
         await connection.execute(
             text(
                 f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
@@ -632,77 +816,137 @@ async def _grant_source_dump_access(
             )
         )
 
-    large_objects = (
+
+async def _normalize_source_dump_access(
+    connection: AsyncConnection,
+    *,
+    dump_role: str,
+    future_owners: tuple[str, ...] = (),
+) -> None:
+    """Normalize access for the public schema selected by ``pg_dump``."""
+    dump = _quote_identifier(dump_role)
+    schema = _quote_identifier("public")
+    await connection.execute(
+        text(f"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM {dump}")
+    )
+    await connection.execute(
+        text(f"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC")
+    )
+    await connection.execute(
+        text(
+            f"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} "
+            f"FROM {dump}"
+        )
+    )
+    await connection.execute(
+        text(
+            f"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} "
+            "FROM PUBLIC"
+        )
+    )
+    await connection.execute(
+        text(f"REVOKE ALL PRIVILEGES ON SCHEMA {schema} FROM {dump}")
+    )
+    await connection.execute(
+        text(f"REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC")
+    )
+    await connection.execute(
+        text(f"REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA {schema} FROM {dump}")
+    )
+    await connection.execute(
+        text(f"REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA {schema} FROM PUBLIC")
+    )
+
+    owner_rows = (
         await connection.execute(
             text(
-                "SELECT large_object.oid, "
-                "pg_catalog.pg_get_userbyid(large_object.lomowner) AS owner "
-                "FROM pg_catalog.pg_largeobject_metadata AS large_object "
-                "ORDER BY large_object.oid"
+                "SELECT DISTINCT owner FROM ("
+                "SELECT pg_catalog.pg_get_userbyid(n.nspowner) AS owner "
+                "FROM pg_catalog.pg_namespace AS n WHERE n.nspname = 'public' "
+                "UNION ALL "
+                "SELECT pg_catalog.pg_get_userbyid(c.relowner) AS owner "
+                "FROM pg_catalog.pg_class AS c "
+                "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+                "WHERE c.relkind IN ('r','p','S','v','m','f') "
+                "AND n.nspname = 'public' "
+                "UNION ALL "
+                "SELECT pg_catalog.pg_get_userbyid(p.proowner) AS owner "
+                "FROM pg_catalog.pg_proc AS p "
+                "JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'public'"
+                ") AS public_owners ORDER BY owner"
             )
         )
     ).mappings().all()
-    for row in large_objects:
-        oid = int(row["oid"])
+    owners = {str(row["owner"]) for row in owner_rows}
+    owners.update(future_owners)
+    for owner_name in sorted(owners):
+        owner = _quote_identifier(owner_name)
         await connection.execute(
-            text(f"GRANT SELECT ON LARGE OBJECT {oid} TO {dump}")
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
+                f"REVOKE ALL PRIVILEGES ON TABLES FROM {dump}"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
+                f"REVOKE ALL PRIVILEGES ON SEQUENCES FROM {dump}"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
+                "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
+                "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
+                "REVOKE ALL PRIVILEGES ON ROUTINES FROM PUBLIC"
+            )
         )
 
+    await _grant_source_dump_access(
+        connection,
+        dump_role=dump_role,
+        future_owners=future_owners,
+    )
 
-async def _grant_owner_memberships(
+
+async def _normalize_dump_database_access(
     connection: AsyncConnection,
     *,
-    roles: RoleNames,
-    server_version_num: int,
+    dump_role: str,
+    active_database: str,
 ) -> None:
-    owner = _quote_identifier(roles.owner)
-    for member, inherit in (
-        (roles.creator, False),
-        (roles.restore, False),
-        (roles.runtime, True),
-    ):
-        member_identifier = _quote_identifier(member)
-        if server_version_num >= 160000:
-            await connection.execute(
-                text(
-                    f"GRANT {owner} TO {member_identifier} WITH SET TRUE, "
-                    f"ADMIN FALSE, INHERIT {'TRUE' if inherit else 'FALSE'}"
-                )
-            )
-        else:
-            await connection.execute(text(f"GRANT {owner} TO {member_identifier}"))
-
-
-def _runtime_urls(
-    settings: Any,
-    roles: RoleNames,
-    passwords: Mapping[str, str],
-) -> dict[str, str]:
-    runtime = make_url(str(settings.database_url))
-
-    def role_url(role: str) -> str:
-        password = passwords.get(role)
-        if password is None:
-            configured = {
-                roles.dump: str(getattr(settings, "backup_dump_database_url", "") or ""),
-                roles.creator: str(getattr(settings, "backup_creator_database_url", "") or ""),
-                roles.restore: str(getattr(settings, "backup_restore_database_url", "") or ""),
-            }[role]
-            if not configured:
-                raise BackupProvisionError(
-                    f"existing role {role!r} requires its configured limited DSN"
-                )
-            return configured
-        return runtime.set(username=role, password=password).render_as_string(
-            hide_password=False
+    """Remove inherited cluster database ACLs, then allow only the active DB."""
+    dump = _quote_identifier(dump_role)
+    rows = (
+        await connection.execute(
+            text("SELECT d.datname FROM pg_catalog.pg_database AS d ORDER BY d.datname")
         )
-
-    return {
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": role_url(roles.dump),
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL": role_url(roles.creator),
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL": role_url(roles.restore),
-        "PPBASE_BACKUP_TARGET_OWNER": roles.owner,
-    }
+    ).mappings().all()
+    for row in rows:
+        database = _quote_identifier(str(row["datname"]))
+        await connection.execute(
+            text(f"REVOKE ALL PRIVILEGES ON DATABASE {database} FROM {dump}")
+        )
+        await connection.execute(
+            text(f"REVOKE ALL PRIVILEGES ON DATABASE {database} FROM PUBLIC")
+        )
+    await connection.execute(
+        text(
+            f"GRANT CONNECT ON DATABASE {_quote_identifier(active_database)} "
+            f"TO {dump}"
+        )
+    )
 
 
 def write_secret_sink(path: str | Path, values: Mapping[str, str]) -> Path:
@@ -962,26 +1206,17 @@ def read_secret_sink(path: str | Path) -> dict[str, str] | None:
 def _postgres_init_values(
     bootstrap_database_url: str | URL,
     spec: PostgresInitSpec,
-    passwords: Mapping[str, str],
+    password: str,
 ) -> dict[str, str]:
     bootstrap = _validated_bootstrap_url(bootstrap_database_url)
-
-    def role_url(role: str) -> str:
-        password = str(passwords.get(role, "") or "")
-        if not password:
-            raise BackupProvisionError(f"limited credential for {role!r} is missing")
-        return bootstrap.set(
-            username=role,
+    if not password:
+        raise BackupProvisionError("runtime credential is missing")
+    return {
+        "PPBASE_DATABASE_URL": bootstrap.set(
+            username=spec.runtime_role,
             password=password,
             database=spec.database,
-        ).render_as_string(hide_password=False)
-
-    return {
-        "PPBASE_DATABASE_URL": role_url(spec.roles.runtime),
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": role_url(spec.roles.dump),
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL": role_url(spec.roles.creator),
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL": role_url(spec.roles.restore),
-        "PPBASE_BACKUP_TARGET_OWNER": spec.roles.owner,
+        ).render_as_string(hide_password=False),
     }
 
 
@@ -989,44 +1224,33 @@ def _validate_postgres_init_values(
     values: Mapping[str, str],
     bootstrap_database_url: str | URL,
     spec: PostgresInitSpec,
-) -> dict[str, str]:
+) -> str:
     if set(values) != INIT_SECRET_KEYS:
         raise BackupProvisionError(
-            "secret sink must contain exactly the limited PPBase credentials"
+            "secret sink must contain exactly PPBASE_DATABASE_URL"
         )
     bootstrap = _validated_bootstrap_url(bootstrap_database_url)
     bootstrap_connection = sqlalchemy_url_to_libpq(bootstrap)
-    expected_roles = {
-        "PPBASE_DATABASE_URL": spec.roles.runtime,
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": spec.roles.dump,
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL": spec.roles.creator,
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL": spec.roles.restore,
-    }
-    passwords: dict[str, str] = {}
-    for key, expected_role in expected_roles.items():
-        try:
-            parsed = make_url(str(values[key]))
-        except Exception:
-            raise BackupProvisionError(
-                f"secret sink contains an invalid limited DSN for {key}"
-            ) from None
+    try:
+        parsed = make_url(str(values["PPBASE_DATABASE_URL"]))
         parsed_connection = sqlalchemy_url_to_libpq(parsed)
-        if (
-            parsed.drivername != "postgresql+asyncpg"
-            or parsed.username != expected_role
-            or parsed.database != spec.database
-            or parsed_connection.host != bootstrap_connection.host
-            or (parsed_connection.port or "5432")
-            != (bootstrap_connection.port or "5432")
-            or not parsed.password
-        ):
-            raise BackupProvisionError(
-                f"secret sink credential {key} does not match this project/server"
-            )
-        passwords[expected_role] = str(parsed.password)
-    if values["PPBASE_BACKUP_TARGET_OWNER"] != spec.roles.owner:
-        raise BackupProvisionError("secret sink target owner does not match the project")
-    return passwords
+    except Exception:
+        raise BackupProvisionError(
+            "secret sink contains an invalid PPBASE_DATABASE_URL"
+        ) from None
+    if (
+        parsed.drivername != "postgresql+asyncpg"
+        or parsed.username != spec.runtime_role
+        or parsed.database != spec.database
+        or parsed_connection.host != bootstrap_connection.host
+        or (parsed_connection.port or "5432")
+        != (bootstrap_connection.port or "5432")
+        or not parsed.password
+    ):
+        raise BackupProvisionError(
+            "secret sink runtime credential does not match this project/server"
+        )
+    return str(parsed.password)
 
 
 def _postgres_error_sqlstate(exc: BaseException) -> str | None:
@@ -1047,138 +1271,127 @@ async def _probe_postgres_init_credentials(
     values: Mapping[str, str],
     spec: PostgresInitSpec,
     *,
-    existing_roles: set[str],
+    role_exists: bool,
     bootstrap_database: str,
     database_exists: bool,
 ) -> list[dict[str, str]]:
-    expected = {
-        "PPBASE_DATABASE_URL": spec.roles.runtime,
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": spec.roles.dump,
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL": spec.roles.creator,
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL": spec.roles.restore,
-    }
-    collisions: list[dict[str, str]] = []
-    for key, role in expected.items():
-        if role not in existing_roles:
-            continue
-        configured = make_url(str(values[key]))
-        probe_url = configured if database_exists else configured.set(
-            database=bootstrap_database
-        )
-        engine = create_async_engine(probe_url, poolclass=NullPool)
-        authenticated = False
+    if not role_exists:
+        return []
+    configured = make_url(str(values["PPBASE_DATABASE_URL"]))
+    probe_url = configured if database_exists else configured.set(
+        database=bootstrap_database
+    )
+    engine = create_async_engine(probe_url, poolclass=NullPool)
+    authenticated = False
+    try:
         try:
-            try:
-                async with engine.connect() as connection:
-                    effective = str(
-                        (
-                            await connection.execute(text("SELECT current_user"))
-                        ).scalar_one()
-                    )
-                    authenticated = effective == role
-                    await connection.rollback()
-            except Exception as exc:
-                # PostgreSQL checks CONNECT after authentication. A 42501 here
-                # therefore still proves that the stored password is valid.
-                authenticated = _postgres_error_sqlstate(exc) == "42501"
-        finally:
-            await engine.dispose()
-        if not authenticated:
-            collisions.append(
-                {
-                    "resource": role,
-                    "reason": f"stored credential {key} could not authenticate",
-                }
+            async with engine.connect() as connection:
+                effective = str(
+                    (await connection.execute(text("SELECT current_user"))).scalar_one()
+                )
+                authenticated = effective == spec.runtime_role
+                await connection.rollback()
+        except Exception as exc:
+            # PostgreSQL checks CONNECT after authentication. A 42501 here
+            # therefore still proves that the stored password is valid.
+            authenticated = _postgres_error_sqlstate(exc) == "42501"
+    finally:
+        await engine.dispose()
+    if authenticated:
+        return []
+    return [
+        {
+            "resource": spec.runtime_role,
+            "reason": "stored credential PPBASE_DATABASE_URL could not authenticate",
+        }
+    ]
+
+
+def _dump_provision_values(
+    settings: Any,
+    *,
+    dump_role: str,
+    password: str | None,
+) -> dict[str, str]:
+    configured = str(
+        getattr(settings, "backup_dump_database_url", "") or ""
+    ).strip()
+    if password is None:
+        if not configured:
+            raise BackupProvisionError(
+                f"existing role {dump_role!r} requires its configured dump DSN"
             )
-    return collisions
+        value = configured
+    else:
+        value = make_url(str(settings.database_url)).set(
+            username=dump_role,
+            password=password,
+        ).render_as_string(hide_password=False)
+    return {"PPBASE_BACKUP_DUMP_DATABASE_URL": value}
 
 
-def _validate_backup_provision_values(
+def _validate_dump_provision_values(
     values: Mapping[str, str],
     runtime_database_url: str | URL,
-    roles: RoleNames,
-) -> dict[str, str]:
-    if set(values) != BACKUP_PROVISION_SECRET_KEYS:
+    dump_role: str,
+) -> str:
+    if set(values) != DUMP_PROVISION_SECRET_KEYS:
         raise BackupProvisionError(
-            "secret sink must contain exactly the limited backup credentials"
+            "secret sink must contain exactly PPBASE_BACKUP_DUMP_DATABASE_URL"
         )
-    runtime_connection = sqlalchemy_url_to_libpq(runtime_database_url)
-    expected_roles = {
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": roles.dump,
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL": roles.creator,
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL": roles.restore,
-    }
-    passwords: dict[str, str] = {}
-    for key, expected_role in expected_roles.items():
-        try:
-            parsed = make_url(str(values[key]))
-            parsed_connection = sqlalchemy_url_to_libpq(parsed)
-        except Exception:
-            raise BackupProvisionError(
-                f"secret sink contains an invalid limited DSN for {key}"
-            ) from None
-        if (
-            parsed.username != expected_role
-            or parsed_connection.host != runtime_connection.host
-            or parsed_connection.port != runtime_connection.port
-            or not parsed.password
-            or (
-                key == "PPBASE_BACKUP_DUMP_DATABASE_URL"
-                and parsed.database != runtime_connection.database
-            )
-        ):
-            raise BackupProvisionError(
-                f"secret sink credential {key} does not match this runtime/server"
-            )
-        passwords[expected_role] = str(parsed.password)
-    if values["PPBASE_BACKUP_TARGET_OWNER"] != roles.owner:
-        raise BackupProvisionError("secret sink target owner does not match settings")
-    return passwords
+    runtime = make_url(str(runtime_database_url))
+    try:
+        configured = make_url(str(values["PPBASE_BACKUP_DUMP_DATABASE_URL"]))
+        runtime_connection = sqlalchemy_url_to_libpq(runtime)
+        configured_connection = sqlalchemy_url_to_libpq(configured)
+    except Exception:
+        raise BackupProvisionError("secret sink contains an invalid dump DSN") from None
+    if (
+        configured.drivername != runtime.drivername
+        or configured.username != dump_role
+        or configured.database != runtime.database
+        or configured_connection.host != runtime_connection.host
+        or (configured_connection.port or "5432")
+        != (runtime_connection.port or "5432")
+        or not configured.password
+    ):
+        raise BackupProvisionError(
+            "secret sink dump credential does not match this runtime/server"
+        )
+    return str(configured.password)
 
 
-async def _require_backup_provision_credentials(
-    values: Mapping[str, str],
-    roles: RoleNames,
+async def _require_dump_provision_credential(
+    database_url: str,
     *,
-    existing_roles: set[str],
+    dump_role: str,
 ) -> None:
-    """Authenticate every pre-existing limited backup login before mutation."""
-    expected = {
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": roles.dump,
-        "PPBASE_BACKUP_CREATOR_DATABASE_URL": roles.creator,
-        "PPBASE_BACKUP_RESTORE_DATABASE_URL": roles.restore,
-    }
-    for key, role in expected.items():
-        if role not in existing_roles:
-            continue
-        engine = create_async_engine(str(values[key]), poolclass=NullPool)
-        authenticated = False
+    """Authenticate a pre-existing role before changing any of its grants."""
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
         try:
-            try:
-                async with engine.connect() as connection:
-                    identity = (
+            async with engine.connect() as connection:
+                effective = str(
+                    (
                         await connection.execute(
                             text(
                                 "SELECT session_user AS session_role, "
                                 "current_user AS effective_role"
                             )
                         )
-                    ).mappings().one()
-                    authenticated = (
-                        str(identity["session_role"]) == role
-                        and str(identity["effective_role"]) == role
-                    )
-                    await connection.rollback()
-            except Exception as exc:
-                # PostgreSQL checks database CONNECT only after password
-                # authentication, so 42501 still proves this exact login secret.
-                authenticated = _postgres_error_sqlstate(exc) == "42501"
-        finally:
-            await engine.dispose()
-        if not authenticated:
+                    ).mappings().one()["session_role"]
+                )
+                await connection.rollback()
+        except Exception:
             raise BackupProvisionError(
-                f"stored credential {key} could not authenticate"
-            )
+                f"stored credential for existing role {dump_role!r} could not authenticate"
+            ) from None
+    finally:
+        await engine.dispose()
+    if effective != dump_role:
+        raise BackupProvisionError(
+            f"stored credential authenticated as {effective!r}, not {dump_role!r}"
+        )
 
 
 async def _read_init_database_row(
@@ -1205,7 +1418,7 @@ def _init_database_collision(
     row: Mapping[str, Any],
     spec: PostgresInitSpec,
 ) -> str | None:
-    if str(row["owner"]) != spec.roles.runtime:
+    if str(row["owner"]) != spec.runtime_role:
         return "database owner differs from the runtime role"
     if str(row["encoding"]).upper().replace("-", "") != "UTF8":
         return "database encoding is not UTF8"
@@ -1246,7 +1459,7 @@ async def _audit_pristine_unmarked_init_database(
                         )
                     )
                 ).mappings().one()
-                if str(database["owner"]) != spec.roles.runtime:
+                if str(database["owner"]) != spec.runtime_role:
                     return "unmarked database owner differs from the runtime role"
                 if not bool(database["default_acl"]):
                     return "unmarked database has explicit database ACLs"
@@ -1343,27 +1556,32 @@ async def execute_provision(
     bootstrap_database_url: str,
     secret_sink: str | Path,
 ) -> dict[str, Any]:
+    """Create/configure only the optional least-privilege dump login."""
     plan = await build_provision_plan(settings)
     if not plan["executable"]:
         raise BackupProvisionError("provisioning plan contains unsafe role collisions")
-    roles = resolve_role_names(settings)
+    dump_role = resolve_dump_role_name(settings)
+    runtime_role = validate_postgres_identifier(
+        sqlalchemy_url_to_libpq(settings.database_url).username,
+        label="runtime role",
+    )
     bootstrap = _validated_bootstrap_url(bootstrap_database_url)
     runtime = make_url(str(settings.database_url))
     bootstrap_connection = sqlalchemy_url_to_libpq(bootstrap)
     runtime_connection = sqlalchemy_url_to_libpq(runtime)
     if (
         bootstrap_connection.host != runtime_connection.host
-        or bootstrap_connection.port != runtime_connection.port
+        or (bootstrap_connection.port or "5432")
+        != (runtime_connection.port or "5432")
     ):
         raise BackupProvisionError("bootstrap and runtime DSNs must target the same server")
     bootstrap_runtime = bootstrap.set(database=runtime.database)
     sink_path = Path(secret_sink).expanduser().absolute()
     values: dict[str, str] | None = None
-    passwords: dict[str, str] = {}
-    warnings: list[dict[str, str]] = []
+    warnings = list(plan.get("warnings", []))
 
     engine = create_async_engine(bootstrap_runtime, poolclass=NullPool)
-    created: list[str] = []
+    created = False
     try:
         async with engine.connect() as connection:
             async with connection.begin():
@@ -1372,118 +1590,104 @@ async def execute_provision(
                     text("SELECT pg_catalog.pg_advisory_xact_lock(:key)"),
                     {"key": PROVISION_LOCK_KEY},
                 )
-                values = read_secret_sink(sink_path)
-                sink_missing = values is None
-                existing_rows = await _read_role_rows(connection, roles)
-                if values is None:
-                    passwords = {
-                        role: _generate_password()
-                        for role, role_spec in _role_specs(roles).items()
-                        if role_spec["login"] and role not in existing_rows
-                    }
-                    values = _runtime_urls(settings, roles, passwords)
-                    _validate_backup_provision_values(values, runtime, roles)
-                else:
-                    passwords = _validate_backup_provision_values(
-                        values,
-                        runtime,
-                        roles,
-                    )
-                await _require_backup_provision_credentials(
-                    values,
-                    roles,
-                    existing_roles=set(existing_rows),
-                )
-                if sink_missing:
-                    write_secret_sink(sink_path, values)
                 effective = str(
                     (await connection.execute(text("SELECT current_user"))).scalar_one()
                 )
-                privileged = bool(
+                is_superuser = bool(
                     (
                         await connection.execute(
                             text(
-                                "SELECT r.rolsuper OR r.rolcreaterole "
+                                "SELECT r.rolsuper "
                                 "FROM pg_catalog.pg_roles AS r WHERE r.rolname = :role"
                             ),
                             {"role": effective},
                         )
                     ).scalar_one()
                 )
-                if not privileged:
+                if not is_superuser:
                     raise BackupProvisionError(
-                        "bootstrap role requires CREATEROLE or superuser for provisioning"
+                        "backup provision requires an ephemeral PostgreSQL superuser DSN"
                     )
-                runtime_row = (
+
+                existing_row = (
                     await connection.execute(
                         text(
-                            "SELECT r.* FROM pg_catalog.pg_roles AS r "
+                            "SELECT r.rolname, r.rolcanlogin, r.rolcreatedb, "
+                            "r.rolinherit, r.rolsuper, r.rolcreaterole, "
+                            "r.rolreplication, r.rolbypassrls "
+                            "FROM pg_catalog.pg_roles AS r "
                             "WHERE r.rolname = :role"
                         ),
-                        {"role": roles.runtime},
+                        {"role": dump_role},
                     )
                 ).mappings().one_or_none()
-                runtime_collision = None
-                runtime_warning = None
-                if runtime_row is not None:
-                    runtime_collision, runtime_warning = _runtime_role_assessment(
-                        runtime_row,
-                        role=roles.runtime,
+                values = read_secret_sink(sink_path)
+                sink_missing = values is None
+                if values is None:
+                    values = _dump_provision_values(
+                        settings,
+                        dump_role=dump_role,
+                        password=(
+                            None if existing_row is not None else _generate_password()
+                        ),
                     )
-                if runtime_row is None or runtime_collision:
-                    raise BackupProvisionError(
-                        "runtime role is missing or violates the strict runtime contract"
-                    )
-                if runtime_warning:
-                    warnings.append(runtime_warning)
-                for role, spec in _role_specs(roles).items():
-                    password = passwords.get(role) if spec["login"] else None
-                    if await _ensure_role(
-                        connection,
-                        role,
-                        spec,
-                        password=password,
-                    ):
-                        created.append(role)
-
-                server_version_num = int(
-                    (
-                        await connection.execute(
-                            text(
-                                "SELECT current_setting('server_version_num')::integer"
-                            )
-                        )
-                    ).scalar_one()
+                password = _validate_dump_provision_values(
+                    values,
+                    runtime,
+                    dump_role,
                 )
-                await _grant_owner_memberships(
+                if existing_row is not None:
+                    await _require_dump_provision_credential(
+                        values["PPBASE_BACKUP_DUMP_DATABASE_URL"],
+                        dump_role=dump_role,
+                    )
+                if sink_missing:
+                    write_secret_sink(sink_path, values)
+                created = await _ensure_role(
                     connection,
-                    roles=roles,
-                    server_version_num=server_version_num,
+                    dump_role,
+                    {"login": True, "createdb": False, "inherit": False},
+                    password=password,
                 )
-                await _require_safe_memberships(connection, roles)
-                database = _quote_identifier(str(runtime.database))
-                dump = _quote_identifier(roles.dump)
-                await connection.execute(
-                    text(f"REVOKE TEMPORARY ON DATABASE {database} FROM PUBLIC")
-                )
-                await connection.execute(
-                    text(f"REVOKE ALL ON DATABASE {database} FROM {dump}")
-                )
-                await connection.execute(
-                    text(f"GRANT CONNECT ON DATABASE {database} TO {dump}")
-                )
-                for role in (roles.creator, roles.restore):
+                memberships = (
                     await connection.execute(
                         text(
-                            f"GRANT CONNECT ON DATABASE {database} "
-                            f"TO {_quote_identifier(role)}"
-                        )
+                            "SELECT member_role.rolname AS member, "
+                            "granted_role.rolname AS granted "
+                            "FROM pg_catalog.pg_auth_members AS membership "
+                            "JOIN pg_catalog.pg_roles AS member_role "
+                            "ON member_role.oid = membership.member "
+                            "JOIN pg_catalog.pg_roles AS granted_role "
+                            "ON granted_role.oid = membership.roleid "
+                            "WHERE member_role.rolname = :role "
+                            "OR granted_role.rolname = :role"
+                        ),
+                        {"role": dump_role},
                     )
-                await _grant_source_dump_access(
+                ).mappings().all()
+                if memberships:
+                    raise BackupProvisionError(
+                        "dump role has unexpected PostgreSQL memberships"
+                    )
+                await _normalize_dump_database_access(
                     connection,
-                    dump_role=roles.dump,
-                    future_owners=(roles.runtime,),
+                    dump_role=dump_role,
+                    active_database=str(runtime.database),
                 )
+                await _normalize_source_dump_access(
+                    connection,
+                    dump_role=dump_role,
+                    future_owners=(runtime_role,),
+                )
+                confinement_violations = await _dump_role_confinement_violations(
+                    connection,
+                    dump_role,
+                )
+                if confinement_violations:
+                    raise BackupProvisionError(
+                        "dump role exceeds the public read-only contract: "
+                        + "; ".join(confinement_violations)
+                    )
     except BackupProvisionError:
         raise
     except Exception:
@@ -1493,11 +1697,36 @@ async def execute_provision(
     finally:
         await engine.dispose()
 
-    if values is None:  # pragma: no cover - guarded by the locked setup above
-        raise BackupProvisionError("limited backup credentials were not prepared")
+    if values is None:
+        raise BackupProvisionError("limited dump credential was not prepared")
+
+    dump_engine = create_async_engine(
+        values["PPBASE_BACKUP_DUMP_DATABASE_URL"],
+        poolclass=NullPool,
+    )
+    try:
+        async with dump_engine.connect() as connection:
+            report = await preflight_dump_role(connection)
+            await connection.rollback()
+    except Exception:
+        raise BackupProvisionError(
+            "dump role verification failed after provisioning"
+        ) from None
+    finally:
+        await dump_engine.dispose()
+    if report.errors:
+        raise BackupProvisionError(
+            f"dump role verification failed: {'; '.join(report.errors)}"
+        )
+    warnings.extend(
+        {"code": "dump_role_warning", "detail": str(detail)}
+        for detail in report.warnings
+    )
+
     return {
         "formatVersion": 1,
-        "createdRoles": sorted(created),
+        "mode": "optional_dump_hardening",
+        "createdRoles": [dump_role] if created else [],
         "secretSink": str(sink_path),
         "configurationKeys": sorted(values),
         "bootstrapCredentialPersisted": False,
@@ -1512,7 +1741,7 @@ async def build_postgres_init_plan(
     project_name: str,
     secret_sink: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Inspect a cluster for autonomous PPBase onboarding without mutations."""
+    """Inspect creation of one database and one runtime role without mutations."""
     spec = resolve_postgres_init_spec(project_name)
     layout = resolve_postgres_init_layout(settings)
     bootstrap = _validated_bootstrap_url(bootstrap_database_url)
@@ -1542,8 +1771,11 @@ async def build_postgres_init_plan(
                         )
                     )
                 ).mappings().one()
-                rows = await _read_role_rows(connection, spec.roles)
-                memberships = await _read_memberships(connection, spec.roles)
+                runtime_row = await _read_role_row(connection, spec.runtime_role)
+                memberships = await _read_role_memberships(
+                    connection,
+                    spec.runtime_role,
+                )
                 database_row = await _read_init_database_row(
                     connection,
                     spec.database,
@@ -1564,67 +1796,70 @@ async def build_postgres_init_plan(
             await _probe_postgres_init_credentials(
                 configured_values,
                 spec,
-                existing_roles=set(rows),
+                role_exists=runtime_row is not None,
                 bootstrap_database=str(identity["database"]),
                 database_exists=database_row is not None,
             )
         )
-    privileged = bool(identity["rolsuper"]) or (
-        bool(identity["rolcreatedb"]) and bool(identity["rolcreaterole"])
-    )
+    privileged = bool(identity["rolsuper"])
     if not privileged:
         collisions.append(
             {
                 "resource": "bootstrap_role",
-                "reason": "bootstrap role requires both CREATEDB and CREATEROLE or superuser",
+                "reason": "init postgres requires an ephemeral PostgreSQL superuser DSN",
             }
         )
 
-    all_role_markers_valid = True
-    for role, role_spec in _init_role_specs(spec.roles).items():
-        row = rows.get(role)
-        if row is None:
-            all_role_markers_valid = False
-            actions.append({"action": "create_role", "role": role})
-            continue
-        collision = _role_collision(row, role_spec)
+    runtime_marker_valid = True
+    runtime_spec = {"login": True, "createdb": False, "inherit": True}
+    if runtime_row is None:
+        runtime_marker_valid = False
+        actions.append(
+            {"action": "create_runtime_role", "role": spec.runtime_role}
+        )
+    else:
+        collision = _role_collision(runtime_row, runtime_spec)
         if collision:
-            all_role_markers_valid = False
-            collisions.append({"resource": role, "reason": collision})
-        elif str(row.get("marker") or "") != _postgres_init_role_marker(
-            spec, role
+            runtime_marker_valid = False
+            collisions.append(
+                {"resource": spec.runtime_role, "reason": collision}
+            )
+        elif str(runtime_row.get("marker") or "") != _postgres_init_role_marker(
+            spec
         ):
-            all_role_markers_valid = False
+            runtime_marker_valid = False
             collisions.append(
                 {
-                    "resource": role,
+                    "resource": spec.runtime_role,
                     "reason": "role is not marked as created by PPBase init",
                 }
             )
-        elif role_spec["login"] and configured_values is None:
-            all_role_markers_valid = False
+        elif configured_values is None:
+            runtime_marker_valid = False
             collisions.append(
                 {
-                    "resource": role,
+                    "resource": spec.runtime_role,
                     "reason": "existing login role has no reusable credential sink",
                 }
             )
         else:
-            actions.append({"action": "noop_role", "role": role})
+            actions.append(
+                {"action": "noop_runtime_role", "role": spec.runtime_role}
+            )
 
     collisions.extend(
         {
             "resource": item["role"],
             "reason": item["reason"],
         }
-        for item in _membership_collisions(memberships, spec.roles)
+        for item in _membership_collisions(memberships, spec.runtime_role)
     )
     if database_row is None:
         actions.append({"action": "create_database", "database": spec.database})
     elif (
         not str(database_row.get("marker") or "")
         and configured_values is not None
-        and all_role_markers_valid
+        and runtime_marker_valid
     ):
         structural_collision = _init_database_collision(database_row, spec)
         if structural_collision != "database is not marked as created by PPBase init":
@@ -1667,9 +1902,7 @@ async def build_postgres_init_plan(
 
     actions.extend(
         (
-            {"action": "grant_owner_memberships", "role": spec.roles.owner},
             {"action": "normalize_database_acl", "database": spec.database},
-            {"action": "grant_dump_default_privileges", "role": spec.roles.dump},
             {
                 "action": (
                     "reuse_runtime_secrets"
@@ -1741,7 +1974,7 @@ async def _create_postgres_init_database(
         await connection.execute(
             text(
                 f"CREATE DATABASE {_quote_identifier(spec.database)} "
-                f"WITH OWNER {_quote_identifier(spec.roles.runtime)} "
+                f"WITH OWNER {_quote_identifier(spec.runtime_role)} "
                 "TEMPLATE template0 ENCODING 'UTF8'"
             )
         )
@@ -1759,6 +1992,7 @@ async def _configure_postgres_init_database(
     values: Mapping[str, str],
     spec: PostgresInitSpec,
 ) -> bool:
+    """Apply the runtime-owned database contract without backup-only roles."""
     bootstrap = _validated_bootstrap_url(bootstrap_database_url).set(
         database=spec.database
     )
@@ -1770,108 +2004,32 @@ async def _configure_postgres_init_database(
             await connection.execute(
                 text(f"REVOKE ALL ON DATABASE {database} FROM PUBLIC")
             )
-            for role in (spec.roles.dump, spec.roles.creator, spec.roles.restore):
-                identifier = _quote_identifier(role)
-                await connection.execute(
-                    text(f"REVOKE ALL ON DATABASE {database} FROM {identifier}")
-                )
-                await connection.execute(
-                    text(f"GRANT CONNECT ON DATABASE {database} TO {identifier}")
-                )
     finally:
         await bootstrap_engine.dispose()
 
     runtime_engine = create_async_engine(values["PPBASE_DATABASE_URL"], poolclass=NullPool)
-    acl_changed = False
     try:
         async with runtime_engine.begin() as connection:
             await set_backup_control_search_path(connection)
             effective = str(
                 (await connection.execute(text("SELECT current_user"))).scalar_one()
             )
-            if effective != spec.roles.runtime:
+            if effective != spec.runtime_role:
                 raise BackupProvisionError(
                     "runtime credential authenticated as an unexpected role"
                 )
-            dump = _quote_identifier(spec.roles.dump)
-            runtime = _quote_identifier(spec.roles.runtime)
             await connection.execute(
                 text("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
             )
-            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {dump}"))
-            await connection.execute(
-                text(
-                    f"ALTER DEFAULT PRIVILEGES FOR ROLE {runtime} IN SCHEMA public "
-                    f"GRANT SELECT ON TABLES TO {dump}"
+            restore_report = await preflight_destructive_restore_role(connection)
+            if not restore_report.ok:
+                raise BackupProvisionError(
+                    "runtime role preflight failed: "
+                    + "; ".join(restore_report.errors)
                 )
-            )
-            await connection.execute(
-                text(
-                    f"ALTER DEFAULT PRIVILEGES FOR ROLE {runtime} IN SCHEMA public "
-                    f"GRANT SELECT ON SEQUENCES TO {dump}"
-                )
-            )
-            large_objects = (
-                await connection.execute(
-                    text(
-                        "SELECT large_object.oid, "
-                        "pg_catalog.pg_get_userbyid(large_object.lomowner) AS owner, "
-                        "pg_catalog.pg_has_role(dump_role.oid, "
-                        "large_object.lomowner, 'USAGE') OR EXISTS ("
-                        "SELECT 1 FROM pg_catalog.aclexplode(COALESCE("
-                        "large_object.lomacl, "
-                        "pg_catalog.acldefault('L', large_object.lomowner)"
-                        ")) AS privilege WHERE privilege.privilege_type = 'SELECT' "
-                        "AND (privilege.grantee = 0 OR pg_catalog.pg_has_role("
-                        "dump_role.oid, privilege.grantee, 'USAGE'))) AS can_select "
-                        "FROM pg_catalog.pg_largeobject_metadata AS large_object "
-                        "CROSS JOIN (SELECT role.oid FROM pg_catalog.pg_roles AS role "
-                        "WHERE role.rolname = :dump_role) AS dump_role "
-                        "ORDER BY large_object.oid"
-                    ),
-                    {"dump_role": spec.roles.dump},
-                )
-            ).mappings().all()
-            for row in large_objects:
-                if str(row["owner"]) != spec.roles.runtime:
-                    raise BackupProvisionError(
-                        "existing large object is not owned by the runtime role"
-                    )
-                if not bool(row["can_select"]):
-                    await connection.execute(
-                        text(
-                            f"GRANT SELECT ON LARGE OBJECT {int(row['oid'])} TO {dump}"
-                        )
-                    )
-                    acl_changed = True
     finally:
         await runtime_engine.dispose()
-
-    for key, expected_role in (
-        ("PPBASE_BACKUP_DUMP_DATABASE_URL", spec.roles.dump),
-        ("PPBASE_BACKUP_CREATOR_DATABASE_URL", spec.roles.creator),
-        ("PPBASE_BACKUP_RESTORE_DATABASE_URL", spec.roles.restore),
-    ):
-        engine = create_async_engine(values[key], poolclass=NullPool)
-        try:
-            async with engine.connect() as connection:
-                effective = str(
-                    (await connection.execute(text("SELECT current_user"))).scalar_one()
-                )
-                if effective != expected_role:
-                    raise BackupProvisionError(
-                        f"{key} authenticated as an unexpected role"
-                    )
-                if key == "PPBASE_BACKUP_DUMP_DATABASE_URL":
-                    report = await preflight_dump_role(connection)
-                    if not report.ok:
-                        raise BackupProvisionError(
-                            "dump role preflight failed: " + "; ".join(report.errors)
-                        )
-                await connection.rollback()
-        finally:
-            await engine.dispose()
-    return acl_changed
+    return False
 
 
 async def execute_postgres_init(
@@ -1881,7 +2039,7 @@ async def execute_postgres_init(
     project_name: str,
     secret_sink: str | Path,
 ) -> dict[str, Any]:
-    """Create or resume a complete PPBase PostgreSQL deployment contract."""
+    """Create or resume one runtime role and its owned PPBase database."""
     spec = resolve_postgres_init_spec(project_name)
     sink_path = Path(secret_sink).expanduser().absolute()
     bootstrap = _validated_bootstrap_url(bootstrap_database_url)
@@ -1910,58 +2068,38 @@ async def execute_postgres_init(
         values = read_secret_sink(sink_path)
         sink_created = values is None
         if values is None:
-            passwords = {
-                role: _generate_password()
-                for role, role_spec in _init_role_specs(spec.roles).items()
-                if role_spec["login"]
-            }
-            values = _postgres_init_values(bootstrap, spec, passwords)
+            password = _generate_password()
+            values = _postgres_init_values(bootstrap, spec, password)
             write_secret_sink(sink_path, values)
         else:
-            passwords = _validate_postgres_init_values(values, bootstrap, spec)
+            password = _validate_postgres_init_values(values, bootstrap, spec)
 
         created_roles: list[str] = []
         async with engine.begin() as connection:
             await set_backup_control_search_path(connection)
-            for role, role_spec in _init_role_specs(spec.roles).items():
-                password = passwords.get(role) if role_spec["login"] else None
-                if await _ensure_role(
-                    connection,
-                    role,
-                    role_spec,
-                    password=password,
-                ):
-                    created_roles.append(role)
-                    await connection.execute(
-                        text(
-                            f"COMMENT ON ROLE {_quote_identifier(role)} IS "
-                            f"{_sql_literal(_postgres_init_role_marker(spec, role))}"
-                        )
-                    )
-            marked_rows = await _read_role_rows(connection, spec.roles)
-            for role in spec.roles.as_dict().values():
-                if str(marked_rows.get(role, {}).get("marker") or "") != (
-                    _postgres_init_role_marker(spec, role)
-                ):
-                    raise BackupProvisionError(
-                        f"managed role {role!r} is detached from the PPBase init marker"
-                    )
-            server_version_num = int(
-                (
-                    await connection.execute(
-                        text(
-                            "SELECT pg_catalog.current_setting("
-                            "'server_version_num')::integer"
-                        )
-                    )
-                ).scalar_one()
-            )
-            await _grant_owner_memberships(
+            created = await _ensure_role(
                 connection,
-                roles=spec.roles,
-                server_version_num=server_version_num,
+                spec.runtime_role,
+                {"login": True, "createdb": False, "inherit": True},
+                password=password,
             )
-            await _require_safe_memberships(connection, spec.roles)
+            if created:
+                created_roles.append(spec.runtime_role)
+                await connection.execute(
+                    text(
+                        f"COMMENT ON ROLE {_quote_identifier(spec.runtime_role)} IS "
+                        f"{_sql_literal(_postgres_init_role_marker(spec))}"
+                    )
+                )
+            marked_row = await _read_role_row(connection, spec.runtime_role)
+            if str((marked_row or {}).get("marker") or "") != (
+                _postgres_init_role_marker(spec)
+            ):
+                raise BackupProvisionError(
+                    f"managed role {spec.runtime_role!r} is detached from "
+                    "the PPBase init marker"
+                )
+            await _require_no_role_memberships(connection, spec.runtime_role)
 
         allow_pristine_resume = any(
             action.get("action") == "resume_pristine_database"
@@ -1982,7 +2120,7 @@ async def execute_postgres_init(
         )
         async with engine.begin() as connection:
             await set_backup_control_search_path(connection)
-            await _require_safe_memberships(connection, spec.roles)
+            await _require_no_role_memberships(connection, spec.runtime_role)
         changed = bool(
             sink_created
             or created_roles
@@ -2025,14 +2163,132 @@ async def execute_postgres_init(
 def _root_check(path: str | Path, *, label: str) -> dict[str, Any]:
     selected = absolute_path_without_symlink_resolution(path)
     try:
-        with ControlPlaneRoot.open(selected, create_missing=False):
-            pass
-        ready = True
+        if selected == Path(selected.anchor):
+            raise ControlPlaneSafetyError("filesystem root is not a private root")
+        current = Path(selected.anchor)
+        for index, component in enumerate(selected.parts[1:]):
+            parent = os.lstat(current)
+            parent_mode = stat.S_IMODE(parent.st_mode)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid not in {0, os.geteuid()}
+                or (parent_mode & 0o022 and not parent_mode & stat.S_ISVTX)
+            ):
+                raise ControlPlaneSafetyError("unsafe directory ancestry")
+            candidate = current / component
+            try:
+                opened = os.lstat(candidate)
+            except FileNotFoundError:
+                if not os.access(current, os.W_OK | os.X_OK):
+                    raise ControlPlaneSafetyError(
+                        "nearest existing parent is not writable"
+                    )
+                return {
+                    "name": label,
+                    "ready": True,
+                    "status": "warn",
+                    "detail": "directory is absent and will be created as private 0700",
+                    "path": str(selected),
+                }
+            if stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode):
+                raise ControlPlaneSafetyError("unsafe symlink or directory entry")
+            if parent_mode & stat.S_ISVTX and opened.st_uid != os.geteuid():
+                raise ControlPlaneSafetyError("unsafe sticky-directory ownership")
+            current = candidate
+            if index == len(selected.parts[1:]) - 1 and (
+                opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise ControlPlaneSafetyError("directory is not owned private 0700")
         detail = "owned private 0700 directory available"
-    except ControlPlaneSafetyError:
+        ready = True
+    except (ControlPlaneSafetyError, OSError):
+        detail = "directory is unsafe, symlinked, or not private 0700"
         ready = False
-        detail = "directory is missing, unsafe, symlinked, detached, or not private 0700"
-    return {"name": label, "ready": ready, "detail": detail, "path": str(selected)}
+    return {
+        "name": label,
+        "ready": ready,
+        "detail": detail,
+        "path": str(selected),
+    }
+
+
+def _root_layout_check(settings: Any) -> dict[str, Any]:
+    """Mirror the service's no-overlap invariant without creating paths."""
+    try:
+        data_dir = Path(settings.data_dir).expanduser().resolve(strict=False)
+        roots = {
+            "backup_root": Path(settings.backup_root).expanduser().resolve(strict=False),
+            "control_plane": Path(settings.backup_control_dir)
+            .expanduser()
+            .resolve(strict=False),
+        }
+        conflicts: list[str] = []
+        for name, root in roots.items():
+            if (
+                root == data_dir
+                or root.is_relative_to(data_dir)
+                or data_dir.is_relative_to(root)
+            ):
+                conflicts.append(f"{name} overlaps data_dir")
+        items = list(roots.items())
+        for index, (left_name, left) in enumerate(items):
+            for right_name, right in items[index + 1 :]:
+                if (
+                    left == right
+                    or left.is_relative_to(right)
+                    or right.is_relative_to(left)
+                ):
+                    conflicts.append(f"{left_name} overlaps {right_name}")
+        ready = not conflicts
+        detail = (
+            "data_dir, backup_root, and control_plane do not overlap"
+            if ready
+            else "; ".join(conflicts)
+        )
+    except (OSError, RuntimeError):
+        ready = False
+        detail = "filesystem root layout could not be resolved safely"
+    return {
+        "name": "root_layout",
+        "ready": ready,
+        "detail": detail,
+    }
+
+
+async def _postgres_server_identity(connection: AsyncConnection) -> dict[str, Any]:
+    """Return fields that bind a DSN to one database on one server instance."""
+    await set_backup_control_search_path(connection)
+    row = (
+        await connection.execute(
+            text(
+                "SELECT current_user AS role, "
+                "pg_catalog.current_database() AS database, "
+                "COALESCE(pg_catalog.inet_server_addr()::text, '') AS server_address, "
+                "COALESCE(pg_catalog.inet_server_port(), 0) AS server_port, "
+                "EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::text "
+                "AS postmaster_started_at, "
+                "pg_catalog.current_setting('server_version_num')::integer AS version"
+            )
+        )
+    ).mappings().one()
+    return {
+        "role": str(row["role"]),
+        "database": str(row["database"]),
+        "server_address": str(row["server_address"]),
+        "server_port": int(row["server_port"]),
+        "postmaster_started_at": str(row["postmaster_started_at"]),
+        "version": int(row["version"]),
+    }
+
+
+def _postgres_server_instance_key(identity: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        identity["server_address"],
+        identity["server_port"],
+        identity["postmaster_started_at"],
+        identity["version"],
+    )
 
 
 def _probe_server_restart(server_url: str) -> dict[str, Any]:
@@ -2051,7 +2307,7 @@ def _probe_server_restart(server_url: str) -> dict[str, Any]:
             "--server must be an http(s) origin without credentials, query, or path"
         )
     endpoint = urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, "/api/health/backup-activation", "", "")
+        (parsed.scheme, parsed.netloc, "/api/health/backup-restart", "", "")
     )
     request = urllib.request.Request(
         endpoint,
@@ -2098,10 +2354,10 @@ def _probe_server_restart(server_url: str) -> dict[str, Any]:
             not isinstance(decoded, dict)
             or decoded.get("code") != 200
             or decoded.get("message")
-            != "Backup activation capability inspected."
+            != "Backup restart capability inspected."
         ):
             raise KeyError("invalid PPBase health envelope")
-        configured = decoded["data"]["activation"]["configured"]
+        configured = decoded["data"]["restart"]["configured"]
     except (KeyError, TypeError):
         configured = None
     if configured is True:
@@ -2109,20 +2365,20 @@ def _probe_server_restart(server_url: str) -> dict[str, Any]:
             "name": "restart",
             "ready": True,
             "status": "pass",
-            "detail": "running PPBase server confirms activation restart support",
+            "detail": "running PPBase server confirms destructive-restore restart support",
         }
     if configured is False:
         return {
             "name": "restart",
             "ready": False,
             "status": "fail",
-            "detail": "running PPBase server confirms activation restart is unavailable",
+            "detail": "running PPBase server confirms destructive-restore restart is unavailable",
         }
     return {
         "name": "restart",
         "ready": False,
         "status": "fail",
-        "detail": "running server returned no authoritative activation capability",
+        "detail": "running server returned no authoritative restart capability",
     }
 
 
@@ -2131,7 +2387,7 @@ async def backup_doctor(
     *,
     server_url: str | None = None,
 ) -> dict[str, Any]:
-    """Run non-secret readiness checks without a cluster-admin credential."""
+    """Check the normal runtime path plus optional dump-role hardening."""
     checks: list[dict[str, Any]] = []
     warnings: list[dict[str, str]] = []
     storage_backend = str(getattr(settings, "storage_backend", "local") or "local")
@@ -2142,14 +2398,11 @@ async def backup_doctor(
             "detail": f"backend={storage_backend}",
         }
     )
-    staging = str(settings.backup_staging_root)
-    target = str(getattr(settings, "backup_target_root", "") or f"{staging}_targets")
     checks.extend(
         (
             _root_check(settings.backup_root, label="backup_root"),
             _root_check(settings.backup_control_dir, label="control_plane"),
-            _root_check(staging, label="staging_root"),
-            _root_check(target, label="target_root"),
+            _root_layout_check(settings),
         )
     )
     if server_url:
@@ -2168,67 +2421,47 @@ async def backup_doctor(
                 ),
             }
         )
-    tool_map = {
-        "pg_dump": settings.backup_pg_dump_path,
-        "pg_restore": settings.backup_pg_restore_path,
-        "psql": settings.backup_psql_path,
-    }
 
-    runtime_engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    runtime_url = str(settings.database_url)
+    runtime_engine = create_async_engine(runtime_url, poolclass=NullPool)
     server_major: int | None = None
+    runtime_identity: dict[str, Any] | None = None
     try:
         async with runtime_engine.connect() as connection:
-            await set_backup_control_search_path(connection)
-            identity = (
-                await connection.execute(
-                    text(
-                        "SELECT current_user AS role, current_database() AS database, "
-                        "current_setting('server_version_num')::integer AS version, "
-                        "r.rolcanlogin, r.rolcreatedb, r.rolinherit, r.rolsuper, "
-                        "r.rolcreaterole, r.rolreplication, r.rolbypassrls "
-                        "FROM pg_catalog.pg_roles AS r WHERE r.rolname = current_user"
-                    )
-                )
-            ).mappings().one()
-            checks.append(
-                {
-                    "name": "runtime_database",
-                    "ready": True,
-                    "detail": f"{identity['role']}@{identity['database']} PostgreSQL {identity['version']}",
+            runtime_identity = await _postgres_server_identity(connection)
+            server_major = int(runtime_identity["version"]) // 10000
+            try:
+                restore_report = await preflight_destructive_restore_role(connection)
+            except Exception:
+                runtime_check: dict[str, Any] = {
+                    "name": "runtime_role",
+                    "ready": False,
+                    "detail": "destructive-restore ownership preflight failed",
                 }
-            )
-            runtime_collision, runtime_warning = _runtime_role_assessment(
-                identity,
-                role=str(identity["role"]),
-            )
-            if runtime_collision:
-                checks.append(
-                    {
-                        "name": "runtime_role",
-                        "ready": False,
-                        "status": "fail",
-                        "detail": runtime_collision,
-                    }
-                )
-            elif runtime_warning:
-                warnings.append(runtime_warning)
-                checks.append(
-                    {
-                        "name": "runtime_role",
-                        "ready": True,
-                        "status": "warn",
-                        **runtime_warning,
-                    }
-                )
             else:
-                checks.append(
-                    {
-                        "name": "runtime_role",
-                        "ready": True,
-                        "detail": "strict runtime role",
+                runtime_check = {
+                    "name": "runtime_role",
+                    "ready": restore_report.ok,
+                    "detail": (
+                        "ready for in-place destructive restore"
+                        if restore_report.ok
+                        else "; ".join(restore_report.errors)
+                    ),
+                }
+                if restore_report.ok and restore_report.warnings:
+                    runtime_check["status"] = "warn"
+                    runtime_check["detail"] = "; ".join(restore_report.warnings)
+                for detail in restore_report.warnings:
+                    warning = {
+                        "code": "runtime_restore_warning",
+                        "detail": str(detail),
+                        "role": str(runtime_identity["role"]),
                     }
-                )
-            server_major = int(identity["version"]) // 10000
+                    if "superuser" in str(detail).lower():
+                        warning["code"] = RUNTIME_SUPERUSER_CODE
+                        warning["detail"] = RUNTIME_SUPERUSER_DETAIL
+                    warnings.append(warning)
+
             allowed_extensions = {
                 tuple(str(item).split("=", 1))
                 for item in (getattr(settings, "backup_allowed_extensions", ()) or ())
@@ -2248,48 +2481,71 @@ async def backup_doctor(
             unsupported_extensions = sorted(
                 installed_extensions - allowed_extensions
             )
-            checks.append(
-                {
-                    "name": "extensions",
-                    "ready": not unsupported_extensions,
-                    "detail": (
-                        "installed extensions match the allowlist"
-                        if not unsupported_extensions
-                        else "unsupported installed extensions: "
-                        + ", ".join(
-                            f"{name}={version}"
-                            for name, version in unsupported_extensions
-                        )
-                    ),
-                }
-            )
             await connection.rollback()
+            checks.extend(
+                (
+                    {
+                        "name": "runtime_database",
+                        "ready": True,
+                        "detail": (
+                            f"{runtime_identity['role']}@{runtime_identity['database']} "
+                            f"PostgreSQL {runtime_identity['version']}"
+                        ),
+                    },
+                    runtime_check,
+                    {
+                        "name": "extensions",
+                        "ready": not unsupported_extensions,
+                        "detail": (
+                            "installed extensions match the allowlist"
+                            if not unsupported_extensions
+                            else "unsupported installed extensions: "
+                            + ", ".join(
+                                f"{name}={version}"
+                                for name, version in unsupported_extensions
+                            )
+                        ),
+                    },
+                )
+            )
     except Exception:
         checks.append(
-            {"name": "runtime_database", "ready": False, "detail": "connection or catalog inspection failed"}
+            {
+                "name": "runtime_database",
+                "ready": False,
+                "detail": "runtime database connection or inspection failed",
+            }
         )
     finally:
         await runtime_engine.dispose()
 
-    for name, executable in tool_map.items():
-        resolved = shutil.which(str(executable))
-        if resolved is None:
-            checks.append(
-                {"name": name, "ready": False, "detail": "executable not found"}
-            )
+    tool_map = {
+        "pg_dump": getattr(settings, "backup_pg_dump_path", None),
+        "pg_restore": getattr(settings, "backup_pg_restore_path", None),
+        "psql": getattr(settings, "backup_psql_path", None),
+    }
+    for name, configured in tool_map.items():
+        try:
+            resolved = resolve_postgres_tool(name, configured)
+        except PostgresToolResolutionError as exc:
+            checks.append({"name": name, "ready": False, "detail": str(exc)})
             continue
         try:
             version = await detect_postgres_tool_version(resolved)
-            matches = server_major is not None and version.major == server_major
+            compatible = server_major is not None and version.major >= server_major
             checks.append(
                 {
                     "name": name,
-                    "ready": matches,
+                    "ready": compatible,
                     "detail": (
-                        f"major {version.major} matches server"
-                        if matches
-                        else f"tool major {version.major} does not match server major {server_major}"
+                        f"client major {version.major} supports server major {server_major}"
+                        if compatible
+                        else (
+                            f"client major {version.major} is older than "
+                            f"server major {server_major}"
+                        )
                     ),
+                    "path": resolved,
                 }
             )
         except PostgresBackupError:
@@ -2297,97 +2553,143 @@ async def backup_doctor(
                 {"name": name, "ready": False, "detail": "version detection failed"}
             )
 
-    dump_url = str(getattr(settings, "backup_dump_database_url", "") or "").strip()
-    if not dump_url:
-        checks.append(
-            {"name": "dump_role", "ready": False, "detail": "dedicated dump DSN missing"}
-        )
-    else:
-        dump_engine = create_async_engine(dump_url, poolclass=NullPool)
-        try:
-            async with dump_engine.connect() as connection:
-                report = await preflight_dump_role(connection)
-                checks.append(
+    configured_dump_url = str(
+        getattr(settings, "backup_dump_database_url", "") or ""
+    ).strip()
+    dump_url = configured_dump_url or runtime_url
+    dump_source = (
+        "dedicated PPBASE_BACKUP_DUMP_DATABASE_URL"
+        if configured_dump_url
+        else "PPBASE_DATABASE_URL"
+    )
+    dump_engine = create_async_engine(dump_url, poolclass=NullPool)
+    try:
+        async with dump_engine.connect() as connection:
+            dump_identity = await _postgres_server_identity(connection)
+            configured_dump_role = validate_postgres_identifier(
+                sqlalchemy_url_to_libpq(dump_url).username,
+                label="dump role",
+            )
+            identity_errors: list[str] = []
+            if runtime_identity is None:
+                identity_errors.append("runtime database identity is unavailable")
+            else:
+                if dump_identity["database"] != runtime_identity["database"]:
+                    identity_errors.append("DSN reached a different database")
+                if _postgres_server_instance_key(
+                    dump_identity
+                ) != _postgres_server_instance_key(runtime_identity):
+                    identity_errors.append("DSN reached a different PostgreSQL server")
+            if dump_identity["role"] != configured_dump_role:
+                identity_errors.append("DSN login does not match current_user")
+            report = await preflight_dump_role(connection)
+            dump_check: dict[str, Any] = {
+                "name": "dump_role",
+                "ready": report.ok and not identity_errors,
+                "detail": (
+                    f"{dump_source}: ready"
+                    if report.ok and not identity_errors
+                    else f"{dump_source}: "
+                    + "; ".join((*identity_errors, *report.errors))
+                ),
+            }
+            if report.ok and not identity_errors and report.warnings:
+                dump_check["status"] = "warn"
+                dump_check["detail"] = (
+                    f"{dump_source}: " + "; ".join(report.warnings)
+                )
+            checks.append(dump_check)
+            for detail in report.warnings:
+                warnings.append(
                     {
-                        "name": "dump_role",
-                        "ready": report.ok,
-                        "detail": "ready" if report.ok else "; ".join(report.errors),
+                        "code": "dump_role_warning",
+                        "detail": str(detail),
                     }
                 )
-                await connection.rollback()
-        except Exception:
-            checks.append(
-                {"name": "dump_role", "ready": False, "detail": "connection or privilege preflight failed"}
-            )
-        finally:
-            await dump_engine.dispose()
-
-    configured_restore = all(
-        str(getattr(settings, field, "") or "").strip()
-        for field in (
-            "backup_creator_database_url",
-            "backup_restore_database_url",
-            "backup_target_owner",
-        )
-    )
-    checks.append(
-        {
-            "name": "restore_roles",
-            "ready": configured_restore,
-            "detail": "configured" if configured_restore else "creator/restore/owner configuration missing",
-        }
-    )
-    if configured_restore:
-        role_connections_ready = True
-        role_details: list[str] = []
-        for attribute, expected_role in (
-            ("backup_creator_database_url", resolve_role_names(settings).creator),
-            ("backup_restore_database_url", resolve_role_names(settings).restore),
-        ):
-            engine = create_async_engine(getattr(settings, attribute), poolclass=NullPool)
-            try:
-                async with engine.connect() as connection:
-                    effective = str(
-                        (await connection.execute(text("SELECT current_user"))).scalar_one()
-                    )
-                    if effective != expected_role:
-                        role_connections_ready = False
-                        role_details.append(f"{attribute} authenticated as another role")
-                    await connection.rollback()
-            except Exception:
-                role_connections_ready = False
-                role_details.append(f"{attribute} connection failed")
-            finally:
-                await engine.dispose()
-        try:
-            role_plan = await build_provision_plan(settings)
-            if role_plan["collisions"]:
-                role_connections_ready = False
-                role_details.append("role attributes or memberships violate the contract")
-        except (BackupProvisionError, PostgresBackupError):
-            role_connections_ready = False
-            role_details.append("role catalog inspection failed")
+            await connection.rollback()
+    except Exception:
         checks.append(
             {
-                "name": "postgres_role_contract",
-                "ready": role_connections_ready,
-                "detail": "ready" if role_connections_ready else "; ".join(role_details),
+                "name": "dump_role",
+                "ready": False,
+                "detail": f"{dump_source}: connection or privilege preflight failed",
             }
         )
+    finally:
+        await dump_engine.dispose()
+
+    backup_checks = {
+        "storage",
+        "backup_root",
+        "control_plane",
+        "root_layout",
+        "runtime_database",
+        "extensions",
+        "pg_dump",
+        "dump_role",
+    }
+    restore_checks = {
+        "storage",
+        "backup_root",
+        "control_plane",
+        "root_layout",
+        "restart",
+        "runtime_database",
+        "runtime_role",
+        "extensions",
+        "pg_restore",
+        "psql",
+    }
     for check in checks:
         check.setdefault("status", "pass" if check.get("ready") else "fail")
-    ready = all(str(check["status"]) != "fail" for check in checks)
-    fully_verified = all(str(check["status"]) == "pass" for check in checks)
+        name = str(check.get("name", ""))
+        check["operations"] = [
+            operation
+            for operation, names in (
+                ("backup", backup_checks),
+                ("restore", restore_checks),
+            )
+            if name in names
+        ]
+
+    def operation_ready(names: set[str]) -> bool:
+        return all(
+            str(check["status"]) != "fail"
+            for check in checks
+            if str(check.get("name", "")) in names
+        )
+
+    def operation_fully_verified(names: set[str]) -> bool:
+        return all(
+            str(check["status"]) == "pass"
+            for check in checks
+            if str(check.get("name", "")) in names
+        )
+
+    backup_ready = operation_ready(backup_checks)
+    restore_ready = operation_ready(restore_checks)
+    backup_fully_verified = operation_fully_verified(backup_checks)
+    restore_fully_verified = operation_fully_verified(restore_checks)
     return {
         "formatVersion": 1,
-        "ready": ready,
-        "fullyVerified": fully_verified,
-        "exitCode": DOCTOR_EXIT_READY if ready else DOCTOR_EXIT_NOT_READY,
+        # Keep the historical top-level fields scoped to the command's backup
+        # exit status. Restore readiness is independent and must not make a
+        # healthy backup path look unconfigured.
+        "ready": backup_ready,
+        "fullyVerified": backup_fully_verified,
+        "backupReady": backup_ready,
+        "backupFullyVerified": backup_fully_verified,
+        "restoreReady": restore_ready,
+        "restoreFullyVerified": restore_fully_verified,
+        "exitCode": DOCTOR_EXIT_READY if backup_ready else DOCTOR_EXIT_NOT_READY,
         "checks": checks,
         "warnings": warnings,
         "commands": {
-            "plan": "ppbase backup provision --plan",
-            "execute": "ppbase backup provision --execute --output-env ./ppbase-backup.env",
+            "optionalDumpRolePlan": "ppbase backup provision --plan",
+            "optionalDumpRoleExecute": (
+                "ppbase backup provision --execute "
+                "--output-env ./ppbase-backup.env"
+            ),
             "doctor": (
                 f"ppbase backup doctor --server {server_url}"
                 if server_url
@@ -2395,7 +2697,6 @@ async def backup_doctor(
             ),
         },
     }
-
 
 def doctor_human(report: Mapping[str, Any]) -> str:
     lines = ["PPBase native backup doctor"]
@@ -2406,12 +2707,22 @@ def doctor_human(report: Mapping[str, Any]) -> str:
         ).upper()
         marker = "OK" if status == "PASS" else status
         lines.append(f"[{marker}] {check.get('name')}: {check.get('detail')}")
-    if not report.get("ready"):
-        lines.append("Not ready; fix the failed checks above.")
+    backup_ready = bool(report.get("backupReady", report.get("ready")))
+    restore_ready = bool(report.get("restoreReady", report.get("ready")))
+    if not backup_ready:
+        lines.append("Backup is not ready; fix the backup failures above.")
+    elif not restore_ready:
+        lines.append(
+            "Backup is ready; destructive restore is not ready. "
+            "Fix the restore-specific failures above."
+        )
     elif report.get("warnings"):
-        lines.append("Ready with security warnings.")
-    elif report.get("fullyVerified", True):
-        lines.append("Ready.")
+        lines.append("Backup and destructive restore are ready with security warnings.")
+    elif (
+        report.get("backupFullyVerified", report.get("fullyVerified", True))
+        and report.get("restoreFullyVerified", report.get("fullyVerified", True))
+    ):
+        lines.append("Backup and destructive restore are ready.")
     else:
         lines.append("No confirmed blocker; readiness is partial.")
     return "\n".join(lines)

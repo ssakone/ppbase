@@ -45,25 +45,24 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_force_path_style: bool = False
 
-    # ---- Native backup / restore staging ----
+    # ---- Native backup / destructive restore ----
     # Canonical sets and control-plane state intentionally live outside the
     # restored business ``data_dir``. Only ``data_dir/storage`` is copied.
     backup_root: str = "./pb_backups"
     backup_control_dir: str = "./pb_backup_control"
+    # Legacy isolated-restore settings remain accepted so existing environment
+    # files still load. The normal backup/restore and provisioning paths ignore
+    # them.
     backup_staging_root: str = "./pb_restore_staging"
-    # Durable isolated restore targets. When empty, PPBase derives a sibling
-    # path from ``backup_staging_root`` for backwards-compatible local setups.
     backup_target_root: str = ""
     backup_barrier_timeout: float = 300.0
     backup_pg_dump_path: str = "pg_dump"
     backup_pg_restore_path: str = "pg_restore"
     backup_psql_path: str = "psql"
-    # Read-only source login used only by pg_dump and its privilege preflight.
-    # It must be distinct from the writable PPBase runtime login.
+    # Optional pg_dump override. Empty uses ``database_url``.
     backup_dump_database_url: str = ""
-    # Restore staging uses separate cluster roles. The creator DSN is used
-    # only against a maintenance DB for CREATE DATABASE; the restore DSN has
-    # no CREATEDB and connects to the newly generated target.
+    # Legacy multi-role restore settings are parsed only for configuration
+    # compatibility. Destructive in-place restore ignores them.
     backup_creator_database_url: str = ""
     backup_restore_database_url: str = ""
     backup_target_owner: str = ""
@@ -78,8 +77,8 @@ class Settings(BaseSettings):
     backup_max_compression_ratio: int = 500
     backup_transport_chunk_size: int = 1024 * 1024
     backup_multipart_overhead_bytes: int = 1024 * 1024
-    # Maximum wall-clock time allowed for the restored process to reach the
-    # durable healthy activation state before an automatic rollback restart.
+    # Legacy isolated-activation setting retained only so old environment files
+    # continue to parse. Destructive in-place restore does not use it.
     backup_activation_health_timeout: float = 120.0
 
     # ---- Auth ----

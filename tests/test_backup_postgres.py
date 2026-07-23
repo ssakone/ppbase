@@ -5,9 +5,7 @@ from pathlib import Path
 import pytest
 
 from ppbase.backup.postgres import (
-    LEGACY_RUNTIME_SUPERUSER_WARNING,
     _forbidden_table_write_privileges,
-    _role_and_target_check_sql,
     CollationContract,
     CommandResult,
     DatabaseContract,
@@ -15,20 +13,17 @@ from ppbase.backup.postgres import (
     ExtensionContract,
     ObjectSecuritySummary,
     PostgresCommandError,
-    PostgresContractError,
     PostgresVersionMismatchError,
     PostgresBackupError,
-    TargetDatabaseExistsError,
-    create_target_database,
-    grant_dump_role_read_access,
-    grant_dump_role_runtime_default_privileges,
-    replace_sqlalchemy_database,
+    inspect_pg_restore_archive,
+    _stream_restore_sql_to_psql,
+    preflight_dump_role,
+    preflight_destructive_restore_role,
+    run_destructive_pg_restore_from_fd,
     run_pg_dump,
-    run_pg_restore,
     sqlalchemy_url_to_libpq,
     temporary_pgpass,
 )
-from ppbase.backup.storage import LocalBackupStore
 
 
 def _contract() -> DatabaseContract:
@@ -66,53 +61,66 @@ def _contract() -> DatabaseContract:
     )
 
 
-def _creator_identity() -> dict[str, object]:
-    return {
-        "role": "creator",
-        "database": "postgres",
-        "server_address": "127.0.0.1",
-        "server_port": 5432,
-        "postmaster_started_at": "1710000000.000000",
-        "server_version_num": "160004",
-    }
-
-
 def test_forbidden_table_privileges_are_server_version_aware() -> None:
     assert "MAINTAIN" not in _forbidden_table_write_privileges(160014)
     assert "MAINTAIN" in _forbidden_table_write_privileges(170000)
     assert "MAINTAIN" in _forbidden_table_write_privileges(180001)
 
 
-def test_target_role_sql_requires_exact_set_only_memberships() -> None:
-    sql = _role_and_target_check_sql(
-        target="staging_123",
-        creator="ppbase_creator",
-        restore="ppbase_restore",
-        runtime="ppbase_runtime",
-        owner="ppbase_owner",
-    )
+@pytest.mark.asyncio
+async def test_dump_preflight_matches_public_schema_dump_scope() -> None:
+    statements: list[str] = []
 
-    assert sql.count("AND NOT rolinherit") == 2
-    assert "AND rolcanlogin" in sql
-    assert "rolsuper\n                      OR (" in sql
-    assert "NOT rolcreatedb AND rolinherit" in sql
-    assert ") AS runtime_superuser" in sql
-    assert sql.count("AND NOT membership.admin_option") == 5
-    assert sql.count("membership.admin_option") == 8
-    assert sql.count("to_jsonb(membership)->>'set_option'") == 5
-    assert sql.count("to_jsonb(membership)->>'inherit_option'") == 8
-    assert sql.count("member_role.rolinherit") == 8
-    assert sql.count("AND NOT EXISTS (") == 3
-    assert sql.count("OR NOT COALESCE(") == 3
-    assert "OR granted_role.rolname IN (" in sql
-    assert "member_role.rolname = 'ppbase_runtime'" in sql
-    assert "'ppbase_creator', 'ppbase_restore', 'ppbase_runtime'," in sql
-    assert "('ppbase_runtime')) AS r(role_name)" in sql
-    assert "r.role_name <> 'ppbase_runtime'" in sql
-    assert "runtime_role.rolsuper" in sql
-    assert LEGACY_RUNTIME_SUPERUSER_WARNING == (
-        "legacy_runtime_superuser: PostgreSQL superuser runtime"
-    )
+    class Result:
+        def __init__(self, *, row=None, rows=None, scalar=None):
+            self._row = row
+            self._rows = rows or []
+            self._scalar = scalar
+
+        def mappings(self):
+            return self
+
+        def one(self):
+            return self._row
+
+        def all(self):
+            return self._rows
+
+        def scalar_one(self):
+            return self._scalar
+
+    class Connection:
+        async def execute(self, statement, _params=None):
+            sql = str(statement)
+            statements.append(sql)
+            if "AS server_version_num" in sql:
+                return Result(
+                    row={
+                        "rolname": "dump",
+                        "rolsuper": False,
+                        "rolcreatedb": False,
+                        "rolcreaterole": False,
+                        "rolreplication": False,
+                        "rolbypassrls": False,
+                        "server_version_num": 160004,
+                        "can_connect": True,
+                        "read_server_files": False,
+                        "write_server_files": False,
+                        "execute_server_program": False,
+                    }
+                )
+            if "SELECT count(*)" in sql:
+                return Result(scalar=0)
+            return Result(rows=[])
+
+    report = await preflight_dump_role(Connection())
+
+    assert report.ok is True
+    scoped_sql = "\n".join(statements[2:])
+    assert "n.nspname = 'public'" in scoped_sql
+    assert "information_schema" not in scoped_sql
+    assert "pg_largeobject" not in scoped_sql
+    assert "large_object" not in scoped_sql
 
 
 def test_sqlalchemy_url_to_libpq_separates_password_and_maps_ssl() -> None:
@@ -129,140 +137,6 @@ def test_sqlalchemy_url_to_libpq_separates_password_and_maps_ssl() -> None:
     assert connection.pgpass_line() == (
         "db.example:5439:target:restore:p\\:a\\\\ss\n"
     )
-
-
-def test_replace_sqlalchemy_database_preserves_credentials_and_options() -> None:
-    replaced = replace_sqlalchemy_database(
-        "postgresql+asyncpg://restore:secret@db/source?sslmode=verify-full",
-        "staging_123",
-    )
-
-    assert replaced.database == "staging_123"
-    assert replaced.username == "restore"
-    assert replaced.password == "secret"
-    assert replaced.query["sslmode"] == "verify-full"
-
-
-@pytest.mark.asyncio
-async def test_grant_dump_role_read_access_is_read_only_and_future_safe() -> None:
-    statements: list[str] = []
-
-    class Connection:
-        async def execute(self, statement):
-            sql = str(statement)
-            statements.append(sql)
-            if "FROM pg_catalog.pg_largeobject_metadata" in sql:
-                return ScalarResultWith([101, 202])
-            if "FROM pg_catalog.pg_namespace" in sql:
-                return ScalarResultWith(["tenant-data", 'Tenant "Blue"'])
-            return object()
-
-    class ScalarResultWith:
-        def __init__(self, values):
-            self.values = values
-
-        def scalars(self):
-            return self
-
-        def all(self):
-            return self.values
-
-    await grant_dump_role_read_access(
-        Connection(),
-        target_owner="ppbase_owner",
-        dump_role="ppbase_dump",
-    )
-
-    joined = "\n".join(statements)
-    assert 'SET LOCAL ROLE "ppbase_owner"' in joined
-    assert 'GRANT SELECT ON LARGE OBJECT 101 TO "ppbase_dump"' in joined
-    assert 'GRANT SELECT ON LARGE OBJECT 202 TO "ppbase_dump"' in joined
-    for schema, quoted_schema in (
-        ("tenant-data", '"tenant-data"'),
-        ('Tenant "Blue"', '"Tenant ""Blue"""'),
-    ):
-        assert f'GRANT USAGE ON SCHEMA {quoted_schema} TO "ppbase_dump"' in joined
-        assert (
-            f'GRANT SELECT ON ALL TABLES IN SCHEMA {quoted_schema} '
-            'TO "ppbase_dump"'
-        ) in joined
-        assert (
-            f'GRANT SELECT ON ALL SEQUENCES IN SCHEMA {quoted_schema} '
-            'TO "ppbase_dump"'
-        ) in joined
-        assert (
-            f'ALTER DEFAULT PRIVILEGES FOR ROLE "ppbase_owner" IN SCHEMA {quoted_schema} '
-            'GRANT SELECT ON TABLES TO "ppbase_dump"'
-        ) in joined
-    assert "INSERT" not in joined
-    assert "UPDATE" not in joined
-    assert "DELETE" not in joined
-
-
-@pytest.mark.asyncio
-async def test_runtime_default_privileges_require_runtime_authentication() -> None:
-    statements: list[str] = []
-
-    class Result:
-        def __init__(self, *, scalar=None, values=None):
-            self.scalar = scalar
-            self.values = values or []
-
-        def scalar_one(self):
-            return self.scalar
-
-        def scalars(self):
-            return self
-
-        def all(self):
-            return self.values
-
-    class Connection:
-        async def execute(self, statement):
-            sql = str(statement)
-            statements.append(sql)
-            if sql == "SELECT current_user":
-                return Result(scalar="ppbase_runtime")
-            if "FROM pg_catalog.pg_namespace" in sql:
-                return Result(values=["tenant-data"])
-            return Result()
-
-    await grant_dump_role_runtime_default_privileges(
-        Connection(),
-        runtime_role="ppbase_runtime",
-        dump_role="ppbase_dump",
-    )
-    joined = "\n".join(statements)
-    assert (
-        'ALTER DEFAULT PRIVILEGES FOR ROLE "ppbase_runtime" IN SCHEMA "tenant-data" '
-        'GRANT SELECT ON TABLES TO "ppbase_dump"'
-    ) in joined
-    assert (
-        'ALTER DEFAULT PRIVILEGES FOR ROLE "ppbase_runtime" IN SCHEMA "tenant-data" '
-        'GRANT SELECT ON SEQUENCES TO "ppbase_dump"'
-    ) in joined
-
-
-@pytest.mark.asyncio
-async def test_runtime_default_privileges_reject_non_runtime_connection() -> None:
-    statements: list[str] = []
-
-    class Result:
-        def scalar_one(self):
-            return "ppbase_restore"
-
-    class Connection:
-        async def execute(self, statement):
-            statements.append(str(statement))
-            return Result()
-
-    with pytest.raises(PostgresContractError, match="runtime-authenticated"):
-        await grant_dump_role_runtime_default_privileges(
-            Connection(),
-            runtime_role="ppbase_runtime",
-            dump_role="ppbase_dump",
-        )
-    assert not any("ALTER DEFAULT PRIVILEGES" in sql for sql in statements)
 
 
 def test_temporary_pgpass_is_0600_and_removed(tmp_path: Path) -> None:
@@ -320,12 +194,13 @@ async def test_run_pg_dump_uses_safe_argv_and_passfile(
     assert isinstance(result, DumpResult)
     assert destination.read_bytes().startswith(b"PGDMP")
     dump_argv = calls[1][0]
-    assert dump_argv[:8] == (
+    assert dump_argv[:9] == (
         "/tools/pg_dump",
         "--format=custom",
         "--no-owner",
         "--no-acl",
         "--no-tablespaces",
+        "--schema=public",
         "--lock-wait-timeout=17s",
         "--snapshot=00000003-0000001B-1",
         "--no-password",
@@ -408,403 +283,339 @@ async def test_run_pg_dump_rejects_client_server_major_mismatch(
 
 
 @pytest.mark.asyncio
-async def test_run_pg_restore_lists_before_safe_transactional_restore(
+async def test_run_pg_dump_accepts_a_newer_client_for_an_older_server(
     tmp_path: Path,
 ) -> None:
-    archive = tmp_path / "database.dump"
-    archive.write_bytes(b"PGDMP\x01\x10test")
-    calls: list[tuple[str, ...]] = []
-
     async def runner(argv, env, redactions):
         argv_tuple = tuple(argv)
-        calls.append(argv_tuple)
         if "--version" in argv_tuple:
-            return CommandResult(argv_tuple, 0, "pg_restore (PostgreSQL) 16.4\n", "")
-        if "--list" in argv_tuple:
-            return CommandResult(argv_tuple, 0, "; Archive TOC\nTABLE public users\n", "")
-        assert Path(env["PGPASSFILE"]).exists()
+            return CommandResult(argv_tuple, 0, "pg_dump (PostgreSQL) 17.5\n", "")
+        Path(argv_tuple[argv_tuple.index("--file") + 1]).write_bytes(b"PGDMP")
         return CommandResult(argv_tuple, 0, "", "")
 
-    result = await run_pg_restore(
-        "postgresql+asyncpg://restore:secret@localhost/staging_123",
-        archive,
-        target_owner="ppbase_owner",
+    destination = tmp_path / "database.dump"
+    await run_pg_dump(
+        "postgresql+asyncpg://dump:secret@localhost/source",
+        destination,
         expected_server_major=16,
-        passfile_directory=tmp_path,
         runner=runner,
     )
 
-    assert calls[1] == ("pg_restore", "--list", str(archive))
-    restore_argv = calls[2]
-    required = {
-        "--single-transaction",
-        "--exit-on-error",
-        "--no-owner",
-        "--no-acl",
-        "--no-tablespaces",
-        "--no-password",
-        "--role=ppbase_owner",
-    }
-    assert required.issubset(restore_argv)
-    assert "--clean" not in restore_argv
-    assert "--create" not in restore_argv
-    assert "secret" not in " ".join(restore_argv)
-    assert result.target_database == "staging_123"
+    assert destination.read_bytes() == b"PGDMP"
 
 
 @pytest.mark.asyncio
-async def test_run_pg_restore_requires_distinct_restore_login_and_owner(
+async def test_archive_inspection_rejects_non_public_schema_before_mutation(
     tmp_path: Path,
 ) -> None:
     archive = tmp_path / "database.dump"
     archive.write_bytes(b"PGDMP")
 
-    with pytest.raises(PostgresContractError):
-        await run_pg_restore(
-            "postgresql+asyncpg://same:secret@localhost/staging",
+    async def runner(argv, env, redactions):
+        argv_tuple = tuple(argv)
+        if "--version" in argv_tuple:
+            return CommandResult(argv_tuple, 0, "pg_restore (PostgreSQL) 17.5\n", "")
+        return CommandResult(
+            argv_tuple,
+            0,
+            "6; 2615 2200 SCHEMA - public owner\n"
+            "7; 2615 2201 SCHEMA - private owner\n"
+            "214; 1259 16385 TABLE private secret owner\n",
+            "",
+        )
+
+    with pytest.raises(PostgresBackupError, match="only the public"):
+        await inspect_pg_restore_archive(
             archive,
-            target_owner="same",
+            pg_restore="/tools/pg_restore",
+            expected_server_major=16,
+            runner=runner,
         )
 
 
 @pytest.mark.asyncio
-async def test_create_target_database_checks_roles_and_uses_template0(
-    tmp_path: Path,
-) -> None:
-    calls: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+async def test_archive_inspection_accepts_public_only_toc(tmp_path: Path) -> None:
+    archive = tmp_path / "database.dump"
+    archive.write_bytes(b"PGDMP")
+    toc = (
+        "2; 3079 16384 EXTENSION - plpgsql owner\n"
+        "6; 2615 2200 SCHEMA - public owner\n"
+        "214; 1259 16385 TABLE public records owner\n"
+        "3348; 0 16385 TABLE DATA public records owner\n"
+        "3350; 0 16385 ACL public TABLE records owner\n"
+    )
 
     async def runner(argv, env, redactions):
         argv_tuple = tuple(argv)
-        calls.append((argv_tuple, tuple(redactions)))
-        assert "secret" not in " ".join(argv_tuple)
-        assert Path(env["PGPASSFILE"]).exists()
-        if len(calls) == 1:
-            return CommandResult(
-                argv_tuple,
-                0,
-                "creator|f|t|t|t|f|t|t|t|t|f|f\n",
-                "",
-            )
-        return CommandResult(argv_tuple, 0, "CREATE DATABASE\n", "")
+        if "--version" in argv_tuple:
+            return CommandResult(argv_tuple, 0, "pg_restore (PostgreSQL) 17.5\n", "")
+        return CommandResult(argv_tuple, 0, toc, "")
 
-    result = await create_target_database(
-        "postgresql+asyncpg://creator:secret@localhost/postgres",
-        "staging_123",
-        target_owner="ppbase_owner",
-        restore_role="restore",
-        runtime_role="runtime",
-        dump_role="dump",
-        contract=_contract(),
-        expected_server_identity=_creator_identity(),
-        passfile_directory=tmp_path,
+    inspection = await inspect_pg_restore_archive(
+        archive,
+        pg_restore="/tools/pg_restore",
+        expected_server_major=16,
         runner=runner,
     )
 
-    assert result.database == "staging_123"
-    assert result.marker_comment.startswith("ppbase-restore-marker:")
-    assert len(result.marker_comment) == len("ppbase-restore-marker:") + 64
-    assert result.marker_comment not in repr(result)
-    assert len(calls) == 2
-    check_argv, _ = calls[0]
-    check_command_indexes = [
-        index
-        for index, value in enumerate(check_argv)
-        if value == "--command"
-    ]
-    assert len(check_command_indexes) == 2
-    assert check_argv[check_command_indexes[0] + 1] == (
-        "SET search_path = pg_catalog, pg_temp"
-    )
-    assert "current_user AS effective_creator" in check_argv[
-        check_command_indexes[1] + 1
-    ]
-    mutation_argv, mutation_redactions = calls[1]
-    command_indexes = [
-        index
-        for index, value in enumerate(mutation_argv)
-        if value == "--command"
-    ]
-    assert len(command_indexes) == 4
-    assert mutation_argv[command_indexes[0] + 1] == (
-        "SET search_path = pg_catalog, pg_temp"
-    )
-    guard_sql = mutation_argv[command_indexes[1] + 1]
-    assert "PPBase restore destination role/database changed before create" in guard_sql
-    assert "pg_postmaster_start_time" in guard_sql
-    assert "role_check.unexpected_membership" in guard_sql
-    create_sql = mutation_argv[command_indexes[2] + 1]
-    assert 'CREATE DATABASE "staging_123"' in create_sql
-    assert "WITH TEMPLATE template0" in create_sql
-    assert "ALLOW_CONNECTIONS false" in create_sql
-    assert 'OWNER "ppbase_owner"' in create_sql
-    assert "ENCODING 'UTF8'" in create_sql
-    assert "LOCALE_PROVIDER libc" in create_sql
-    acl_sql = mutation_argv[command_indexes[3] + 1]
-    assert 'REVOKE ALL ON DATABASE "staging_123" FROM PUBLIC' in acl_sql
-    assert (
-        'GRANT CONNECT, TEMPORARY ON DATABASE "staging_123" TO "restore"'
-        in acl_sql
-    )
-    assert (
-        'GRANT CONNECT, TEMPORARY ON DATABASE "staging_123" TO "runtime"'
-        in acl_sql
-    )
-    assert 'GRANT CONNECT ON DATABASE "staging_123" TO "dump"' in acl_sql
-    assert 'GRANT TEMPORARY ON DATABASE "staging_123" TO "dump"' not in acl_sql
-    assert (
-        f"COMMENT ON DATABASE \"staging_123\" IS '{result.marker_comment}'"
-        in acl_sql
-    )
-    assert 'ALTER DATABASE "staging_123" ALLOW_CONNECTIONS true' in acl_sql
-    assert acl_sql.index("COMMENT ON DATABASE") < acl_sql.index(
-        "ALLOW_CONNECTIONS true"
-    )
-    assert result.marker_comment in mutation_redactions
+    assert inspection.toc == toc
 
 
 @pytest.mark.asyncio
-async def test_create_target_database_uses_anchored_anonymous_passfile(
-    tmp_path: Path,
-) -> None:
-    store = LocalBackupStore(tmp_path / "backups")
-    staging_root = tmp_path / "restore-staging"
-    staging_root.mkdir(mode=0o700)
-    staging_root.chmod(0o700)
-    target = store.open_staging_data_dir(
-        staging_root,
-        Path("plan-anonymous-passfile") / "data",
-    )
-    visible_parent = target.path.parent
-    detached_parent = staging_root / "detached-plan"
-    active_data_dir = tmp_path / "active-data"
-    active_data_dir.mkdir(mode=0o700)
-    active_data_dir.chmod(0o700)
-    calls = 0
-    observed_passfile_paths: list[Path] = []
+async def test_preflight_accepts_effective_database_and_schema_owner() -> None:
+    statements: list[str] = []
 
-    async def runner(argv, env, redactions):
-        nonlocal calls
-        _ = redactions
-        calls += 1
-        passfile = Path(env["PGPASSFILE"])
-        observed_passfile_paths.append(passfile)
-        assert passfile.parent in {Path("/proc/self/fd"), Path("/dev/fd")}
-        assert passfile.stat().st_mode & 0o777 == 0o600
-        assert passfile.read_text(encoding="utf-8") == (
-            "localhost:5432:postgres:creator:secret\n"
-        )
-        argv_tuple = tuple(argv)
-        if calls == 1:
-            visible_parent.rename(detached_parent)
-            visible_parent.symlink_to(active_data_dir, target_is_directory=True)
-            return CommandResult(
-                argv_tuple,
-                0,
-                "creator|f|t|t|t|f|t|t|t|t|f|f\n",
-                "",
+    class Result:
+        def __init__(self, row: dict[str, object] | None = None) -> None:
+            self.row = row
+
+        def mappings(self) -> Result:
+            return self
+
+        def one(self) -> dict[str, object]:
+            assert self.row is not None
+            return self.row
+
+    class Connection:
+        async def execute(self, statement, *_args, **_kwargs):
+            rendered = str(statement)
+            statements.append(rendered)
+            if rendered.startswith("SET LOCAL"):
+                return Result()
+            return Result(
+                {
+                    "role": "runtime_owner",
+                    "is_superuser": False,
+                    "owns_database": True,
+                    "owns_schema": True,
+                }
             )
-        return CommandResult(argv_tuple, 0, "CREATE DATABASE\n", "")
 
+    report = await preflight_destructive_restore_role(Connection())  # type: ignore[arg-type]
+
+    assert report.ok
+    assert report.warnings == ()
+    assert len(statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_destructive_restore_wraps_generated_sql_and_marker_in_one_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "database.dump"
+    archive.write_bytes(b"PGDMP test")
+    capture = tmp_path / "restore.sql"
+    pg_restore = tmp_path / "pg_restore"
+    psql = tmp_path / "psql"
+    pg_restore.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then\n"
+        "  echo 'pg_restore (PostgreSQL) 17.5'\n"
+        "elif [ \"$1\" = \"--list\" ]; then\n"
+        "  echo '214; 1259 16385 TABLE public restored owner'\n"
+        "else\n"
+        "  echo 'CREATE TABLE public.restored (id integer);'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    psql.write_text(
+        "#!/bin/sh\ncat > \"$PPBASE_TEST_SQL_CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    pg_restore.chmod(0o700)
+    psql.chmod(0o700)
+    monkeypatch.setenv("PPBASE_TEST_SQL_CAPTURE", str(capture))
+
+    descriptor = archive.open("rb")
     try:
-        result = await create_target_database(
-            "postgresql+asyncpg://creator:secret@localhost/postgres",
-            "staging_anchored_passfile",
-            target_owner="ppbase_owner",
-            restore_role="restore",
-            runtime_role="runtime",
-            contract=_contract(),
-            expected_server_identity=_creator_identity(),
-            passfile_factory=target.temporary_file,
-            runner=runner,
+        result = await run_destructive_pg_restore_from_fd(
+            "postgresql+asyncpg://Runtime%20Owner:secret@localhost/active",
+            descriptor.fileno(),
+            archive_label=archive,
+            restore_id="e" * 32,
+            pg_restore=str(pg_restore),
+            psql=str(psql),
+            expected_server_major=16,
         )
     finally:
-        target.close()
+        descriptor.close()
 
-    assert result.database == "staging_anchored_passfile"
-    assert calls == 2
-    assert observed_passfile_paths[0] == observed_passfile_paths[1]
-    assert list(active_data_dir.iterdir()) == []
-    assert sorted(path.name for path in detached_parent.iterdir()) == ["data"]
-    assert not observed_passfile_paths[0].exists()
-
-
-@pytest.mark.asyncio
-async def test_create_target_database_refuses_existing_target(tmp_path: Path) -> None:
-    calls: list[tuple[str, ...]] = []
-
-    async def runner(argv, env, redactions):
-        argv_tuple = tuple(argv)
-        calls.append(argv_tuple)
-        return CommandResult(
-            argv_tuple,
-            0,
-            "creator|t|t|t|t|f|t|t|t|t|f|f\n",
-            "",
-        )
-
-    with pytest.raises(TargetDatabaseExistsError):
-        await create_target_database(
-            "postgresql+asyncpg://creator:secret@localhost/postgres",
-            "staging_123",
-            target_owner="ppbase_owner",
-            restore_role="restore",
-            runtime_role="runtime",
-            contract=_contract(),
-            expected_server_identity=_creator_identity(),
-            passfile_directory=tmp_path,
-            runner=runner,
-        )
-    assert len(calls) == 1
-    assert not list(tmp_path.glob(".ppbase-pgpass-*"))
+    sql = capture.read_text(encoding="utf-8")
+    assert sql.index("BEGIN;") < sql.index("DROP SCHEMA IF EXISTS public CASCADE;")
+    assert 'CREATE SCHEMA public AUTHORIZATION "Runtime Owner";' in sql
+    assert sql.index("CREATE TABLE public.restored") < sql.index(
+        'CREATE SCHEMA "_ppbase_restore_control"'
+    )
+    assert sql.rstrip().endswith("COMMIT;")
+    assert result.runtime_role == "Runtime Owner"
+    assert result.restore_id == "e" * 32
 
 
 @pytest.mark.asyncio
-async def test_create_target_database_accepts_legacy_superuser_runtime(
-    tmp_path: Path,
-) -> None:
-    calls = 0
+async def test_restore_stream_strips_only_header_transaction_timeout() -> None:
+    """The PostgreSQL 17 header GUC is dropped without touching COPY payloads.
 
-    async def runner(argv, env, redactions):
-        nonlocal calls
-        _ = env, redactions
-        calls += 1
-        argv_tuple = tuple(argv)
-        if calls == 1:
-            return CommandResult(
-                argv_tuple,
-                0,
-                "creator|f|t|t|t|t|t|t|t|t|f|f\n",
-                "",
-            )
-        return CommandResult(argv_tuple, 0, "CREATE DATABASE\n", "")
-
-    result = await create_target_database(
-        "postgresql+asyncpg://creator:secret@localhost/postgres",
-        "staging_legacy_runtime",
-        target_owner="ppbase_owner",
-        restore_role="restore",
-        runtime_role="legacy_runtime",
-        contract=_contract(),
-        expected_server_identity=_creator_identity(),
-        passfile_directory=tmp_path,
-        runner=runner,
+    A ``SET transaction_timeout`` line that appears in the leading header (past
+    the ``\\restrict`` guard) must be removed so a 17 client can restore into a
+    16 server, while an identical string inside COPY data is streamed verbatim.
+    """
+    payload = (
+        b"--\n-- PostgreSQL database dump\n--\n\n"
+        b"\\restrict abc123\n\n"
+        b"SET statement_timeout = 0;\n"
+        b"SET transaction_timeout = 0;\n"
+        b"SET client_encoding = 'UTF8';\n"
+        b"CREATE TABLE public.records (payload text);\n"
+        b"COPY public.records (payload) FROM stdin;\n"
+        b"SET transaction_timeout = 0;\n"  # legitimate row data, must survive
+        b"\\.\n"
     )
 
-    assert result.database == "staging_legacy_runtime"
-    assert calls == 2
+    class Source:
+        """Yield tiny fixed-size chunks so lines straddle read boundaries."""
+
+        def __init__(self, data: bytes, *, chunk: int) -> None:
+            self._data = data
+            self._chunk = chunk
+
+        async def read(self, size: int) -> bytes:
+            take = min(self._chunk, size)
+            chunk = self._data[:take]
+            self._data = self._data[take:]
+            return chunk
+
+    class Destination:
+        def __init__(self) -> None:
+            self.buffer = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.buffer.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+    destination = Destination()
+    # A 3-byte cap forces every header line (and the boundary between the
+    # header and the COPY body) to span several reads, exercising the
+    # partial-line buffering path rather than a single whole-buffer read.
+    await _stream_restore_sql_to_psql(Source(payload, chunk=3), destination)
+    result = bytes(destination.buffer)
+
+    # Header GUC removed exactly once; the COPY data copy is preserved.
+    assert result.count(b"SET transaction_timeout = 0;\n") == 1
+    assert b"CREATE TABLE public.records" in result
+    assert b"COPY public.records" in result
+    assert result.index(b"COPY public.records") < result.index(
+        b"SET transaction_timeout = 0;\n"
+    )
+    assert b"\\restrict abc123\n" in result
+    assert b"SET statement_timeout = 0;\n" in result
 
 
 @pytest.mark.asyncio
-async def test_create_target_database_rejects_elevated_runtime_role(
+async def test_destructive_restore_recreates_public_for_modern_toc(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = 0
+    """A PostgreSQL 15+ archive lists ``SCHEMA - public`` yet never re-creates it.
 
-    async def runner(argv, env, redactions):
-        nonlocal calls
-        _ = env, redactions
-        calls += 1
-        argv_tuple = tuple(argv)
-        return CommandResult(
-            argv_tuple,
-            0,
-            "creator|f|t|t|f|f|t|t|t|t|f|f\n",
-            "",
+    ``pg_restore --schema=public`` emits no ``CREATE SCHEMA public`` statement
+    for the built-in schema, so the restore wrapper must recreate ``public``
+    itself after the drop or every ``CREATE TABLE public.*`` would fail.
+    """
+    archive = tmp_path / "database.dump"
+    archive.write_bytes(b"PGDMP test")
+    capture = tmp_path / "restore.sql"
+    pg_restore = tmp_path / "pg_restore"
+    psql = tmp_path / "psql"
+    pg_restore.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then\n"
+        "  echo 'pg_restore (PostgreSQL) 17.5'\n"
+        "elif [ \"$1\" = \"--list\" ]; then\n"
+        "  echo '4; 2615 2200 SCHEMA - public pg_database_owner'\n"
+        "  echo '214; 1259 16385 TABLE public restored owner'\n"
+        "else\n"
+        "  echo 'CREATE TABLE public.restored (id integer);'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    psql.write_text(
+        "#!/bin/sh\ncat > \"$PPBASE_TEST_SQL_CAPTURE\"\n",
+        encoding="utf-8",
+    )
+    pg_restore.chmod(0o700)
+    psql.chmod(0o700)
+    monkeypatch.setenv("PPBASE_TEST_SQL_CAPTURE", str(capture))
+
+    descriptor = archive.open("rb")
+    try:
+        await run_destructive_pg_restore_from_fd(
+            "postgresql+asyncpg://runtime:secret@localhost/active",
+            descriptor.fileno(),
+            archive_label=archive,
+            restore_id="a" * 32,
+            pg_restore=str(pg_restore),
+            psql=str(psql),
+            expected_server_major=16,
         )
+    finally:
+        descriptor.close()
 
-    with pytest.raises(
-        PostgresContractError,
-        match="runtime role must be LOGIN",
-    ):
-        await create_target_database(
-            "postgresql+asyncpg://creator:secret@localhost/postgres",
-            "staging_123",
-            target_owner="ppbase_owner",
-            restore_role="restore",
-            runtime_role="runtime",
-            contract=_contract(),
-            expected_server_identity=_creator_identity(),
-            passfile_directory=tmp_path,
-            runner=runner,
-        )
-
-    assert calls == 1
+    sql = capture.read_text(encoding="utf-8")
+    assert sql.index("DROP SCHEMA IF EXISTS public CASCADE;") < sql.index(
+        "CREATE SCHEMA public AUTHORIZATION"
+    )
+    assert sql.index("CREATE SCHEMA public AUTHORIZATION") < sql.index(
+        "CREATE TABLE public.restored"
+    )
 
 
 @pytest.mark.asyncio
-async def test_create_target_database_rejects_noninherited_runtime_membership(
+async def test_destructive_restore_reports_psql_failure_as_postgres_error(
     tmp_path: Path,
 ) -> None:
-    calls = 0
+    archive = tmp_path / "database.dump"
+    archive.write_bytes(b"PGDMP test")
+    pg_restore = tmp_path / "pg_restore"
+    psql = tmp_path / "psql"
+    pg_restore.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then\n"
+        "  echo 'pg_restore (PostgreSQL) 17.5'\n"
+        "elif [ \"$1\" = \"--list\" ]; then\n"
+        "  echo '214; 1259 16385 TABLE public restored owner'\n"
+        "else\n"
+        "  echo 'CREATE TABLE public.restored (id integer);'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    psql.write_text(
+        "#!/bin/sh\ncat >/dev/null\necho 'synthetic SQL failure' >&2\nexit 3\n",
+        encoding="utf-8",
+    )
+    pg_restore.chmod(0o700)
+    psql.chmod(0o700)
 
-    async def runner(argv, env, redactions):
-        nonlocal calls
-        _ = env, redactions
-        calls += 1
-        argv_tuple = tuple(argv)
-        return CommandResult(
-            argv_tuple,
-            0,
-            "creator|f|t|t|t|f|t|t|t|f|f|f\n",
-            "",
-        )
+    descriptor = archive.open("rb")
+    try:
+        with pytest.raises(PostgresCommandError) as rejected:
+            await run_destructive_pg_restore_from_fd(
+                "postgresql+asyncpg://runtime:secret@localhost/active",
+                descriptor.fileno(),
+                archive_label=archive,
+                restore_id="f" * 32,
+                pg_restore=str(pg_restore),
+                psql=str(psql),
+                expected_server_major=16,
+            )
+    finally:
+        descriptor.close()
 
-    with pytest.raises(PostgresContractError, match="direct inherited, non-admin"):
-        await create_target_database(
-            "postgresql+asyncpg://creator:secret@localhost/postgres",
-            "staging_123",
-            target_owner="ppbase_owner",
-            restore_role="restore",
-            runtime_role="runtime",
-            contract=_contract(),
-            expected_server_identity=_creator_identity(),
-            passfile_directory=tmp_path,
-            runner=runner,
-        )
-
-    assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_create_target_database_requires_distinct_runtime_role(
-    tmp_path: Path,
-) -> None:
-    async def runner(argv, env, redactions):  # pragma: no cover - must not run
-        raise AssertionError("PostgreSQL tooling must not run for duplicate roles")
-
-    with pytest.raises(PostgresContractError, match="must be distinct roles"):
-        await create_target_database(
-            "postgresql+asyncpg://creator:secret@localhost/postgres",
-            "staging_123",
-            target_owner="ppbase_owner",
-            restore_role="restore",
-            runtime_role="restore",
-            contract=_contract(),
-            expected_server_identity=_creator_identity(),
-            passfile_directory=tmp_path,
-            runner=runner,
-        )
-
-
-@pytest.mark.asyncio
-async def test_create_target_database_rejects_predefined_target_owner(
-    tmp_path: Path,
-) -> None:
-    async def runner(argv, env, redactions):  # pragma: no cover - must not run
-        raise AssertionError("PostgreSQL tooling must not run for a predefined owner")
-
-    with pytest.raises(PostgresContractError, match="dedicated role"):
-        await create_target_database(
-            "postgresql+asyncpg://creator:secret@localhost/postgres",
-            "staging_123",
-            target_owner="pg_read_all_data",
-            restore_role="restore",
-            runtime_role="runtime",
-            contract=_contract(),
-            expected_server_identity=_creator_identity(),
-            passfile_directory=tmp_path,
-            runner=runner,
-        )
+    assert rejected.value.executable == str(psql)
+    assert rejected.value.returncode == 3
+    assert "synthetic SQL failure" in str(rejected.value)
 
 
 def test_database_contract_manifest_round_trip() -> None:

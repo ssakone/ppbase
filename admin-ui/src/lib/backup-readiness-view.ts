@@ -1,78 +1,52 @@
-import type {
-  BackupReadiness,
-  BackupReadinessCheck,
-  BackupReadinessWarning,
-} from '../api/types'
+import type { BackupReadiness, BackupReadinessWarning } from '../api/types'
 
-export const BACKUP_READINESS_SUCCESS_TEXT = 'All set for backup & restore'
-
-type BackupReadinessCheckKey =
-  | 'create'
-  | 'restore'
-  | 'activation'
-  | 'postgresqlTools'
-  | 'storage'
-  | 'controlPlane'
-
-const CHECKS: ReadonlyArray<{
-  key: BackupReadinessCheckKey
-  label: string
-}> = [
-  { key: 'create', label: 'Backup creation' },
-  { key: 'restore', label: 'Restore staging' },
-  { key: 'activation', label: 'Activation restart' },
-  { key: 'postgresqlTools', label: 'PostgreSQL tools' },
-  { key: 'storage', label: 'Storage' },
-  { key: 'controlPlane', label: 'Control plane and target root' },
-]
-
-export interface BackupReadinessBlocker {
-  action: string
-  areas: string[]
-}
-
-export interface BackupReadinessDetail {
-  key: BackupReadinessCheckKey
-  label: string
-  check: BackupReadinessCheck
-}
-
+// Backup and restore run against PPBASE_DATABASE_URL and never require
+// `ppbase init postgres` or `ppbase backup provision`. The API reports only
+// operational blockers here (tools, local storage, and automatic restart);
+// role-hardening guidance remains advisory.
 export interface BackupReadinessView {
-  ready: boolean
-  successText: typeof BACKUP_READINESS_SUCCESS_TEXT
   warnings: BackupReadinessWarning[]
-  blockers: BackupReadinessBlocker[]
-  details: BackupReadinessDetail[]
-  createBlocked: boolean
-  restoreBlocked: boolean
+  createReady: boolean
+  createMissing: string[]
+  restoreReady: boolean
+  restoreMissing: string[]
+  toolsReady: boolean
+  toolsMissing: string[]
+  restartReady: boolean
+  notes: string[]
 }
 
 export function buildBackupReadinessView(
   readiness: BackupReadiness,
 ): BackupReadinessView {
-  const blockerAreas = new Map<string, string[]>()
-  const details = CHECKS.map(({ key, label }) => {
-    const check = readiness[key]
-    if (!check.configured) {
-      const actions = check.missing.length > 0
-        ? check.missing
-        : [`Review ${label.toLowerCase()} configuration`]
-      for (const action of actions) {
-        const areas = blockerAreas.get(action) || []
-        if (!areas.includes(label)) areas.push(label)
-        blockerAreas.set(action, areas)
-      }
-    }
-    return { key, label, check }
-  })
+  const toolsReady = readiness.postgresqlTools?.configured ?? true
+  const toolsMissing = readiness.postgresqlTools?.missing ?? []
+  const restartReady = readiness.restart?.configured ?? true
+  const createReady = readiness.create?.configured
+    ?? !toolsMissing.some((tool) => tool === 'pg_dump' || tool === 'pg_restore')
+  const restoreReady = readiness.restore?.configured
+    ?? (restartReady && !toolsMissing.some((tool) => tool === 'pg_restore' || tool === 'psql'))
+  const createMissing = readiness.create?.missing ?? []
+  const restoreMissing = readiness.restore?.missing ?? []
+  const storageBackend = (readiness.storageBackend || 'local').toLowerCase()
+
+  const notes: string[] = []
+  if (storageBackend !== 'local') {
+    notes.push(
+      'Native backups capture local file storage; the configured storage '
+      + 'backend is not local, so external object storage is not included.',
+    )
+  }
 
   return {
-    ready: details.every(({ check }) => check.configured),
-    successText: BACKUP_READINESS_SUCCESS_TEXT,
     warnings: [...(readiness.warnings || [])],
-    blockers: [...blockerAreas].map(([action, areas]) => ({ action, areas })),
-    details,
-    createBlocked: !readiness.create.configured,
-    restoreBlocked: !readiness.restore.configured,
+    createReady,
+    createMissing,
+    restoreReady,
+    restoreMissing,
+    toolsReady,
+    toolsMissing,
+    restartReady,
+    notes,
   }
 }

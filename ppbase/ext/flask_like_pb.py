@@ -15,7 +15,7 @@ from ppbase.api.deps import (
 )
 from ppbase.config import Settings
 from ppbase.ext.hooks import HookBinding
-from ppbase.ext.loading import load_hook_target
+from ppbase.ext.loading import load_hook_target, validate_hook_target
 from ppbase.ext.events import ROUTE_REQUEST_STORE_ATTR
 from ppbase.ext.record_repository import RecordRepository
 from ppbase.ext.registry import (
@@ -556,6 +556,8 @@ class FlaskLikePB:
         self.settings = Settings(**kwargs)  # type: ignore[arg-type]
         self._app = None
         self._extensions = ExtensionRegistry()
+        self._pending_hook_targets: list[str] = []
+        self._extensions_loaded = False
         self.apis = _BuiltinRouteMiddlewares(self)
 
     def configure(self, **settings_overrides: object) -> FlaskLikePB:
@@ -574,30 +576,33 @@ class FlaskLikePB:
 
             hooks_dir = self.settings.hooks_dir
             hook_manager = HookManager(hooks_dir, self._extensions, self)
-            hook_manager.initial_load()
             self._hook_manager = hook_manager
 
-            self._extensions.freeze()
+            def load_pending_extensions() -> None:
+                if self._extensions_loaded:
+                    return
+                for target in self._pending_hook_targets:
+                    load_hook_target(target, self)
+                self._pending_hook_targets.clear()
+                hook_manager.initial_load()
+                self._extensions.freeze()
+                self._extensions_loaded = True
+
             self._app = create_app(
                 self.settings,
                 extensions=self._extensions,
                 hook_manager=hook_manager,
+                # Automatic hook targets and files are user code. They must
+                # never be imported before startup has checked PostgreSQL for
+                # an interrupted destructive restore, including the abnormal
+                # marker-without-journal case that cannot be detected locally.
+                deferred_extension_loader=load_pending_extensions,
             )
         return self._app
 
     def start(self, host: str | None = None, port: int | None = None) -> None:
         """Start the server with uvicorn (blocking)."""
         import uvicorn
-
-        from ppbase.backup.activation import begin_activation_startup
-        from ppbase.db.ensure_db import ensure_database_exists
-        from ppbase.services.process_control import (
-            schedule_backup_activation_watchdog,
-        )
-
-        # Restore activation is a durable runtime overlay.  It must select the
-        # staged or rollback target before even the friendly database probe.
-        activation_state = begin_activation_startup(self.settings)
 
         effective_host = str(host or self.settings.host)
         effective_port = int(port or self.settings.port)
@@ -607,29 +612,6 @@ class FlaskLikePB:
         self.settings.host = effective_host
         self.settings.port = effective_port
 
-        is_initial_activation_target = bool(
-            activation_state is not None
-            and activation_state.get("status") == "starting"
-            and activation_state.get("selectedTarget") == "target"
-        )
-        is_activation_rollback = bool(
-            activation_state is not None
-            and activation_state.get("status") == "rollback_pending"
-            and activation_state.get("selectedTarget") == "previous"
-        )
-        if is_initial_activation_target:
-            schedule_backup_activation_watchdog(
-                control_dir=self.settings.backup_control_dir,
-                activation_id=str(activation_state.get("activationId", "")),
-                timeout_seconds=float(
-                    self.settings.backup_activation_health_timeout
-                ),
-            )
-        # The lifespan owns the first target connection so every failure can
-        # durably select and restart the previous target.  Ordinary startups
-        # retain the friendly preflight/create behavior.
-        if not is_initial_activation_target and not is_activation_rollback:
-            ensure_database_exists(self.settings.database_url)
         app = self.get_app()
         app_settings = getattr(app.state, "settings", None)
         if app_settings is not None:
@@ -952,9 +934,18 @@ class FlaskLikePB:
         collections: tuple[str, ...] = (),
         id: str | None = None,
         priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ) -> Callable[[HookHandler], HookHandler]:
         hook = self._extensions.get_hook(hook_name)
         normalized_collections = {value for value in collections if value}
+        if middleware is None:
+            middlewares: tuple[HookHandler, ...] = ()
+        elif callable(middleware):
+            middlewares = (middleware,)
+        else:
+            middlewares = tuple(middleware)
+        if any(not callable(item) for item in middlewares):
+            raise TypeError("Hook middleware must be callable.")
 
         def _collection_predicate(event: Any) -> bool:
             if not normalized_collections:
@@ -970,6 +961,13 @@ class FlaskLikePB:
             )
 
         def decorator(func: HookHandler) -> HookHandler:
+            for index, handler in enumerate(middlewares):
+                hook.bind_func(
+                    handler,
+                    id=f"{id}:middleware:{index}" if id else None,
+                    priority=priority,
+                    predicate=_collection_predicate,
+                )
             hook.bind_func(
                 func,
                 id=id,
@@ -990,133 +988,159 @@ class FlaskLikePB:
         return self._hook_decorator(HOOK_TERMINATE, id=id, priority=priority)
 
     def on_records_list_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORDS_LIST_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_view_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_VIEW_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_create_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_CREATE_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_update_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_UPDATE_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_delete_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_DELETE_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_auth_with_password_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_auth_with_oauth2_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_request_otp_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_REQUEST_OTP_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_auth_with_otp_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_AUTH_WITH_OTP_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_auth_refresh_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_AUTH_REFRESH_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_record_auth_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_RECORD_AUTH_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_file_download_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_FILE_DOWNLOAD_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_file_token_request(
-        self, *collections: str, id: str | None = None, priority: int = 0
+        self, *collections: str, id: str | None = None, priority: int = 0,
+        middleware: HookHandler | Sequence[HookHandler] | None = None,
     ):
         return self._hook_decorator(
             HOOK_FILE_TOKEN_REQUEST,
             collections=collections,
             id=id,
             priority=priority,
+            middleware=middleware,
         )
 
     def on_realtime_connect_request(self, *, id: str | None = None, priority: int = 0):
@@ -1141,7 +1165,9 @@ class FlaskLikePB:
         )
 
     def load_hooks(self, target: str) -> FlaskLikePB:
-        load_hook_target(target, self)
+        if self._app is not None:
+            raise RuntimeError("Cannot load hook targets after app materialization.")
+        self._pending_hook_targets.append(validate_hook_target(target))
         return self
 
     def _reset_for_tests(self) -> None:
@@ -1150,3 +1176,5 @@ class FlaskLikePB:
         self._settings_kwargs = {}
         self.settings = Settings()
         self._extensions = ExtensionRegistry()
+        self._pending_hook_targets = []
+        self._extensions_loaded = False

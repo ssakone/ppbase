@@ -1,8 +1,13 @@
 # Backup/restore natif — complément Phase 0
 
-> **Document historique.** Il décrit les contrats de la Phase 0 et est remplacé
-> par [Native Backup & Restore](./native-backup-restore.md) pour le comportement
-> livré, l'exploitation et le format de transport actuels.
+> **Document historique — obsolète.** Il décrit le modèle Phase 0 fondé sur le
+> restore de staging/validation, l'activation vers une nouvelle base et le
+> rollback durable. Ce modèle **n'est plus implémenté** : le restore livré est
+> désormais **destructif et en place** (il remplace la base et le stockage
+> actifs puis redémarre). Voir
+> [Native Backup & Restore](./native-backup-restore.md) pour le comportement,
+> l'exploitation et le format de transport actuels. Les sections ci-dessous sont
+> conservées uniquement à titre de référence de conception.
 
 Ce complément fixe les contrats volontairement laissés ouverts par le rapport
 Phase 0. La première capacité livrée est appelée **restore de

@@ -28,6 +28,12 @@ def _build_app_with_hooks(hooks_dir: Path) -> PPBase:
     return pb
 
 
+def _load_startup_extensions(app: object) -> None:
+    loader = app.state.deferred_extension_loader  # type: ignore[attr-defined]
+    assert callable(loader)
+    loader()
+
+
 # ---------------------------------------------------------------------------
 # GET /api/hooks — list
 # ---------------------------------------------------------------------------
@@ -69,6 +75,7 @@ async def test_hooks_list_with_files(tmp_path: Path) -> None:
     )
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     states = hook_mgr.get_all_states()
@@ -95,6 +102,7 @@ async def test_hooks_toggle_disable_enable(tmp_path: Path) -> None:
     )
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     state = hook_mgr.get_state("toggleable")
@@ -128,6 +136,7 @@ async def test_hooks_toggle_disable_enable(tmp_path: Path) -> None:
 async def test_hooks_rescan_picks_up_new_file(tmp_path: Path) -> None:
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     assert len(hook_mgr.get_all_states()) == 0
@@ -149,6 +158,7 @@ async def test_hooks_reload_updates_content(tmp_path: Path) -> None:
     _write_hook(tmp_path, "evolving.py", 'HOOK_NAME = "V1"\ndef register(pb):\n    pass\n')
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     assert hook_mgr.get_state("evolving")["name"] == "V1"
@@ -162,6 +172,7 @@ async def test_hooks_reload_updates_content(tmp_path: Path) -> None:
 async def test_hooks_reload_nonexistent_returns_none(tmp_path: Path) -> None:
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     result = hook_mgr.reload_file("ghost")
@@ -182,6 +193,7 @@ async def test_hooks_error_state_reported(tmp_path: Path) -> None:
     )
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     state = hook_mgr.get_state("bad")
@@ -195,6 +207,7 @@ async def test_hooks_syntax_error_reported(tmp_path: Path) -> None:
     _write_hook(tmp_path, "syntaxerr.py", "def register(pb)\n    pass\n")
     pb = _build_app_with_hooks(tmp_path)
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_mgr = app.state.hook_manager
 
     state = hook_mgr.get_state("syntaxerr")

@@ -20,11 +20,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2.2",
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
     "httpx>=0.27.0",
     "testcontainers[postgres]>=4.0",
     "pillow>=11.0.0",
+    "wheel>=0.45.1",
 ]
 
 [project.scripts]
@@ -34,7 +36,36 @@ ppbase = "ppbase.__main__:main"
 include = ["ppbase*"]
 
 [tool.setuptools.package-data]
-"ppbase" = ["admin/dist/**/*"]
+"ppbase" = [
+    "admin/dist/**/*",
+    "_vendor/postgresql/*.json",
+    "_vendor/postgresql/*.md",
+    "_vendor/postgresql/bin/*",
+    "_vendor/postgresql/licenses/*",
+]
+
+[tool.cibuildwheel]
+# The payload is Python-ABI independent, so one CPython build is deliberately
+# retagged by setup.py as py3-none-<platform>.  Building it four times produces
+# the four files published under the same ppbase project and version.
+build = "cp311-*"
+skip = "*-musllinux_*"
+build-verbosity = 1
+before-build = "python {project}/scripts/vendor_postgresql.py --dest {project}/ppbase/_vendor/postgresql --work-dir {project}/build/postgresql-vendor"
+test-command = "python {project}/scripts/smoke_test_wheel.py"
+environment = { PPBASE_BUILD_PLATFORM_WHEEL = "1", SOURCE_DATE_EPOCH = "1778112000" }
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "dnf install -y openssl openssl-devel zlib-devel perl"
+repair-wheel-command = "python {project}/scripts/repair_wheel.py --platform linux --wheel {wheel} --dest-dir {dest_dir}"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+before-all = "brew install openssl@3"
+repair-wheel-command = "python {project}/scripts/repair_wheel.py --platform macos --wheel {wheel} --dest-dir {dest_dir}"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -46,5 +77,5 @@ filterwarnings = [
 ]
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=75.0", "wheel>=0.45.1"]
 build-backend = "setuptools.build_meta"

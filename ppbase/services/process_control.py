@@ -9,7 +9,6 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -18,8 +17,6 @@ _RESTART_CMD_ENV = "PPBASE_RESTART_CMD"
 _restart_lock = threading.Lock()
 _restart_scheduled = False
 _restart_reservation: "ProcessRestartReservation | None" = None
-_activation_watchdog_lock = threading.Lock()
-_activation_watchdog_keys: set[tuple[str, str]] = set()
 
 
 class ProcessRestartReservation:
@@ -42,7 +39,7 @@ class ProcessRestartReservation:
 
 
 def reserve_process_restart() -> ProcessRestartReservation | None:
-    """Reserve restart single-flight before publishing activation state."""
+    """Reserve restart single-flight before a destructive cutover commits."""
     global _restart_reservation, _restart_scheduled
     with _restart_lock:
         if _restart_scheduled:
@@ -256,102 +253,6 @@ def schedule_process_restart(
     return True
 
 
-def schedule_backup_activation_watchdog(
-    *,
-    control_dir: str,
-    activation_id: str,
-    timeout_seconds: float,
-) -> threading.Thread | None:
-    """Rollback a restored target that never reaches its health commit point.
-
-    The watchdog is a daemon thread rather than an asyncio task so it still
-    fires when synchronous startup hooks or another event-loop stall prevent
-    the lifespan from progressing. The activation journal remains the source
-    of truth: the thread only acts while the exact activation is still in the
-    durable ``starting`` state.
-    """
-    normalized_id = str(activation_id or "").strip()
-    try:
-        timeout = float(timeout_seconds)
-    except (TypeError, ValueError):
-        return None
-    if not normalized_id or not timeout > 0 or timeout == float("inf"):
-        return None
-
-    try:
-        selected_control = Path(control_dir).expanduser()
-        if not selected_control.is_absolute():
-            selected_control = Path(
-                os.path.abspath(os.fspath(selected_control))
-            )
-        watchdog_key = (os.fspath(selected_control), normalized_id)
-    except (OSError, TypeError, ValueError):
-        return None
-
-    with _activation_watchdog_lock:
-        if watchdog_key in _activation_watchdog_keys:
-            return None
-        _activation_watchdog_keys.add(watchdog_key)
-
-    def _watch() -> None:
-        restart_spec: tuple[list[str], dict[str, str]] | None = None
-        try:
-            time.sleep(timeout)
-            from ppbase.backup.activation import (
-                BackupActivationStore,
-                activation_restart_spec,
-            )
-            from ppbase.backup.control import ControlPlaneRoot
-
-            root = ControlPlaneRoot.open(
-                selected_control,
-                create_missing=False,
-            )
-            store = BackupActivationStore(root)
-            try:
-                state = store.inspect(normalized_id)
-                if (
-                    state.get("status") != "starting"
-                    or state.get("selectedTarget") != "target"
-                ):
-                    return
-                state = store.mark_rollback_pending(
-                    normalized_id,
-                    error_code="activation_health_timeout",
-                )
-                restart_spec = activation_restart_spec(state)
-            finally:
-                store.close()
-                root.close()
-        except Exception:
-            logger.exception(
-                "Backup activation health watchdog could not schedule rollback"
-            )
-        finally:
-            with _activation_watchdog_lock:
-                _activation_watchdog_keys.discard(watchdog_key)
-
-        if restart_spec is None:
-            return
-        command, environment = restart_spec
-        try:
-            restart_process_now(
-                "Backup activation health check timed out; rolling back",
-                command=command,
-                env_overrides=environment,
-            )
-        except Exception:
-            logger.exception(
-                "Backup activation health watchdog failed to restart the previous target"
-            )
-
-    thread = threading.Thread(
-        target=_watch,
-        name=f"ppbase-backup-health-{normalized_id[:8]}",
-        daemon=True,
-    )
-    thread.start()
-    return thread
 
 
 def serialize_restart_state() -> dict[str, Any]:
