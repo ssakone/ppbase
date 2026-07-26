@@ -7,7 +7,8 @@
 > actifs puis redémarre). Voir
 > [Native Backup & Restore](./native-backup-restore.md) pour le comportement,
 > l'exploitation et le format de transport actuels. Les sections ci-dessous sont
-> conservées uniquement à titre de référence de conception.
+> conservées uniquement à titre de référence de conception et ne constituent
+> pas un runbook de déploiement ou de restauration.
 
 Ce complément fixe les contrats volontairement laissés ouverts par le rapport
 Phase 0. La première capacité livrée est appelée **restore de

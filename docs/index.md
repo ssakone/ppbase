@@ -8,6 +8,7 @@ PPBase is a Python reimplementation of [PocketBase](https://pocketbase.io/) back
 |-------|-------------|
 | [Getting Started](./getting-started.md) | Installation, first run, create-admin |
 | [Production Deployment](./production.md) | Deployment checklist, scaling and hardening |
+| [Deployment from a source clone](./deployment-from-clone.md) | Clone, editable install, first boot, upgrades and restore rehearsal |
 | [Custom Routes](./routes.md) | `@pb.get`, `@pb.post`, route groups, `pb.configure()`, `pb.apis` |
 | [Hooks](./hooks.md) | Lifecycle & record event hooks |
 | [Middleware](./middleware.md) | Global/group/route extension middleware, plus built-in API rate limiting |
@@ -97,6 +98,9 @@ All settings use the `PPBASE_` prefix:
 | `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | PostgreSQL migration-lock timeout in seconds |
 | `PPBASE_PUBLIC_DIR` | _(none)_ | Optional directory served as static files at `/` |
 | `PPBASE_MIGRATIONS_DIR` | `pb_migrations` | Directory where migration files live |
+| `PPBASE_BACKUP_ROOT` | `./pb_backups` | Native backup sets root, created by `serve` |
+| `PPBASE_BACKUP_CONTROL_DIR` | `./pb_backup_control` | Ed25519 identity, trust and restore-control root, created by `serve` |
+| `PPBASE_BACKUP_MAX_UPLOAD_BYTES` | `21474836480` | Maximum native backup ZIP upload size (20 GiB) |
 | `PPBASE_STORAGE_BACKEND` | `local` | `local` or `s3` |
 | `PPBASE_S3_ENDPOINT` | _(none)_ | S3-compatible endpoint (AWS/Cloudflare R2/MinIO) |
 | `PPBASE_S3_BUCKET` | _(none)_ | Bucket name |

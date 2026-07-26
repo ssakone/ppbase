@@ -72,6 +72,8 @@ python -m ppbase serve
 ```
 
 The server starts at **http://localhost:8090**. Admin UI is at **http://localhost:8090/_/**.
+On first startup PPBase creates `pb_backups` and `pb_backup_control`
+automatically with the same normal directory policy used by `pb_data`.
 
 ### 5. Create an admin account
 
@@ -129,9 +131,14 @@ Restore is a destructive in-place operation: after fully verifying the archive,
 PPBase blocks writes, replaces the active database and local file storage with
 the backup's contents, and restarts. Startup recovery then finalizes the file
 inventory before applying any newer migrations. It does not merge records or
-files. A pre-commit failure restores the previous files and rolls back the
-database transaction; after commit, PPBase stays fenced until startup recovery
-has verified and finalized the matching files.
+files. The restored archive also replaces `_superusers` and the project-local
+JWT secret: target-only admins disappear, source admins return, and operators
+should sign in again with a superuser contained in the archive. The target's
+`pb_backup_control` is not restored, so its Ed25519 identity and approved
+external signers remain local to that server. A pre-commit failure restores the
+previous files and rolls back the database transaction; after commit, PPBase
+stays fenced until startup recovery has verified and finalized the matching
+files.
 See [Native Backup & Restore](docs/native-backup-restore.md).
 
 A shell script (`ppctl.sh`) is also available:
@@ -275,6 +282,9 @@ All settings use the `PPBASE_` environment variable prefix:
 | `PPBASE_APPLY_MIGRATIONS_ON_START` | inherits legacy setting | Apply pending files before serving traffic |
 | `PPBASE_GENERATE_MIGRATIONS` | inherits legacy setting | Generate files after Dashboard collection changes |
 | `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | Seconds to wait for another instance's migration lock |
+| `PPBASE_BACKUP_ROOT` | `./pb_backups` | Automatically created local native-backup sets root |
+| `PPBASE_BACKUP_CONTROL_DIR` | `./pb_backup_control` | Automatically created local Ed25519 identity, trust and restore-control root |
+| `PPBASE_BACKUP_MAX_UPLOAD_BYTES` | `21474836480` | Maximum native backup ZIP upload size (20 GiB) |
 
 ## Development
 

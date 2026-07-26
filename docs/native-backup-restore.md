@@ -51,8 +51,10 @@ supported archive layout; restore accepts exactly this format version and
 rejects any other before touching the active target.
 
 The Ed25519 private key, trust store and PostgreSQL credentials are never
-exported. ZIP upload is streamed and bounded; ZIP Slip, duplicate members,
-special files, symlinks, compression bombs, unknown manifest versions, invalid
+exported. ZIP upload is received incrementally into bounded temporary storage
+before verification; allow temporary disk space for the transport ZIP in
+addition to the extracted backup set. ZIP Slip, duplicate members, special
+files, symlinks, compression bombs, unknown manifest versions, invalid
 signatures and checksum mismatches are rejected before publication.
 
 PocketBase SQLite archives containing `data.db` are not native PPBase backups.
@@ -123,8 +125,64 @@ previous files back. After commit, an unexpected validation or restart failure
 stays fail-closed in maintenance mode; startup recovery must verify the matching
 signed inventory before it can discard the previous files. There is no durable
 user-selectable rollback after successful recovery — the restored target is the
-live target. Sessions signed with the backup's JWT secret remain valid;
-sessions from the replaced instance do not.
+live target.
+
+## What restore replaces and what it preserves
+
+A native restore replaces the complete managed `public` database state,
+including `_superusers`, collection metadata, application migration history and
+records. A superuser created only on the target before restore therefore
+disappears; the superusers contained in the source archive become authoritative
+and retain their existing password hashes. After restart, sign in again with a
+source superuser. If the archive contains no usable superuser, run
+`ppbase create-admin` against the restored database.
+
+The archive also restores its signed JWT-secret resource to
+`data_dir/.jwt_secret`. When `PPBASE_JWT_SECRET` is unset, source sessions signed
+with that secret can remain valid and sessions from the replaced target do not.
+When `PPBASE_JWT_SECRET` is explicitly supplied by the deployment environment,
+that external value still takes precedence after restart; operators must manage
+and restore that external secret consistently if token continuity matters.
+
+`PPBASE_BACKUP_CONTROL_DIR` is deliberately not part of the archive. The target
+server keeps its own Ed25519 signing identity, trust approvals, operation locks
+and restore journal. Consequently, an archive imported from another server is
+`authenticated_untrusted` until a target superuser approves that exact external
+public key, but the target does not become the source server's signing identity.
+
+## Large ZIP uploads and intermediaries
+
+PPBase accepts native uploads up to `PPBASE_BACKUP_MAX_UPLOAD_BYTES` (20 GiB by
+default), but every HTTP intermediary must accept the same request. Reverse
+proxies, hosted tunnels and CDNs often impose much smaller body-size, buffering
+or idle-timeout limits. A transfer that stops around a fixed threshold before
+PPBase logs a completed request should be diagnosed at that intermediary first.
+
+For Nginx, configure an appropriate body limit and disable request buffering on
+the PPBase location, for example:
+
+```nginx
+client_max_body_size 2g;
+
+location / {
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_pass http://127.0.0.1:8090;
+}
+```
+
+For a one-off restore rehearsal, an SSH local forward bypasses the public proxy
+or tunnel while keeping PPBase bound to loopback:
+
+```bash
+ssh -N -L 18090:127.0.0.1:8090 deploy@server-address
+```
+
+Open `http://127.0.0.1:18090/_/` locally and upload through the Dashboard. `-N`
+starts no remote shell; `-L` maps local port `18090` through the encrypted SSH
+connection to PPBase's loopback port on the server. Closing the SSH command
+closes the forward.
 
 ## SDK-compatible endpoints
 

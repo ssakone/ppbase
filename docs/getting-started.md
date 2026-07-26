@@ -32,6 +32,9 @@ Native backup/restore needs no external PostgreSQL client binaries: it uses the
 same asyncpg driver as the server, so it works identically from an editable
 source checkout and an installed package.
 
+For an operational source-clone deployment rather than framework development,
+follow the [Deployment from a source clone runbook](./deployment-from-clone.md).
+
 ## Start the database
 
 PPBase ships with an optional `db` CLI sub-command that manages a local Docker
@@ -113,6 +116,10 @@ Or using the shell helper:
 ```
 
 Open **http://127.0.0.1:8090/_/** in your browser to access the Admin UI.
+
+The first `serve` automatically creates `pb_backups` and
+`pb_backup_control` using the same normal directory policy as `pb_data`. No
+preparatory filesystem command is required for the defaults.
 
 When deploying directly from a source clone, build the assets once after clone
 and rebuild them after Admin UI changes before restarting PPBase:
@@ -318,4 +325,5 @@ only the file: physical collection-schema mutations still take the lock.
 python -c "from ppbase.app import create_app; app = create_app(); print('OK')"
 ```
 
-For production rollout guidance, see [Production Deployment](./production.md).
+For production rollout guidance, see [Production Deployment](./production.md)
+and the [Deployment from a source clone runbook](./deployment-from-clone.md).

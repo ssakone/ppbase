@@ -5,13 +5,15 @@ This guide covers a practical production setup for PPBase.
 ## 1) Preflight checklist
 
 - PostgreSQL is externalized and backed up.
-- `PPBASE_JWT_SECRET` is explicitly set (do not rely on auto-generated secret for production).
+- JWT-secret ownership is deliberate: either use the project-local generated
+  secret captured by native backups, or restore an externally managed
+  `PPBASE_JWT_SECRET` through the deployment secret manager.
 - CORS origins are restricted (`PPBASE_ORIGINS` not `*`).
 - SMTP is configured and validated (`POST /api/settings/test/email`).
 - Storage backend is validated (local disk or S3/R2).
 - Reverse proxy (TLS termination) is in front of PPBase.
 - PostgreSQL 16 or 17 is reachable from the PPBase process.
-- PPBase is installed with `pip install ppbase`.
+- PPBase is installed from a package or an editable source checkout.
 
 Docker is not required in production. The `ppbase db` Docker helper is only a
 local-development convenience; PPBase and native backup/restore work with a
@@ -60,7 +62,9 @@ npm run build
 ```
 
 The build publishes assets into `ppbase/admin/dist`; installed packages use
-their packaged assets.
+their packaged assets. See the
+[Deployment from a source clone runbook](./deployment-from-clone.md) for the
+complete clone, editable-install, upgrade and restore workflow.
 
 ## 3) Reverse proxy and TLS
 
@@ -71,6 +75,12 @@ Requirements:
 - Forward `Authorization` header unchanged.
 - Keep SSE streaming enabled for `/api/realtime` (no buffering).
 - Preserve client IP headers if you rely on `trustedProxy` rate-limit settings.
+- Size request-body and timeout limits for the largest native backup ZIP you
+  intend to upload. Hosted tunnels and CDNs may impose a lower hard limit even
+  when PPBase accepts the archive.
+
+See [Large ZIP uploads and intermediaries](./native-backup-restore.md#large-zip-uploads-and-intermediaries)
+for proxy settings and the SSH-forward fallback.
 
 ## 4) Workers and scaling notes
 
@@ -165,13 +175,15 @@ PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
 
 The execute command requires an ephemeral PostgreSQL superuser DSN. The init
 output is exclusive mode `0600` and contains only `PPBASE_DATABASE_URL`.
-Bootstrap credentials are never persisted. Default PPBase filesystem roots are
-created safely and need no manual `mkdir` or `chmod`.
+Bootstrap credentials are never persisted. Normal `serve` startup creates
+`PPBASE_BACKUP_ROOT` and `PPBASE_BACKUP_CONTROL_DIR` automatically with the
+same directory policy as `PPBASE_DATA_DIR`. Internal sets and identity material
+retain restricted permissions, including mode `0600` for the Ed25519 private
+key.
 
-Run PPBase as a dedicated non-root user and keep `PPBASE_BACKUP_CONTROL_DIR`
-private (`0700`). Before relying on the workflow, rehearse a full restore on a
-staging host: create a backup, restore it destructively, and confirm the server
-restarts and comes back healthy.
+Before relying on the workflow, rehearse a full restore on a staging host:
+create a backup, restore it destructively, and confirm the server restarts and
+comes back healthy.
 
 Run the live readiness check after restart. It reports `backupReady` and
 `restoreReady` independently; its process exit status follows backup creation
@@ -211,6 +223,17 @@ files and then normal startup applies newer migrations. A pre-commit failure
 rolls back PostgreSQL and restores the previous files; a post-commit restart
 failure remains fenced until PPBase is restarted and recovery succeeds.
 
+The restored database includes `_superusers`. Any admin created only on the
+target before restore is replaced by the source archive's superusers; reconnect
+with a source credential after restart, or run `ppbase create-admin` if no
+usable superuser exists. The target's `PPBASE_BACKUP_CONTROL_DIR` is preserved,
+so its Ed25519 identity and trust approvals do not move with the archive.
+
+The signed JWT resource is restored to `data_dir/.jwt_secret`. An explicit
+deployment-level `PPBASE_JWT_SECRET` still overrides that file after restart;
+back it up and restore it through the external secret manager when using that
+mode.
+
 Native backups intentionally cover only the application objects in `public`;
 PostgreSQL large objects and objects in other schemas are outside this contract.
 
@@ -227,6 +250,10 @@ After deploy, verify:
 - Auth login/refresh works
 - Realtime subscription works (`/api/realtime`)
 - File upload/download works (`/api/files/...`)
+- `ppbase backup doctor --server http://127.0.0.1:8090` reports backup and
+  restore readiness
+- A rehearsal restore accepts the expected source superuser and leaves the
+  target Ed25519 control-plane identity intact
 
 ## 8) Security hardening
 
