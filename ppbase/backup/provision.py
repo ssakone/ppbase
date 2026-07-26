@@ -1255,47 +1255,28 @@ async def execute_postgres_init(
 def _root_check(path: str | Path, *, label: str) -> dict[str, Any]:
     selected = absolute_path_without_symlink_resolution(path)
     try:
-        if selected == Path(selected.anchor):
-            raise ControlPlaneSafetyError("filesystem root is not a private root")
-        current = Path(selected.anchor)
-        for index, component in enumerate(selected.parts[1:]):
-            parent = os.lstat(current)
-            parent_mode = stat.S_IMODE(parent.st_mode)
-            if (
-                not stat.S_ISDIR(parent.st_mode)
-                or parent.st_uid not in {0, os.geteuid()}
-                or (parent_mode & 0o022 and not parent_mode & stat.S_ISVTX)
-            ):
-                raise ControlPlaneSafetyError("unsafe directory ancestry")
-            candidate = current / component
-            try:
-                opened = os.lstat(candidate)
-            except FileNotFoundError:
-                if not os.access(current, os.W_OK | os.X_OK):
-                    raise ControlPlaneSafetyError(
-                        "nearest existing parent is not writable"
-                    )
-                return {
-                    "name": label,
-                    "ready": True,
-                    "status": "warn",
-                    "detail": "directory is absent and will be created as private 0700",
-                    "path": str(selected),
-                }
-            if stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode):
-                raise ControlPlaneSafetyError("unsafe symlink or directory entry")
-            if parent_mode & stat.S_ISVTX and opened.st_uid != os.geteuid():
-                raise ControlPlaneSafetyError("unsafe sticky-directory ownership")
-            current = candidate
-            if index == len(selected.parts[1:]) - 1 and (
-                opened.st_uid != os.geteuid()
-                or stat.S_IMODE(opened.st_mode) != 0o700
-            ):
-                raise ControlPlaneSafetyError("directory is not owned private 0700")
-        detail = "owned private 0700 directory available"
-        ready = True
+        if selected.is_dir():
+            detail = "directory available"
+            ready = True
+        elif selected.exists() or selected.is_symlink():
+            raise ControlPlaneSafetyError("path is not a directory")
+        else:
+            current = selected.parent
+            while not current.exists() and current != current.parent:
+                current = current.parent
+            if not current.is_dir() or not os.access(current, os.W_OK | os.X_OK):
+                raise ControlPlaneSafetyError(
+                    "nearest existing parent is not writable"
+                )
+            return {
+                "name": label,
+                "ready": True,
+                "status": "warn",
+                "detail": "directory is absent and will be created on startup",
+                "path": str(selected),
+            }
     except (ControlPlaneSafetyError, OSError):
-        detail = "directory is unsafe, symlinked, or not private 0700"
+        detail = "path is not a usable directory"
         ready = False
     return {
         "name": label,

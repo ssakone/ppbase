@@ -164,6 +164,7 @@ def _start_daemon(
 def _cmd_serve(args: argparse.Namespace) -> None:
     """Start the PPBase server (foreground or daemon)."""
     from ppbase import pb
+    from ppbase.backup.control import ensure_runtime_backup_roots
 
     os.environ["PPBASE_RESTART_CMD"] = json.dumps(
         [sys.executable, "-m", "ppbase", *sys.argv[1:]]
@@ -189,6 +190,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
     if overrides:
         pb.configure(**overrides)
+    ensure_runtime_backup_roots(pb.settings)
     for target in args.hooks:
         pb.load_hooks(target)
 

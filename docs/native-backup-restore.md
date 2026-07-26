@@ -142,11 +142,13 @@ The HTTP surface mirrors PocketBase so existing tooling keeps working:
 
 ## Control-plane filesystem
 
-Run PPBase as a dedicated non-root user. `PPBASE_BACKUP_CONTROL_DIR` (default
-`./pb_backup_control`) must be a private `0700` directory owned by that user.
-Identity, trust, operation locks and the in-flight restore journal are
-descriptor-anchored with `dir_fd` and `O_NOFOLLOW`; detachment or substitution
-fails closed.
+`PPBASE_BACKUP_ROOT` (default `./pb_backups`) and
+`PPBASE_BACKUP_CONTROL_DIR` (default `./pb_backup_control`) are created on
+`serve` with the same directory policy as `PPBASE_DATA_DIR`: ownership and
+permissions follow the service user and its `umask`. Internal backup sets,
+identity material, trust state, operation locks and the in-flight restore
+journal keep their own restricted permissions; the Ed25519 private key remains
+mode `0600`.
 
 Keep these roots distinct and non-overlapping:
 

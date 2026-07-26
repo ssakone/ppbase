@@ -124,6 +124,16 @@ def _ensure_private_directory(path: Path) -> None:
     _fsync_directory(path)
 
 
+def _ensure_runtime_directory(path: Path) -> None:
+    """Create a runtime root with the same policy as ``data_dir``."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BackupStateError(f"cannot create backup directory: {path}") from exc
+    if not path.is_dir():
+        raise BackupStateError(f"backup path is not a directory: {path}")
+
+
 def _create_private_directory_tree_exclusive(path: Path) -> None:
     if _path_exists(path):
         raise FileExistsError(path)
@@ -2007,7 +2017,7 @@ class LocalBackupStore:
         self._owned_control_root: ControlPlaneRoot | None = None
         self._owns_identity = False
         self.root = Path(root)
-        _ensure_private_directory(self.root)
+        _ensure_runtime_directory(self.root)
         self.sets_dir = self.root / "sets"
         _ensure_private_directory(self.sets_dir)
         if identity is None:
@@ -2637,6 +2647,7 @@ class LocalBackupStore:
                 storage_root = ControlPlaneRoot.open(
                     self.root,
                     create_missing=False,
+                    require_private=False,
                 )
                 sets_fd = storage_root.open_private_directory(
                     "sets",
@@ -3046,6 +3057,7 @@ class LocalBackupStore:
             storage_root = ControlPlaneRoot.open(
                 self.root,
                 create_missing=False,
+                require_private=False,
             )
             sets_fd = storage_root.open_private_directory(
                 "sets",

@@ -61,16 +61,14 @@ def _assert_safe_ancestor(parent_fd: int) -> os.stat_result:
         raise ControlPlaneSafetyError(
             "The backup control ancestry contains a non-directory entry."
         )
-    if info.st_uid not in {0, os.geteuid()}:
-        raise ControlPlaneSafetyError(
-            "The backup control ancestry must belong to root or the service user."
-        )
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & 0o022 and not mode & stat.S_ISVTX:
-        raise ControlPlaneSafetyError(
-            "The backup control ancestry contains a non-sticky writable directory."
-        )
     return info
+
+
+def ensure_runtime_backup_roots(settings: object) -> None:
+    """Create backup roots with the same policy as the project data directory."""
+    for attribute in ("backup_root", "backup_control_dir"):
+        configured = Path(getattr(settings, attribute)).expanduser()
+        configured.mkdir(parents=True, exist_ok=True)
 
 
 def _open_control_root(

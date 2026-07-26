@@ -609,14 +609,20 @@ async def recover_interrupted_destructive_restore(
     connection: Any,
 ) -> dict[str, Any] | None:
     """Finish or roll back the sole in-flight file permutation during startup."""
-    control_path = Path(settings.backup_control_dir).expanduser().absolute()
+    control_path = (
+        Path(settings.backup_control_dir).expanduser().resolve(strict=False)
+    )
     if not control_path.exists():
         if await read_database_restore_marker(connection) is not None:
             raise DestructiveRestoreError(
                 "database restore marker exists without its filesystem journal"
             )
         return None
-    control_root = ControlPlaneRoot.open(control_path, create_missing=False)
+    control_root = ControlPlaneRoot.open(
+        control_path,
+        create_missing=False,
+        require_private=False,
+    )
     journal = DestructiveRestoreJournal(control_root)
     try:
         state = journal.read()

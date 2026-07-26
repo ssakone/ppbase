@@ -526,10 +526,15 @@ class NativeBackupService:
         self.engine = engine
         self.settings = settings
         self.backup_root = Path(settings.backup_root).expanduser().resolve(strict=False)
-        self.control_dir = Path(settings.backup_control_dir).expanduser().absolute()
+        self.control_dir = (
+            Path(settings.backup_control_dir).expanduser().resolve(strict=False)
+        )
         self._validate_roots()
         try:
-            self.control_root = ControlPlaneRoot.open(self.control_dir)
+            self.control_root = ControlPlaneRoot.open(
+                self.control_dir,
+                require_private=False,
+            )
         except ControlPlaneSafetyError as exc:
             raise BackupServiceError(
                 500,

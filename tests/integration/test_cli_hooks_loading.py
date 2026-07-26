@@ -8,6 +8,8 @@ from httpx import ASGITransport, AsyncClient
 
 from ppbase import PPBase
 from ppbase import __main__ as cli
+from ppbase.backup.control import ensure_runtime_backup_roots
+from ppbase.config import Settings
 
 
 def _load_deferred_extensions(app: object) -> None:
@@ -70,6 +72,29 @@ def test_load_hooks_errors_are_explicit() -> None:
     app = app_pb.get_app()
     with pytest.raises(AttributeError, match="not found"):
         _load_deferred_extensions(app)
+
+
+def test_serve_layout_creates_backup_roots_like_data_dir(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    settings = Settings(
+        data_dir=str(project / "pb_data"),
+        backup_root=str(project / "pb_backups"),
+        backup_control_dir=str(project / "pb_backup_control"),
+    )
+    data_dir = Path(settings.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    ensure_runtime_backup_roots(settings)
+
+    for path in (
+        Path(settings.backup_root),
+        Path(settings.backup_control_dir),
+    ):
+        assert path.is_dir()
+        assert path.stat().st_mode & 0o777 == data_dir.stat().st_mode & 0o777
 
 
 def test_load_hooks_queues_user_import_until_app_materialization(

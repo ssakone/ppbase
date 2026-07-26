@@ -350,7 +350,7 @@ def test_postgres_init_layout_creates_private_defaults_idempotently(
     assert not Path(settings.backup_target_root).exists()
 
 
-def test_doctor_root_check_refuses_symlink_and_non_private_directory(
+def test_doctor_root_check_matches_data_directory_policy(
     tmp_path: Path,
 ) -> None:
     private = tmp_path / "private"
@@ -359,17 +359,17 @@ def test_doctor_root_check_refuses_symlink_and_non_private_directory(
 
     non_private = tmp_path / "non-private"
     non_private.mkdir(mode=0o755)
-    assert provision._root_check(non_private, label="non_private")["ready"] is False
+    assert provision._root_check(non_private, label="non_private")["ready"] is True
 
     link = tmp_path / "link"
     link.symlink_to(private, target_is_directory=True)
-    assert provision._root_check(link, label="link")["ready"] is False
+    assert provision._root_check(link, label="link")["ready"] is True
 
     missing = provision._root_check(tmp_path / "missing", label="missing")
     assert missing["ready"] is True
     assert missing["status"] == "warn"
     assert not (tmp_path / "missing").exists()
-    assert provision._root_check(Path("/"), label="root")["ready"] is False
+    assert provision._root_check(Path("/"), label="root")["ready"] is True
 
 
 def test_doctor_root_check_refuses_missing_root_under_unwritable_parent(
