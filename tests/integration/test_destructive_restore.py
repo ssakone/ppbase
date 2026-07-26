@@ -16,9 +16,9 @@ localhost:5433) for two reasons:
 
 * the destructive restore drops and recreates the public schema, so it must
   never run against a database that other work depends on, and
-* PostgreSQL 16 is one of the server majors supported by the bundled
-  PostgreSQL 17 client payload and exercises the cross-major compatibility
-  contract used by the release-wheel CI.
+* PostgreSQL 16 is one of the server majors the native asyncpg engine
+  supports, so it exercises the cross-major compatibility contract without any
+  ``pg_dump``/``pg_restore``/``psql`` client binaries.
 
 Restart stubbing
 ----------------
@@ -38,14 +38,13 @@ tests remain independent. No ``os.execvpe`` is ever invoked.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import re
 import secrets
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -61,13 +60,43 @@ from sqlalchemy.pool import NullPool
 import ppbase.services.process_control as process_control
 from ppbase.backup.postgres import preflight_destructive_restore_role
 from ppbase.backup.service import BackupServiceError, NativeBackupService
-from ppbase.backup.tools import PostgresToolResolutionError, resolve_postgres_tool
+from ppbase.backup.storage import DATA_COPY_RESOURCE
 from ppbase.config import Settings
+from ppbase.db import schema_manager
 from ppbase.db.bootstrap import bootstrap_system_collections
 from ppbase.db.system_tables import create_system_tables
 
 
 pytestmark = pytest.mark.asyncio
+
+
+# A real PPBase-managed base collection: the physical table is emitted through
+# ``schema_manager`` (id/created/updated + managed indexes) and its field schema
+# is registered in ``_collections`` so the strict v2 canonical model reconciles
+# it as an authored table. VARCHAR(15) ids match the PPBase id contract.
+SENTINEL_SCHEMA: list[dict[str, object]] = [{"name": "note", "type": "text"}]
+SENTINEL_ROW_ID = "sentinelrow01"
+SENTINEL_EXTRA_ID = "sentinelrow02"
+
+
+async def _seed_sentinel_collection(engine: object) -> None:
+    """Create + register the ``sentinel`` base collection with one seeded row."""
+    collection = SimpleNamespace(
+        name="sentinel", type="base", schema=SENTINEL_SCHEMA, options={}
+    )
+    await schema_manager.create_collection_table(engine, collection)
+    async with engine.begin() as connection:  # type: ignore[union-attr]
+        await connection.execute(
+            text("INSERT INTO sentinel (id, note) VALUES (:id, :note)"),
+            {"id": SENTINEL_ROW_ID, "note": "from-backup"},
+        )
+        await connection.execute(
+            text(
+                'INSERT INTO "_collections" (id, name, type, schema) '
+                "VALUES (:id, 'sentinel', 'base', CAST(:schema AS jsonb))"
+            ),
+            {"id": secrets.token_hex(7), "schema": json.dumps(SENTINEL_SCHEMA)},
+        )
 
 
 try:  # pragma: no cover - import guard only
@@ -79,8 +108,9 @@ except Exception as exc:  # pragma: no cover - environment specific
     _TESTCONTAINERS_IMPORT_ERROR = exc
 
 
-# Exercise every PostgreSQL major supported by the release wheels. The bundled
-# PostgreSQL 17 client payload must restore against both a 16 and a 17 server.
+# Exercise every PostgreSQL major the native asyncpg engine supports. The
+# in-process restore must rebuild the schema against both a 16 and a 17 server
+# without any external PostgreSQL client binaries.
 _POSTGRES_IMAGES = ("postgres:16-alpine", "postgres:17-alpine")
 
 
@@ -110,35 +140,6 @@ def destructive_restore_cluster(request: pytest.FixtureRequest) -> Iterator[str]
         yield f"postgresql+asyncpg://pptest:pptest@{host}:{port}"
     finally:
         container.stop()
-
-
-async def _tool_major(pg_dump_path: str) -> int:
-    """Return the client major of a ``pg_dump`` executable (e.g. ``16``)."""
-    process = await asyncio.create_subprocess_exec(
-        pg_dump_path,
-        "--version",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    stdout, _ = await process.communicate()
-    match = re.search(r"(\d+)\.\d+", stdout.decode("utf-8", "replace"))
-    assert match is not None, stdout
-    return int(match.group(1))
-
-
-async def _server_major(admin_url: str) -> int:
-    """Return the running server's major from ``server_version_num``."""
-    engine = create_async_engine(
-        admin_url, poolclass=NullPool, isolation_level="AUTOCOMMIT"
-    )
-    try:
-        async with engine.connect() as connection:
-            version_num = await connection.scalar(
-                text("SELECT current_setting('server_version_num')")
-            )
-    finally:
-        await engine.dispose()
-    return int(version_num) // 10000
 
 
 async def _create_throwaway_database(base_url: str) -> str:
@@ -179,27 +180,7 @@ async def seeded_backup(
     destructive restore. All process-control state and temporary directories
     are cleaned up afterwards regardless of test outcome.
     """
-    try:
-        postgres_tools = {
-            name: resolve_postgres_tool(name)
-            for name in ("pg_dump", "pg_restore", "psql")
-        }
-    except PostgresToolResolutionError as exc:
-        pytest.skip(f"destructive restore client tools are unavailable: {exc}")
-
     base_url = destructive_restore_cluster
-
-    # The bundled release tools are PostgreSQL 17.9 and can dump both a 16 and a
-    # 17 server. An editable checkout falls back to whatever ``pg_dump`` sits on
-    # PATH, which may be older than the containerised server: a client cannot
-    # dump a newer server, so skip that combination instead of erroring.
-    client_major = await _tool_major(postgres_tools["pg_dump"])
-    server_major = await _server_major(f"{base_url}/pptest")
-    if client_major < server_major:
-        pytest.skip(
-            f"resolved pg_dump {client_major} cannot dump a PostgreSQL "
-            f"{server_major} server; the release wheel bundles 17.x tools"
-        )
 
     url = await _create_throwaway_database(base_url)
 
@@ -226,9 +207,6 @@ async def seeded_backup(
         backup_control_dir=str(tmp / "pb_control"),
         jwt_secret="",
         auto_migrate=False,
-        backup_pg_dump_path=postgres_tools["pg_dump"],
-        backup_pg_restore_path=postgres_tools["pg_restore"],
-        backup_psql_path=postgres_tools["psql"],
     )
 
     engine = create_async_engine(url, poolclass=NullPool)
@@ -241,14 +219,12 @@ async def seeded_backup(
         async with session.begin():
             await bootstrap_system_collections(session, engine)
 
-    # A sentinel table lets us prove the active database is (or is not) mutated.
-    async with engine.begin() as connection:
-        await connection.execute(
-            text("CREATE TABLE sentinel (id integer PRIMARY KEY, note text)")
-        )
-        await connection.execute(
-            text("INSERT INTO sentinel (id, note) VALUES (1, 'from-backup')")
-        )
+    # A sentinel collection lets us prove the active database is (or is not)
+    # mutated. It is a real PPBase-managed base collection (emitted through
+    # schema_manager with id/created/updated + managed indexes and registered
+    # with its field schema) so the strict native v2 canonical contract
+    # reconciles it as an authored object instead of failing closed.
+    await _seed_sentinel_collection(engine)
 
     service = NativeBackupService(engine, settings)
     try:
@@ -294,7 +270,7 @@ async def test_invalid_archive_rejected_before_mutation(
     """A corrupt archive must be rejected before any active target changes.
 
     This is the core verify-before-mutate acceptance criterion: the signed
-    resource checksum is validated up front, so a tampered ``database.dump``
+    resource checksum is validated up front, so a tampered ``data.copy``
     aborts the restore while the live database and its sentinel row are left
     completely untouched.
     """
@@ -303,17 +279,17 @@ async def test_invalid_archive_rejected_before_mutation(
     engine = seeded_backup["engine"]
     backup_id = str(seeded_backup["backup_id"])
 
-    # Corrupt the signed database archive inside the sealed backup set.
+    # Corrupt the signed native COPY payload inside the sealed backup set.
     dump_path = (
         Path(settings.backup_root)  # type: ignore[attr-defined]
         / "sets"
         / backup_id
-        / "resources"
-        / "database.dump"
+        / DATA_COPY_RESOURCE
     )
     raw = bytearray(dump_path.read_bytes())
-    assert len(raw) > 200, "unexpectedly small database dump resource"
-    raw[100:160] = b"\x00" * 60
+    assert raw, "unexpectedly empty database COPY resource"
+    for index in range(len(raw)):
+        raw[index] ^= 0xFF
     dump_path.write_bytes(bytes(raw))
 
     service = NativeBackupService(engine, settings)  # type: ignore[arg-type]
@@ -331,7 +307,9 @@ async def test_invalid_archive_rejected_before_mutation(
 
     # The live database is unchanged: the sentinel row is still present and the
     # bootstrapped schema still exists.
-    note = await _scalar(url, "SELECT note FROM sentinel WHERE id = 1")
+    note = await _scalar(
+        url, f"SELECT note FROM sentinel WHERE id = '{SENTINEL_ROW_ID}'"
+    )
     assert note == "from-backup"
     collections = await _scalar(
         url,
@@ -361,10 +339,16 @@ async def test_destructive_restore_round_trip(
     # Mutate the database and the storage file away from the backup contents.
     async with engine.begin() as connection:  # type: ignore[union-attr]
         await connection.execute(
-            text("UPDATE sentinel SET note = 'mutated' WHERE id = 1")
+            text(
+                "UPDATE sentinel SET note = 'mutated' "
+                f"WHERE id = '{SENTINEL_ROW_ID}'"
+            )
         )
         await connection.execute(
-            text("INSERT INTO sentinel (id, note) VALUES (2, 'extra-row')")
+            text(
+                "INSERT INTO sentinel (id, note) "
+                f"VALUES ('{SENTINEL_EXTRA_ID}', 'extra-row')"
+            )
         )
     storage_file.write_text("MUTATED", encoding="utf-8")
 
@@ -386,9 +370,13 @@ async def test_destructive_restore_round_trip(
 
     # The database is back to the backup contents: the mutation is gone and the
     # extra row was not part of the backup.
-    note = await _scalar(url, "SELECT note FROM sentinel WHERE id = 1")
+    note = await _scalar(
+        url, f"SELECT note FROM sentinel WHERE id = '{SENTINEL_ROW_ID}'"
+    )
     assert note == "from-backup"
-    extra = await _scalar(url, "SELECT count(*) FROM sentinel WHERE id = 2")
+    extra = await _scalar(
+        url, f"SELECT count(*) FROM sentinel WHERE id = '{SENTINEL_EXTRA_ID}'"
+    )
     assert int(extra) == 0  # type: ignore[arg-type]
 
     # The storage file was restored in place from the backup.

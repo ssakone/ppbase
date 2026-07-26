@@ -7,20 +7,12 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from ppbase.backup.postgres import (
-    preflight_destructive_restore_role,
-    preflight_dump_role,
-)
+from ppbase.backup.postgres import preflight_destructive_restore_role
 from ppbase.backup.provision import (
-    BackupProvisionError,
-    _dump_role_confinement_violations,
-    build_provision_plan,
     execute_postgres_init,
-    execute_provision,
     read_secret_sink,
 )
 from ppbase.config import Settings
@@ -67,17 +59,15 @@ async def _cleanup_project(
         await engine.dispose()
 
 
-async def test_real_postgres_init_and_optional_dump_provision(
+async def test_real_postgres_init(
     pg_url: str,
     tmp_path: Path,
 ) -> None:
     await _require_superuser(pg_url)
     project = f"ppinit_{secrets.token_hex(6)}"
-    dump_role = f"ppdump_{secrets.token_hex(6)}"
     bootstrap = make_url(pg_url)
     bootstrap_url = bootstrap.render_as_string(hide_password=False)
     runtime_sink = tmp_path / "runtime.env"
-    dump_sink = tmp_path / "dump.env"
     settings = Settings(
         data_dir=str(tmp_path / "pb_data"),
         backup_root=str(tmp_path / "pb_backups"),
@@ -180,14 +170,6 @@ async def test_real_postgres_init_and_optional_dump_provision(
                         "INSERT INTO public.provision_sample VALUES (1, 'readable')"
                     )
                 )
-                await connection.execute(
-                    text(
-                        "CREATE FUNCTION public.provision_mutate() RETURNS void "
-                        "LANGUAGE sql SECURITY DEFINER "
-                        "AS $$ INSERT INTO public.provision_sample "
-                        "VALUES (3, 'must-not-run') $$"
-                    )
-                )
         finally:
             await runtime_engine.dispose()
 
@@ -200,99 +182,9 @@ async def test_real_postgres_init_and_optional_dump_provision(
         )
         assert repeated["noOp"] is True
         assert runtime_sink.stat().st_ino == first_inode
-
-        provision_settings = settings.model_copy(
-            update={
-                "database_url": runtime_url,
-                "backup_dump_database_url": make_url(runtime_url).set(
-                    username=dump_role,
-                    password="name-selection-only",
-                ).render_as_string(hide_password=False),
-            }
-        )
-        provisioned = await execute_provision(
-            provision_settings,
-            bootstrap_database_url=bootstrap_url,
-            secret_sink=dump_sink,
-        )
-        dump_values = read_secret_sink(dump_sink)
-        assert dump_values is not None
-        assert set(dump_values) == {"PPBASE_BACKUP_DUMP_DATABASE_URL"}
-        assert provisioned["createdRoles"] == [dump_role]
-        assert provisioned["configurationKeys"] == [
-            "PPBASE_BACKUP_DUMP_DATABASE_URL"
-        ]
-        assert stat.S_IMODE(dump_sink.stat().st_mode) == 0o600
-
-        app_admin_engine = create_async_engine(
-            bootstrap.set(database=project).render_as_string(hide_password=False),
-            poolclass=NullPool,
-        )
-        try:
-            async with app_admin_engine.connect() as connection:
-                assert await _dump_role_confinement_violations(
-                    connection,
-                    dump_role,
-                ) == []
-        finally:
-            await app_admin_engine.dispose()
-
-        dump_engine = create_async_engine(
-            dump_values["PPBASE_BACKUP_DUMP_DATABASE_URL"],
-            poolclass=NullPool,
-        )
-        try:
-            async with dump_engine.connect() as connection:
-                report = await preflight_dump_role(connection)
-                assert report.ok
-                assert await connection.scalar(
-                    text("SELECT value FROM public.provision_sample WHERE id = 1")
-                ) == "readable"
-                with pytest.raises(DBAPIError):
-                    await connection.execute(
-                        text(
-                            "INSERT INTO public.provision_sample VALUES (2, 'blocked')"
-                        )
-                    )
-                await connection.rollback()
-                with pytest.raises(DBAPIError):
-                    await connection.execute(
-                        text("SELECT public.provision_mutate()")
-                    )
-                await connection.rollback()
-        finally:
-            await dump_engine.dispose()
-
-        drift_engine = create_async_engine(
-            bootstrap.set(database=project).render_as_string(hide_password=False),
-            poolclass=NullPool,
-        )
-        try:
-            async with drift_engine.begin() as connection:
-                await connection.execute(
-                    text(f'CREATE SCHEMA private_drift AUTHORIZATION "{dump_role}"')
-                )
-        finally:
-            await drift_engine.dispose()
-
-        drifted_plan = await build_provision_plan(provision_settings)
-        assert drifted_plan["executable"] is False
-        assert any(
-            "owns schema" in collision["reason"]
-            for collision in drifted_plan["collisions"]
-        )
-        with pytest.raises(
-            BackupProvisionError,
-            match="unsafe role collisions",
-        ):
-            await execute_provision(
-                provision_settings,
-                bootstrap_database_url=bootstrap_url,
-                secret_sink=dump_sink,
-            )
     finally:
         await _cleanup_project(
             bootstrap_url,
             database=project,
-            roles=(dump_role, project),
+            roles=(project,),
         )

@@ -18,6 +18,10 @@ from sqlalchemy.pool import NullPool
 
 from ppbase import __version__
 from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
+from ppbase.backup.canonical import (
+    fingerprint_collection_objects,
+    validate_canonical_collection_objects,
+)
 from ppbase.backup.destructive import (
     build_file_reference_inventory,
     DestructiveRestoreError,
@@ -56,17 +60,20 @@ from ppbase.backup.operations import (
 from ppbase.backup.postgres import (
     DatabaseContract,
     PostgresBackupError,
-    detect_postgres_versions,
     inspect_database_contract,
-    inspect_pg_restore_archive,
     preflight_destructive_restore_role,
-    preflight_dump_role,
-    run_pg_dump,
-    run_destructive_pg_restore_from_fd,
     set_backup_control_search_path,
-    sqlalchemy_url_to_libpq,
 )
+from ppbase.backup.native import (
+    collect_applied_migrations,
+    export_native_database,
+    restore_native_database,
+    verify_migration_hashes_on_disk,
+)
+from ppbase.backup.schema_contract import DatabaseSchema
 from ppbase.backup.storage import (
+    DATA_COPY_RESOURCE,
+    SCHEMA_JSON_RESOURCE,
     AuthenticatedBackupInspection,
     BackupDeleteCancelledError,
     BackupDeletionUncertainError,
@@ -88,7 +95,6 @@ from ppbase.backup.transport import (
     validate_backup_transport_filename,
 )
 from ppbase.backup.trust import BackupTrustError, BackupTrustStore
-from ppbase.backup.tools import PostgresToolResolutionError, resolve_postgres_tool
 from ppbase.services.async_utils import (
     to_thread_quiescent as _to_thread_quiescent,
 )
@@ -851,29 +857,6 @@ class NativeBackupService:
                 filename=transport_filename,
             )
             self._operation_commit_guard(operation_lease)
-        dump_url = self._dump_configuration()
-        try:
-            dump_info = sqlalchemy_url_to_libpq(dump_url)
-            pg_dump = resolve_postgres_tool(
-                "pg_dump",
-                getattr(self.settings, "backup_pg_dump_path", None),
-            )
-            pg_restore = resolve_postgres_tool(
-                "pg_restore",
-                getattr(self.settings, "backup_pg_restore_path", None),
-            )
-        except PostgresToolResolutionError as exc:
-            raise BackupServiceError(
-                503,
-                "postgresql_tool_unavailable",
-                str(exc),
-            ) from exc
-        except PostgresBackupError as exc:
-            raise BackupServiceError(
-                409,
-                "dump_database_url_invalid",
-                "The configured dump PostgreSQL DSN is invalid.",
-            ) from exc
 
         local_secret_path: Path | None = None
         explicit_jwt_secret: str | None = None
@@ -918,8 +901,6 @@ class NativeBackupService:
         contract: DatabaseContract | None = None
         source_summary: dict[str, int] | None = None
         source_file_references: tuple[LocalFileReference, ...] | None = None
-        dump_version = ""
-        restore_version = ""
         source_app_name = "PPBase"
         preflight_warnings: list[str] = []
         manifest_created_at: datetime | None = None
@@ -934,8 +915,35 @@ class NativeBackupService:
                         raise BackupServiceError(
                             409,
                             "unsupported_storage_backend",
-                            "Native backup v1 supports the local storage "
+                            "Native backup supports the local storage "
                             "backend only.",
+                        )
+                    # Canonicalizing expected views/indexes uses temporary
+                    # PostgreSQL objects inside savepoints. PostgreSQL forbids
+                    # even TEMP DDL in a READ ONLY transaction, so perform this
+                    # non-persistent reconciliation in its own transaction
+                    # while the write barrier is already held, immediately
+                    # before opening the read-only export snapshot.  The
+                    # transaction is REPEATABLE READ (but still read-write, so
+                    # the temp DDL is allowed) so that validation and the
+                    # fingerprint taken right after it observe one identical
+                    # snapshot — otherwise an external client could mutate an
+                    # already-validated object before the fingerprint records it,
+                    # letting the unvalidated state pass the export re-check.
+                    async with lease.connection.begin():
+                        await lease.connection.execute(
+                            text(
+                                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                            )
+                        )
+                        await set_backup_control_search_path(lease.connection)
+                        await validate_canonical_collection_objects(
+                            lease.connection
+                        )
+                        validated_fingerprint = (
+                            await fingerprint_collection_objects(
+                                lease.connection
+                            )
                         )
                     async with lease.connection.begin():
                         await lease.connection.execute(
@@ -944,6 +952,29 @@ class NativeBackupService:
                                 "READ ONLY"
                             )
                         )
+                        # Re-check the validated objects inside the export
+                        # snapshot before the first COPY.  The write barrier does
+                        # not fence external PostgreSQL clients, so a view, index,
+                        # or _collections row could have drifted after validation;
+                        # this REPEATABLE READ read pins the snapshot and fails
+                        # closed on any mismatch.  The search path must match the
+                        # validation transaction: ``pg_get_viewdef`` schema-
+                        # qualifies relations only when they are outside the
+                        # search path, so both fingerprints must resolve names the
+                        # same way or a valid view would look like drift.
+                        await set_backup_control_search_path(lease.connection)
+                        snapshot_fingerprint = (
+                            await fingerprint_collection_objects(
+                                lease.connection
+                            )
+                        )
+                        if snapshot_fingerprint != validated_fingerprint:
+                            raise BackupServiceError(
+                                409,
+                                "schema_drift_during_backup",
+                                "Collection metadata, views, or indexes changed "
+                                "after validation; backup was refused.",
+                            )
                         durable_settings = (
                             await lease.connection.execute(
                                 text(
@@ -992,75 +1023,35 @@ class NativeBackupService:
                             database_size + storage_size,
                             operation="native backup",
                         )
+                        contract = await inspect_database_contract(lease.connection)
+                        # Stream the live schema out with COPY on the raw asyncpg
+                        # connection underlying this same REPEATABLE READ, READ ONLY
+                        # transaction — no external binaries and no separate
+                        # exported snapshot.
                         builder = self.store.begin_set()
-                        runtime_identity = await self._postgres_server_identity(
+                        builder.create_database_directory()
+                        raw_connection = await lease.connection.get_raw_connection()
+                        pg_conn = raw_connection.driver_connection
+                        migrations_dir = Path(
+                            self.settings.migrations_dir
+                        ).expanduser()
+                        migrations = await collect_applied_migrations(
+                            pg_conn, migrations_dir=migrations_dir
+                        )
+                        source_summary = await self._source_summary(
                             lease.connection
                         )
-                        contract = await inspect_database_contract(lease.connection)
-                        if dump_info.database != contract.database:
-                            raise PostgresBackupError(
-                                "pg_dump DSN must target the active PPBase database"
-                            )
-                        dump_engine = create_async_engine(
-                            dump_url,
-                            poolclass=NullPool,
-                        )
-                        try:
-                            async with dump_engine.connect() as dump_connection:
-                                dump_identity = await self._postgres_server_identity(
-                                    dump_connection
-                                )
-                                if dump_identity["role"] != dump_info.username:
-                                    raise PostgresBackupError(
-                                        "pg_dump DSN login does not match current_user"
-                                    )
-                                if dump_identity["database"] != contract.database:
-                                    raise PostgresBackupError(
-                                        "pg_dump preflight reached a different "
-                                        "database"
-                                    )
-                                if self._server_instance_key(
-                                    dump_identity
-                                ) != self._server_instance_key(runtime_identity):
-                                    raise PostgresBackupError(
-                                        "pg_dump DSN reached a different PostgreSQL "
-                                        "server instance"
-                                    )
-                                dump_report = await preflight_dump_role(
-                                    dump_connection
-                                )
-                                dump_report.require_ok()
-                                preflight_warnings.extend(dump_report.warnings)
-                                await dump_connection.rollback()
-                        finally:
-                            await dump_engine.dispose()
-                        versions = await detect_postgres_versions(
-                            lease.connection,
-                            pg_dump=pg_dump,
-                            pg_restore=pg_restore,
-                        )
-                        dump_version = versions.pg_dump.version
-                        restore_version = versions.pg_restore.version
-                        source_summary = await self._source_summary(lease.connection)
                         source_file_references = (
                             await read_canonical_local_file_references(
                                 lease.connection
                             )
                         )
-                        snapshot_id = str(
-                            (
-                                await lease.connection.execute(
-                                    text("SELECT pg_export_snapshot()")
-                                )
-                            ).scalar_one()
-                        )
-                        await run_pg_dump(
-                            dump_url,
-                            builder.database_dump_path,
-                            pg_dump=pg_dump,
-                            expected_server_major=contract.server_major,
-                            passfile_directory=builder.path,
-                            snapshot_id=snapshot_id,
+                        await export_native_database(
+                            pg_conn,
+                            schema_path=builder.database_schema_path,
+                            copy_path=builder.database_copy_path,
+                            migrations=migrations,
+                            source_postgres_version=contract.server_version_num,
                         )
                     await _to_thread_quiescent(
                         builder.copy_storage,
@@ -1151,10 +1142,6 @@ class NativeBackupService:
             _FILE_REFERENCE_INVENTORY_KEY: _file_reference_inventory(
                 source_file_references
             ),
-            "postgres_tools": {
-                "pg_dump": dump_version,
-                "pg_restore": restore_version,
-            },
             "jwt_secret": {
                 "mode": (
                     "included_resource"
@@ -1529,29 +1516,17 @@ class NativeBackupService:
                 expected_reference_inventory = (
                     _require_manifest_file_reference_inventory(inspection)
                 )
-                try:
-                    pg_restore = resolve_postgres_tool(
-                        "pg_restore",
-                        getattr(self.settings, "backup_pg_restore_path", None),
-                    )
-                    psql = resolve_postgres_tool(
-                        "psql",
-                        getattr(self.settings, "backup_psql_path", None),
-                    )
-                except PostgresToolResolutionError as exc:
-                    raise BackupServiceError(
-                        503,
-                        "postgresql_tool_unavailable",
-                        str(exc),
-                    ) from exc
-
-                # Parse the exact signed archive before any active target is
-                # changed. The descriptor-pinned copy is parsed again under the
-                # write barrier immediately before the transactional restore.
-                await inspect_pg_restore_archive(
-                    inspection.path / "resources" / "database.dump",
-                    pg_restore=pg_restore,
-                    expected_server_major=contract.server_major,
+                # Validate the native contract (format_version already checked by
+                # the manifest; here contract_version, system_schema_version,
+                # archive completeness and every recorded application-migration
+                # SHA-256) BEFORE any destructive action. A mismatch is refused
+                # while the live database and storage are still untouched. The
+                # descriptor-pinned copy is re-parsed under the write barrier
+                # immediately before the in-process rebuild.
+                await _to_thread_quiescent(
+                    self._validate_native_contract_preflight,
+                    inspection.path / SCHEMA_JSON_RESOURCE,
+                    Path(self.settings.migrations_dir).expanduser(),
                 )
 
                 preflight_warnings: list[str] = []
@@ -1635,14 +1610,36 @@ class NativeBackupService:
                     raise BackupIntegrityError(
                         "signed local-file reference inventory changed during restore"
                     )
-                pinned_archive = await _to_thread_quiescent(
-                    self.store.pin_database_dump,
+                pinned_schema = None
+                pinned_copy = None
+                pinned_schema = await _to_thread_quiescent(
+                    self.store.pin_database_resource,
                     inspection,
+                    resource_path=SCHEMA_JSON_RESOURCE,
+                    directory=prepared_files.target,
+                    cancel_cleanup=lambda archive: archive.close(),
+                )
+                pinned_copy = await _to_thread_quiescent(
+                    self.store.pin_database_resource,
+                    inspection,
+                    resource_path=DATA_COPY_RESOURCE,
                     directory=prepared_files.target,
                     cancel_cleanup=lambda archive: archive.close(),
                 )
                 restore_error: BaseException | None = None
                 try:
+                    # Re-parse the descriptor-pinned schema and re-hash local
+                    # migrations under the retained write barrier. This closes
+                    # the interval between the early path-based preflight and
+                    # the first destructive storage operation.
+                    schema_bytes = os.pread(
+                        pinned_schema.fileno(), pinned_schema.size, 0
+                    )
+                    await _to_thread_quiescent(
+                        self._validate_native_contract_bytes,
+                        schema_bytes,
+                        Path(self.settings.migrations_dir).expanduser(),
+                    )
                     # Fail closed before entering the blocking swap. If
                     # cancellation lands after the worker has changed the active
                     # files, the helper completes a rollback before cancellation
@@ -1656,20 +1653,43 @@ class NativeBackupService:
                         cutover_must_remain = False
                         raise
                     try:
-                        await run_destructive_pg_restore_from_fd(
+                        # Rebuild the database in-process from the pinned, verified
+                        # schema.json + data.copy inodes — no external binaries are
+                        # involved.
+                        restore_engine = create_async_engine(
                             self.settings.database_url,
-                            pinned_archive.fileno(),
-                            archive_label=pinned_archive.source_path,
-                            restore_id=restore_id,
-                            pg_restore=pg_restore,
-                            psql=psql,
-                            expected_server_major=contract.server_major,
-                            passfile_factory=prepared_files.target.temporary_file,
+                            poolclass=NullPool,
                         )
+                        try:
+                            async with restore_engine.connect() as connection:
+                                raw_connection = (
+                                    await connection.get_raw_connection()
+                                )
+                                pg_conn = raw_connection.driver_connection
+                                # Dup the pinned fd so the SegmentReader's file
+                                # object can close without releasing the pin.
+                                copy_file = os.fdopen(
+                                    os.dup(pinned_copy.fileno()), "rb"
+                                )
+                                try:
+                                    await restore_native_database(
+                                        pg_conn,
+                                        schema_bytes=schema_bytes,
+                                        copy_file=copy_file,
+                                        copy_size=pinned_copy.size,
+                                        restore_id=restore_id,
+                                    )
+                                finally:
+                                    copy_file.close()
+                        finally:
+                            await restore_engine.dispose()
                     except BaseException as exc:
                         restore_error = exc
                 finally:
-                    pinned_archive.close()
+                    if pinned_schema is not None:
+                        pinned_schema.close()
+                    if pinned_copy is not None:
+                        pinned_copy.close()
 
                 marker_engine = create_async_engine(
                     self.settings.database_url,
@@ -1899,15 +1919,6 @@ class NativeBackupService:
             ),
         }
 
-    @staticmethod
-    def _server_instance_key(identity: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            identity["server_address"],
-            identity["server_port"],
-            identity["postmaster_started_at"],
-            identity["server_version_num"],
-        )
-
     async def _source_summary(self, connection: Any) -> dict[str, int]:
         row = (
             await connection.execute(
@@ -1995,10 +2006,39 @@ class NativeBackupService:
             raise BackupIntegrityError("manifest database contract is missing")
         return DatabaseContract.from_dict(raw)
 
-    def _dump_configuration(self) -> str:
-        dump_url = str(self.settings.backup_dump_database_url or "").strip()
-        return dump_url or str(self.settings.database_url)
+    @staticmethod
+    def _validate_native_contract_preflight(
+        schema_path: Path, migrations_dir: Path
+    ) -> None:
+        """Validate a native (v2) ``schema.json`` before any destructive action.
 
+        Parses the archive contract with the strict, fail-closed loader so a
+        mismatch is refused while the live database and storage are still
+        untouched.  :meth:`DatabaseSchema.from_archive_bytes` enforces the exact
+        ``contract_version`` and ``system_schema_version`` (the manifest already
+        pinned ``format_version``) and the completeness of the COPY segment
+        cover.  It then recomputes every archived application-migration SHA-256
+        against ``migrations_dir`` and refuses a missing, null, symlinked,
+        path-escaping, or mismatched migration — so a divergent migration set is
+        rejected before any destruction (extra unapplied local files are
+        allowed).  Runs off the event loop via ``_to_thread_quiescent`` because
+        it does blocking file IO.
+        """
+        schema_bytes = schema_path.read_bytes()
+        NativeBackupService._validate_native_contract_bytes(
+            schema_bytes,
+            migrations_dir,
+        )
+
+    @staticmethod
+    def _validate_native_contract_bytes(
+        schema_bytes: bytes, migrations_dir: Path
+    ) -> None:
+        """Validate pinned native-contract bytes and their local migrations."""
+        schema = DatabaseSchema.from_archive_bytes(schema_bytes)
+        verify_migration_hashes_on_disk(
+            schema.migrations, migrations_dir=migrations_dir
+        )
 
     def _trust_status_for_public_key(self, public_key: bytes | None) -> str:
         if public_key is None:

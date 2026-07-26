@@ -10,7 +10,6 @@ function configuredReadiness(): BackupReadiness {
     create: { ...configured },
     restore: { ...configured },
     restart: { ...configured },
-    postgresqlTools: { ...configured },
     storage: { ...configured },
     controlPlane: { ...configured },
     storageBackend: 'local',
@@ -55,16 +54,15 @@ describe('backup readiness presentation', () => {
     const readiness = configuredReadiness()
     readiness.restore = {
       configured: false,
-      missing: ['psql', 'PPBASE_RESTART_CMD'],
+      missing: ['PPBASE_RESTART_CMD'],
     }
     readiness.restart = { configured: false, missing: ['PPBASE_RESTART_CMD'] }
-    readiness.postgresqlTools = { configured: false, missing: ['psql'] }
 
     const view = buildBackupReadinessView(readiness)
 
     expect(view.createReady).toBe(true)
     expect(view.restoreReady).toBe(false)
-    expect(view.restoreMissing).toEqual(['psql', 'PPBASE_RESTART_CMD'])
+    expect(view.restoreMissing).toEqual(['PPBASE_RESTART_CMD'])
     expect(view.restartReady).toBe(false)
   })
 })

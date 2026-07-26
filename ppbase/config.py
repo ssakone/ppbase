@@ -56,11 +56,6 @@ class Settings(BaseSettings):
     backup_staging_root: str = "./pb_restore_staging"
     backup_target_root: str = ""
     backup_barrier_timeout: float = 300.0
-    backup_pg_dump_path: str = "pg_dump"
-    backup_pg_restore_path: str = "pg_restore"
-    backup_psql_path: str = "psql"
-    # Optional pg_dump override. Empty uses ``database_url``.
-    backup_dump_database_url: str = ""
     # Legacy multi-role restore settings are parsed only for configuration
     # compatibility. Destructive in-place restore ignores them.
     backup_creator_database_url: str = ""

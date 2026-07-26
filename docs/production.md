@@ -11,19 +11,14 @@ This guide covers a practical production setup for PPBase.
 - Storage backend is validated (local disk or S3/R2).
 - Reverse proxy (TLS termination) is in front of PPBase.
 - PostgreSQL 16 or 17 is reachable from the PPBase process.
-- PPBase is installed from the official wheel for the deployment platform, so
-  the verified PostgreSQL client payload is present.
+- PPBase is installed with `pip install ppbase`.
 
 Docker is not required in production. The `ppbase db` Docker helper is only a
 local-development convenience; PPBase and native backup/restore work with a
 normal reachable PostgreSQL service.
 
-PyPI exposes only the `ppbase` project/version. On Linux glibc 2.28+
-(x86_64/ARM64) and macOS 15+ (Intel/Apple Silicon), `pip install ppbase`
-selects the matching wheel and installs its private `pg_dump`, `pg_restore`,
-`psql`, shared libraries, licenses and provenance. Alpine/musl, Windows and
-macOS 14 or older are outside the supported release matrix and fail explicitly
-on the current release instead of silently installing an old universal wheel.
+Native backup and restore use the same asyncpg driver as the server and need no
+external PostgreSQL client binaries (`pg_dump`, `pg_restore`, `psql`).
 
 ## 2) Recommended runtime config
 
@@ -64,8 +59,8 @@ npm ci
 npm run build
 ```
 
-The build publishes assets into `ppbase/admin/dist`; installed wheels use their
-packaged assets.
+The build publishes assets into `ppbase/admin/dist`; installed packages use
+their packaged assets.
 
 ## 3) Reverse proxy and TLS
 
@@ -155,10 +150,10 @@ provisioning is required. Restore readiness is stricter than backup readiness:
 the runtime must be a superuser or own the database and `public`, and the live
 server must expose its reusable restart command.
 
-Both commands below are optional and independent. `init postgres` creates one
-fresh project database, its runtime role and safe filesystem roots. `backup
-provision` adds one least-privilege dump role to a fresh or existing application
-database:
+The `init postgres` command below is optional. It creates one fresh project
+database, its runtime role and safe filesystem roots. The native backup engine
+uses the runtime role over the wire, so no separate dump role or credential is
+needed:
 
 ```bash
 # Optional fresh-project onboarding (runtime role only)
@@ -166,39 +161,12 @@ PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
   ppbase init postgres --plan --name myapp --output-env /etc/ppbase/myapp.env
 PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
   ppbase init postgres --execute --name myapp --output-env /etc/ppbase/myapp.env
-
-# Optional dump-role hardening (fresh or existing database)
-ppbase backup provision --plan \
-  --db "$PPBASE_DATABASE_URL"
-
-PPBASE_BACKUP_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://bootstrap:...@db/postgres' \
-  ppbase backup provision --execute \
-  --db "$PPBASE_DATABASE_URL" \
-  --output-env /etc/ppbase/backup.env
 ```
 
-Both execute commands require an ephemeral PostgreSQL superuser DSN. The init
-output is exclusive mode `0600` and contains only
-`PPBASE_DATABASE_URL`; the backup-provision output contains only
-`PPBASE_BACKUP_DUMP_DATABASE_URL`. Bootstrap credentials are never persisted.
-Default PPBase filesystem roots are created safely and need no manual `mkdir` or
-`chmod`.
-
-`backup provision --execute` enforces a real database-level boundary for the
-dedicated credential. It revokes database privileges inherited from `PUBLIC`
-across the PostgreSQL cluster, then grants the dump role only `CONNECT` on the
-active application database. It also removes `PUBLIC` write/default privileges
-and routine execution in that database's `public` schema before granting the
-dump role `USAGE` and `SELECT`. Database/schema owners keep their inherent
-owner privileges. On a shared cluster, review the read-only plan and ensure
-non-owner service roles do not intentionally depend on permissive `PUBLIC`
-ACLs before executing it.
-
-The bootstrap DSN exists only in the execute process and is never written to
-the mode-`0600` output. Configure the service manager or secret manager to load
-`/etc/ppbase/backup.env` on every PPBase start, then restart the service. A
-`source` command in another terminal cannot update an already running server.
-Never commit the generated file.
+The execute command requires an ephemeral PostgreSQL superuser DSN. The init
+output is exclusive mode `0600` and contains only `PPBASE_DATABASE_URL`.
+Bootstrap credentials are never persisted. Default PPBase filesystem roots are
+created safely and need no manual `mkdir` or `chmod`.
 
 Run PPBase as a dedicated non-root user and keep `PPBASE_BACKUP_CONTROL_DIR`
 private (`0700`). Before relying on the workflow, rehearse a full restore on a
@@ -220,11 +188,10 @@ Without `--server`, restart capability is intentionally reported as
 partial/SKIP because a standalone doctor process cannot observe the restart
 configuration injected into the server process.
 
-For an existing application, `backup provision` accepts `--db`; `backup doctor`
-also accepts `--dir` as a compatibility override matching `serve`. A PostgreSQL
-superuser runtime is supported without mutation across backup and restore;
-doctor and the Dashboard report the non-blocking `runtime_superuser` warning.
-The optional dump role remains read-only and never needs `CREATEDB`.
+For an existing application, `backup doctor` accepts `--dir` as a compatibility
+override matching `serve`. A PostgreSQL superuser runtime is supported without
+mutation across backup and restore; doctor and the Dashboard report the
+non-blocking `runtime_superuser` warning.
 
 The selected database and `data_dir` are one inseparable runtime target. If the
 database references a local business file that is absent from

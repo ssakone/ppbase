@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import stat
 import struct
@@ -9,9 +10,24 @@ from pathlib import Path
 
 import pytest
 
+from ppbase.backup.copy_format import COMPRESSION_ZLIB, CopySegment
 from ppbase.backup.identity import BackupIdentity
 from ppbase.backup.models import canonical_json_bytes, parse_canonical_json
-from ppbase.backup.storage import LocalBackupStore
+from ppbase.backup.schema_contract import (
+    ColumnSpec,
+    DatabaseSchema,
+    IndexKeySpec,
+    IndexSpec,
+    MigrationSpec,
+    TableSpec,
+    ViewSpec,
+)
+from ppbase.backup.storage import (
+    BACKUP_FORMAT_VERSION,
+    DATA_COPY_RESOURCE,
+    SCHEMA_JSON_RESOURCE,
+    LocalBackupStore,
+)
 from ppbase.backup.transport import (
     BackupTransportError,
     BackupTransportLimits,
@@ -75,7 +91,11 @@ def _create_backup(
     secret.write_bytes(b"D" * 64)
 
     builder = store.begin_set(backup_id)
-    builder.database_dump_path.write_bytes(dump_payload)
+    builder.create_database_directory()
+    builder.database_schema_path.write_bytes(
+        b'{"tables": [], "views": [], "indexes": []}'
+    )
+    builder.database_copy_path.write_bytes(dump_payload)
     builder.copy_storage(storage)
     builder.copy_jwt_secret(secret)
     inspection = store.finalize_set(
@@ -84,6 +104,133 @@ def _create_backup(
         created_at=FIXED_TIME,
     )
     return store, inspection
+
+
+def _native_schema_bytes() -> tuple[bytes, bytes]:
+    """Return a genuine (schema.json, data.copy) pair for a v2 backup set.
+
+    The COPY payload is a real compressed segment container consistent with the
+    single-segment schema, so the artifact that flows through the ZIP is an
+    authentic native v2 backup rather than opaque filler.
+    """
+    data_copy = b"x" * 20
+    segment = CopySegment(
+        table="posts",
+        columns=("id", "title", "tags"),
+        offset=0,
+        compressed_size=len(data_copy),
+        compressed_sha256=hashlib.sha256(data_copy).hexdigest(),
+        uncompressed_size=40,
+        uncompressed_sha256=hashlib.sha256(b"y" * 40).hexdigest(),
+        row_count=0,
+        compression=COMPRESSION_ZLIB,
+    )
+    schema = DatabaseSchema(
+        tables=(
+            TableSpec(
+                name="posts",
+                kind="base",
+                columns=(
+                    ColumnSpec("id", "character varying(15)", False, None),
+                    ColumnSpec("title", "text", True, None),
+                    ColumnSpec("tags", "text[]", True, "'{}'::text[]"),
+                ),
+                primary_key=("id",),
+                unique_constraints=(("title",),),
+            ),
+        ),
+        views=(
+            ViewSpec(
+                name="posts_public",
+                definition="SELECT id, title FROM posts",
+                depends_on=("posts",),
+            ),
+        ),
+        indexes=(
+            IndexSpec(
+                name="idx_posts_title",
+                table="posts",
+                method="btree",
+                unique=False,
+                nulls_not_distinct=False,
+                keys=(IndexKeySpec("title", descending=True, nulls_first=None),),
+                included=("id",),
+                predicate="(\"title\" <> ''::text)",
+            ),
+        ),
+        migrations=(MigrationSpec("0001_init.py", "a" * 64, "2021-01-01T00:00:00Z"),),
+        segments=(segment,),
+        data_copy_size=len(data_copy),
+        source_postgres_version=160014,
+    )
+    return schema.to_canonical_bytes(), data_copy
+
+
+def _create_native_v2_backup(
+    tmp_path: Path,
+    *,
+    identity: BackupIdentity | None = None,
+    backup_id: str = "native-v2-source",
+) -> tuple[LocalBackupStore, object, bytes, bytes]:
+    store = LocalBackupStore(tmp_path / f"{backup_id}-store", identity=identity)
+    storage = tmp_path / f"{backup_id}-data" / "storage"
+    business_file = storage / "collection" / "record" / "document.txt"
+    business_file.parent.mkdir(parents=True)
+    business_file.write_bytes(b"business file payload")
+    secret = storage.parent / ".jwt_secret"
+    secret.write_bytes(b"D" * 64)
+
+    schema_bytes, data_copy = _native_schema_bytes()
+    builder = store.begin_set(backup_id, format_version=BACKUP_FORMAT_VERSION)
+    builder.create_database_directory()
+    builder.database_schema_path.write_bytes(schema_bytes)
+    builder.database_copy_path.write_bytes(data_copy)
+    builder.copy_storage(storage)
+    builder.copy_jwt_secret(secret)
+    inspection = store.finalize_set(
+        builder.prepare(),
+        metadata={"app_name": "My PPBase App"},
+        created_at=FIXED_TIME,
+    )
+    return store, inspection, schema_bytes, data_copy
+
+
+def test_native_v2_zip_round_trip_preserves_schema_and_copy(tmp_path: Path) -> None:
+    identity = BackupIdentity.load_or_create(tmp_path / "control")
+    source, inspection, schema_bytes, data_copy = _create_native_v2_backup(
+        tmp_path, identity=identity
+    )
+    assert inspection.manifest.format_version == BACKUP_FORMAT_VERSION
+
+    payload = _download_bytes(source, inspection.manifest.backup_id)
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        names = archive.namelist()
+        assert names[:3] == ["manifest.json", "manifest.sig", "signer.pub"]
+        assert SCHEMA_JSON_RESOURCE in names
+        assert DATA_COPY_RESOURCE in names
+        assert "resources/database.dump" not in names
+        assert archive.read(SCHEMA_JSON_RESOURCE) == schema_bytes
+        assert archive.read(DATA_COPY_RESOURCE) == data_copy
+
+    target = LocalBackupStore(tmp_path / "target-store", identity=identity)
+    prepared = prepare_backup_zip_import(
+        target,
+        io.BytesIO(payload),
+        expected_public_key=identity.public_key_bytes,
+        limits=_limits(),
+    )
+    imported = target.finalize_imported_set(
+        prepared.prepared,
+        manifest_bytes=prepared.manifest_bytes,
+        signature=prepared.signature,
+        signer_public_key=prepared.signer_public_key,
+        expected_public_key=identity.public_key_bytes,
+    )
+
+    assert imported.manifest == inspection.manifest
+    assert imported.manifest.format_version == BACKUP_FORMAT_VERSION
+    assert (imported.path / SCHEMA_JSON_RESOURCE).read_bytes() == schema_bytes
+    assert (imported.path / DATA_COPY_RESOURCE).read_bytes() == data_copy
 
 
 def _download_bytes(store: LocalBackupStore, backup_id: str) -> bytes:
@@ -189,8 +336,8 @@ def test_standard_zip_round_trip_preserves_signed_envelope_and_resources(
     assert (imported.path / "manifest.json").read_bytes() == (
         source_inspection.path / "manifest.json"
     ).read_bytes()
-    assert (imported.path / "resources" / "database.dump").read_bytes() == (
-        source_inspection.path / "resources" / "database.dump"
+    assert (imported.path / DATA_COPY_RESOURCE).read_bytes() == (
+        source_inspection.path / DATA_COPY_RESOURCE
     ).read_bytes()
 
 
@@ -312,7 +459,7 @@ def test_foreign_signer_is_fully_checksum_verified_before_untrusted_result(
     payload = _download_bytes(foreign, inspection.manifest.backup_id)
 
     def alter_same_size(name: str, data: bytes, info: zipfile.ZipInfo):
-        if name == "resources/database.dump":
+        if name == DATA_COPY_RESOURCE:
             data = bytes([data[0] ^ 1]) + data[1:]
         return name, data, info
 
@@ -339,7 +486,7 @@ def test_signature_and_resource_tampering_are_rejected(tmp_path: Path) -> None:
         return name, data, info
 
     def alter_dump(name: str, data: bytes, info: zipfile.ZipInfo):
-        if name == "resources/database.dump":
+        if name == DATA_COPY_RESOURCE:
             data = b"tampered dump payload"
         return name, data, info
 
@@ -375,7 +522,7 @@ def test_corrupt_deflate_stream_is_mapped_and_partial_is_removed(
         _rewrite_zip(stored, lambda name, data, info: (name, data, info))
     )
     with zipfile.ZipFile(io.BytesIO(compressed), "r") as archive:
-        info = archive.getinfo("resources/database.dump")
+        info = archive.getinfo(DATA_COPY_RESOURCE)
         local_offset = info.header_offset
         filename_size = struct.unpack_from("<H", compressed, local_offset + 26)[0]
         extra_size = struct.unpack_from("<H", compressed, local_offset + 28)[0]
@@ -560,7 +707,9 @@ def test_unknown_manifest_version_and_member_set_are_rejected(tmp_path: Path) ->
 
     manifest = parse_canonical_json(values["manifest.json"])
     assert isinstance(manifest, dict)
-    manifest["format_version"] = 2
+    # format_version 1 (legacy dump) and 2 (native logical) are both supported;
+    # use a version the reader has never heard of to exercise the reject path.
+    manifest["format_version"] = 999
     unsupported_manifest = canonical_json_bytes(manifest)
     values["manifest.json"] = unsupported_manifest
     values["manifest.sig"] = source.identity.sign_manifest(unsupported_manifest)

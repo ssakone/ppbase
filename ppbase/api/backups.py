@@ -38,7 +38,6 @@ from ppbase.backup.transport import (
     PinnedBackupZip,
     validate_backup_transport_filename,
 )
-from ppbase.backup.tools import PostgresToolResolutionError, resolve_postgres_tool
 from ppbase.db.engine import get_engine
 from ppbase.services.async_utils import to_thread_quiescent
 from ppbase.services.file_tokens import verify_file_token
@@ -305,22 +304,6 @@ def _backup_readiness(
     ]
 
     restart_ready = can_self_restart()
-    tool_missing: list[str] = []
-    for attribute, label in (
-        ("backup_pg_dump_path", "pg_dump"),
-        ("backup_pg_restore_path", "pg_restore"),
-        ("backup_psql_path", "psql"),
-    ):
-        try:
-            resolve_postgres_tool(label, getattr(settings, attribute, None))
-        except PostgresToolResolutionError:
-            tool_missing.append(label)
-    create_missing.extend(
-        label for label in ("pg_dump", "pg_restore") if label in tool_missing
-    )
-    restore_missing.extend(
-        label for label in ("pg_restore", "psql") if label in tool_missing
-    )
     if not restart_ready:
         restore_missing.append("PPBASE_RESTART_CMD")
     storage_missing = [] if storage_backend == "local" else [
@@ -347,10 +330,6 @@ def _backup_readiness(
             "configured": restart_ready,
             "missing": [] if restart_ready else ["PPBASE_RESTART_CMD"],
         },
-        "postgresqlTools": {
-            "configured": not tool_missing,
-            "missing": tool_missing,
-        },
         "storage": {
             "configured": not storage_missing,
             "missing": storage_missing,
@@ -366,7 +345,6 @@ def _backup_readiness(
             "productionCommand": "ppbase backup doctor",
             "localCommand": "ppbase backup doctor",
             "doctorCommand": "ppbase backup doctor",
-            "advancedProvisionCommand": "ppbase backup provision --plan",
         },
     }
 

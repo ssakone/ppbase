@@ -13,8 +13,14 @@ from typing import Any, TypeAlias
 
 
 BACKUP_FORMAT = "ppbase-backup-set"
-BACKUP_FORMAT_VERSION = 1
-DATABASE_DUMP_RESOURCE = "resources/database.dump"
+# Native logical format (COPY-based schema.json + data.copy) is the sole,
+# official baseline.  The legacy pg_dump/pg_restore custom archive (v1) has been
+# removed: no PostgreSQL client binaries are used or shipped.  Restore accepts
+# only an exact match and refuses any other version.
+BACKUP_FORMAT_VERSION = 2
+_SUPPORTED_FORMAT_VERSIONS = frozenset({BACKUP_FORMAT_VERSION})
+SCHEMA_JSON_RESOURCE = "resources/database/schema.json"
+DATA_COPY_RESOURCE = "resources/database/data.copy"
 JWT_SECRET_RESOURCE_PATH = "resources/secrets/jwt_secret"
 
 _BACKUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -373,7 +379,7 @@ class BackupManifest:
             raise BackupManifestError(f"unsupported backup format: {self.format}")
         if (
             isinstance(self.format_version, bool)
-            or self.format_version != BACKUP_FORMAT_VERSION
+            or self.format_version not in _SUPPORTED_FORMAT_VERSIONS
         ):
             raise BackupManifestError(
                 f"unsupported backup format version: {self.format_version}"
@@ -391,14 +397,21 @@ class BackupManifest:
             raise BackupManifestError(
                 "manifest resources must have unique paths in ascending order"
             )
-        if DATABASE_DUMP_RESOURCE not in paths:
-            raise BackupManifestError("manifest is missing resources/database.dump")
+        if SCHEMA_JSON_RESOURCE not in paths or DATA_COPY_RESOURCE not in paths:
+            raise BackupManifestError(
+                "manifest is missing resources/database/schema.json "
+                "or resources/database/data.copy"
+            )
         for path in paths:
-            if path == DATABASE_DUMP_RESOURCE or path == JWT_SECRET_RESOURCE_PATH:
+            if path in (
+                SCHEMA_JSON_RESOURCE,
+                DATA_COPY_RESOURCE,
+                JWT_SECRET_RESOURCE_PATH,
+            ):
                 continue
             if path.startswith("resources/files/"):
                 continue
-            raise BackupManifestError(f"unsupported v1 backup resource: {path}")
+            raise BackupManifestError(f"unsupported backup resource: {path}")
         object.__setattr__(self, "resources", resources)
 
         normalized_metadata = _normalize_json(self.metadata, path="$.metadata")

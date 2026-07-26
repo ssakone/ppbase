@@ -16,15 +16,6 @@ source .venv/bin/activate.fish   # fish
 pip install ppbase
 ```
 
-There is one PyPI project and version named `ppbase`. On supported targets,
-`pip` selects the native wheel for Linux glibc 2.28+ (x86_64/ARM64) or macOS
-15+ (Intel/Apple Silicon) automatically. Alpine/musl, Windows and macOS 14 or
-older are not supported by this release. Each wheel contains `pg_dump`,
-`pg_restore`, `psql`, their required shared libraries, licenses and provenance;
-users never select a platform package. A source guard on the same current
-release makes unsupported targets fail explicitly rather than fall back to an
-older universal PPBase wheel.
-
 For framework development from a source checkout:
 
 ```bash
@@ -37,9 +28,9 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Generated PostgreSQL binaries are intentionally absent from editable source
-trees. Install matching clients on the development host or run the release
-vendor build before testing native backup/restore from such a checkout.
+Native backup/restore needs no external PostgreSQL client binaries: it uses the
+same asyncpg driver as the server, so it works identically from an editable
+source checkout and an installed package.
 
 ## Start the database
 
@@ -55,8 +46,7 @@ python -m ppbase db restart  # restart
 
 > **Custom PostgreSQL?** Set `PPBASE_DATABASE_URL` to your connection string and skip this step.
 
-Docker is not required by PPBase itself or by native backup/restore. Official
-PyPI wheels carry their own PostgreSQL client tools.
+Docker is not required by PPBase itself or by native backup/restore.
 
 ### Optional: initialize a fresh PostgreSQL project
 
@@ -82,9 +72,6 @@ directories. Repeating the same command with the same env file is a no-op and
 preserves its credentials and inode. Use the advanced path flags only when the
 deployment cannot use the PPBase defaults, and expose the same custom paths
 through their `PPBASE_*` variables when starting the service.
-
-For an application database/runtime that already exists, you can optionally run
-`ppbase backup provision` to add a dedicated least-privilege dump role.
 
 ## Create your first admin
 
@@ -136,7 +123,7 @@ npm ci
 npm run build
 ```
 
-Installed wheels include their packaged Admin UI assets.
+Installed packages include their packaged Admin UI assets.
 
 ### SMTP test (admin)
 

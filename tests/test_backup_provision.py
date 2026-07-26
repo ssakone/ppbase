@@ -14,7 +14,6 @@ from ppbase.backup import provision
 from ppbase.backup.provision import (
     BackupProvisionError,
     build_postgres_init_plan,
-    build_provision_plan,
     doctor_human,
     ensure_postgres_init_layout,
     resolve_postgres_init_spec,
@@ -120,511 +119,6 @@ def test_secret_sink_recovers_interrupted_hardlink_publication(
 
 
 @pytest.mark.asyncio
-async def test_provision_plan_is_read_only_and_dump_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    statements: list[str] = []
-
-    class Result:
-        def __init__(self, *, one=None, row=None, rows=None, scalar=None):
-            self._one = one
-            self._row = row
-            self._rows = rows or []
-            self._scalar = scalar
-
-        def mappings(self):
-            return self
-
-        def one(self):
-            return self._one
-
-        def one_or_none(self):
-            return self._row
-
-        def all(self):
-            return self._rows
-
-        def scalar_one(self):
-            return self._scalar
-
-    class Transaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Connection:
-        def begin(self):
-            return Transaction()
-
-        async def execute(self, statement, _params=None):
-            sql = str(statement)
-            statements.append(sql)
-            if "AS server_version_num" in sql:
-                return Result(
-                    one={
-                        "role": "runtime",
-                        "database": "app",
-                        "server_version_num": 160004,
-                        "runtime_superuser": False,
-                    }
-                )
-            if "FROM pg_catalog.pg_auth_members" in sql:
-                return Result(rows=[])
-            if "c.relrowsecurity" in sql:
-                return Result(scalar=0)
-            if "FROM pg_catalog.pg_roles AS r" in sql:
-                return Result(row=None)
-            return Result()
-
-    class ConnectionContext:
-        async def __aenter__(self):
-            return Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def connect(self):
-            return ConnectionContext()
-
-        async def dispose(self):
-            return None
-
-    monkeypatch.setattr(provision, "create_async_engine", lambda *_a, **_kw: Engine())
-
-    plan = await build_provision_plan(_settings(tmp_path))
-
-    assert plan["readOnly"] is True
-    assert plan["mode"] == "optional_dump_hardening"
-    assert plan["roles"] == {
-        "runtime": "runtime",
-        "dump": "ppbase_backup_dump",
-    }
-    assert plan["executable"] is True
-    assert plan["warnings"] == []
-    assert "RUNTIME_SECRET" not in json.dumps(plan)
-    assert {
-        action["action"] for action in plan["actions"]
-    } == {
-        "create_dump_role",
-        "normalize_public_database_acl",
-        "grant_dump_read_access",
-        "write_dump_credential",
-    }
-    assert not any(
-        token in statement.upper()
-        for statement in statements
-        for token in ("CREATE ROLE", "CREATE DATABASE", "GRANT ", "REVOKE ")
-    )
-
-
-@pytest.mark.asyncio
-async def test_dump_role_nocreatedb_is_not_blocked_by_runtime_restore_preflight(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    strict_dump_row = {
-        "rolname": "ppbase_backup_dump",
-        "rolcanlogin": True,
-        "rolcreatedb": False,
-        "rolinherit": False,
-        "rolsuper": False,
-        "rolcreaterole": False,
-        "rolreplication": False,
-        "rolbypassrls": False,
-        "marker": None,
-    }
-
-    class Result:
-        def __init__(self, *, one=None, row=None, rows=None, scalar=None):
-            self._one = one
-            self._row = row
-            self._rows = rows or []
-            self._scalar = scalar
-
-        def mappings(self):
-            return self
-
-        def one(self):
-            return self._one
-
-        def one_or_none(self):
-            return self._row
-
-        def all(self):
-            return self._rows
-
-        def scalar_one(self):
-            return self._scalar
-
-    class Transaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Connection:
-        def begin(self):
-            return Transaction()
-
-        async def execute(self, statement, _params=None):
-            sql = str(statement)
-            if "AS server_version_num" in sql:
-                return Result(
-                    one={
-                        "role": "runtime",
-                        "database": "app",
-                        "server_version_num": 160004,
-                        "runtime_superuser": False,
-                    }
-                )
-            if "shobj_description" in sql:
-                return Result(row=strict_dump_row)
-            if "FROM pg_catalog.pg_auth_members" in sql:
-                return Result(rows=[])
-            if "c.relrowsecurity" in sql:
-                return Result(scalar=0)
-            return Result()
-
-    class Context:
-        async def __aenter__(self):
-            return Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def connect(self):
-            return Context()
-
-        async def dispose(self):
-            return None
-
-    async def forbidden_restore_preflight(_connection):
-        raise AssertionError("dump provisioning must not run restore preflight")
-
-    monkeypatch.setattr(provision, "create_async_engine", lambda *_a, **_kw: Engine())
-    monkeypatch.setattr(
-        provision,
-        "preflight_destructive_restore_role",
-        forbidden_restore_preflight,
-    )
-
-    plan = await build_provision_plan(_settings(tmp_path))
-
-    assert plan["executable"] is True
-    assert plan["collisions"] == []
-    assert {action["action"] for action in plan["actions"]} == {
-        "reuse_dump_role",
-        "normalize_public_database_acl",
-        "grant_dump_read_access",
-        "write_dump_credential",
-    }
-
-
-@pytest.mark.asyncio
-async def test_provision_plan_ignores_legacy_restore_settings_and_warns_for_superuser(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _settings(tmp_path).model_copy(
-        update={
-            "backup_creator_database_url": (
-                "postgresql+asyncpg://runtime:IGNORED@localhost/app"
-            ),
-            "backup_restore_database_url": (
-                "postgresql+asyncpg://runtime:IGNORED@localhost/app"
-            ),
-            "backup_target_owner": "runtime",
-        }
-    )
-
-    class Result:
-        def __init__(self, *, one=None, row=None, rows=None, scalar=None):
-            self._one = one
-            self._row = row
-            self._rows = rows or []
-            self._scalar = scalar
-
-        def mappings(self):
-            return self
-
-        def one(self):
-            return self._one
-
-        def one_or_none(self):
-            return self._row
-
-        def all(self):
-            return self._rows
-
-        def scalar_one(self):
-            return self._scalar
-
-    class Transaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Connection:
-        def begin(self):
-            return Transaction()
-
-        async def execute(self, statement, _params=None):
-            sql = str(statement)
-            if "AS server_version_num" in sql:
-                return Result(
-                    one={
-                        "role": "runtime",
-                        "database": "app",
-                        "server_version_num": 160004,
-                        "runtime_superuser": True,
-                    }
-                )
-            if "FROM pg_catalog.pg_auth_members" in sql:
-                return Result(rows=[])
-            if "c.relrowsecurity" in sql:
-                return Result(scalar=0)
-            if "FROM pg_catalog.pg_roles AS r" in sql:
-                return Result(row=None)
-            return Result()
-
-    class ConnectionContext:
-        async def __aenter__(self):
-            return Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def connect(self):
-            return ConnectionContext()
-
-        async def dispose(self):
-            return None
-
-    monkeypatch.setattr(provision, "create_async_engine", lambda *_a, **_kw: Engine())
-
-    plan = await build_provision_plan(settings)
-
-    assert plan["executable"] is True
-    assert plan["collisions"] == []
-    assert plan["warnings"] == [
-        {
-            "code": "runtime_superuser",
-            "detail": "PostgreSQL superuser runtime",
-            "role": "runtime",
-        }
-    ]
-    assert set(plan["roles"]) == {"runtime", "dump"}
-
-
-@pytest.mark.asyncio
-async def test_execute_provisions_only_the_optional_dump_role(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _settings(tmp_path).model_copy(
-        update={
-            "backup_dump_database_url": (
-                "postgresql+asyncpg://dump:DUMP@localhost/app"
-            ),
-            "backup_creator_database_url": (
-                "postgresql+asyncpg://creator:IGNORED@localhost/app"
-            ),
-            "backup_restore_database_url": (
-                "postgresql+asyncpg://restore:IGNORED@localhost/app"
-            ),
-            "backup_target_owner": "ignored_owner",
-        }
-    )
-    values = {
-        "PPBASE_BACKUP_DUMP_DATABASE_URL": settings.backup_dump_database_url,
-    }
-    statements: list[str] = []
-    normalized: list[tuple[str, tuple[str, ...]]] = []
-
-    class Result:
-        def __init__(self, *, scalar=None, row=None, rows=None):
-            self._scalar = scalar
-            self._row = row
-            self._rows = rows or []
-
-        def scalar_one(self):
-            return self._scalar
-
-        def mappings(self):
-            return self
-
-        def one_or_none(self):
-            return self._row
-
-        def all(self):
-            return self._rows
-
-    class Transaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    strict_dump_row = {
-        "rolname": "dump",
-        "rolcanlogin": True,
-        "rolcreatedb": False,
-        "rolinherit": False,
-        "rolsuper": False,
-        "rolcreaterole": False,
-        "rolreplication": False,
-        "rolbypassrls": False,
-    }
-
-    class Connection:
-        def begin(self):
-            return Transaction()
-
-        async def execute(self, statement, _params=None):
-            sql = str(statement)
-            statements.append(sql)
-            if sql == "SELECT current_user":
-                return Result(scalar="clusteradmin")
-            if sql.startswith("SELECT r.rolsuper "):
-                return Result(scalar=True)
-            if "FROM pg_catalog.pg_roles AS r" in sql:
-                return Result(row=strict_dump_row)
-            if "FROM pg_catalog.pg_auth_members" in sql:
-                return Result(rows=[])
-            return Result()
-
-        async def rollback(self):
-            return None
-
-    class ConnectionContext:
-        async def __aenter__(self):
-            return Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def connect(self):
-            return ConnectionContext()
-
-        async def dispose(self):
-            return None
-
-    async def plan(_settings_value):
-        return {"executable": True, "warnings": [], "collisions": []}
-
-    async def credential(_url, *, dump_role):
-        assert dump_role == "dump"
-
-    async def existing_role(*_args, **_kwargs):
-        return False
-
-    async def normalize(_connection, *, dump_role, future_owners):
-        normalized.append((dump_role, future_owners))
-
-    async def dump_preflight(_connection):
-        return SimpleNamespace(ok=True, errors=(), warnings=())
-
-    monkeypatch.setattr(provision, "build_provision_plan", plan)
-    monkeypatch.setattr(provision, "create_async_engine", lambda *_a, **_kw: Engine())
-    monkeypatch.setattr(provision, "read_secret_sink", lambda _path: values)
-    monkeypatch.setattr(provision, "_require_dump_provision_credential", credential)
-    monkeypatch.setattr(provision, "_ensure_role", existing_role)
-    monkeypatch.setattr(provision, "_normalize_source_dump_access", normalize)
-    monkeypatch.setattr(provision, "preflight_dump_role", dump_preflight)
-
-    result = await provision.execute_provision(
-        settings,
-        bootstrap_database_url=(
-            "postgresql+asyncpg://clusteradmin:BOOTSTRAP@localhost/postgres"
-        ),
-        secret_sink=tmp_path / "backup.env",
-    )
-
-    assert result["mode"] == "optional_dump_hardening"
-    assert result["createdRoles"] == []
-    assert result["configurationKeys"] == ["PPBASE_BACKUP_DUMP_DATABASE_URL"]
-    assert normalized == [("dump", ("runtime",))]
-    joined = "\n".join(statements).upper()
-    assert "CREATE DATABASE" not in joined
-    assert "BACKUP_CREATOR" not in joined
-    assert "BACKUP_RESTORE" not in joined
-
-
-@pytest.mark.asyncio
-async def test_execute_provision_requires_superuser_bootstrap(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _settings(tmp_path)
-
-    class Result:
-        def __init__(self, value: object) -> None:
-            self.value = value
-
-        def scalar_one(self):
-            return self.value
-
-    class Transaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Connection:
-        def begin(self):
-            return Transaction()
-
-        async def execute(self, statement, _params=None):
-            sql = str(statement)
-            if sql == "SELECT current_user":
-                return Result("clusteradmin")
-            if sql.startswith("SELECT r.rolsuper "):
-                return Result(False)
-            return Result(None)
-
-    class ConnectionContext:
-        async def __aenter__(self):
-            return Connection()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def connect(self):
-            return ConnectionContext()
-
-        async def dispose(self):
-            return None
-
-    async def plan(_settings_value):
-        return {"executable": True, "warnings": [], "collisions": []}
-
-    monkeypatch.setattr(provision, "build_provision_plan", plan)
-    monkeypatch.setattr(provision, "create_async_engine", lambda *_a, **_kw: Engine())
-
-    with pytest.raises(BackupProvisionError, match="superuser DSN"):
-        await provision.execute_provision(
-            settings,
-            bootstrap_database_url=(
-                "postgresql+asyncpg://clusteradmin:BOOTSTRAP@localhost/postgres"
-            ),
-            secret_sink=tmp_path / "backup.env",
-        )
-
-
-@pytest.mark.asyncio
 async def test_absent_runtime_role_is_created_without_cluster_privileges() -> None:
     statements: list[str] = []
 
@@ -668,39 +162,6 @@ async def test_absent_runtime_role_is_created_without_cluster_privileges() -> No
     assert "backup_creator" not in create_sql
     assert "backup_restore" not in create_sql
     assert "backup_owner" not in create_sql
-
-
-@pytest.mark.asyncio
-async def test_dump_acl_normalization_is_limited_to_public_schema() -> None:
-    statements: list[str] = []
-
-    class Result:
-        def mappings(self):
-            return self
-
-        def all(self):
-            return [{"owner": "runtime"}]
-
-        def scalar_one(self):
-            return "app"
-
-    class Connection:
-        async def execute(self, statement, _params=None):
-            statements.append(str(statement))
-            return Result()
-
-    await provision._normalize_source_dump_access(
-        Connection(),
-        dump_role="dump",
-        future_owners=("runtime",),
-    )
-
-    joined = "\n".join(statements)
-    assert 'SCHEMA "public"' in joined
-    assert "n.nspname = 'public'" in joined
-    assert "information_schema" not in joined
-    assert "pg_largeobject" not in joined
-    assert "LARGE OBJECT" not in joined
 
 
 def test_doctor_human_output_is_stable() -> None:
@@ -747,174 +208,12 @@ def test_doctor_human_reports_non_blocking_runtime_security_warning() -> None:
     )
 
 
-@pytest.mark.parametrize("dedicated_dump", (False, True))
-@pytest.mark.asyncio
-async def test_doctor_uses_effective_dump_dsn_without_legacy_setup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    dedicated_dump: bool,
-) -> None:
-    dump_url = "postgresql+asyncpg://dump:DUMP@localhost/app"
-    settings = _settings(tmp_path).model_copy(
-        update={
-            "backup_dump_database_url": dump_url if dedicated_dump else "",
-            "backup_creator_database_url": "ignored legacy value",
-            "backup_restore_database_url": "ignored legacy value",
-            "backup_target_owner": "ignored_legacy_owner",
-            "backup_pg_dump_path": sys.executable,
-            "backup_pg_restore_path": sys.executable,
-            "backup_psql_path": sys.executable,
-        }
-    )
-    for name in ("backups", "control"):
-        (tmp_path / name).mkdir(mode=0o700)
-
-    opened_urls: list[str] = []
-
-    class Result:
-        def __init__(self, *, row=None, rows=None):
-            self._row = row
-            self._rows = rows or []
-
-        def mappings(self):
-            return self
-
-        def one(self):
-            return self._row
-
-        def all(self):
-            return self._rows
-
-    class Connection:
-        def __init__(self, role: str):
-            self.role = role
-
-        async def execute(self, statement, _params=None):
-            sql = str(statement)
-            if "AS version" in sql:
-                return Result(
-                    row={
-                        "role": self.role,
-                        "database": "app",
-                        "server_address": "127.0.0.1",
-                        "server_port": 5432,
-                        "postmaster_started_at": "1000.0",
-                        "version": 160004,
-                    }
-                )
-            if "FROM pg_catalog.pg_extension" in sql:
-                return Result(rows=[{"name": "plpgsql", "version": "1.0"}])
-            return Result()
-
-        async def rollback(self):
-            return None
-
-    class ConnectionContext:
-        def __init__(self, role: str):
-            self.role = role
-
-        async def __aenter__(self):
-            return Connection(self.role)
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def __init__(self, role: str):
-            self.role = role
-
-        def connect(self):
-            return ConnectionContext(self.role)
-
-        async def dispose(self):
-            return None
-
-    def engine_for(url, **_kwargs):
-        opened_urls.append(str(url))
-        role = "dump" if "://dump:" in str(url) else "runtime"
-        return Engine(role)
-
-    async def matching_version(executable: str):
-        return SimpleNamespace(executable=executable, version="16", major=16)
-
-    async def restore_preflight(_connection):
-        return SimpleNamespace(
-            ok=True,
-            errors=(),
-            warnings=("destructive restore uses the PostgreSQL runtime superuser",),
-        )
-
-    async def dump_preflight(_connection):
-        return SimpleNamespace(ok=True, errors=(), warnings=())
-
-    monkeypatch.setattr(provision, "create_async_engine", engine_for)
-    monkeypatch.setattr(provision, "detect_postgres_tool_version", matching_version)
-    monkeypatch.setattr(
-        provision,
-        "preflight_destructive_restore_role",
-        restore_preflight,
-    )
-    monkeypatch.setattr(provision, "preflight_dump_role", dump_preflight)
-    monkeypatch.setattr(provision, "can_self_restart", lambda: False)
-
-    report = await provision.backup_doctor(settings)
-
-    runtime_check = next(
-        check for check in report["checks"] if check["name"] == "runtime_role"
-    )
-    dump_check = next(
-        check for check in report["checks"] if check["name"] == "dump_role"
-    )
-    check_names = {check["name"] for check in report["checks"]}
-    assert report["ready"] is True
-    assert report["backupReady"] is True
-    assert report["restoreReady"] is True
-    assert report["exitCode"] == 0
-    assert runtime_check["status"] == "warn"
-    assert dump_check == {
-        "name": "dump_role",
-        "ready": True,
-        "detail": (
-            "dedicated PPBASE_BACKUP_DUMP_DATABASE_URL: ready"
-            if dedicated_dump
-            else "PPBASE_DATABASE_URL: ready"
-        ),
-        "status": "pass",
-        "operations": ["backup"],
-    }
-    assert opened_urls == [
-        settings.database_url,
-        dump_url if dedicated_dump else settings.database_url,
-    ]
-    assert {
-        "staging_root",
-        "target_root",
-        "restore_roles",
-        "postgres_role_contract",
-    }.isdisjoint(check_names)
-    assert not (tmp_path / "staging").exists()
-    assert not (tmp_path / "targets").exists()
-    assert report["warnings"] == [
-        {
-            "code": "runtime_superuser",
-            "detail": "PostgreSQL superuser runtime",
-            "role": "runtime",
-        }
-    ]
-
-
 @pytest.mark.asyncio
 async def test_doctor_reports_restore_blocker_without_blocking_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = _settings(tmp_path).model_copy(
-        update={
-            "backup_pg_dump_path": sys.executable,
-            "backup_pg_restore_path": sys.executable,
-            "backup_psql_path": sys.executable,
-        }
-    )
+    settings = _settings(tmp_path)
     for name in ("backups", "control"):
         (tmp_path / name).mkdir(mode=0o700)
 
@@ -967,9 +266,6 @@ async def test_doctor_reports_restore_blocker_without_blocking_backup(
         async def dispose(self):
             return None
 
-    async def matching_version(executable: str):
-        return SimpleNamespace(executable=executable, version="16", major=16)
-
     async def restore_preflight(_connection):
         return SimpleNamespace(
             ok=False,
@@ -977,21 +273,16 @@ async def test_doctor_reports_restore_blocker_without_blocking_backup(
             warnings=(),
         )
 
-    async def dump_preflight(_connection):
-        return SimpleNamespace(ok=True, errors=(), warnings=())
-
     monkeypatch.setattr(
         provision,
         "create_async_engine",
         lambda *_a, **_kw: Engine(),
     )
-    monkeypatch.setattr(provision, "detect_postgres_tool_version", matching_version)
     monkeypatch.setattr(
         provision,
         "preflight_destructive_restore_role",
         restore_preflight,
     )
-    monkeypatch.setattr(provision, "preflight_dump_role", dump_preflight)
     monkeypatch.setattr(provision, "can_self_restart", lambda: False)
 
     report = await provision.backup_doctor(settings)
@@ -1009,104 +300,6 @@ async def test_doctor_reports_restore_blocker_without_blocking_backup(
         "Backup is ready; destructive restore is not ready. "
         "Fix the restore-specific failures above."
     )
-
-
-@pytest.mark.asyncio
-async def test_doctor_rejects_dump_dsn_for_a_different_server_instance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _settings(tmp_path).model_copy(
-        update={
-            "backup_dump_database_url": (
-                "postgresql+asyncpg://dump:DUMP@other-host/app"
-            ),
-            "backup_pg_dump_path": sys.executable,
-            "backup_pg_restore_path": sys.executable,
-            "backup_psql_path": sys.executable,
-        }
-    )
-    for name in ("backups", "control"):
-        (tmp_path / name).mkdir(mode=0o700)
-
-    class Result:
-        def __init__(self, rows=None):
-            self._rows = rows or []
-
-        def mappings(self):
-            return self
-
-        def all(self):
-            return self._rows
-
-    class Connection:
-        def __init__(self, role: str):
-            self.role = role
-
-        async def execute(self, statement, _params=None):
-            if "FROM pg_catalog.pg_extension" in str(statement):
-                return Result([{"name": "plpgsql", "version": "1.0"}])
-            return Result()
-
-        async def rollback(self):
-            return None
-
-    class ConnectionContext:
-        def __init__(self, role: str):
-            self.role = role
-
-        async def __aenter__(self):
-            return Connection(self.role)
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class Engine:
-        def __init__(self, role: str):
-            self.role = role
-
-        def connect(self):
-            return ConnectionContext(self.role)
-
-        async def dispose(self):
-            return None
-
-    def engine_for(url, **_kwargs):
-        return Engine("dump" if "://dump:" in str(url) else "runtime")
-
-    async def identity(connection):
-        return {
-            "role": connection.role,
-            "database": "app",
-            "server_address": "127.0.0.1",
-            "server_port": 5432,
-            "postmaster_started_at": (
-                "2000.0" if connection.role == "dump" else "1000.0"
-            ),
-            "version": 160004,
-        }
-
-    async def matching_version(executable: str):
-        return SimpleNamespace(executable=executable, version="16", major=16)
-
-    async def preflight(_connection):
-        return SimpleNamespace(ok=True, errors=(), warnings=())
-
-    monkeypatch.setattr(provision, "create_async_engine", engine_for)
-    monkeypatch.setattr(provision, "_postgres_server_identity", identity)
-    monkeypatch.setattr(provision, "detect_postgres_tool_version", matching_version)
-    monkeypatch.setattr(provision, "preflight_destructive_restore_role", preflight)
-    monkeypatch.setattr(provision, "preflight_dump_role", preflight)
-    monkeypatch.setattr(provision, "can_self_restart", lambda: False)
-
-    report = await provision.backup_doctor(settings)
-    dump_check = next(
-        check for check in report["checks"] if check["name"] == "dump_role"
-    )
-
-    assert dump_check["ready"] is False
-    assert "different PostgreSQL server" in dump_check["detail"]
-    assert report["backupReady"] is False
 
 
 def test_postgres_init_name_contract_is_deterministic_and_bounded() -> None:
@@ -1558,16 +751,6 @@ def test_installed_console_script_matches_python_module_help() -> None:
         [
             "ppbase",
             "backup",
-            "provision",
-            "--plan",
-            "--db",
-            "postgresql+asyncpg://runtime:SECRET@localhost/app",
-            "--dir",
-            "/tmp/ppbase-cli-data",
-        ],
-        [
-            "ppbase",
-            "backup",
             "doctor",
             "--db",
             "postgresql+asyncpg://runtime:SECRET@localhost/app",
@@ -1598,9 +781,7 @@ def test_backup_subcommands_parse_db_and_dir_like_serve(
     assert captured.data_dir == "/tmp/ppbase-cli-data"
 
 
-@pytest.mark.parametrize("action", ("provision", "doctor"))
 def test_backup_commands_apply_db_and_dir_to_settings(
-    action: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1610,10 +791,6 @@ def test_backup_commands_apply_db_and_dir_to_settings(
     database_url = "postgresql+asyncpg://legacy:SECRET@localhost/app"
     data_dir = str(tmp_path / "custom-data")
     captured: dict[str, Settings] = {}
-
-    async def plan(settings):
-        captured["settings"] = settings
-        return {"executable": True, "warnings": [], "collisions": []}
 
     async def doctor(settings, *, server_url=None):
         captured["settings"] = settings
@@ -1626,16 +803,14 @@ def test_backup_commands_apply_db_and_dir_to_settings(
             "warnings": [],
         }
 
-    monkeypatch.setattr(provision, "build_provision_plan", plan)
     monkeypatch.setattr(provision, "backup_doctor", doctor)
     args = SimpleNamespace(
-        action=action,
+        action="doctor",
         db=database_url,
         data_dir=data_dir,
         server=None,
         json=True,
         local=False,
-        plan=action == "provision",
         execute=False,
         output_env=None,
         bootstrap_dsn_file=None,

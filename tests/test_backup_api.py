@@ -119,18 +119,9 @@ def test_backup_readiness_reports_per_operation_blockers(
 ) -> None:
     monkeypatch.setattr(backups_api, "can_self_restart", lambda: False)
 
-    def resolve(name: str, _configured: str | None = None) -> str:
-        if name == "psql":
-            raise backups_api.PostgresToolResolutionError("psql unavailable")
-        return f"/tools/{name}"
-
-    monkeypatch.setattr(backups_api, "resolve_postgres_tool", resolve)
     payload = backups_api._backup_readiness(
         SimpleNamespace(
             storage_backend="local",
-            backup_pg_dump_path="pg_dump",
-            backup_pg_restore_path="pg_restore",
-            backup_psql_path="psql",
             backup_root=str(tmp_path / "backups"),
             backup_control_dir=str(tmp_path / "control"),
         )
@@ -139,7 +130,7 @@ def test_backup_readiness_reports_per_operation_blockers(
     assert payload["create"] == {"configured": True, "missing": []}
     assert payload["restore"] == {
         "configured": False,
-        "missing": ["psql", "PPBASE_RESTART_CMD"],
+        "missing": ["PPBASE_RESTART_CMD"],
     }
     assert payload["restart"] == {
         "configured": False,

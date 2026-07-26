@@ -29,8 +29,10 @@ from ppbase.backup.identity import (
     verify_manifest_signature,
 )
 from ppbase.backup.models import (
-    DATABASE_DUMP_RESOURCE,
+    BACKUP_FORMAT_VERSION,
+    DATA_COPY_RESOURCE,
     JWT_SECRET_RESOURCE_PATH,
+    SCHEMA_JSON_RESOURCE,
     BackupAlreadyExistsError,
     BackupError,
     BackupInspection,
@@ -1209,10 +1211,22 @@ def _scan_file_tree(
         os.close(root_fd)
 
 
+def _required_database_resources(
+    format_version: int = BACKUP_FORMAT_VERSION,
+) -> frozenset[str]:
+    """Return the mandatory database resource paths for a backup set.
+
+    The native COPY format is the only supported baseline, so a backup always
+    carries ``schema.json`` + ``data.copy``.
+    """
+    return frozenset({SCHEMA_JSON_RESOURCE, DATA_COPY_RESOURCE})
+
+
 def _scan_resource_tree(
     resource_root: Path,
     *,
     repair_permissions: bool,
+    format_version: int = BACKUP_FORMAT_VERSION,
 ) -> tuple[BackupResource, ...]:
     resources = _scan_file_tree(
         resource_root,
@@ -1220,8 +1234,12 @@ def _scan_resource_tree(
         repair_permissions=repair_permissions,
     )
     paths = {resource.path for resource in resources}
-    if DATABASE_DUMP_RESOURCE not in paths:
-        raise BackupStateError("pg_dump did not create resources/database.dump")
+    missing = _required_database_resources(format_version) - paths
+    if missing:
+        raise BackupStateError(
+            "backup set is missing its database resources: "
+            + ", ".join(sorted(missing))
+        )
     return resources
 
 
@@ -1241,6 +1259,7 @@ class PreparedBackupSet:
     path: Path
     resources: tuple[BackupResource, ...]
     store_root: Path
+    format_version: int = BACKUP_FORMAT_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -1529,7 +1548,7 @@ class AnchoredStagingDataDir:
 
 @dataclass(slots=True)
 class PinnedBackupArchive:
-    """Anonymous verified archive whose inode is held open for pg_restore."""
+    """Anonymous verified archive whose inode is held open for the rebuild."""
 
     source_path: Path
     size: int
@@ -1610,13 +1629,22 @@ class BackupDeleteGate:
 class BackupSetBuilder:
     """Single-use builder for the write-barrier-protected phase."""
 
-    def __init__(self, store: "LocalBackupStore", backup_id: str, path: Path) -> None:
+    def __init__(
+        self,
+        store: "LocalBackupStore",
+        backup_id: str,
+        path: Path,
+        *,
+        format_version: int = BACKUP_FORMAT_VERSION,
+    ) -> None:
         self._store = store
         self.backup_id = backup_id
         self.path = path
+        self.format_version = format_version
         self._state = "building"
         self._storage_copied = False
         self._jwt_secret_copied = False
+        self._database_resources_written = False
 
     def _require_building(self) -> None:
         self._store._require_open()
@@ -1624,9 +1652,29 @@ class BackupSetBuilder:
             raise BackupStateError(f"backup builder is already {self._state}")
 
     @property
-    def database_dump_path(self) -> Path:
-        """Absent destination that must be passed directly to ``pg_dump``."""
-        return self.path / DATABASE_DUMP_RESOURCE
+    def database_schema_path(self) -> Path:
+        """Destination for the native ``resources/database/schema.json``."""
+        return self.path / SCHEMA_JSON_RESOURCE
+
+    @property
+    def database_copy_path(self) -> Path:
+        """Destination for the native ``resources/database/data.copy``."""
+        return self.path / DATA_COPY_RESOURCE
+
+    def create_database_directory(self) -> Path:
+        """Create the private ``resources/database/`` directory for COPY output.
+
+        The native COPY exporter writes ``schema.json`` and ``data.copy`` into
+        this 0700 directory; :meth:`prepare` then hashes and permission-repairs
+        them.
+        """
+        self._require_building()
+        directory = self.path / RESOURCES_DIRNAME / "database"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700, follow_symlinks=False)
+        _fsync_directory(directory)
+        _fsync_directory(self.path / RESOURCES_DIRNAME)
+        return directory
 
     @property
     def files_path(self) -> Path:
@@ -1920,6 +1968,7 @@ class BackupSetBuilder:
         resources = _scan_resource_tree(
             self.path / RESOURCES_DIRNAME,
             repair_permissions=True,
+            format_version=self.format_version,
         )
         _fsync_directory(self.path)
         self._state = "prepared"
@@ -1928,6 +1977,7 @@ class BackupSetBuilder:
             path=self.path,
             resources=resources,
             store_root=self._store.root,
+            format_version=self.format_version,
         )
 
     def abort(self) -> None:
@@ -2307,9 +2357,18 @@ class LocalBackupStore:
             if source_parent_fd is not None:
                 os.close(source_parent_fd)
 
-    def begin_set(self, backup_id: str | None = None) -> BackupSetBuilder:
+    def begin_set(
+        self,
+        backup_id: str | None = None,
+        *,
+        format_version: int = BACKUP_FORMAT_VERSION,
+    ) -> BackupSetBuilder:
         """Create a private partial set; no listing API can observe it."""
         self._require_open()
+        if format_version != BACKUP_FORMAT_VERSION:
+            raise BackupStateError(
+                f"unsupported backup format version: {format_version}"
+            )
         if self._identity_guard is not None:
             self._identity_guard()
         selected_id = validate_backup_id(backup_id or self._generate_backup_id())
@@ -2331,7 +2390,9 @@ class LocalBackupStore:
         _fsync_directory(resources_path)
         _fsync_directory(partial_path)
         _fsync_directory(self.sets_dir)
-        return BackupSetBuilder(self, selected_id, partial_path)
+        return BackupSetBuilder(
+            self, selected_id, partial_path, format_version=format_version
+        )
 
     def finalize_set(
         self,
@@ -2355,6 +2416,7 @@ class LocalBackupStore:
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
+                format_version=prepared.format_version,
             )
             if current_resources != prepared.resources:
                 raise BackupIntegrityError(
@@ -2367,6 +2429,7 @@ class LocalBackupStore:
                 signer_fingerprint_sha256=self.identity.fingerprint_sha256,
                 resources=current_resources,
                 metadata=metadata or {},
+                format_version=prepared.format_version,
             )
             manifest_bytes = manifest.to_bytes()
             if len(manifest_bytes) > _MAX_MANIFEST_BYTES:
@@ -2488,6 +2551,7 @@ class LocalBackupStore:
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
+                format_version=manifest.format_version,
             )
             if (
                 current_resources != prepared.resources
@@ -3194,6 +3258,7 @@ class LocalBackupStore:
             actual_resources = _scan_resource_tree(
                 set_path / RESOURCES_DIRNAME,
                 repair_permissions=False,
+                format_version=manifest.format_version,
             )
             if actual_resources != manifest.resources:
                 raise BackupIntegrityError("backup resource checksum validation failed")
@@ -3230,26 +3295,48 @@ class LocalBackupStore:
             _store_token=self._capability_token,
         )
 
-    def pin_database_dump(
+    def pin_database_resource(
         self,
         authenticated: AuthenticatedBackupInspection,
         *,
+        resource_path: str,
         directory: str | Path | AnchoredStagingDataDir,
     ) -> PinnedBackupArchive:
-        """Copy the authenticated dump into an anonymous verified inode.
+        """Pin one native database resource into an anonymous verified inode.
 
-        The returned descriptor, not a reopenable path, is the only input that
-        should be handed to ``pg_restore``. The caller must close it.
+        Used for ``resources/database/schema.json`` and
+        ``resources/database/data.copy``.  The returned descriptor — not a
+        reopenable path — is the only safe input for the in-process rebuild.
+        The caller must close it.
         """
+        if resource_path not in (SCHEMA_JSON_RESOURCE, DATA_COPY_RESOURCE):
+            raise BackupIntegrityError(
+                "only native database resources may be pinned by path"
+            )
+        return self._pin_manifest_resource(
+            authenticated,
+            resource_path=resource_path,
+            directory=directory,
+        )
+
+    def _pin_manifest_resource(
+        self,
+        authenticated: AuthenticatedBackupInspection,
+        *,
+        resource_path: str,
+        directory: str | Path | AnchoredStagingDataDir,
+    ) -> PinnedBackupArchive:
         self._require_open()
         inspection = self._reinspect(authenticated)
         matches = [
             resource
             for resource in inspection.manifest.resources
-            if resource.path == DATABASE_DUMP_RESOURCE
+            if resource.path == resource_path
         ]
         if len(matches) != 1:
-            raise BackupIntegrityError("backup set has no unique database dump")
+            raise BackupIntegrityError(
+                f"backup set has no unique resource {resource_path}"
+            )
         expected = matches[0]
 
         anchored_target: AnchoredStagingDataDir | None = None
@@ -3275,7 +3362,7 @@ class LocalBackupStore:
                     "pinned-archive directory must be a safe 0700 directory"
                 )
 
-        source = inspection.path / DATABASE_DUMP_RESOURCE
+        source = inspection.path / resource_path
         handle: BinaryIO | None = None
         source_parent_fd: int | None = None
         source_fd: int | None = None
@@ -3297,7 +3384,7 @@ class LocalBackupStore:
                 or stat.S_IMODE(before.st_mode) != 0o600
             ):
                 raise BackupIntegrityError(
-                    "database dump is not a private regular file"
+                    "pinned restore resource is not a private regular file"
                 )
 
             digest = hashlib.sha256()
@@ -3321,12 +3408,12 @@ class LocalBackupStore:
                 or size != after.st_size
             ):
                 raise BackupIntegrityError(
-                    "database dump changed while pinning restore input"
+                    "restore resource changed while pinning restore input"
                 )
             actual_sha256 = digest.hexdigest()
             if size != expected.size or actual_sha256 != expected.sha256:
                 raise BackupIntegrityError(
-                    "pinned database dump differs from the signed manifest"
+                    "pinned restore resource differs from the signed manifest"
                 )
             handle.seek(0)
             if anchored_target is not None:
@@ -3342,7 +3429,9 @@ class LocalBackupStore:
         except BackupError:
             raise
         except OSError as exc:
-            raise BackupStateError("database dump could not be pinned safely") from exc
+            raise BackupStateError(
+                "restore resource could not be pinned safely"
+            ) from exc
         finally:
             if source_fd is not None:
                 os.close(source_fd)

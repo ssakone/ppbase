@@ -1,17 +1,15 @@
 import type { BackupReadiness, BackupReadinessWarning } from '../api/types'
 
-// Backup and restore run against PPBASE_DATABASE_URL and never require
-// `ppbase init postgres` or `ppbase backup provision`. The API reports only
-// operational blockers here (tools, local storage, and automatic restart);
-// role-hardening guidance remains advisory.
+// Backup and restore run against PPBASE_DATABASE_URL. The native engine speaks
+// the PostgreSQL wire protocol directly, so there are no external client tools
+// to check; the API reports only operational blockers here (local storage and
+// automatic restart). Role-hardening guidance remains advisory.
 export interface BackupReadinessView {
   warnings: BackupReadinessWarning[]
   createReady: boolean
   createMissing: string[]
   restoreReady: boolean
   restoreMissing: string[]
-  toolsReady: boolean
-  toolsMissing: string[]
   restartReady: boolean
   notes: string[]
 }
@@ -19,13 +17,9 @@ export interface BackupReadinessView {
 export function buildBackupReadinessView(
   readiness: BackupReadiness,
 ): BackupReadinessView {
-  const toolsReady = readiness.postgresqlTools?.configured ?? true
-  const toolsMissing = readiness.postgresqlTools?.missing ?? []
   const restartReady = readiness.restart?.configured ?? true
-  const createReady = readiness.create?.configured
-    ?? !toolsMissing.some((tool) => tool === 'pg_dump' || tool === 'pg_restore')
-  const restoreReady = readiness.restore?.configured
-    ?? (restartReady && !toolsMissing.some((tool) => tool === 'pg_restore' || tool === 'psql'))
+  const createReady = readiness.create?.configured ?? true
+  const restoreReady = readiness.restore?.configured ?? restartReady
   const createMissing = readiness.create?.missing ?? []
   const restoreMissing = readiness.restore?.missing ?? []
   const storageBackend = (readiness.storageBackend || 'local').toLowerCase()
@@ -44,8 +38,6 @@ export function buildBackupReadinessView(
     createMissing,
     restoreReady,
     restoreMissing,
-    toolsReady,
-    toolsMissing,
     restartReady,
     notes,
   }

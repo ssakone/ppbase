@@ -205,7 +205,6 @@ export interface BackupReadiness {
   create?: BackupReadinessCheck
   restore?: BackupReadinessCheck
   restart?: BackupReadinessCheck
-  postgresqlTools?: BackupReadinessCheck
   storage?: BackupReadinessCheck
   controlPlane?: BackupReadinessCheck
   storageBackend?: string

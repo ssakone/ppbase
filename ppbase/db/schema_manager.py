@@ -968,6 +968,184 @@ async def _sync_collection_indexes(
 # ---------------------------------------------------------------------------
 
 
+def expected_collection_index_statements(collection: Any) -> dict[str, str]:
+    """Return every secondary index PPBase expects for ``collection``.
+
+    The mapping is keyed by the identifier PostgreSQL stores (including its
+    63-byte truncation rule) and includes both PPBase-managed indexes and the
+    custom statements persisted in ``_collections.indexes``.  Keeping this
+    derivation here lets backup reconciliation use the exact same rules as the
+    create/update paths instead of maintaining a second index model.
+    """
+    collection_type = _collection_type(collection)
+    if collection_type == "view":
+        return {}
+    if collection_type not in {"base", "auth"}:
+        raise ValueError(
+            f"Unsupported collection type {collection_type!r} for index validation."
+        )
+
+    managed = _managed_indexes(collection)
+    custom = _custom_indexes_by_stored_name(
+        _custom_indexes(collection),
+        require_names=True,
+    )
+    _validate_managed_custom_index_names(managed, custom)
+
+    # A custom index must target exactly its own collection's table in the
+    # public schema. Validate (and schema-qualify) each statement's target
+    # before it is used for reconciliation: otherwise a statement that names a
+    # *different* table would later be canonicalized against this collection's
+    # clone in _expected_index_definition, silently accepting an inconsistent
+    # contract. Mirrors the create/update path's _create_index_if_owned.
+    table_name = _safe_name(collection.name)
+    normalized_custom = {
+        stored_name: _normalize_index_statement_target(statement, table_name)
+        for stored_name, statement in custom.items()
+    }
+
+    expected = {
+        _truncate_postgres_identifier(name): statement
+        for name, statement in managed.items()
+    }
+    expected.update(normalized_custom)
+    return expected
+
+
+async def validate_collection_indexes(
+    connection: AsyncConnection,
+    collection: Any,
+) -> None:
+    """Fail when a collection's live secondary indexes diverge from metadata.
+
+    Missing, extra, invalid, or behaviorally different indexes are rejected.
+    Expected custom SQL is canonicalized by PostgreSQL on an empty temporary
+    clone before comparison, using the same machinery as collection updates.
+    """
+    table_name = _safe_name(collection.name)
+    expected = expected_collection_index_statements(collection)
+    actual_result = await connection.execute(
+        text(
+            "SELECT index_relation.relname "
+            "FROM pg_catalog.pg_index AS index_metadata "
+            "JOIN pg_catalog.pg_class AS index_relation "
+            "ON index_relation.oid = index_metadata.indexrelid "
+            "JOIN pg_catalog.pg_class AS table_relation "
+            "ON table_relation.oid = index_metadata.indrelid "
+            "JOIN pg_catalog.pg_namespace AS table_namespace "
+            "ON table_namespace.oid = table_relation.relnamespace "
+            "WHERE table_namespace.nspname = 'public' "
+            "AND table_relation.relname = :table_name "
+            "AND NOT index_metadata.indisprimary "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM pg_catalog.pg_constraint AS constraint_metadata "
+            "  WHERE constraint_metadata.conindid = index_metadata.indexrelid "
+            "  AND constraint_metadata.contype IN ('u', 'p', 'x')"
+            ") ORDER BY index_relation.relname"
+        ),
+        {"table_name": table_name},
+    )
+    actual_names = {str(name) for name in actual_result.scalars().all()}
+    expected_names = set(expected)
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        raise ValueError(
+            f"Collection {table_name!r} indexes diverge from its PPBase model "
+            f"(missing={missing}, unexpected={extra})."
+        )
+
+    expected_owner = _truncate_postgres_identifier(table_name)
+    for index_name, statement in expected.items():
+        actual = await _read_index_definition(connection, index_name)
+        if actual is None:  # pragma: no cover - set equality above guarantees it
+            raise ValueError(f"Collection index {index_name!r} disappeared.")
+        if actual.owner != expected_owner:
+            raise ValueError(
+                f"Collection index {index_name!r} belongs to {actual.owner!r}, "
+                f"not {expected_owner!r}."
+            )
+        canonical = await _expected_index_definition(
+            connection,
+            statement,
+            table_name,
+        )
+        if actual.signature() != canonical.signature():
+            raise ValueError(
+                f"Collection index {index_name!r} diverges from its PPBase "
+                "definition."
+            )
+
+
+async def validate_collection_view(
+    connection: AsyncConnection,
+    collection: Any,
+) -> None:
+    """Fail when a live collection view differs from ``options.query``.
+
+    PostgreSQL canonicalizes the stored query through a temporary view in a
+    savepoint.  Comparing that rendering with ``pg_get_viewdef`` avoids fragile
+    raw-SQL string comparisons while still detecting semantic drift.
+    """
+    table_name = _safe_name(collection.name)
+    if _collection_type(collection) != "view":
+        raise ValueError(f"Collection {table_name!r} is not a view.")
+    query = _view_query(collection)
+    if not query:
+        raise ValueError(
+            f"View collection {table_name!r} has no options.query definition."
+        )
+
+    probe_name = f"_ppbase_view_probe_{uuid.uuid4().hex}"
+    savepoint = await connection.begin_nested()
+    try:
+        # Contract inspection pins search_path to pg_catalog,pg_temp.  The
+        # original collection query may legitimately use bare public relation
+        # names, so expose public after pg_catalog only inside this savepoint.
+        await connection.execute(
+            text("SET LOCAL search_path = pg_catalog, public, pg_temp")
+        )
+        actual = (
+            await connection.execute(
+                text(
+                    "SELECT pg_catalog.pg_get_viewdef(view_relation.oid, true) "
+                    "FROM pg_catalog.pg_class AS view_relation "
+                    "JOIN pg_catalog.pg_namespace AS view_namespace "
+                    "ON view_namespace.oid = view_relation.relnamespace "
+                    "WHERE view_namespace.nspname = 'public' "
+                    "AND view_relation.relkind = 'v' "
+                    "AND view_relation.relname = :view_name"
+                ),
+                {"view_name": table_name},
+            )
+        ).scalar_one_or_none()
+        if actual is None:
+            raise ValueError(f"Collection view {table_name!r} is missing.")
+        await connection.execute(
+            text(f'CREATE TEMP VIEW "{probe_name}" AS {query}')
+        )
+        canonical = (
+            await connection.execute(
+                text(
+                    "SELECT pg_catalog.pg_get_viewdef(view_relation.oid, true) "
+                    "FROM pg_catalog.pg_class AS view_relation "
+                    "WHERE view_relation.relnamespace = pg_catalog.pg_my_temp_schema() "
+                    "AND view_relation.relkind = 'v' "
+                    "AND view_relation.relname = :view_name"
+                ),
+                {"view_name": probe_name},
+            )
+        ).scalar_one()
+    finally:
+        if savepoint.is_active:
+            await savepoint.rollback()
+
+    if str(actual) != str(canonical):
+        raise ValueError(
+            f"Collection view {table_name!r} diverges from options.query."
+        )
+
+
 async def create_collection_table(
     engine: SchemaExecutor,
     collection: Any,

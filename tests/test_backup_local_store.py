@@ -33,19 +33,26 @@ from ppbase.backup import (
 )
 from ppbase.backup.models import parse_canonical_json
 from ppbase.backup.control import ControlPlaneRoot
+from ppbase.backup.storage import DATA_COPY_RESOURCE, SCHEMA_JSON_RESOURCE
 from ppbase.core.storage_safety import local_storage_id_name
 
 
 FIXED_TIME = datetime(2026, 7, 16, 12, 34, 56, 123456, tzinfo=UTC)
+
+_SCHEMA_PAYLOAD = b'{"tables": [], "views": [], "indexes": []}'
 
 
 def _write_dump(
     builder: BackupSetBuilder,
     payload: bytes = b"PGDMP test payload",
 ) -> None:
-    destination = builder.database_dump_path
-    assert not destination.exists()
-    destination.write_bytes(payload)
+    builder.create_database_directory()
+    schema = builder.database_schema_path
+    data = builder.database_copy_path
+    assert not schema.exists()
+    assert not data.exists()
+    schema.write_bytes(_SCHEMA_PAYLOAD)
+    data.write_bytes(payload)
 
 
 def _prepare_minimal_set(
@@ -57,6 +64,24 @@ def _prepare_minimal_set(
     builder = store.begin_set(backup_id)
     _write_dump(builder, payload)
     return builder.prepare()
+
+
+def _import_database_resources(
+    builder: BackupSetBuilder,
+    source_inspection: AuthenticatedBackupInspection,
+    payload: bytes,
+    *,
+    chunk_size: int | None = None,
+) -> None:
+    """Copy every signed database resource from a source into ``builder``."""
+    contents = {SCHEMA_JSON_RESOURCE: _SCHEMA_PAYLOAD, DATA_COPY_RESOURCE: payload}
+    for resource in source_inspection.manifest.resources:
+        kwargs = {} if chunk_size is None else {"chunk_size": chunk_size}
+        builder.write_imported_resource(
+            resource,
+            io.BytesIO(contents[resource.path]),
+            **kwargs,
+        )
 
 
 def _mode(path: Path) -> int:
@@ -429,9 +454,14 @@ def test_manifest_roundtrip_has_a_strict_schema() -> None:
         signer_fingerprint_sha256="a" * 64,
         resources=(
             BackupResource(
-                path="resources/database.dump",
+                path=DATA_COPY_RESOURCE,
                 size=4,
                 sha256="b" * 64,
+            ),
+            BackupResource(
+                path=SCHEMA_JSON_RESOURCE,
+                size=4,
+                sha256="d" * 64,
             ),
         ),
         metadata={
@@ -461,7 +491,7 @@ def test_manifest_roundtrip_has_a_strict_schema() -> None:
             resources=manifest.resources,
             metadata={"runtime": {"jwt_secret": "must-not-leak"}},
         )
-    with pytest.raises(BackupManifestError, match="unsupported v1"):
+    with pytest.raises(BackupManifestError, match="unsupported backup resource"):
         BackupManifest(
             backup_id="backup-extra",
             created_at="2026-07-16T12:34:56.123456Z",
@@ -530,7 +560,8 @@ def test_prepare_then_finalize_creates_one_signed_sealed_set(tmp_path: Path) -> 
 
     resource_paths = {item.path for item in inspection.manifest.resources}
     assert resource_paths == {
-        "resources/database.dump",
+        SCHEMA_JSON_RESOURCE,
+        DATA_COPY_RESOURCE,
         "resources/files/collection/record/document.txt",
         JWT_SECRET_RESOURCE,
     }
@@ -543,7 +574,7 @@ def test_prepare_then_finalize_creates_one_signed_sealed_set(tmp_path: Path) -> 
     summaries = store.list_sets()
     assert [summary.backup_id for summary in summaries] == ["backup-001"]
     assert summaries[0].integrity_status == "valid"
-    assert summaries[0].resource_count == 3
+    assert summaries[0].resource_count == 4
     assert summaries[0].total_size == inspection.manifest.total_size
 
     public_key = (inspection.path / "signer.pub").read_bytes()
@@ -567,7 +598,7 @@ def test_resource_tampering_is_detected_but_listing_stays_cheap(tmp_path: Path) 
     store = LocalBackupStore(tmp_path / "backups")
     prepared = _prepare_minimal_set(store, "backup-tamper")
     inspection = store.finalize_set(prepared, created_at=FIXED_TIME)
-    dump_path = inspection.path / "resources" / "database.dump"
+    dump_path = inspection.path / DATA_COPY_RESOURCE
 
     dump_path.write_bytes(b"tampered dump")
 
@@ -598,7 +629,7 @@ def test_listing_isolates_a_corrupt_sealed_set(tmp_path: Path) -> None:
 def test_finalize_revalidates_resources_after_prepare(tmp_path: Path) -> None:
     store = LocalBackupStore(tmp_path / "backups")
     prepared = _prepare_minimal_set(store, "backup-race")
-    prepared_dump = prepared.path / "resources" / "database.dump"
+    prepared_dump = prepared.path / DATA_COPY_RESOURCE
 
     prepared_dump.write_bytes(b"changed after the barrier")
 
@@ -618,7 +649,7 @@ def test_publication_never_overwrites_an_existing_set(tmp_path: Path) -> None:
         store.finalize_set(second, created_at=FIXED_TIME)
 
     assert (
-        first_inspection.path / "resources" / "database.dump"
+        first_inspection.path / DATA_COPY_RESOURCE
     ).read_bytes() == b"first dump"
     assert [item.backup_id for item in store.list_sets()] == ["same-id"]
     with pytest.raises(BackupAlreadyExistsError):
@@ -629,7 +660,7 @@ def test_imported_set_preserves_the_exact_signed_envelope(tmp_path: Path) -> Non
     identity = BackupIdentity.load_or_create(tmp_path / "control")
     source = LocalBackupStore(tmp_path / "source", identity=identity)
     source_builder = source.begin_set("transport-roundtrip")
-    source_builder.database_dump_path.write_bytes(b"PGDMP imported payload")
+    _write_dump(source_builder, b"PGDMP imported payload")
     source_inspection = source.finalize_set(
         source_builder.prepare(),
         metadata={"app_name": "Transport Tests"},
@@ -641,10 +672,10 @@ def test_imported_set_preserves_the_exact_signed_envelope(tmp_path: Path) -> Non
 
     target = LocalBackupStore(tmp_path / "target", identity=identity)
     target_builder = target.begin_set("transport-roundtrip")
-    resource = source_inspection.manifest.resources[0]
-    target_builder.write_imported_resource(
-        resource,
-        io.BytesIO(b"PGDMP imported payload"),
+    _import_database_resources(
+        target_builder,
+        source_inspection,
+        b"PGDMP imported payload",
         chunk_size=3,
     )
     imported = target.finalize_imported_set(
@@ -666,7 +697,7 @@ def test_imported_set_never_re_signs_an_unapproved_envelope(tmp_path: Path) -> N
     foreign_identity = BackupIdentity.load_or_create(tmp_path / "foreign-control")
     foreign = LocalBackupStore(tmp_path / "foreign", identity=foreign_identity)
     foreign_builder = foreign.begin_set("foreign-transport")
-    foreign_builder.database_dump_path.write_bytes(b"PGDMP foreign payload")
+    _write_dump(foreign_builder, b"PGDMP foreign payload")
     foreign_inspection = foreign.finalize_set(
         foreign_builder.prepare(),
         created_at=FIXED_TIME,
@@ -674,9 +705,10 @@ def test_imported_set_never_re_signs_an_unapproved_envelope(tmp_path: Path) -> N
 
     local = LocalBackupStore(tmp_path / "local")
     local_builder = local.begin_set("foreign-transport")
-    local_builder.write_imported_resource(
-        foreign_inspection.manifest.resources[0],
-        io.BytesIO(b"PGDMP foreign payload"),
+    _import_database_resources(
+        local_builder,
+        foreign_inspection,
+        b"PGDMP foreign payload",
     )
 
     with pytest.raises(BackupIntegrityError, match="expected key"):
@@ -1478,7 +1510,7 @@ def test_pinned_database_dump_is_independent_from_canonical_path(
     store = LocalBackupStore(tmp_path / "backups")
     builder = store.begin_set("pinned-dump")
     original = b"PGDMP\x01\x10authenticated-archive"
-    builder.database_dump_path.write_bytes(original)
+    _write_dump(builder, original)
     builder.copy_storage(tmp_path / "missing-storage")
     prepared = builder.prepare()
     store.finalize_set(
@@ -1490,12 +1522,13 @@ def test_pinned_database_dump_is_independent_from_canonical_path(
     private_directory = tmp_path / "pinned"
     private_directory.mkdir(mode=0o700)
 
-    pinned = store.pin_database_dump(
+    pinned = store.pin_database_resource(
         authenticated,
+        resource_path=DATA_COPY_RESOURCE,
         directory=private_directory,
     )
     try:
-        canonical = authenticated.path / "resources" / "database.dump"
+        canonical = authenticated.path / DATA_COPY_RESOURCE
         canonical.write_bytes(b"PGDMP\x01\x10substituted")
         os.lseek(pinned.fileno(), 0, os.SEEK_SET)
         assert os.read(pinned.fileno(), len(original) + 1) == original
@@ -1577,7 +1610,11 @@ def test_anchored_staging_capability_restores_files_jwt_and_pinned_dump(
         finally:
             temporary.close()
 
-        pinned = store.pin_database_dump(authenticated, directory=target)
+        pinned = store.pin_database_resource(
+            authenticated,
+            resource_path=DATA_COPY_RESOURCE,
+            directory=target,
+        )
         try:
             assert os.read(pinned.fileno(), 64) == b"PGDMP anchored restore"
         finally:

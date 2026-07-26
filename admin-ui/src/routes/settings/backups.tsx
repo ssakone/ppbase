@@ -790,7 +790,7 @@ export function BackupsPage() {
             <ArchiveRestore className="h-5 w-5 text-indigo-600" />
             <div>
               <h1 className="font-semibold">Backup and restore PPBase data</h1>
-              <p className="text-sm text-slate-500">Signed PostgreSQL dumps and local files, restored destructively into this instance.</p>
+              <p className="text-sm text-slate-500">Signed native PostgreSQL backups and local files, restored destructively into this instance.</p>
             </div>
           </div>
 
