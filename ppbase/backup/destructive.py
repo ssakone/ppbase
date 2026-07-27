@@ -16,7 +16,11 @@ from typing import Any
 
 from sqlalchemy import text
 
-from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
+from ppbase.backup.control import (
+    ControlPlaneRoot,
+    ControlPlaneSafetyError,
+    absolute_path_without_symlink_resolution,
+)
 from ppbase.backup.models import canonical_json_bytes
 from ppbase.backup.storage import AnchoredStagingDataDir, AuthenticatedBackupInspection
 from ppbase.services.file_references import (
@@ -609,10 +613,12 @@ async def recover_interrupted_destructive_restore(
     connection: Any,
 ) -> dict[str, Any] | None:
     """Finish or roll back the sole in-flight file permutation during startup."""
-    control_path = (
-        Path(settings.backup_control_dir).expanduser().resolve(strict=False)
+    control_path = absolute_path_without_symlink_resolution(
+        settings.backup_control_dir
     )
-    if not control_path.exists():
+    try:
+        control_path.lstat()
+    except FileNotFoundError:
         if await read_database_restore_marker(connection) is not None:
             raise DestructiveRestoreError(
                 "database restore marker exists without its filesystem journal"
@@ -621,7 +627,7 @@ async def recover_interrupted_destructive_restore(
     control_root = ControlPlaneRoot.open(
         control_path,
         create_missing=False,
-        require_private=False,
+        normalize_private=True,
     )
     journal = DestructiveRestoreJournal(control_root)
     try:

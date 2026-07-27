@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+import stat
 import threading
 from types import SimpleNamespace
 
@@ -197,6 +198,26 @@ async def test_recovery_rejects_database_marker_without_journal(
         match="marker exists without its filesystem journal",
     ):
         await recover_interrupted_destructive_restore(settings, object())
+
+
+@pytest.mark.asyncio
+async def test_recovery_normalizes_owned_control_root_before_opening_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    control_root = Path(settings.backup_control_dir)
+    control_root.mkdir(mode=0o755)
+
+    async def no_marker(_connection: object) -> None:
+        return None
+
+    monkeypatch.setattr(destructive, "read_database_restore_marker", no_marker)
+
+    result = await recover_interrupted_destructive_restore(settings, object())
+
+    assert result is None
+    assert stat.S_IMODE(control_root.lstat().st_mode) == 0o700
 
 
 @pytest.mark.asyncio

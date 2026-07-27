@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     backup_staging_root: str = "./pb_restore_staging"
     backup_target_root: str = ""
     backup_barrier_timeout: float = 300.0
+    backup_restore_connect_timeout: float = 60.0
+    backup_restore_command_timeout: float = 21_600.0
     # Legacy multi-role restore settings are parsed only for configuration
     # compatibility. Destructive in-place restore ignores them.
     backup_creator_database_url: str = ""

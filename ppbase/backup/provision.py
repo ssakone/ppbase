@@ -25,6 +25,7 @@ from ppbase.backup.control import (
     ControlPlaneSafetyError,
     absolute_path_without_symlink_resolution,
     fsync_directory,
+    inspect_runtime_backup_root,
     same_file_identity,
     validate_entry_name,
 )
@@ -1255,19 +1256,19 @@ async def execute_postgres_init(
 def _root_check(path: str | Path, *, label: str) -> dict[str, Any]:
     selected = absolute_path_without_symlink_resolution(path)
     try:
-        if selected.is_dir():
-            detail = "directory available"
-            ready = True
-        elif selected.exists() or selected.is_symlink():
-            raise ControlPlaneSafetyError("path is not a directory")
+        inspection = inspect_runtime_backup_root(selected)
+        if inspection.exists and inspection.private:
+            return {
+                "name": label,
+                "ready": True,
+                "status": "pass",
+                "detail": "owned private 0700 directory available",
+                "path": str(selected),
+            }
+        if inspection.exists:
+            detail = "directory is not private 0700"
+            ready = False
         else:
-            current = selected.parent
-            while not current.exists() and current != current.parent:
-                current = current.parent
-            if not current.is_dir() or not os.access(current, os.W_OK | os.X_OK):
-                raise ControlPlaneSafetyError(
-                    "nearest existing parent is not writable"
-                )
             return {
                 "name": label,
                 "ready": True,
@@ -1276,7 +1277,7 @@ def _root_check(path: str | Path, *, label: str) -> dict[str, Any]:
                 "path": str(selected),
             }
     except (ControlPlaneSafetyError, OSError):
-        detail = "path is not a usable directory"
+        detail = "directory is unsafe, symlinked, or inaccessible"
         ready = False
     return {
         "name": label,

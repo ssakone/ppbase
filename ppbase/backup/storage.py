@@ -19,6 +19,7 @@ from typing import BinaryIO
 from ppbase.backup.control import (
     ControlPlaneRoot,
     ControlPlaneSafetyError,
+    absolute_path_without_symlink_resolution,
     verify_directory_attached_at,
 )
 from ppbase.backup.identity import (
@@ -124,14 +125,21 @@ def _ensure_private_directory(path: Path) -> None:
     _fsync_directory(path)
 
 
-def _ensure_runtime_directory(path: Path) -> None:
-    """Create a runtime root with the same policy as ``data_dir``."""
+def _ensure_runtime_directory(path: Path) -> Path:
+    """Create an owned private runtime root without following symlinks."""
+    selected = absolute_path_without_symlink_resolution(path)
     try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise BackupStateError(f"cannot create backup directory: {path}") from exc
-    if not path.is_dir():
-        raise BackupStateError(f"backup path is not a directory: {path}")
+        with ControlPlaneRoot.open(
+            selected,
+            create_missing=True,
+            normalize_private=True,
+        ):
+            pass
+    except ControlPlaneSafetyError as exc:
+        raise BackupStateError(
+            f"cannot create backup directory safely: {selected}"
+        ) from exc
+    return selected
 
 
 def _create_private_directory_tree_exclusive(path: Path) -> None:
@@ -2012,8 +2020,7 @@ class LocalBackupStore:
         self._closed = False
         self._owned_control_root: ControlPlaneRoot | None = None
         self._owns_identity = False
-        self.root = Path(root)
-        _ensure_runtime_directory(self.root)
+        self.root = _ensure_runtime_directory(Path(root))
         self.sets_dir = self.root / "sets"
         _ensure_private_directory(self.sets_dir)
         if identity is None:
@@ -2641,7 +2648,6 @@ class LocalBackupStore:
                 storage_root = ControlPlaneRoot.open(
                     self.root,
                     create_missing=False,
-                    require_private=False,
                 )
                 sets_fd = storage_root.open_private_directory(
                     "sets",
@@ -3051,7 +3057,6 @@ class LocalBackupStore:
             storage_root = ControlPlaneRoot.open(
                 self.root,
                 create_missing=False,
-                require_private=False,
             )
             sets_fd = storage_root.open_private_directory(
                 "sets",

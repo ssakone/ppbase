@@ -350,26 +350,28 @@ def test_postgres_init_layout_creates_private_defaults_idempotently(
     assert not Path(settings.backup_target_root).exists()
 
 
-def test_doctor_root_check_matches_data_directory_policy(
+def test_doctor_root_check_matches_runtime_backup_root_policy(
     tmp_path: Path,
 ) -> None:
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
-    assert provision._root_check(private, label="private")["ready"] is True
+    private_check = provision._root_check(private, label="private")
+    assert private_check["ready"] is True
+    assert private_check["status"] == "pass"
 
     non_private = tmp_path / "non-private"
     non_private.mkdir(mode=0o755)
-    assert provision._root_check(non_private, label="non_private")["ready"] is True
+    assert provision._root_check(non_private, label="non_private")["ready"] is False
 
     link = tmp_path / "link"
     link.symlink_to(private, target_is_directory=True)
-    assert provision._root_check(link, label="link")["ready"] is True
+    assert provision._root_check(link, label="link")["ready"] is False
 
     missing = provision._root_check(tmp_path / "missing", label="missing")
     assert missing["ready"] is True
     assert missing["status"] == "warn"
     assert not (tmp_path / "missing").exists()
-    assert provision._root_check(Path("/"), label="root")["ready"] is True
+    assert provision._root_check(Path("/"), label="root")["ready"] is False
 
 
 def test_doctor_root_check_refuses_missing_root_under_unwritable_parent(
@@ -388,6 +390,33 @@ def test_doctor_root_check_refuses_missing_root_under_unwritable_parent(
     check = provision._root_check(tmp_path / "missing", label="missing")
 
     assert check["ready"] is False
+
+
+def test_doctor_root_check_refuses_symlinked_and_writable_ancestry(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+
+    linked_check = provision._root_check(
+        linked / "backups",
+        label="linked",
+    )
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o777)
+    writable_check = provision._root_check(
+        unsafe / "backups",
+        label="writable",
+    )
+
+    assert linked_check["ready"] is False
+    assert writable_check["ready"] is False
+    assert not (outside / "backups").exists()
+    assert not (unsafe / "backups").exists()
 
 
 def test_doctor_root_layout_rejects_data_and_backup_overlap(tmp_path: Path) -> None:

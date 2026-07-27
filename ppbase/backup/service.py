@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
 import os
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
@@ -17,7 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ppbase import __version__
-from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
+from ppbase.backup.control import (
+    ControlPlaneRoot,
+    ControlPlaneSafetyError,
+    absolute_path_without_symlink_resolution,
+    ensure_runtime_backup_roots,
+)
 from ppbase.backup.canonical import (
     fingerprint_collection_objects,
     validate_canonical_collection_objects,
@@ -518,6 +524,39 @@ async def _abort_partial_backup_quiescent(builder: Any) -> None:
         ) from cleanup_error
 
 
+def _restore_engine_connect_args(settings: Any) -> dict[str, float]:
+    """Return bounded asyncpg connection and command timeouts for cutover."""
+    connect_timeout = float(settings.backup_restore_connect_timeout)
+    command_timeout = float(settings.backup_restore_command_timeout)
+    if (
+        not math.isfinite(connect_timeout)
+        or connect_timeout <= 0
+        or not math.isfinite(command_timeout)
+        or command_timeout <= 0
+    ):
+        raise BackupServiceError(
+            500,
+            "backup_restore_timeout_invalid",
+            "The destructive restore PostgreSQL timeouts must be positive.",
+        )
+    return {
+        "timeout": connect_timeout,
+        "command_timeout": command_timeout,
+    }
+
+
+def _create_restore_cutover_engine(
+    settings: Any,
+    connect_args: dict[str, float],
+) -> AsyncEngine:
+    """Create one unpooled engine with the restore cutover time bounds."""
+    return create_async_engine(
+        settings.database_url,
+        poolclass=NullPool,
+        connect_args=dict(connect_args),
+    )
+
+
 class NativeBackupService:
     """Create signed local sets and restore them into the active targets."""
 
@@ -525,15 +564,24 @@ class NativeBackupService:
         self._closed = False
         self.engine = engine
         self.settings = settings
-        self.backup_root = Path(settings.backup_root).expanduser().resolve(strict=False)
-        self.control_dir = (
-            Path(settings.backup_control_dir).expanduser().resolve(strict=False)
+        self.backup_root = absolute_path_without_symlink_resolution(
+            settings.backup_root
         )
+        self.control_dir = absolute_path_without_symlink_resolution(
+            settings.backup_control_dir
+        )
+        try:
+            ensure_runtime_backup_roots(settings)
+        except ControlPlaneSafetyError as exc:
+            raise BackupServiceError(
+                500,
+                "backup_roots_invalid",
+                "The native backup directories are missing or unsafe.",
+            ) from exc
         self._validate_roots()
         try:
             self.control_root = ControlPlaneRoot.open(
                 self.control_dir,
-                require_private=False,
             )
         except ControlPlaneSafetyError as exc:
             raise BackupServiceError(
@@ -1513,6 +1561,7 @@ class NativeBackupService:
         database_committed = False
         cutover_must_remain = False
         try:
+            restore_connect_args = _restore_engine_connect_args(self.settings)
             operation_lease.verify_attached()
             backup_id = await self._resolve_backup_reference(backup_id)
             with self.operations.backup_shared(backup_id) as backup_lease:
@@ -1661,9 +1710,9 @@ class NativeBackupService:
                         # Rebuild the database in-process from the pinned, verified
                         # schema.json + data.copy inodes — no external binaries are
                         # involved.
-                        restore_engine = create_async_engine(
-                            self.settings.database_url,
-                            poolclass=NullPool,
+                        restore_engine = _create_restore_cutover_engine(
+                            self.settings,
+                            restore_connect_args,
                         )
                         try:
                             async with restore_engine.connect() as connection:
@@ -1696,9 +1745,9 @@ class NativeBackupService:
                     if pinned_copy is not None:
                         pinned_copy.close()
 
-                marker_engine = create_async_engine(
-                    self.settings.database_url,
-                    poolclass=NullPool,
+                marker_engine = _create_restore_cutover_engine(
+                    self.settings,
+                    restore_connect_args,
                 )
                 try:
                     async with marker_engine.connect() as connection:
