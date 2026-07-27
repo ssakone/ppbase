@@ -16,7 +16,6 @@ from ppbase.backup.identity import (
 from ppbase.backup.models import (
     BACKUP_FORMAT,
     BACKUP_FORMAT_VERSION,
-    DATABASE_DUMP_RESOURCE,
     BackupAlreadyExistsError,
     BackupError,
     BackupInspection,
@@ -49,7 +48,6 @@ from ppbase.backup.trust import (
 __all__ = [
     "BACKUP_FORMAT",
     "BACKUP_FORMAT_VERSION",
-    "DATABASE_DUMP_RESOURCE",
     "JWT_SECRET_RESOURCE",
     "MANIFEST_SIGNATURE_DOMAIN",
     "AuthenticatedBackupInspection",

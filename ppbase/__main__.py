@@ -164,6 +164,7 @@ def _start_daemon(
 def _cmd_serve(args: argparse.Namespace) -> None:
     """Start the PPBase server (foreground or daemon)."""
     from ppbase import pb
+    from ppbase.backup.control import ensure_runtime_backup_roots
 
     os.environ["PBBASE_RESTART_CMD"] = json.dumps(
         [sys.executable, "-m", "ppbase", *sys.argv[1:]]
@@ -189,6 +190,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
     if overrides:
         pb.configure(**overrides)
+    ensure_runtime_backup_roots(pb.settings)
     for target in args.hooks:
         pb.load_hooks(target)
 
@@ -396,11 +398,7 @@ def _cmd_create_admin(args: argparse.Namespace) -> None:
 
 def _read_bootstrap_dsn(args: argparse.Namespace) -> str:
     """Read the ephemeral cluster-admin DSN without accepting it on argv."""
-    environment_name = (
-        "PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL"
-        if getattr(args, "command", None) == "init"
-        else "PPBASE_BACKUP_BOOTSTRAP_DATABASE_URL"
-    )
+    environment_name = "PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL"
     value = str(os.environ.get(environment_name, "") or "").strip()
     path_value = str(getattr(args, "bootstrap_dsn_file", "") or "").strip()
     if value and path_value:
@@ -442,8 +440,6 @@ def _cmd_init(args: argparse.Namespace) -> None:
             ("data_dir", args.data_dir),
             ("backup_root", args.backup_root),
             ("backup_control_dir", args.backup_control_dir),
-            ("backup_staging_root", args.backup_staging_root),
-            ("backup_target_root", args.backup_target_root),
         )
         if value is not None
     }
@@ -467,7 +463,7 @@ def _cmd_init(args: argparse.Namespace) -> None:
             raise BackupProvisionError("Select exactly one of --plan or --execute.")
         if not args.output_env:
             raise BackupProvisionError(
-                "--output-env is required as the mode-0600 limited-credential sink"
+                "--output-env is required as the mode-0600 runtime credential sink"
             )
         result = await execute_postgres_init(
             settings,
@@ -485,13 +481,11 @@ def _cmd_init(args: argparse.Namespace) -> None:
 
 
 def _cmd_backup(args: argparse.Namespace) -> None:
-    """Provision and diagnose native backup prerequisites."""
+    """Diagnose native backup readiness."""
     from ppbase.backup.provision import (
         BackupProvisionError,
         backup_doctor,
-        build_provision_plan,
         doctor_human,
-        execute_provision,
     )
     from ppbase.config import Settings
 
@@ -507,44 +501,12 @@ def _cmd_backup(args: argparse.Namespace) -> None:
     )
 
     async def run() -> None:
-        if args.action == "doctor":
-            report = await backup_doctor(settings, server_url=args.server)
-            print(json.dumps(report, sort_keys=True) if args.json else doctor_human(report))
-            if not report["ready"]:
-                raise SystemExit(int(report["exitCode"]))
-            return
-        if args.action != "provision":
-            raise BackupProvisionError("Use ppbase backup provision or ppbase backup doctor.")
-        if args.local:
-            from ppbase.backup.postgres import sqlalchemy_url_to_libpq
-
-            runtime = sqlalchemy_url_to_libpq(settings.database_url)
-            if runtime.host not in {"localhost", "127.0.0.1", "::1", ""}:
-                raise BackupProvisionError(
-                    "--local is restricted to loopback TCP or Unix sockets"
-                )
-            print(
-                "WARNING: local provisioning is for development only and is not a production default.",
-                file=sys.stderr,
-            )
-        if args.plan:
-            plan = await build_provision_plan(settings)
-            print(json.dumps(plan, indent=2, sort_keys=True))
-            if not plan["executable"]:
-                raise SystemExit(2)
-            return
-        if not args.execute:
-            raise BackupProvisionError("Select exactly one of --plan or --execute.")
-        if not args.output_env:
-            raise BackupProvisionError(
-                "--output-env is required as the explicit 0600 limited-credential sink"
-            )
-        result = await execute_provision(
-            settings,
-            bootstrap_database_url=_read_bootstrap_dsn(args),
-            secret_sink=args.output_env,
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
+        if args.action != "doctor":
+            raise BackupProvisionError("Use ppbase backup doctor.")
+        report = await backup_doctor(settings, server_url=args.server)
+        print(json.dumps(report, sort_keys=True) if args.json else doctor_human(report))
+        if not report["ready"]:
+            raise SystemExit(int(report["exitCode"]))
 
     try:
         asyncio.run(run())
@@ -871,7 +833,7 @@ def main() -> None:
     init_subs = init_parser.add_subparsers(dest="resource")
     init_postgres = init_subs.add_parser(
         "postgres",
-        help="Create the application database and limited backup roles",
+        help="Create one application database, runtime role, and private roots",
     )
     init_mode = init_postgres.add_mutually_exclusive_group(required=True)
     init_mode.add_argument("--plan", action="store_true", help="Read-only plan")
@@ -884,12 +846,12 @@ def main() -> None:
     init_postgres.add_argument(
         "--output-env",
         default=None,
-        help="Exclusive mode-0600 env file for all limited credentials",
+        help="Exclusive mode-0600 env file for PPBASE_DATABASE_URL",
     )
     init_postgres.add_argument(
         "--bootstrap-dsn-file",
         default=None,
-        help="Mode-0600 file containing the ephemeral privileged PostgreSQL DSN",
+        help="Mode-0600 file containing the ephemeral PostgreSQL superuser DSN",
     )
     init_paths = init_postgres.add_argument_group("advanced path overrides")
     init_paths.add_argument("--data-dir", default=None, help="Override ./pb_data")
@@ -901,63 +863,22 @@ def main() -> None:
         default=None,
         help="Override ./pb_backup_control",
     )
-    init_paths.add_argument(
-        "--backup-staging-root",
-        default=None,
-        help="Override ./pb_restore_staging",
-    )
-    init_paths.add_argument(
-        "--backup-target-root",
-        default=None,
-        help="Override the sibling durable target root",
-    )
-
-    # native backup provisioning / doctor
+    # native backup doctor
     backup_parser = subparsers.add_parser(
         "backup",
-        help="Provision and diagnose native backup/restore prerequisites",
+        help="Check backup and restore readiness",
     )
     backup_subs = backup_parser.add_subparsers(dest="action")
-    backup_provision = backup_subs.add_parser(
-        "provision",
-        help="Plan or execute strict PostgreSQL backup role provisioning",
-    )
-    provision_mode = backup_provision.add_mutually_exclusive_group(required=True)
-    provision_mode.add_argument("--plan", action="store_true", help="Read-only plan")
-    provision_mode.add_argument("--execute", action="store_true", help="Execute the plan")
-    backup_provision.add_argument(
-        "--output-env",
-        default=None,
-        help="Exclusive mode-0600 env file for the limited runtime credentials",
-    )
-    backup_provision.add_argument(
-        "--bootstrap-dsn-file",
-        default=None,
-        help="Mode-0600 file containing the ephemeral privileged PostgreSQL DSN",
-    )
-    backup_provision.add_argument(
-        "--local",
-        action="store_true",
-        help="Explicit development-only loopback/socket mode",
-    )
-    backup_provision.add_argument("--db", type=str, default=None, help="Database URL")
-    backup_provision.add_argument(
-        "--dir",
-        dest="data_dir",
-        type=str,
-        default=None,
-        help="Data directory (PocketBase compatible option name).",
-    )
     backup_doctor_parser = backup_subs.add_parser(
         "doctor",
-        help="Check backup readiness without cluster-admin credentials",
+        help="Report backup and destructive-restore readiness separately",
     )
     backup_doctor_parser.add_argument("--json", action="store_true")
     backup_doctor_parser.add_argument(
         "--server",
         default=None,
         metavar="URL",
-        help="Probe the running PPBase process for activation capability",
+        help="Probe the running PPBase process for automatic restart capability",
     )
     backup_doctor_parser.add_argument("--db", type=str, default=None, help="Database URL")
     backup_doctor_parser.add_argument(

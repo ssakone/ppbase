@@ -1167,7 +1167,10 @@ def prepare_backup_zip_import(
                     "The ZIP is signed correctly but its signer is not trusted locally.",
                 )
 
-            builder = store.begin_set(manifest.backup_id)
+            builder = store.begin_set(
+                manifest.backup_id,
+                format_version=manifest.format_version,
+            )
             for resource in manifest.resources:
                 info = resource_infos[resource.path][1]
                 try:

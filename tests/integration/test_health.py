@@ -24,7 +24,7 @@ async def test_health_includes_current_version() -> None:
 
 
 @pytest.mark.parametrize("configured", (True, False))
-async def test_backup_activation_probe_reflects_live_process_capability(
+async def test_backup_restart_probe_reflects_live_process_capability(
     monkeypatch: pytest.MonkeyPatch,
     configured: bool,
 ) -> None:
@@ -33,11 +33,19 @@ async def test_backup_activation_probe_reflects_live_process_capability(
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.get("/api/health/backup-activation")
+        response = await client.get("/api/health/backup-restart")
 
     assert response.status_code == 200
     assert response.json() == {
         "code": 200,
-        "message": "Backup activation capability inspected.",
-        "data": {"activation": {"configured": configured}},
+        "message": "Backup restart capability inspected.",
+        "data": {"restart": {"configured": configured}},
     }
+
+
+async def test_legacy_backup_activation_probe_is_hidden_from_openapi() -> None:
+    app = PPBase().get_app()
+    schema_paths = app.openapi()["paths"]
+
+    assert "/api/health/backup-restart" in schema_paths
+    assert "/api/health/backup-activation" not in schema_paths

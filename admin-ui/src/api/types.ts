@@ -198,21 +198,18 @@ export interface BackupReadinessWarning {
   detail: string
 }
 
+// Operational readiness surfaced by the Dashboard. The destructive restore
+// path runs against PPBASE_DATABASE_URL and never requires provisioning; only
+// concrete runtime prerequisites reported in create/restore block an action.
 export interface BackupReadiness {
-  create: BackupReadinessCheck
-  restore: BackupReadinessCheck
-  activation: BackupReadinessCheck
-  postgresqlTools: BackupReadinessCheck
-  storage: BackupReadinessCheck
-  controlPlane: BackupReadinessCheck
-  storageBackend: string
+  create?: BackupReadinessCheck
+  restore?: BackupReadinessCheck
+  restart?: BackupReadinessCheck
+  storage?: BackupReadinessCheck
+  controlPlane?: BackupReadinessCheck
+  storageBackend?: string
   warnings?: BackupReadinessWarning[]
-  onboarding: {
-    recommended: 'production'
-    productionCommand: string
-    localCommand: string
-    doctorCommand: string
-  }
+  onboarding?: Record<string, unknown>
 }
 
 export interface BackupTrustEntry {
@@ -224,61 +221,6 @@ export interface BackupTrustEntry {
   actorId?: string | null
   status?: string
   trustStatus?: string
-}
-
-export type JwtSecretMode = 'disaster_recovery' | 'clone'
-
-export interface BackupStagingPlan {
-  id: string
-  backupId: string
-  manifestSha256: string
-  destinationFingerprintSha256?: string
-  targetDatabase?: string
-  targetDataDir?: string
-  jwtSecretMode: JwtSecretMode
-  createdAt?: string
-  actorId?: string | null
-  planHash: string
-  status: string
-  preflightWarnings?: string[]
-  validation?: Record<string, unknown>
-  migrationsApplied?: string[]
-  cloneRotation?: Record<string, unknown>
-  failureCode?: string
-  activationPerformed?: boolean
-  [key: string]: unknown
-}
-
-export interface BackupActivationStart {
-  activationId: string
-  resumeToken: string
-  planId: string
-  planHash: string
-  backupId: string
-  jwtSecretMode: JwtSecretMode
-  status: string
-  phase?: string
-}
-
-export interface BackupActivation {
-  id?: string
-  activationId?: string
-  backupId?: string
-  planId?: string
-  planHash?: string
-  jwtSecretMode?: JwtSecretMode
-  status: string
-  phase?: string
-  message?: string
-  startedAt?: string
-  updatedAt?: string
-  completedAt?: string
-  health?: Record<string, unknown>
-  rollback?: Record<string, unknown>
-  errorCode?: string
-  failureCode?: string
-  actionRequired?: string
-  [key: string]: unknown
 }
 
 export interface OAuth2ProviderConfig {

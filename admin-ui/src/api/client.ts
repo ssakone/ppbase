@@ -1,3 +1,5 @@
+import { buildApiResponseError, parseResponsePayload } from './response'
+
 const TOKEN_KEY = 'ppbase_token'
 
 export interface ApiRequestOptions {
@@ -9,15 +11,6 @@ export interface UploadProgress {
   loaded: number
   total: number | null
   percent: number | null
-}
-
-function parseResponsePayload(raw: string): unknown {
-  if (!raw) return null
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return { message: raw }
-  }
 }
 
 class ApiClient {
@@ -72,10 +65,11 @@ class ApiClient {
     const data = parseResponsePayload(await res.text())
 
     if (!res.ok) {
-      throw {
-        status: res.status,
-        ...(data && typeof data === 'object' ? data : { message: String(data ?? '') }),
-      }
+      throw buildApiResponseError(
+        res.status,
+        data,
+        res.headers.get('content-type') ?? '',
+      )
     }
 
     return data as T
@@ -104,10 +98,11 @@ class ApiClient {
     const data = parseResponsePayload(await res.text())
 
     if (!res.ok) {
-      throw {
-        status: res.status,
-        ...(data && typeof data === 'object' ? data : { message: String(data ?? '') }),
-      }
+      throw buildApiResponseError(
+        res.status,
+        data,
+        res.headers.get('content-type') ?? '',
+      )
     }
 
     return data as T
@@ -166,10 +161,11 @@ class ApiClient {
           finish(() => resolve((xhr.status === 204 ? null : data) as T))
           return
         }
-        finish(() => reject({
-          status: xhr.status,
-          ...(data && typeof data === 'object' ? data : { message: String(data ?? '') }),
-        }))
+        finish(() => reject(buildApiResponseError(
+          xhr.status,
+          data,
+          xhr.getResponseHeader('content-type') ?? '',
+        )))
       }
 
       signal?.addEventListener('abort', abort, { once: true })

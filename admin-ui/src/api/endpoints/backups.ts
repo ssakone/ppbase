@@ -1,14 +1,10 @@
 import { apiClient, type UploadProgress } from '../client'
 import type {
-  BackupActivation,
-  BackupActivationStart,
   BackupIdentity,
   BackupInspection,
   BackupListItem,
   BackupReadiness,
-  BackupStagingPlan,
   BackupTrustEntry,
-  JwtSecretMode,
 } from '../types'
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -130,71 +126,15 @@ export function revokeBackupSigner(fingerprint: string): Promise<void> {
   )
 }
 
-export function createBackupStagingPlan(
-  id: string,
-  jwtSecretMode: JwtSecretMode,
-): Promise<BackupStagingPlan> {
-  return apiClient.request<BackupStagingPlan>(
+/**
+ * Destructively restore a backup into the active PostgreSQL database and local
+ * file storage, then let the server restart itself. The server validates the
+ * archive fully before mutating anything and returns 202 once the restore has
+ * committed and a restart has been scheduled.
+ */
+export function restoreBackupDestructive(id: string): Promise<Record<string, unknown>> {
+  return apiClient.request<Record<string, unknown>>(
     'POST',
-    `/api/backups/${encodeURIComponent(id)}/staging-plans`,
-    { jwtSecretMode },
+    `/api/backups/${encodeURIComponent(id)}/restore-destructive`,
   )
-}
-
-export function executeBackupStagingPlan(
-  planId: string,
-  planHash: string,
-): Promise<BackupStagingPlan> {
-  return apiClient.request<BackupStagingPlan>(
-    'POST',
-    `/api/backup-staging/${encodeURIComponent(planId)}/execute`,
-    { planHash },
-  )
-}
-
-export function inspectBackupStagingPlan(planId: string): Promise<BackupStagingPlan> {
-  return apiClient.request<BackupStagingPlan>(
-    'GET',
-    `/api/backup-staging/${encodeURIComponent(planId)}`,
-  )
-}
-
-export function abandonBackupStagingPlan(
-  planId: string,
-  planHash: string,
-): Promise<void> {
-  return apiClient.request<void>(
-    'POST',
-    `/api/backup-staging/${encodeURIComponent(planId)}/abandon`,
-    { planHash },
-  )
-}
-
-export function activateBackupStagingPlan(
-  planId: string,
-  planHash: string,
-  activationId: string,
-  resumeToken: string,
-): Promise<BackupActivationStart> {
-  return apiClient.request<BackupActivationStart>(
-    'POST',
-    `/api/backup-staging/${encodeURIComponent(planId)}/activate`,
-    { planHash, activationId, resumeToken },
-  )
-}
-
-export function getBackupActivation(
-  activationId: string,
-  resumeToken: string,
-): Promise<BackupActivation> {
-  return apiClient.request<BackupActivation>(
-    'GET',
-    `/api/backup-activations/${encodeURIComponent(activationId)}`,
-    undefined,
-    { headers: { 'X-PPBase-Activation-Token': resumeToken } },
-  )
-}
-
-export function restoreBackupSdkCompatible(id: string): Promise<void> {
-  return apiClient.request<void>('POST', `/api/backups/${encodeURIComponent(id)}/restore`)
 }

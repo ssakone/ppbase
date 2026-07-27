@@ -2,8 +2,20 @@
 
 PPBase exposes a signed PostgreSQL backup workflow in **Settings → Backups**.
 The browser experience follows PocketBase (create, ZIP download, ZIP upload,
-restore and delete), while restoration remains PostgreSQL-specific: PPBase
-always restores into a new database and a new data directory before activation.
+restore and delete). Restore is a **destructive in-place** operation: after the
+archive is fully verified, PPBase replaces the active database and local file
+storage with the backup's contents and restarts.
+
+Backup and restore run against `PPBASE_DATABASE_URL` with the same role that
+runs `serve`; `ppbase init postgres` is not required. The backup engine is
+native — it streams the live schema and data over the PostgreSQL wire protocol
+with `COPY` using the same asyncpg driver as the server. No `pg_dump`,
+`pg_restore` or `psql` binary is used or bundled at any point. Backup needs read
+access to `public`. Destructive restore additionally requires a superuser
+runtime or ownership of the active database and `public`, plus a reusable
+restart command recorded by `serve`. `backup doctor` reports these two readiness
+states separately. The onboarding command is optional (see
+[Optional hardening](#optional-hardening)).
 
 ## What the Dashboard can do
 
@@ -11,18 +23,13 @@ always restores into a new database and a new data directory before activation.
 - Download a standard `.zip` file.
 - Upload and inspect a PPBase ZIP from another server.
 - Quarantine an unknown Ed25519 signer and approve its exact public key.
-- Restore in disaster-recovery or clone mode.
-- Apply missing deployed migrations only to the staged database.
-- Validate PostgreSQL, files, migrations and JWT state.
-- Activate the validated target, restart PPBase and poll the health gate.
-- Roll back automatically to the previous database and data directory on
-  startup failure or health timeout.
+- Restore a verified backup destructively into the active target and restart.
 - Delete backups that are not currently in use.
 - Configure a five-field UTC cron and automatic-backup retention.
 
 ## Canonical storage and transport
 
-The canonical server-side representation remains an immutable backup set below
+The canonical server-side representation is an immutable backup set below
 `PPBASE_BACKUP_ROOT`. The browser receives a standard ZIP generated from that
 set. A ZIP contains at least:
 
@@ -30,210 +37,191 @@ set. A ZIP contains at least:
 manifest.json
 manifest.sig
 signer.pub
-resources/database.dump
+resources/database/schema.json
+resources/database/data.copy
 resources/files/...
 resources/secrets/jwt_secret
 ```
 
-The Ed25519 private key, trust store, staging plans, activation journal and
-PostgreSQL credentials are never exported. ZIP upload is streamed and bounded;
-ZIP Slip, duplicate members, special files, symlinks, compression bombs,
-unknown manifest versions, invalid signatures and checksum mismatches are
-rejected before publication.
+The database is captured as a native pair: `schema.json` records the managed
+`public` schema contract (`format_version = 2`, `contract_version = 1`,
+`system_schema_version = 1`, plus applied migration filenames and SHA-256
+hashes) and `data.copy` holds the streamed `COPY` payload. This is the only
+supported archive layout; restore accepts exactly this format version and
+rejects any other before touching the active target.
+
+The Ed25519 private key, trust store and PostgreSQL credentials are never
+exported. ZIP upload is received incrementally into bounded temporary storage
+before verification; allow temporary disk space for the transport ZIP in
+addition to the extracted backup set. ZIP Slip, duplicate members, special
+files, symlinks, compression bombs, unknown manifest versions, invalid
+signatures and checksum mismatches are rejected before publication.
 
 PocketBase SQLite archives containing `data.db` are not native PPBase backups.
-PPBase only requires PostgreSQL and matching `pg_dump`, `pg_restore`, and
-`psql` tools. Docker is optional tooling for local development and integration
-tests, not a runtime or backup/restore dependency.
+Because the backup engine speaks the PostgreSQL wire protocol directly with the
+same asyncpg driver as the server, no external PostgreSQL client binaries are
+required. Docker, root privileges and first-run downloads are not runtime or
+backup/restore dependencies.
 
-## Required deployment configuration
+## Creating a backup
 
-The Dashboard never receives or persists PostgreSQL credentials. Configure the
-following deployment secrets before using native backup and restore:
+Backup connects with the runtime role (`PPBASE_DATABASE_URL`). Both superuser and
+non-superuser roles are accepted; an elevated runtime role is reported with the
+non-blocking `runtime_superuser` warning and is never rejected or
+altered.
 
-| Variable | Purpose |
-|---|---|
-| `PPBASE_BACKUP_DUMP_DATABASE_URL` | Dedicated read-only source login used by `pg_dump`. |
-| `PPBASE_BACKUP_CREATOR_DATABASE_URL` | `CREATEDB` login connected to a maintenance database. |
-| `PPBASE_BACKUP_RESTORE_DATABASE_URL` | Non-`CREATEDB` login used by `pg_restore`. |
-| `PPBASE_BACKUP_TARGET_OWNER` | Dedicated `NOLOGIN` owner for restored objects. |
-| `PPBASE_BACKUP_TARGET_ROOT` | Durable `0700` root for isolated restored `data_dir` targets; must not overlap staging, backups or control-plane. |
-| `PPBASE_BACKUP_ALLOWED_EXTENSIONS` | Exact `name=version` allowlist; `plpgsql=1.0` is the default. |
+Default directories (`./pb_backups`, `./pb_backup_control`, and the temporary
+work area) are created automatically when missing. Creation checks that enough
+disk space is available for the native `COPY` export plus business files.
 
-Settings → Backups displays compact, non-secret readiness for creation,
-restore staging and restart. A ready deployment is summarized as
-`All set for backup & restore`; real blockers alone remain expanded, while
-secondary diagnostics are available under `Show details`. Readiness only
-confirms that deployment inputs are present; every operation performs the
-complete PostgreSQL privilege, endpoint, version, locale, extension and
-membership preflight again.
+Every local file referenced by PostgreSQL must exist below the active
+`<data_dir>/storage`. If a referenced file is missing or unsafe, creation stops
+with `backup_integrity_failed` (reporting the offending path), removes the
+partial set, and publishes no backup instead of an incomplete archive.
 
-An unprovisioned PostgreSQL cluster cannot be safely bootstrapped from an HTTP
-Dashboard without giving the web runtime a privileged cluster credential.
-PPBase deliberately does not do that. For a completely new project, initialize
-the database, runtime role, backup roles and safe default filesystem roots once
-from the host:
+PPBase application objects are confined to PostgreSQL's `public` schema. Native
+backups capture only `public`, and restore rejects an archive whose schema
+contract targets another application schema, or contains any unmanaged object,
+before any mutation. Schemas outside `public` are neither backed up nor
+replaced; do not store PPBase application state in them.
 
-```bash
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
-  ppbase init postgres --plan --name myapp --output-env ./ppbase.env
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
-  ppbase init postgres --execute --name myapp --output-env ./ppbase.env
+## Restoring a backup
+
+Restore is destructive and applies to the active database and local file
+storage. The Dashboard flow is:
+
+1. Select a backup (or upload one) and open the restore dialog.
+2. If the archive was signed by an unknown external Ed25519 identity, approve
+   that exact key. Restore stays blocked until the signer is trusted and the
+   integrity check passes.
+3. Retype the exact ZIP filename to confirm.
+4. Restore and restart.
+
+What the server does:
+
+1. **Verify everything first.** The archive's structure, checksums, signature,
+   signer trust and schema contract (format/contract/system-schema version plus
+   migration hashes) are validated before any mutation. An invalid or
+   version-mismatched archive is rejected and the active database is left
+   untouched.
+2. **Enter read-only maintenance.** A write barrier blocks application writes
+   for the duration of the restore.
+3. **Prepare restored files** in a temporary directory alongside the active
+   `data_dir`.
+4. **Swap local storage** and the project-local `.jwt_secret` into place while
+   retaining the previous files for immediate pre-commit recovery.
+5. **Replace the database atomically.** Public application objects are dropped
+   and rebuilt from `resources/database/schema.json`, then repopulated by
+   streaming `resources/database/data.copy` back in with `COPY`, in one
+   transaction that writes the restore commit marker.
+6. **Schedule the mandatory restart** through the memorized `serve` command
+   while the write fence and old files remain retained.
+7. **Recover on startup before hooks.** PPBase matches the database marker to
+   the signed file-reference inventory, finalizes the file swap, then performs
+   normal bootstrap and applies any newer migrations.
+
+Before the PostgreSQL commit, an error rolls back the database and puts the
+previous files back. After commit, an unexpected validation or restart failure
+stays fail-closed in maintenance mode; startup recovery must verify the matching
+signed inventory before it can discard the previous files. There is no durable
+user-selectable rollback after successful recovery — the restored target is the
+live target.
+
+## What restore replaces and what it preserves
+
+A native restore replaces the complete managed `public` database state,
+including `_superusers`, collection metadata, application migration history and
+records. A superuser created only on the target before restore therefore
+disappears; the superusers contained in the source archive become authoritative
+and retain their existing password hashes. After restart, sign in again with a
+source superuser. If the archive contains no usable superuser, run
+`ppbase create-admin` against the restored database.
+
+The archive also restores its signed JWT-secret resource to
+`data_dir/.jwt_secret`. When `PPBASE_JWT_SECRET` is unset, source sessions signed
+with that secret can remain valid and sessions from the replaced target do not.
+When `PPBASE_JWT_SECRET` is explicitly supplied by the deployment environment,
+that external value still takes precedence after restart; operators must manage
+and restore that external secret consistently if token continuity matters.
+
+`PPBASE_BACKUP_CONTROL_DIR` is deliberately not part of the archive. The target
+server keeps its own Ed25519 signing identity, trust approvals, operation locks
+and restore journal. Consequently, an archive imported from another server is
+`authenticated_untrusted` until a target superuser approves that exact external
+public key, but the target does not become the source server's signing identity.
+
+## Large ZIP uploads and intermediaries
+
+PPBase accepts native uploads up to `PPBASE_BACKUP_MAX_UPLOAD_BYTES` (20 GiB by
+default), but every HTTP intermediary must accept the same request. Reverse
+proxies, hosted tunnels and CDNs often impose much smaller body-size, buffering
+or idle-timeout limits. A transfer that stops around a fixed threshold before
+PPBase logs a completed request should be diagnosed at that intermediary first.
+
+For Nginx, configure an appropriate body limit and disable request buffering on
+the PPBase location, for example:
+
+```nginx
+client_max_body_size 2g;
+
+location / {
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_pass http://127.0.0.1:8090;
+}
 ```
 
-For a database and runtime role that already exist, provision only the backup
-contract. Pass the exact same application database and `data_dir` used by
-`serve`:
+For a one-off restore rehearsal, an SSH local forward bypasses the public proxy
+or tunnel while keeping PPBase bound to loopback:
 
 ```bash
-export PPBASE_DATABASE_URL='postgresql+asyncpg://runtime:...@db/myapp'
-export PPBASE_DATA_DIR='/var/lib/ppbase/pb_data'
-
-ppbase backup provision --plan \
-  --db "$PPBASE_DATABASE_URL" \
-  --dir "$PPBASE_DATA_DIR"
-
-PPBASE_BACKUP_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://bootstrap:...@db/postgres' \
-  ppbase backup provision --execute \
-  --db "$PPBASE_DATABASE_URL" \
-  --dir "$PPBASE_DATA_DIR" \
-  --output-env /etc/ppbase/backup.env
+ssh -N -L 18090:127.0.0.1:8090 deploy@server-address
 ```
 
-`backup provision` and `backup doctor` accept the same runtime target
-overrides as `serve`: `--db "$PPBASE_DATABASE_URL" --dir "$PPBASE_DATA_DIR"`.
-These options select the application database and data directory only;
-`backup provision --execute` still requires the separate ephemeral bootstrap
-credential and an explicit `--output-env` sink.
+Open `http://127.0.0.1:18090/_/` locally and upload through the Dashboard. `-N`
+starts no remote shell; `-L` maps local port `18090` through the encrypted SSH
+connection to PPBase's loopback port on the server. Closing the SSH command
+closes the forward.
 
-The bootstrap DSN is ephemeral and is never written to the output file, logs,
-Dashboard or activation journal. The output file is created exclusively with
-mode `0600` and contains only the dedicated limited credentials that must then
-be supplied through the deployment environment, a secret manager or that
-private file. Configure the service manager to load it on every start (for
-example, systemd `EnvironmentFile=/etc/ppbase/backup.env`) and restart PPBase;
-sourcing it in an unrelated shell does not update an already running process.
-Never commit this file. `--bootstrap-dsn-file` accepts a mode-`0600` file when
-an environment variable is unsuitable. Existing manually provisioned roles
-remain supported; unsafe name/attribute collisions are refused rather than
-repaired.
+## SDK-compatible endpoints
 
-After restart, validate the live process from an environment that also has the
-runtime database and backup variables:
+The HTTP surface mirrors PocketBase so existing tooling keeps working:
 
-```bash
-ppbase backup doctor \
-  --db "$PPBASE_DATABASE_URL" \
-  --dir "$PPBASE_DATA_DIR" \
-  --server http://127.0.0.1:8090
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/backups` | Create a signed backup. |
+| `POST` | `/api/backups/upload` | Upload and inspect a backup ZIP. |
+| `GET` | `/api/backups` | List backups. |
+| `GET` | `/api/backups/{id}` | Inspect (or download with a file token). |
+| `DELETE` | `/api/backups/{id}` | Delete a backup not in use. |
+| `POST` | `/api/backups/{id}/restore` | SDK-compatible restore. |
+| `POST` | `/api/backups/{id}/restore-destructive` | Destructive in-place restore (returns `202`). |
+
+## Control-plane filesystem
+
+`PPBASE_BACKUP_ROOT` (default `./pb_backups`) and
+`PPBASE_BACKUP_CONTROL_DIR` (default `./pb_backup_control`) are created on
+`serve` with the same directory policy as `PPBASE_DATA_DIR`: ownership and
+permissions follow the service user and its `umask`. Internal backup sets,
+identity material, trust state, operation locks and the in-flight restore
+journal keep their own restricted permissions; the Ed25519 private key remains
+mode `0600`.
+
+Keep these roots distinct and non-overlapping:
+
+```text
+PPBASE_BACKUP_ROOT          canonical immutable backup sets
+PPBASE_BACKUP_CONTROL_DIR   identity, trust, locks and the restore journal
+PPBASE_DATA_DIR             the active target (database files + storage)
 ```
 
-`--server` asks the live PPBase process whether activation restart is actually
-configured. Standalone doctor runs mark this check as SKIP/WARN and do not
-produce a false Not-ready result.
-
-For compatibility with an existing deployment, the application runtime may be
-a PostgreSQL superuser under any role name. PPBase never changes that role's
-name, password or attributes and reports the stable non-blocking warning
-`legacy_runtime_superuser`. Provisioning, doctor, backup, staging restore,
-activation and subsequent backups all use the same exception. The dump,
-creator, restore and target-owner roles remain subject to the strict limited
-contract below, and every unrelated contract violation remains blocking.
-
-The database and `data_dir` form one runtime target and must always match. In
-particular, every local file referenced by PostgreSQL must exist below the
-selected `<data_dir>/storage`. If the wrong directory is supplied or a file is
-missing/unsafe, creation stops with `backup_integrity_failed`, removes the
-partial set, and publishes no backup. Pointing PPBase at another directory is
-not a repair; restore or import the intended files into the matching target.
-
-Table and sequence read access is maintained with PostgreSQL default
-privileges. PostgreSQL does not expose equivalent default privileges for large
-objects, so onboarding grants all existing large objects explicitly and doctor
-requires the idempotent init/provision command to be rerun after a new large
-object is introduced.
-
-`provision --plan` uses only the runtime connection and a read-only repeatable
-read transaction. `provision --execute` takes a PostgreSQL advisory lock and is
-idempotent; it never drops a role or database and never rotates an existing
-password. The explicit `--local` mode is limited to loopback TCP/Unix sockets,
-prints a permanent development warning and is never selected automatically.
-
-### PostgreSQL role contract
-
-- Dump login: `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
-  NOBYPASSRLS`, `CONNECT`, schema `USAGE`, and read access to all dumped data.
-- Target owner: `NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
-  NOBYPASSRLS`.
-- Creator login: `LOGIN CREATEDB NOINHERIT`, with direct membership in the
-  target owner using `SET TRUE, ADMIN FALSE, INHERIT FALSE`.
-- Restore login: `LOGIN NOCREATEDB NOINHERIT`, with the same direct owner
-  membership.
-- Runtime login: distinct from the three roles above, with direct membership in
-  the target owner using `SET TRUE, ADMIN FALSE, INHERIT TRUE`. A legacy
-  superuser runtime is accepted with the `legacy_runtime_superuser` security
-  warning; PPBase does not normalize or rotate it.
-
-No backup role may have `pg_read_server_files`, `pg_write_server_files` or
-`pg_execute_server_program`. PPBase uses temporary `0600` passfiles and never
-places PostgreSQL passwords in child-process arguments.
-
-## A → B workflow
-
-1. On A, create the backup in Settings → Backups.
-2. Download the generated ZIP.
-3. On B, upload the ZIP. Its signature is verified immediately, but an unknown
-   signer remains quarantined.
-4. Inspect and explicitly approve A's Ed25519 fingerprint/public key on B.
-5. Select disaster recovery or clone.
-6. PPBase creates a sealed plan, a generated PostgreSQL database and an anchored
-   isolated `data_dir` below the durable target root. “Staging” is the logical
-   validation state, not a disposable filesystem location.
-7. It restores the dump and files, applies only missing deployed migrations,
-   and validates the complete target.
-8. Retype the ZIP filename to confirm activation.
-9. PPBase publishes the activation journal and restarts on the new targets.
-10. The Dashboard resumes polling with a short scoped token. Success is exposed
-    only after startup, migration, database identity, filesystem and JWT checks.
-
-The active database and active `data_dir` are not modified during staging.
-Activation keeps both previous targets for rollback; it does not drop or erase
-them after success. Restore never merges, upserts, or appends the archive into
-the active database/files. It prepares and validates an entire new target, then
-switches the database and `data_dir` together at activation.
-
-When PPBase is deployed from a source clone, build the Admin UI once after
-clone and rebuild it after frontend changes before restarting the service, so
-Settings → Backups serves the current Dashboard:
-
-```bash
-cd admin-ui
-npm ci
-npm run build
-```
-
-Installed wheels use their packaged Admin UI assets.
-
-## JWT modes
-
-- `disaster_recovery`: the signed JWT secret is restored and compatible
-  sessions remain valid.
-- `clone`: a new JWT secret is generated and auth-record/superuser token keys
-  and collection purpose-token secrets are rotated. Existing sessions and
-  purpose tokens become invalid, while accounts and password hashes remain.
-
-During activation the selected target always reads its private
-`data_dir/.jwt_secret`, even if the launching deployment normally supplies
-`PPBASE_JWT_SECRET`. Rollback starts as a fresh process and selects the previous
-deployment secret or previous project-local secret.
-
-## Restart and rollback contract
+## Restart contract
 
 `python -m ppbase serve` records a reusable argument vector in
 `PPBASE_RESTART_CMD`; the DSN is removed from that vector and supplied only in a
-scoped `PPBASE_DATABASE_URL` environment override. Activation also retargets
-`PPBASE_BACKUP_DUMP_DATABASE_URL`, so a successful restored server can create
-its next backup immediately with the same dedicated dump role.
+scoped `PPBASE_DATABASE_URL` environment override. After a successful restore,
+PPBase restarts through that command.
 
 - Local foreground and PPBase daemon modes use `os.execvpe`, preserving the
   process identity expected by a supervisor.
@@ -243,10 +231,11 @@ its next backup immediately with the same dedicated dump role.
   signals) and use an appropriate restart policy. Replacing only one process in
   a multi-worker deployment is unsupported.
 
-The restored process must reach its durable health commit within
-`PPBASE_BACKUP_ACTIVATION_HEALTH_TIMEOUT` (120 seconds by default). A daemon
-watchdog marks rollback intent and restarts the previous target if startup
-hangs. A thrown startup error follows the same rollback path immediately.
+Automatic restart is a restore prerequisite. If no reusable command is
+configured, the Dashboard blocks restore and the server rejects it before any
+mutation. `python -m ppbase serve` configures the command automatically. If
+restart scheduling or `exec` fails after the database commit, PPBase remains
+read-only until the process is restarted and startup recovery succeeds.
 
 ## Automatic backups
 
@@ -255,45 +244,52 @@ maximum number of automatic backups to retain. Empty cron disables automation;
 `cronMaxKeep=0` disables pruning. Automatic runs reuse the same signed engine,
 write barrier and cross-worker single-flight lock as manual runs.
 
-Native backup archives are canonical local sets in v1. Backup-specific S3
-archive storage is not implemented; PPBase does not present the business-file
-S3 backend as if it were a safe backup repository. Native v1 creation therefore
-requires the business-file backend to be local.
+Native backup archives are canonical local sets. Backup-specific S3 archive
+storage is not implemented; native creation requires the business-file backend
+to be local. When the configured storage backend is not local, the Dashboard
+blocks native create/restore and explains that external object storage is not
+captured.
 
-## Control-plane filesystem
+## Optional hardening
 
-Run PPBase as a dedicated non-root user. `PPBASE_BACKUP_CONTROL_DIR` must be a
-private `0700` directory owned by that user. Identity, trust, operation locks,
-plans and activation state are descriptor-anchored with `dir_fd` and
-`O_NOFOLLOW`; detachment or substitution fails closed.
+Backup and restore use `PPBASE_DATABASE_URL`; the command below is optional.
+`init postgres` creates a fresh database/runtime role and safe default
+filesystem roots. Its execute mode requires an ephemeral PostgreSQL superuser
+DSN; it is never persisted.
 
-Keep these roots distinct and non-overlapping:
+For a completely new project, initialize the database, runtime role and safe
+default filesystem roots once from the host:
 
-```text
-PPBASE_BACKUP_ROOT          canonical immutable sets
-PPBASE_BACKUP_CONTROL_DIR   identity, trust, plans and journals
-PPBASE_BACKUP_STAGING_ROOT  scratch and legacy recovery only
-PPBASE_BACKUP_TARGET_ROOT   durable isolated restore targets
-PPBASE_DATA_DIR             current active target
+```bash
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase init postgres --plan --name myapp --output-env ./ppbase.env
+PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
+  ppbase init postgres --execute --name myapp --output-env ./ppbase.env
 ```
 
-An active `data_dir` may be below `PPBASE_BACKUP_TARGET_ROOT` only when the
-activation journal proves the exact path and inode. Arbitrary children fail
-closed. Abandonment and retention do not delete durable targets.
+The mode-`0600` init output contains only `PPBASE_DATABASE_URL`. Because the
+native engine backs up and restores with the runtime role over the wire, no
+separate dump role or credential file is needed.
 
-### Bare-metal and legacy-layout recovery
+After restart, inspect the two independent readiness results from an environment
+that also has the runtime database variables. The command exits nonzero only
+when backup creation is blocked; `restoreReady` and the human summary identify
+restore-only ownership or restart blockers:
 
-Precreate the four backup roots as the dedicated PPBase user with mode `0700`,
-place canonical backups and targets on storage sized for the full PostgreSQL
-dump plus business files, and run `ppbase backup doctor` from the same service
-environment before starting PPBase.
+```bash
+ppbase backup doctor \
+  --db "$PPBASE_DATABASE_URL" \
+  --dir "$PPBASE_DATA_DIR" \
+  --server http://127.0.0.1:8090
+```
 
-Older activations may have an active target at
-`PPBASE_BACKUP_STAGING_ROOT/<plan-id>/data`. On the next stopped-process startup,
-PPBase verifies the journaled device/inode and performs an idempotent
-descriptor-anchored rename to `PPBASE_BACKUP_TARGET_ROOT/<plan-id>/data`, fsyncs
-both parents, then rewrites the activation restart paths. A crash after rename
-is reconciled by inode on the next startup. This legacy promotion requires the
-staging and target roots to be on the same filesystem; if they are not, stop
-PPBase, place `PPBASE_BACKUP_TARGET_ROOT` temporarily on that filesystem, start
-once to reconcile, and only then plan a separate operator-controlled move.
+When PPBase is deployed from a source clone, build the Admin UI once after clone
+and rebuild it after frontend changes before restarting the service:
+
+```bash
+cd admin-ui
+npm ci
+npm run build
+```
+
+Installed packages use their packaged Admin UI assets.

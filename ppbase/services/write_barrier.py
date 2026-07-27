@@ -85,10 +85,15 @@ def _process_cutover_is_fenced() -> bool:
         return _cutover_fence_count > 0
 
 
+def process_cutover_is_fenced() -> bool:
+    """Return whether this process is intentionally rejecting new mutations."""
+    return _process_cutover_is_fenced()
+
+
 def _reject_process_cutover_mutation() -> None:
     if _process_cutover_is_fenced():
         raise WriteBarrierError(
-            "DB/file mutations are fenced while backup activation replaces "
+            "DB/file mutations are fenced while destructive restore replaces "
             "the current PPBase process."
         )
 
@@ -146,8 +151,8 @@ class RetainedBackupWriteBarrier:
     where DB/file mutations could commit against the old runtime after the new
     target had already been published.  This explicitly retained form keeps
     the exclusive write barrier and migration lock on one connection until
-    either ``exec`` replaces the process or the durable activation rollback is
-    complete.
+    either ``exec`` replaces the process or startup recovery resolves the
+    destructive cutover.
 
     The guard is loop-affine because the SQLAlchemy async connection is.  It
     deliberately does not install a ContextVar lease: cutover code must not do

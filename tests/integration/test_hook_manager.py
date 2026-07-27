@@ -31,6 +31,12 @@ def _make_manager(hooks_dir: Path) -> tuple[HookManager, PPBase]:
     return mgr, pb
 
 
+def _load_startup_extensions(app: object) -> None:
+    loader = app.state.deferred_extension_loader  # type: ignore[attr-defined]
+    assert callable(loader)
+    loader()
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -393,6 +399,7 @@ def test_route_file_reload_after_materialization_is_restart_required(tmp_path: P
     )
     pb = PPBase(hooks_dir=str(tmp_path))
     app = pb.get_app()
+    _load_startup_extensions(app)
     hook_manager = getattr(app.state, "hook_manager", None)
     assert hook_manager is not None
 

@@ -48,8 +48,9 @@ def pg_url() -> Generator[str, None, None]:
 
     from testcontainers.postgres import PostgresContainer
 
+    image = os.environ.get("PPBASE_TEST_POSTGRES_IMAGE", "postgres:16-alpine")
     with PostgresContainer(
-        image="postgres:16-alpine",
+        image=image,
         username="pptest",
         password="pptest",
         dbname="pptest",

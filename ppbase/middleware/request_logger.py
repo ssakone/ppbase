@@ -26,7 +26,7 @@ _SKIP_PREFIXES = ("/_/", "/api/health", "/api/realtime")
 # Backup control and future transport endpoints must authenticate before any
 # request body is consumed. They are still logged, but never body-captured by
 # this outer middleware.
-_AUTH_BEFORE_BODY_PREFIXES = ("/api/backups", "/api/backup-staging")
+_AUTH_BEFORE_BODY_PREFIXES = ("/api/backups",)
 
 # Capture only small, text-like payloads to avoid large/binary blobs in logs.
 _MAX_CAPTURE_BYTES = 32 * 1024

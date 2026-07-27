@@ -1,4 +1,4 @@
-"""Superuser API for native backup, transport, restore, and activation."""
+"""Superuser API for native backup, transport, and destructive restore."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -21,7 +20,6 @@ from pydantic import (
     Field,
     ValidationError,
     field_validator,
-    model_validator,
 )
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,12 +28,6 @@ from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ppbase.api.deps import get_optional_auth, get_session, require_admin
-from ppbase.backup.activation import (
-    ActivationError,
-    BackupActivationStore,
-    settle_failed_activation_restart,
-)
-from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
 from ppbase.backup.service import (
     BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT,
     BACKUP_INSPECTION_MAX_RESOURCE_LIMIT,
@@ -47,10 +39,10 @@ from ppbase.backup.transport import (
     validate_backup_transport_filename,
 )
 from ppbase.db.engine import get_engine
-from ppbase.db.engine import get_async_session
 from ppbase.services.async_utils import to_thread_quiescent
 from ppbase.services.file_tokens import verify_file_token
 from ppbase.services.process_control import can_self_restart, schedule_process_restart
+from ppbase.services.write_barrier import process_cutover_is_fenced
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +101,7 @@ class _AppOwnedBackupRestoreCoordinator:
                     operation_lease=operation_lease,
                 )
                 runner = self._run(
+                    request.app,
                     service,
                     operation_context,
                     operation_lease,
@@ -138,6 +131,7 @@ class _AppOwnedBackupRestoreCoordinator:
 
     async def _run(
         self,
+        app: Any,
         service: NativeBackupService,
         operation_context: Any,
         operation_lease: Any,
@@ -146,6 +140,7 @@ class _AppOwnedBackupRestoreCoordinator:
         actor_id: str | None,
     ) -> None:
         operation_context_transferred = False
+        app.state.backup_maintenance = True
         try:
             prepared = await service.restore_local_backup(
                 backup_id,
@@ -155,32 +150,15 @@ class _AppOwnedBackupRestoreCoordinator:
             try:
                 cutover_guard = _prepared_cutover_guard(prepared)
             except BaseException:
-                try:
-                    service.abandon_prepared_activation(
-                        str(prepared.get("activationId", "")),
-                        error_code="activation_guard_missing",
-                    )
-                except BaseException:
-                    _FAILED_SDK_CUTOVER_CONTEXTS.append(operation_context)
-                    operation_context_transferred = True
-                    raise
                 raise
             try:
                 cutover_guard.retain_operation_context(operation_context)
             except BaseException:
-                try:
-                    service.abandon_prepared_activation(
-                        str(prepared.get("activationId", "")),
-                        error_code="activation_guard_transfer_failed",
-                    )
-                except BaseException:
-                    _FAILED_SDK_CUTOVER_CONTEXTS.append(operation_context)
-                    operation_context_transferred = True
-                    raise
-                await cutover_guard.close()
+                _FAILED_SDK_CUTOVER_CONTEXTS.append(operation_context)
+                operation_context_transferred = True
                 raise
             operation_context_transferred = True
-            await _schedule_backup_activation(service, prepared)
+            await _schedule_destructive_restore(prepared)
         except asyncio.CancelledError:
             raise
         except BackupServiceError as exc:
@@ -195,6 +173,8 @@ class _AppOwnedBackupRestoreCoordinator:
                     logger.exception(
                         "Failed to release the SDK restore operation lease"
                     )
+            if not process_cutover_is_fenced():
+                app.state.backup_maintenance = False
             service.close()
 
     def _task_done(self, task: asyncio.Task[None]) -> None:
@@ -257,11 +237,6 @@ router = APIRouter(
     tags=["backups"],
     lifespan=_backup_router_lifespan,
 )
-staging_router = APIRouter(prefix="/backup-staging", tags=["backup-staging"])
-activation_router = APIRouter(
-    prefix="/backup-activations",
-    tags=["backup-activations"],
-)
 
 
 class _PinnedBackupStreamingResponse(StreamingResponse):
@@ -278,10 +253,6 @@ class _PinnedBackupStreamingResponse(StreamingResponse):
             self._pinned.close()
 
 
-class StagingPlanCreateBody(BaseModel):
-    jwt_secret_mode: str = Field(alias="jwtSecretMode")
-
-    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class BackupCreateBody(BaseModel):
@@ -302,34 +273,6 @@ class BackupCreateBody(BaseModel):
             ) from exc
 
 
-class StagingExecuteBody(BaseModel):
-    plan_hash: str = Field(alias="planHash", min_length=64, max_length=64)
-
-
-class StagingActivateBody(StagingExecuteBody):
-    activation_id: str | None = Field(
-        default=None,
-        alias="activationId",
-        pattern=r"^[a-f0-9]{32}$",
-    )
-    resume_token: str | None = Field(
-        default=None,
-        alias="resumeToken",
-        min_length=32,
-        max_length=512,
-        pattern=r"^[A-Za-z0-9_-]+$",
-    )
-
-    @model_validator(mode="after")
-    def require_complete_resume_credentials(self) -> "StagingActivateBody":
-        if (self.activation_id is None) != (self.resume_token is None):
-            raise ValueError(
-                "activationId and resumeToken must either both be supplied or "
-                "both be omitted"
-            )
-        return self
-
-    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class BackupTrustApproveBody(BaseModel):
@@ -353,50 +296,23 @@ def _backup_readiness(
         getattr(settings, "storage_backend", "local") or "local"
     ).strip().lower()
     create_missing: list[str] = []
-    if not str(
-        getattr(settings, "backup_dump_database_url", "") or ""
-    ).strip():
-        create_missing.append("PPBASE_BACKUP_DUMP_DATABASE_URL")
     if storage_backend != "local":
         create_missing.append("local business-file storage backend")
 
-    restore_missing: list[str] = []
-    for attribute, label in (
-        (
-            "backup_creator_database_url",
-            "PPBASE_BACKUP_CREATOR_DATABASE_URL",
-        ),
-        (
-            "backup_restore_database_url",
-            "PPBASE_BACKUP_RESTORE_DATABASE_URL",
-        ),
-        ("backup_target_owner", "PPBASE_BACKUP_TARGET_OWNER"),
-    ):
-        if not str(getattr(settings, attribute, "") or "").strip():
-            restore_missing.append(label)
+    restore_missing: list[str] = [] if storage_backend == "local" else [
+        "local business-file storage backend"
+    ]
 
     restart_ready = can_self_restart()
-    tool_missing = [
-        label
-        for attribute, label in (
-            ("backup_pg_dump_path", "pg_dump"),
-            ("backup_pg_restore_path", "pg_restore"),
-            ("backup_psql_path", "psql"),
-        )
-        if shutil.which(str(getattr(settings, attribute, "") or "")) is None
-    ]
+    if not restart_ready:
+        restore_missing.append("PPBASE_RESTART_CMD")
     storage_missing = [] if storage_backend == "local" else [
         "local business-file storage backend"
     ]
-    staging_value = str(getattr(settings, "backup_staging_root", "") or "")
-    target_value = str(
-        getattr(settings, "backup_target_root", "") or f"{staging_value}_targets"
-    )
     control_missing: list[str] = []
     for value, label in (
+        (getattr(settings, "backup_root", ""), "PPBASE_BACKUP_ROOT"),
         (getattr(settings, "backup_control_dir", ""), "PPBASE_BACKUP_CONTROL_DIR"),
-        (staging_value, "PPBASE_BACKUP_STAGING_ROOT"),
-        (target_value, "PPBASE_BACKUP_TARGET_ROOT"),
     ):
         path = Path(str(value)).expanduser()
         if path.exists() and (not path.is_dir() or path.is_symlink()):
@@ -410,13 +326,9 @@ def _backup_readiness(
             "configured": not restore_missing,
             "missing": restore_missing,
         },
-        "activation": {
+        "restart": {
             "configured": restart_ready,
             "missing": [] if restart_ready else ["PPBASE_RESTART_CMD"],
-        },
-        "postgresqlTools": {
-            "configured": not tool_missing,
-            "missing": tool_missing,
         },
         "storage": {
             "configured": not storage_missing,
@@ -429,9 +341,9 @@ def _backup_readiness(
         "storageBackend": storage_backend,
         "warnings": list(warnings or []),
         "onboarding": {
-            "recommended": "production",
-            "productionCommand": "ppbase backup provision --plan",
-            "localCommand": "ppbase backup provision --plan --local",
+            "recommended": "automatic",
+            "productionCommand": "ppbase backup doctor",
+            "localCommand": "ppbase backup doctor",
             "doctorCommand": "ppbase backup doctor",
         },
     }
@@ -450,13 +362,19 @@ async def _runtime_readiness_warnings(
             )
         )
     )
-    if not is_superuser:
-        return []
+    if is_superuser:
+        return [
+            {
+                "code": "runtime_superuser",
+                "name": "runtime_role",
+                "detail": "Backup and restore use the active PostgreSQL superuser runtime.",
+            }
+        ]
     return [
         {
-            "code": "legacy_runtime_superuser",
+            "code": "runtime_database_role",
             "name": "runtime_role",
-            "detail": "PostgreSQL superuser runtime",
+            "detail": "Backup and restore use PPBASE_DATABASE_URL by default.",
         }
     ]
 
@@ -523,14 +441,6 @@ def _raise_backup_error(exc: BackupServiceError) -> None:
     ) from exc
 
 
-async def _require_activation_admin(request: Request) -> dict[str, Any]:
-    """Authenticate an admin only after a scoped resume token was rejected."""
-    async for session in get_async_session():
-        auth = await get_optional_auth(request, session)
-        admin = await require_admin(auth)
-        await session.rollback()
-        return admin
-    raise HTTPException(status_code=503, detail="Database session unavailable")
 
 
 def _prepared_cutover_guard(prepared: dict[str, Any]) -> Any:
@@ -545,88 +455,43 @@ def _prepared_cutover_guard(prepared: dict[str, Any]) -> Any:
     ):
         raise BackupServiceError(
             500,
-            "backup_activation_guard_missing",
-            "The accepted activation did not retain its cutover guards.",
+            "backup_restore_guard_missing",
+            "The accepted destructive restore did not retain its cutover guards.",
         )
     return guard
 
 
-async def _schedule_backup_activation(
-    service: NativeBackupService,
-    prepared: dict[str, Any],
-) -> None:
-    activation_id = str(prepared.get("activationId", ""))
+async def _schedule_destructive_restore(prepared: dict[str, Any]) -> None:
+    """Restart the unchanged serve command while retaining the write fence."""
     cutover_guard = _prepared_cutover_guard(prepared)
-    control_root = getattr(service, "control_root", None)
-    control_dir = getattr(control_root, "path", None)
 
-    def persist_exec_failure(_exc: BaseException) -> None:
-        if control_dir is None:
-            logger.critical(
-                "Accepted backup activation restart failed without a durable control path"
-            )
-            return
-        try:
-            settle_failed_activation_restart(
-                control_dir,
-                activation_id,
-                error_code="restart_exec_failed",
-            )
-        except Exception:
-            logger.exception(
-                "Failed to persist the backup activation restart failure"
-            )
-            # Fail closed: releasing the guards without a durable rollback
-            # would reopen mutations while the target remains selected.
-            raise
-        try:
-            cutover_guard.close_from_restart_thread()
-        except Exception:
-            logger.exception(
-                "Failed to release cutover guards after durable exec rollback"
-            )
-            raise
+    def fail_closed_after_exec_error(exc: BaseException) -> None:
+        logger.critical(
+            "Destructive restore committed, but PPBase could not exec its saved "
+            "serve command; restart PPBase manually to complete recovery",
+            exc_info=exc,
+        )
+        # Raising tells process_control not to clear its restart state. The
+        # cutover guard intentionally remains self-retained and read-only.
+        raise RuntimeError("destructive restore restart failed closed") from exc
 
-    async def abandon_and_release(*, error_code: str) -> None:
-        # The journal transition is the commit point for reopening writes.
-        # If it cannot be persisted, the self-retained guard stays fail-closed.
-        service.abandon_prepared_activation(
-            activation_id,
-            error_code=error_code,
-        )
-        await cutover_guard.close()
-
-    try:
-        command, env_overrides = service.get_activation_restart_spec(
-            activation_id
-        )
-        scheduled = schedule_process_restart(
-            "Activating a validated native backup restore target",
-            delay_seconds=1.0,
-            command=command,
-            env_overrides=env_overrides,
-            on_failure=persist_exec_failure,
-            reservation=cutover_guard.restart_reservation,
-            before_exec=cutover_guard.verify_from_restart_thread,
-        )
-    except BackupServiceError:
-        await abandon_and_release(error_code="restart_schedule_failed")
-        raise
-    except Exception as exc:
-        await abandon_and_release(error_code="restart_schedule_failed")
-        raise BackupServiceError(
-            500,
-            "backup_activation_restart_failed",
-            "The activation was cleared because restart scheduling failed.",
-        ) from exc
+    scheduled = schedule_process_restart(
+        "Destructive native backup restore completed",
+        delay_seconds=1.0,
+        on_failure=fail_closed_after_exec_error,
+        reservation=cutover_guard.restart_reservation,
+        before_exec=cutover_guard.verify_from_restart_thread,
+    )
     if scheduled:
         return
-    await abandon_and_release(error_code="restart_schedule_rejected")
     raise BackupServiceError(
-        409,
-        "backup_activation_restart_rejected",
-        "The activation was cleared because PPBase could not schedule its restart.",
+        503,
+        "backup_restore_restart_rejected",
+        "The database restore committed, but automatic restart could not be scheduled. "
+        "PPBase remains in maintenance mode until it is restarted manually.",
     )
+
+
 
 
 def _upload_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -1048,27 +913,6 @@ async def delete_local_backup(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/{backup_id}/staging-plans", status_code=status.HTTP_201_CREATED)
-async def create_staging_plan(
-    backup_id: str,
-    request: Request,
-    admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
-    payload = await _read_control_json(request)
-    body = _validate_body(StagingPlanCreateBody, payload)
-    if not isinstance(body, StagingPlanCreateBody):  # pragma: no cover
-        raise RuntimeError("Invalid staging plan model")
-    try:
-        with _service(request) as service:
-            return await service.create_staging_plan(
-                backup_id,
-                jwt_secret_mode=body.jwt_secret_mode,
-                actor_id=_actor_id(admin),
-            )
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-
-
 @router.post("/{backup_id}/restore", status_code=status.HTTP_204_NO_CONTENT)
 async def restore_local_backup_sdk_compatible(
     backup_id: str,
@@ -1087,151 +931,51 @@ async def restore_local_backup_sdk_compatible(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@staging_router.get("/{plan_id}")
-async def inspect_staging_plan(
-    plan_id: str,
-    request: Request,
-    _admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
-    try:
-        with _service(request) as service:
-            return service.inspect_staging_plan(plan_id)
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-
-
-@staging_router.post(
-    "/{plan_id}/abandon",
-    status_code=status.HTTP_204_NO_CONTENT,
+@router.post(
+    "/{backup_id}/restore-destructive",
+    status_code=status.HTTP_202_ACCEPTED,
 )
-async def abandon_staging_plan(
-    plan_id: str,
-    request: Request,
-    admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> Response:
-    payload = await _read_control_json(request)
-    body = _validate_body(StagingExecuteBody, payload)
-    if not isinstance(body, StagingExecuteBody):  # pragma: no cover
-        raise RuntimeError("Invalid staging abandonment model")
-    try:
-        with _service(request) as service:
-            await service.abandon_staging_plan(
-                plan_id,
-                expected_plan_hash=body.plan_hash,
-                actor_id=_actor_id(admin),
-            )
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@staging_router.post("/{plan_id}/execute")
-async def execute_staging_plan(
-    plan_id: str,
-    request: Request,
-    _admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
-    payload = await _read_control_json(request)
-    body = _validate_body(StagingExecuteBody, payload)
-    if not isinstance(body, StagingExecuteBody):  # pragma: no cover
-        raise RuntimeError("Invalid staging execute model")
-    try:
-        with _service(request) as service:
-            return await service.execute_staging_plan(
-                plan_id,
-                expected_plan_hash=body.plan_hash,
-            )
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-
-
-@staging_router.post("/{plan_id}/activate", status_code=status.HTTP_202_ACCEPTED)
-async def activate_staging_plan(
-    plan_id: str,
+async def restore_local_backup_destructive(
+    backup_id: str,
     request: Request,
     admin: dict[str, Any] = Depends(_require_backup_admin),
 ) -> dict[str, Any]:
-    payload = await _read_control_json(request)
-    body = _validate_body(StagingActivateBody, payload)
-    if not isinstance(body, StagingActivateBody):  # pragma: no cover
-        raise RuntimeError("Invalid staging activation model")
+    """Validate, restore, and schedule restart with actionable API errors."""
+    service: NativeBackupService | None = None
+    operation_context: Any = None
+    operation_entered = False
+    operation_transferred = False
+    request.app.state.backup_maintenance = True
     try:
-        with _service(request) as service:
-            prepared = await service.activate_staging_plan(
-                plan_id,
-                expected_plan_hash=body.plan_hash,
-                actor_id=_actor_id(admin),
-                activation_id=body.activation_id,
-                resume_token=body.resume_token,
-            )
-            await _schedule_backup_activation(service, prepared)
-            return prepared
+        service = _service(request)
+        operation_context = service.mutation_operation()
+        operation_lease = operation_context.__enter__()
+        operation_entered = True
+        resolved_backup_id = await service.resolve_restore_reference(
+            backup_id,
+            operation_lease=operation_lease,
+        )
+        prepared = await service.restore_local_backup(
+            resolved_backup_id,
+            actor_id=_actor_id(admin),
+            operation_lease=operation_lease,
+        )
+        cutover_guard = _prepared_cutover_guard(prepared)
+        cutover_guard.retain_operation_context(operation_context)
+        operation_transferred = True
+        await _schedule_destructive_restore(prepared)
+        return dict(prepared)
     except BackupServiceError as exc:
         _raise_backup_error(exc)
-
-
-@activation_router.get("/{activation_id}")
-async def inspect_backup_activation(
-    activation_id: str,
-    request: Request,
-) -> dict[str, Any]:
-    """Poll restart/rollback with either admin auth or a scoped resume token."""
-    resume_token = str(
-        request.headers.get("X-PPBase-Activation-Token", "") or ""
-    ).strip()
-    if len(resume_token) > 512:
-        resume_token = ""
-    control_root: ControlPlaneRoot | None = None
-    store: BackupActivationStore | None = None
-    try:
-        control_path = Path(
-            str(request.app.state.settings.backup_control_dir)
-        ).expanduser()
-        if not control_path.is_absolute():
-            control_path = Path(os.path.abspath(os.fspath(control_path)))
-        control_root = ControlPlaneRoot.open(control_path, create_missing=False)
-        store = BackupActivationStore(control_root)
-        state = (
-            store.authenticate_state(activation_id, resume_token)
-            if resume_token
-            else None
-        )
-        if state is None:
-            await _require_activation_admin(request)
-            state = store.inspect(activation_id)
-        return store.public_payload(state)
-    except ActivationError as exc:
-        control_detached = "detached or substituted" in str(exc)
-        if control_root is not None and not control_detached:
-            try:
-                control_root.verify_attached()
-            except ControlPlaneSafetyError:
-                control_detached = True
-        if control_detached:
-            _raise_backup_error(
-                BackupServiceError(
-                    500,
-                    "backup_control_invalid",
-                    "The native backup activation control plane is missing or unsafe.",
-                )
-            )
-        _raise_backup_error(
-            BackupServiceError(
-                404,
-                "backup_activation_not_found",
-                "The requested backup activation was not found or is invalid.",
-            )
-        )
-    except (ControlPlaneSafetyError, OSError) as exc:
-        _raise_backup_error(
-            BackupServiceError(
-                500,
-                "backup_control_invalid",
-                "The native backup activation control plane is missing or unsafe.",
-            )
-        )
     finally:
-        if store is not None:
-            store.close()
-        if control_root is not None:
-            control_root.close()
+        if operation_entered and not operation_transferred:
+            try:
+                operation_context.__exit__(None, None, None)
+            except Exception:
+                logger.exception(
+                    "Failed to release a destructive restore operation lease"
+                )
+        if not process_cutover_is_fenced():
+            request.app.state.backup_maintenance = False
+        if service is not None:
+            service.close()

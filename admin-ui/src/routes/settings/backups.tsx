@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArchiveRestore,
-  CheckCircle2,
   Clock3,
   Download,
   Eye,
@@ -21,7 +20,6 @@ import type { UploadProgress } from '@/api/client'
 import type {
   BackupInspection,
   BackupListItem,
-  BackupStagingPlan,
   BackupTrustEntry,
 } from '@/api/types'
 import {
@@ -30,15 +28,12 @@ import {
   getBackupErrorMessage,
 } from '@/api/endpoints/backups'
 import {
-  useAbandonBackupStagingPlan,
   useApproveBackupSigner,
   useBackup,
-  useBackupActivation,
   useBackupIdentity,
   useBackupReadiness,
   useBackups,
   useBackupTrust,
-  useBackupStagingPlan,
   useCreateBackup,
   useDeleteBackup,
   useRevokeBackupSigner,
@@ -52,19 +47,8 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyState } from '@/components/empty-state'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { BackupRestoreWizard } from '@/components/backups/backup-restore-wizard'
-import {
-  activationBlocksBackupOperations,
-  activationShouldClearResume,
-  activationStatusMatchesResume,
-  isCanonicalStagingStatus,
-  readActivationResume,
-  readStagingResume,
-  saveActivationResume,
-  saveStagingResume,
-  type ActivationResumeState,
-  type StagingResumeState,
-} from '@/lib/backup-resume-state'
 import { buildBackupReadinessView } from '@/lib/backup-readiness-view'
+import { isBackupTrusted } from '@/lib/backup-trust'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -113,25 +97,8 @@ function displayFilename(backup: BackupListItem): string {
 }
 
 function isUntrusted(backup?: BackupListItem | BackupInspection): boolean {
-  return ['authenticated_untrusted', 'unknown', 'revoked', 'invalid'].includes(
-    backup?.trustStatus || '',
-  )
-}
-
-function errorStatus(error: unknown): number | null {
-  if (!error || typeof error !== 'object') return null
-  const status = (error as { status?: unknown }).status
-  return typeof status === 'number' ? status : null
-}
-
-function stagingPlanMatchesResume(
-  plan: BackupStagingPlan,
-  resume: StagingResumeState,
-): boolean {
-  return plan.id === resume.planId
-    && plan.planHash === resume.planHash
-    && plan.backupId === resume.backupId
-    && plan.jwtSecretMode === resume.mode
+  return backup !== undefined
+    && !isBackupTrusted(backup.trustStatus, backup.authenticated)
 }
 
 function StatusBadge({ backup }: { backup: BackupListItem }) {
@@ -341,12 +308,14 @@ function BackupDetailsDialog({
   id,
   open,
   operationsDisabled,
+  restoreDisabled,
   onOpenChange,
   onRestore,
 }: {
   id: string | null
   open: boolean
   operationsDisabled: boolean
+  restoreDisabled: boolean
   onOpenChange: (open: boolean) => void
   onRestore: (backup: BackupInspection) => void
 }) {
@@ -379,7 +348,7 @@ function BackupDetailsDialog({
         fingerprintSha256: data.signerFingerprintSha256,
       })
       await refetch()
-      toast.success('Signer approved. Restore staging is now available.')
+      toast.success('Signer approved. Restore is now available.')
     } catch (err) {
       setError(getBackupErrorMessage(err, 'The signer could not be approved.'))
     }
@@ -487,7 +456,12 @@ function BackupDetailsDialog({
           {data && (
             <Button
               onClick={() => onRestore(data)}
-              disabled={operationsDisabled || isUntrusted(data) || data.integrityStatus === 'invalid'}
+              disabled={
+                operationsDisabled
+                || restoreDisabled
+                || isUntrusted(data)
+                || data.integrityStatus === 'invalid'
+              }
             >
               <RotateCcw className="h-4 w-4" />Restore
             </Button>
@@ -495,152 +469,6 @@ function BackupDetailsDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  )
-}
-
-const ACTIVATION_PHASES = [
-  'activating',
-  'restarting',
-  'health_check',
-  'rolling_back',
-  'rollback_restart',
-  'rollback_health_check',
-]
-
-function activationPhaseLabel(value?: string) {
-  const labels: Record<string, string> = {
-    queued: 'Queued',
-    activating: 'Switching targets',
-    restarting: 'Restarting PPBase',
-    health_check: 'Running health check',
-    rolling_back: 'Restoring previous targets',
-    rollback_restart: 'Restarting after rollback',
-    rollback_health_check: 'Validating rollback',
-    succeeded: 'Activation succeeded',
-    rolled_back: 'Rollback succeeded',
-    failed: 'Activation failed',
-    action_required: 'Operator action required',
-  }
-  return labels[value || ''] || (value || 'Waiting for status').replace(/_/g, ' ')
-}
-
-function activationIsTerminal(status?: string) {
-  return ['succeeded', 'rolled_back', 'failed', 'action_required'].includes(status || '')
-}
-
-function ActivationMonitor({
-  resume,
-  resumePersisted,
-  onAccepted,
-  onClear,
-}: {
-  resume: ActivationResumeState
-  resumePersisted: boolean
-  onAccepted: () => void
-  onClear: () => void
-}) {
-  const { logout } = useAuth()
-  const handledTerminal = useRef(false)
-  const { data, error, isError, isFetching, refetch } = useBackupActivation(
-    resume.activationId,
-    resume.resumeToken,
-  )
-  const responseMatches = !!data && activationStatusMatchesResume(data, resume)
-  const activationMissing = isError && errorStatus(error) === 404
-  const status = responseMatches ? data.status : undefined
-  const phase = responseMatches ? data.phase || status : undefined
-  const displayedPhase = activationIsTerminal(status) ? status : phase
-
-  useEffect(() => {
-    if (responseMatches) onAccepted()
-  }, [onAccepted, responseMatches])
-
-  useEffect(() => {
-    if (!activationShouldClearResume(status) || handledTerminal.current) return
-    handledTerminal.current = true
-    saveActivationResume(null)
-    if (status !== 'succeeded') return
-    toast.success('Backup activation completed and passed its health check.')
-    if (resume.mode === 'clone') {
-      logout()
-      return
-    }
-    window.setTimeout(() => window.location.reload(), 1200)
-  }, [logout, resume.mode, status])
-
-  const currentIndex = ACTIVATION_PHASES.indexOf(phase || '')
-  const rolledBack = status === 'rolled_back'
-  const failed = status === 'failed' || status === 'action_required'
-
-  return (
-    <div className={`rounded-xl border p-4 ${
-      status === 'succeeded' ? 'border-emerald-200 bg-emerald-50'
-        : rolledBack ? 'border-amber-200 bg-amber-50'
-          : failed ? 'border-red-200 bg-red-50' : 'border-indigo-200 bg-indigo-50'
-    }`}>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="flex items-center gap-2 font-semibold">
-            {status === 'succeeded' ? <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-              : failed ? <ShieldAlert className="h-5 w-5 text-red-600" />
-                : <RefreshCw className={`h-5 w-5 text-indigo-600 ${activationIsTerminal(status) ? '' : 'animate-spin'}`} />}
-            {data && !responseMatches
-              ? 'Activation response mismatch'
-              : activationPhaseLabel(displayedPhase)}
-          </div>
-          <p className="mt-1 text-sm text-slate-600">
-            {data && !responseMatches
-              ? 'The returned activation does not match the saved browser intent. Operations remain blocked.'
-              : data?.message || `Restoring ${resume.filename} in ${resume.mode === 'clone' ? 'clone' : 'disaster recovery'} mode.`}
-          </p>
-          <p className="mt-1 font-mono text-xs text-slate-500">Activation {resume.activationId}</p>
-          {!resumePersisted && (
-            <p className="mt-2 rounded bg-amber-100 px-2 py-1.5 text-xs text-amber-900">
-              This browser denied session storage. Keep this page open: reloading cannot resume activation tracking.
-            </p>
-          )}
-        </div>
-        <div className="flex gap-2">
-          {isError && (
-            <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
-              Retry status
-            </Button>
-          )}
-          {((activationMissing && !isFetching)
-            || (activationIsTerminal(status) && status !== 'succeeded')) && (
-            <Button size="sm" variant="outline" onClick={onClear}>Dismiss</Button>
-          )}
-        </div>
-      </div>
-      {!activationIsTerminal(status) && (
-        <div className="mt-4 grid grid-cols-3 gap-1 sm:grid-cols-6">
-          {ACTIVATION_PHASES.map((item, index) => (
-            <div key={item} className="text-center">
-              <div className={`mx-auto mb-1 h-1.5 rounded-full ${index <= currentIndex ? 'bg-indigo-600' : 'bg-slate-200'}`} />
-              <span className="text-[10px] text-slate-500">{activationPhaseLabel(item)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {responseMatches && data.actionRequired && <p className="mt-3 rounded bg-white p-2 text-sm text-red-700">{data.actionRequired}</p>}
-      {responseMatches && (data.errorCode || data.failureCode) && (
-        <p className="mt-3 rounded bg-white p-2 font-mono text-xs text-red-700">
-          Failure code: {data.errorCode || data.failureCode}
-        </p>
-      )}
-      {activationMissing && !data ? (
-        <p className="mt-3 text-sm text-slate-600">
-          No canonical activation exists for this intent. Dismiss it to return to the retained staging plan.
-        </p>
-      ) : isError && !data && (
-        <p className="mt-3 text-sm text-red-700">
-          {getBackupErrorMessage(
-            error,
-            'PPBase may be restarting. Status polling will continue with the scoped activation token.',
-          )}
-        </p>
-      )}
-    </div>
   )
 }
 
@@ -771,13 +599,13 @@ function BackupAutomationCard({ disabled }: { disabled: boolean }) {
 }
 
 export function BackupsPage() {
+  const { logout } = useAuth()
   const { data: backups = [], isLoading, isError, error: backupsError, refetch } = useBackups()
   const { data: identity, error: identityError } = useBackupIdentity()
   const { data: readiness, error: readinessError } = useBackupReadiness()
   const { data: trustEntries = [] } = useBackupTrust()
   const deleteBackup = useDeleteBackup()
   const revokeSigner = useRevokeBackupSigner()
-  const abandonStagingPlan = useAbandonBackupStagingPlan()
 
   const [createOpen, setCreateOpen] = useState(false)
   const [uploadOpen, setUploadOpen] = useState(false)
@@ -786,55 +614,39 @@ export function BackupsPage() {
   const [deleteTarget, setDeleteTarget] = useState<BackupListItem | null>(null)
   const [revokeTarget, setRevokeTarget] = useState<BackupTrustEntry | null>(null)
   const [downloadingId, setDownloadingId] = useState<string | null>(null)
-  const [activationResume, setActivationResume] = useState<ActivationResumeState | null>(readActivationResume)
-  const [activationResumePersisted, setActivationResumePersisted] = useState(true)
-  const [stagingResume, setStagingResume] = useState<StagingResumeState | null>(readStagingResume)
-  const [stagingResumePersisted, setStagingResumePersisted] = useState(true)
-  const abandonedPlanNoticeRef = useRef<string | null>(null)
-  const stagingPlanQuery = useBackupStagingPlan(stagingResume?.planId)
-  const activationQuery = useBackupActivation(
-    activationResume?.activationId,
-    activationResume?.resumeToken,
-  )
+  const [restoringFilename, setRestoringFilename] = useState<string | null>(null)
 
-  const activationResponseMatches = !!activationResume
-    && !!activationQuery.data
-    && activationStatusMatchesResume(activationQuery.data, activationResume)
-  const activationBlocksOperations = activationBlocksBackupOperations(
-    activationResume,
-    activationResponseMatches ? activationQuery.data : undefined,
-  )
   const readinessView = useMemo(
     () => readiness ? buildBackupReadinessView(readiness) : null,
     [readiness],
   )
-  const canonicalStagingPlan = stagingResume
-    && stagingPlanQuery.data
-    && stagingPlanMatchesResume(stagingPlanQuery.data, stagingResume)
-    ? stagingPlanQuery.data
-    : null
-  const stagingStatus = isCanonicalStagingStatus(canonicalStagingPlan?.status)
-    ? canonicalStagingPlan.status
-    : null
+
+  // Once a destructive restore is accepted (HTTP 202), the database has already
+  // been replaced and PPBase is restarting. Lock the page and reload into a
+  // fresh session shortly after.
+  const restoring = restoringFilename !== null
+  const operationsDisabled = restoring
+  const createBlocked = readinessView?.createReady === false
+  const restoreBlocked = readinessView?.restoreReady === false
+  const createDisabled = operationsDisabled || createBlocked
+
+  const handleRestoreStarted = (filename: string) => {
+    setRestoringFilename(filename)
+    toast.success('Restore committed. PPBase is restarting to finish applying it.')
+    window.setTimeout(() => {
+      logout()
+      window.location.reload()
+    }, 6000)
+  }
 
   const sortedBackups = useMemo(() => [...backups].sort((a, b) => {
     const left = new Date(a.modified || a.createdAt || 0).getTime()
     const right = new Date(b.modified || b.createdAt || 0).getTime()
     return right - left
   }), [backups])
-  const stagedBackup = useMemo(
-    () => stagingResume
-      ? backups.find((backup) => backupKey(backup) === stagingResume.backupId) || {
-        id: stagingResume.backupId,
-        key: stagingResume.backupId,
-        filename: stagingResume.filename,
-      }
-      : null,
-    [backups, stagingResume],
-  )
 
   const startDownload = async (backup: BackupListItem) => {
-    if (activationBlocksOperations) return
+    if (operationsDisabled) return
     const id = backupKey(backup)
     setDownloadingId(id)
     try {
@@ -847,7 +659,7 @@ export function BackupsPage() {
   }
 
   const confirmDelete = async () => {
-    if (!deleteTarget || activationBlocksOperations) return
+    if (!deleteTarget || operationsDisabled) return
     try {
       await deleteBackup.mutateAsync(backupKey(deleteTarget))
       toast.success(`${displayFilename(deleteTarget)} deleted.`)
@@ -858,7 +670,7 @@ export function BackupsPage() {
   }
 
   const confirmRevoke = async () => {
-    if (!revokeTarget || activationBlocksOperations) return
+    if (!revokeTarget || operationsDisabled) return
     try {
       await revokeSigner.mutateAsync(revokeTarget.fingerprintSha256)
       toast.success('Backup signer trust revoked.')
@@ -868,77 +680,30 @@ export function BackupsPage() {
     }
   }
 
-  const stagingResumeChanged = useCallback((state: StagingResumeState | null) => {
-    const persisted = saveStagingResume(state)
-    setStagingResume(state)
-    setStagingResumePersisted(state ? persisted : true)
-    return persisted
-  }, [])
-
-  const activationResumeChanged = useCallback((state: ActivationResumeState | null) => {
-    const persisted = saveActivationResume(state)
-    setActivationResume(state)
-    setActivationResumePersisted(state ? persisted : true)
-    return persisted
-  }, [])
-
-  const activationAccepted = useCallback(() => {
-    saveStagingResume(null)
-    setStagingResume(null)
-    setStagingResumePersisted(true)
-  }, [])
-
-  useEffect(() => {
-    if (!stagingResume || stagingStatus !== 'abandoned') return
-    if (abandonedPlanNoticeRef.current === stagingResume.planId) return
-    abandonedPlanNoticeRef.current = stagingResume.planId
-    stagingResumeChanged(null)
-    toast.info('The saved restore staging plan was already abandoned on the server and was cleared locally.')
-  }, [stagingResume, stagingResumeChanged, stagingStatus])
-
-  const abandonSavedStaging = async () => {
-    if (!stagingResume || stagingStatus === 'running' || abandonStagingPlan.isPending) return
-    try {
-      await abandonStagingPlan.mutateAsync({
-        planId: stagingResume.planId,
-        planHash: stagingResume.planHash,
-      })
-    } catch (err) {
-      if (!err || typeof err !== 'object' || (err as { status?: unknown }).status !== 404) {
-        toast.error(getBackupErrorMessage(err, 'The staging plan could not be abandoned safely.'))
-        return
-      }
-    }
-    stagingResumeChanged(null)
-    toast.success('Restore staging plan abandoned.')
-  }
-
   return (
     <>
       <ContentHeader
         left={<Breadcrumb items={[{ label: 'Settings' }, { label: 'Backups', active: true }]} />}
         right={
           <>
-            <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
+            <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading || operationsDisabled}>
               <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />Refresh
             </Button>
             <Button
               variant="outline"
               size="sm"
               onClick={() => setUploadOpen(true)}
-              disabled={activationBlocksOperations}
+              disabled={operationsDisabled}
             >
               <Upload className="h-4 w-4" />Upload ZIP
             </Button>
             <Button
               size="sm"
               onClick={() => setCreateOpen(true)}
-              disabled={activationBlocksOperations || readinessView?.createBlocked === true}
+              disabled={createDisabled}
               title={
-                activationBlocksOperations
-                  ? 'Backup operations are locked while activation status is unknown or in progress.'
-                  : readinessView?.createBlocked
-                  ? 'Configure the dedicated pg_dump role and local storage first.'
+                createBlocked
+                  ? `Backup creation is unavailable: ${readinessView?.createMissing.join(', ') || 'missing runtime prerequisite'}.`
                   : undefined
               }
             >
@@ -949,160 +714,50 @@ export function BackupsPage() {
       />
 
       <div className="flex-1 space-y-5 overflow-auto p-4 md:p-6">
-        {activationResume && (
-          <ActivationMonitor
-            resume={activationResume}
-            resumePersisted={activationResumePersisted}
-            onAccepted={activationAccepted}
-            onClear={() => {
-              activationResumeChanged(null)
-            }}
-          />
+        {restoring && (
+          <div className="flex items-center gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900">
+            <RefreshCw className="h-5 w-5 shrink-0 animate-spin text-indigo-600" />
+            <div>
+              <p className="font-semibold">Restoring {restoringFilename} and restarting PPBase…</p>
+              <p className="mt-0.5 text-indigo-800">
+                The database and files have been replaced. This page will reload into a fresh session once PPBase is back.
+              </p>
+            </div>
+          </div>
         )}
 
-        {stagingResume && !activationResume && (
-          <div className={`rounded-xl border p-4 ${
-            stagingStatus === 'validated' ? 'border-emerald-200 bg-emerald-50'
-              : stagingStatus === 'failed' || stagingStatus === 'quarantined'
-                ? 'border-red-200 bg-red-50'
-                : 'border-indigo-200 bg-indigo-50'
-          }`}>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div>
-                <div className="flex items-center gap-2 font-semibold">
-                  {stagingStatus === 'validated' ? <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-                    : stagingStatus === 'failed' || stagingStatus === 'quarantined'
-                      ? <ShieldAlert className="h-5 w-5 text-red-600" />
-                      : <RefreshCw className={`h-5 w-5 text-indigo-600 ${stagingStatus === 'running' ? 'animate-spin' : ''}`} />}
-                  {stagingPlanQuery.isLoading ? 'Checking saved staging plan'
-                    : stagingPlanQuery.isError ? 'Saved staging plan needs attention'
-                      : stagingStatus === 'planned' ? 'Staging plan ready to execute'
-                        : stagingStatus === 'running' ? 'Restore staging is running'
-                          : stagingStatus === 'validated' ? 'Validated staging plan ready'
-                            : stagingStatus === 'failed' ? 'Restore staging failed'
-                              : stagingStatus === 'quarantined' ? 'Restore staging quarantined'
-                                : 'Saved staging status is unknown'}
-                </div>
-                <p className="mt-1 text-sm text-slate-700">
-                  {stagingResume.filename} · {stagingResume.mode === 'clone' ? 'Clone' : 'Disaster recovery'}
+        {readinessView && (createBlocked || restoreBlocked) && (
+          <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+            <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+            <div>
+              <p className="font-semibold">Backup prerequisites are unavailable</p>
+              {createBlocked && (
+                <p className="mt-0.5">
+                  Create backup: {readinessView.createMissing.join(', ') || 'runtime prerequisite missing'}.
                 </p>
-                <p className="mt-1 font-mono text-xs text-slate-600">Plan {stagingResume.planId}</p>
-                {stagingStatus === 'running' && (
-                  <p className="mt-2 text-xs text-indigo-900">
-                    Canonical status is polled automatically. Abandon is disabled until execution finishes.
-                  </p>
-                )}
-                {(stagingStatus === 'failed' || stagingStatus === 'quarantined') && (
-                  <p className="mt-2 text-xs text-red-800">
-                    The isolated targets were not activated. Review the failure, then abandon this plan client and server side.
-                  </p>
-                )}
-                {stagingPlanQuery.isError && (
-                  <p className="mt-2 text-xs text-amber-900">
-                    The canonical plan could not be loaded. Resume to retry inspection or abandon it safely.
-                  </p>
-                )}
-                {!stagingResumePersisted && (
-                  <p className="mt-2 text-xs text-amber-900">
-                    Session storage is unavailable. This plan can be resumed while this page remains open, but not after a reload.
-                  </p>
-                )}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={() => stagedBackup && setRestoreBackup(stagedBackup)}
-                  disabled={!stagedBackup || activationBlocksOperations}
-                >
-                  {stagingStatus === 'validated' ? 'Resume activation' : 'Resume restore'}
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={abandonSavedStaging}
-                  disabled={
-                    stagingPlanQuery.isLoading
-                    || stagingStatus === 'running'
-                    || abandonStagingPlan.isPending
-                  }
-                >
-                  {abandonStagingPlan.isPending && <LoadingSpinner size="sm" />}
-                  Abandon
-                </Button>
-              </div>
+              )}
+              {restoreBlocked && (
+                <p className="mt-0.5">
+                  Restore: {readinessView.restoreMissing.join(', ') || 'runtime prerequisite missing'}.
+                  {!readinessView.restartReady && ' Start PPBase with `python -m ppbase serve` to enable automatic restart.'}
+                </p>
+              )}
             </div>
           </div>
         )}
-
-        {readiness && readinessView?.ready && (
-          <div className="space-y-2" aria-label="Native backup readiness">
-            <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-900">
-              <ShieldCheck className="h-5 w-5 shrink-0 text-emerald-600" />
-              {readinessView.successText}
-            </div>
-            {readinessView.warnings.length > 0 && (
-              <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">
-                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                <div>
-                  {readinessView.warnings.map((warning) => (
-                    <p key={`${warning.code}:${warning.name}`}>
-                      <span className="font-medium">{warning.name}:</span> {warning.detail}
-                    </p>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-        {readiness && readinessView && !readinessView.ready && (
-          <div className="rounded-xl border border-red-200 bg-white p-4">
-            <div className="flex items-center gap-2 text-red-800">
-              <ShieldAlert className="h-5 w-5 shrink-0" />
-              <h2 className="font-semibold">Backup & restore needs setup</h2>
-            </div>
-            <ul className="mt-3 divide-y divide-red-100 border-y border-red-100">
-              {readinessView.blockers.map((blocker) => (
-                <li key={blocker.action} className="py-2.5 text-sm">
-                  <div className="font-medium text-slate-900">{blocker.action}</div>
-                  <div className="mt-0.5 text-xs text-slate-500">
-                    Required for {blocker.areas.join(', ')}
-                  </div>
-                </li>
+        {readinessView && (readinessView.warnings.length > 0 || readinessView.notes.length > 0) && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950" role="status">
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+            <div className="space-y-1">
+              {readinessView.warnings.map((warning) => (
+                <p key={`${warning.code}:${warning.name}`}>
+                  <span className="font-medium">{warning.name}:</span> {warning.detail}
+                </p>
               ))}
-            </ul>
-            <details className="mt-3 text-sm text-slate-600">
-              <summary className="cursor-pointer select-none font-medium text-slate-700">
-                Show details
-              </summary>
-              <div className="mt-3 space-y-3 border-t pt-3">
-                <div className="space-y-1 text-xs">
-                  {readinessView.details.map(({ key, label, check }) => (
-                    <div key={key} className="flex items-start justify-between gap-3">
-                      <span>{label}</span>
-                      <span className={check.configured ? 'text-emerald-700' : 'text-red-700'}>
-                        {check.configured ? 'Ready' : 'Needs setup'}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-                {readinessView.warnings.map((warning) => (
-                  <p key={`${warning.code}:${warning.name}`} className="text-xs text-amber-800">
-                    {warning.name}: {warning.detail}
-                  </p>
-                ))}
-                <div>
-                  <div className="text-xs font-medium text-slate-700">Recommended setup</div>
-                  <code className="mt-1 block break-all rounded bg-slate-50 px-2 py-1.5 text-[11px] text-slate-700">
-                    {readiness.onboarding.productionCommand}
-                  </code>
-                  <code className="mt-1 block break-all rounded bg-slate-50 px-2 py-1.5 text-[11px] text-slate-700">
-                    {readiness.onboarding.doctorCommand}
-                  </code>
-                </div>
-              </div>
-            </details>
+              {readinessView.notes.map((note) => (
+                <p key={note}>{note}</p>
+              ))}
+            </div>
           </div>
         )}
         {!readiness && readinessError && (
@@ -1111,7 +766,7 @@ export function BackupsPage() {
           </div>
         )}
 
-        <BackupAutomationCard disabled={activationBlocksOperations} />
+        <BackupAutomationCard disabled={operationsDisabled} />
 
         <div className="grid gap-4 lg:grid-cols-2">
           <div className="rounded-xl border bg-white p-4">
@@ -1125,7 +780,7 @@ export function BackupsPage() {
           </div>
           <TrustStore
             entries={trustEntries}
-            disabled={activationBlocksOperations}
+            disabled={operationsDisabled}
             onRevoke={setRevokeTarget}
           />
         </div>
@@ -1135,7 +790,7 @@ export function BackupsPage() {
             <ArchiveRestore className="h-5 w-5 text-indigo-600" />
             <div>
               <h1 className="font-semibold">Backup and restore PPBase data</h1>
-              <p className="text-sm text-slate-500">Signed PostgreSQL dumps, local files and restore validation.</p>
+              <p className="text-sm text-slate-500">Signed native PostgreSQL backups and local files, restored destructively into this instance.</p>
             </div>
           </div>
 
@@ -1191,7 +846,7 @@ export function BackupsPage() {
                             variant="ghost"
                             size="icon"
                             onClick={() => startDownload(backup)}
-                            disabled={activationBlocksOperations || downloadingId === id || unusable}
+                            disabled={operationsDisabled || downloadingId === id || unusable}
                             aria-label="Download backup"
                           >
                             {downloadingId === id ? <LoadingSpinner size="sm" /> : <Download className="h-4 w-4" />}
@@ -1203,9 +858,8 @@ export function BackupsPage() {
                             disabled={
                               isUntrusted(backup)
                               || unusable
-                              || activationBlocksOperations
-                              || (!!stagingResume && stagingResume.backupId !== id)
-                              || readinessView?.restoreBlocked === true
+                              || operationsDisabled
+                              || restoreBlocked
                             }
                             aria-label="Restore backup"
                           ><RotateCcw className="h-4 w-4" /></Button>
@@ -1214,7 +868,7 @@ export function BackupsPage() {
                             size="icon"
                             className="text-red-600 hover:text-red-700"
                             onClick={() => setDeleteTarget(backup)}
-                            disabled={activationBlocksOperations}
+                            disabled={operationsDisabled}
                             aria-label="Delete backup"
                           ><Trash2 className="h-4 w-4" /></Button>
                         </div>
@@ -1230,19 +884,20 @@ export function BackupsPage() {
 
       <CreateBackupDialog
         open={createOpen}
-        disabled={activationBlocksOperations}
+        disabled={createDisabled}
         onOpenChange={setCreateOpen}
       />
       <UploadBackupDialog
         open={uploadOpen}
-        disabled={activationBlocksOperations}
+        disabled={operationsDisabled}
         onOpenChange={setUploadOpen}
         onUploaded={(inspection) => setDetailsId(inspection.id || inspection.key)}
       />
       <BackupDetailsDialog
         id={detailsId}
         open={!!detailsId}
-        operationsDisabled={activationBlocksOperations}
+        operationsDisabled={operationsDisabled}
+        restoreDisabled={restoreBlocked}
         onOpenChange={(open) => !open && setDetailsId(null)}
         onRestore={(backup) => {
           setDetailsId(null)
@@ -1252,17 +907,15 @@ export function BackupsPage() {
       <BackupRestoreWizard
         backup={restoreBackup}
         open={!!restoreBackup}
+        disabled={restoreBlocked}
         onOpenChange={(open) => !open && setRestoreBackup(null)}
-        stagingResume={stagingResume}
-        onStagingResumeChange={stagingResumeChanged}
-        onActivationResumeChange={activationResumeChanged}
-        onActivationAccepted={activationAccepted}
+        onRestoreStarted={handleRestoreStarted}
       />
       <ConfirmDialog
         open={!!deleteTarget}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
         title="Delete backup"
-        description={`Delete ${deleteTarget ? displayFilename(deleteTarget) : 'this backup'} permanently? A backup currently used by staging or download will be refused by the server.`}
+        description={`Delete ${deleteTarget ? displayFilename(deleteTarget) : 'this backup'} permanently? A backup currently being downloaded will be refused by the server.`}
         confirmLabel="Delete"
         variant="destructive"
         onConfirm={confirmDelete}

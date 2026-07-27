@@ -1,34 +1,48 @@
-"""Application orchestration for signed backup, staged restore, and activation."""
+"""Application orchestration for signed backup and destructive restore."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
-import ipaddress
+import math
 import os
-import stat
-import socket
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 import secrets
 from typing import Any, BinaryIO, Callable, TypeVar
 
 from sqlalchemy import text
-from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ppbase import __version__
-from ppbase.backup.activation import (
-    ActivationError,
-    BackupActivationStore,
-    activation_restart_spec,
-    replace_serve_command_targets,
+from ppbase.backup.control import (
+    ControlPlaneRoot,
+    ControlPlaneSafetyError,
+    absolute_path_without_symlink_resolution,
+    ensure_runtime_backup_roots,
 )
-from ppbase.backup.control import ControlPlaneRoot, ControlPlaneSafetyError
+from ppbase.backup.canonical import (
+    fingerprint_collection_objects,
+    validate_canonical_collection_objects,
+)
+from ppbase.backup.destructive import (
+    build_file_reference_inventory,
+    DestructiveRestoreError,
+    DestructiveRestoreJournal,
+    normalize_file_reference_inventory,
+    PreparedStorageRestore,
+    prepare_storage_restore,
+    read_database_restore_marker,
+    validate_committed_destructive_restore,
+)
+from ppbase.backup.disk import (
+    BackupDiskSpaceError,
+    local_tree_size,
+    require_disk_space,
+)
 from ppbase.backup.identity import (
     BackupIdentity,
     BackupIdentityError,
@@ -41,7 +55,6 @@ from ppbase.backup.models import (
     BackupManifest,
     BackupNotFoundError,
     BackupSetSummary,
-    canonical_json_bytes,
     format_manifest_timestamp,
 )
 from ppbase.backup.operations import (
@@ -50,29 +63,23 @@ from ppbase.backup.operations import (
     BackupOperationLease,
     BackupOperationSafetyError,
 )
-from ppbase.backup.plans import StagingPlan, StagingPlanError, StagingPlanStore
 from ppbase.backup.postgres import (
     DatabaseContract,
-    LibpqConnectionInfo,
     PostgresBackupError,
-    create_target_database,
-    detect_postgres_versions,
-    grant_dump_role_read_access,
-    grant_dump_role_runtime_default_privileges,
     inspect_database_contract,
-    inspect_pg_restore_archive,
-    preflight_database_contract,
-    preflight_dump_role,
-    replace_sqlalchemy_database,
-    run_pg_dump,
-    run_pg_restore_from_fd,
+    preflight_destructive_restore_role,
     set_backup_control_search_path,
-    sqlalchemy_url_to_libpq,
-    validate_postgres_identifier,
 )
+from ppbase.backup.native import (
+    collect_applied_migrations,
+    export_native_database,
+    restore_native_database,
+    verify_migration_hashes_on_disk,
+)
+from ppbase.backup.schema_contract import DatabaseSchema
 from ppbase.backup.storage import (
-    JWT_SECRET_RESOURCE,
-    AnchoredStagingDataDir,
+    DATA_COPY_RESOURCE,
+    SCHEMA_JSON_RESOURCE,
     AuthenticatedBackupInspection,
     BackupDeleteCancelledError,
     BackupDeletionUncertainError,
@@ -94,15 +101,11 @@ from ppbase.backup.transport import (
     validate_backup_transport_filename,
 )
 from ppbase.backup.trust import BackupTrustError, BackupTrustStore
-from ppbase.backup.validation import (
-    generate_clone_jwt_secret,
-    rotate_clone_database_secrets,
-    validate_staged_database,
-)
 from ppbase.services.async_utils import (
     to_thread_quiescent as _to_thread_quiescent,
 )
 from ppbase.services.file_storage import (
+    get_storage_file_path,
     open_file_stream,
     pin_storage_config,
     resolve_storage_config_from_settings_payload,
@@ -110,12 +113,6 @@ from ppbase.services.file_storage import (
 from ppbase.services.file_references import (
     LocalFileReference,
     read_canonical_local_file_references,
-)
-from ppbase.services.migration_runner import (
-    MigrationLockError,
-    apply_pending_on_connection,
-    get_pending_migrations,
-    migration_lock_on_connection,
 )
 from ppbase.services.process_control import (
     ProcessRestartReservation,
@@ -133,25 +130,19 @@ from ppbase.services.write_barrier import (
 )
 
 
-_DESTINATION_DOMAIN = b"PPBASE-RESTORE-DESTINATION-V1\0"
-_FILE_REFERENCE_INVENTORY_DOMAIN = b"PPBASE-LOCAL-FILE-REFERENCES-V1\0"
 _FILE_REFERENCE_INVENTORY_KEY = "local_file_reference_inventory"
-_FILE_REFERENCE_INVENTORY_VERSION = 1
-_RESTORE_GUARD_POLL_SECONDS = 0.1
-_RESTORE_GUARD_VERIFY_TIMEOUT_SECONDS = 2.0
 BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT = 100
 BACKUP_INSPECTION_MAX_RESOURCE_LIMIT = 250
 _T = TypeVar("_T")
 _RETAINED_CUTOVER_GUARDS: set["BackupCutoverGuard"] = set()
-_FAILED_CUTOVER_OPERATION_CONTEXTS: list[ExitStack] = []
 
 
 class BackupCutoverGuard:
     """Retain every cutover exclusion until exec or durable rollback.
 
     The PostgreSQL barrier is released first and filesystem operation leases
-    second, but only after the activation journal has already selected the
-    previous target again.  Instances keep themselves alive so an exceptional
+    second, but only after the destructive restore journal has recorded a safe
+    outcome. Instances keep themselves alive so an exceptional
     scheduling path cannot accidentally drop the last Python reference and
     reopen the mutation window.
     """
@@ -236,8 +227,9 @@ class BackupCutoverGuard:
         future.result(timeout=timeout_seconds)
 
 
-class PreparedBackupActivation(dict[str, Any]):
-    """JSON-compatible activation response carrying its process-local guard."""
+
+class PreparedDestructiveRestore(dict[str, Any]):
+    """Restore response carrying the guards that remain held until restart."""
 
     def __init__(
         self,
@@ -249,55 +241,50 @@ class PreparedBackupActivation(dict[str, Any]):
         self.cutover_guard = cutover_guard
 
 
+class _StorageSwapRollbackFailed(DestructiveRestoreError):
+    """The active file selection may be ambiguous and must stay fenced."""
+
+
+async def _swap_prepared_storage_or_rollback(
+    prepared_files: PreparedStorageRestore,
+) -> None:
+    """Finish a file swap or durably restore the previous active files.
+
+    Cancellation can arrive after the blocking swap worker has completed but
+    before its await returns.  Always finish a rollback before propagating any
+    swap error; a rollback failure is distinguished so the caller can retain
+    the process/database cutover fence for startup recovery.
+    """
+    try:
+        await _to_thread_cleanup_quiescent(prepared_files.swap_into_place)
+    except BaseException:
+        try:
+            await _thread_result_while_resolving_cancellation(
+                prepared_files.rollback
+            )
+        except BaseException as rollback_error:
+            raise _StorageSwapRollbackFailed(
+                "restored files could not be activated or rolled back safely"
+            ) from rollback_error
+        raise
+
+
 def _file_reference_inventory(
     references: tuple[LocalFileReference, ...],
 ) -> dict[str, Any]:
-    canonical = tuple(sorted(set(references)))
-    digest = hashlib.sha256(_FILE_REFERENCE_INVENTORY_DOMAIN)
-    for reference in canonical:
-        encoded = canonical_json_bytes(list(reference))
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-    return {
-        "version": _FILE_REFERENCE_INVENTORY_VERSION,
-        "count": len(canonical),
-        "sha256": digest.hexdigest(),
-    }
+    return build_file_reference_inventory(references)
 
 
 def _require_manifest_file_reference_inventory(
     inspection: AuthenticatedBackupInspection,
-    references: tuple[LocalFileReference, ...],
-) -> None:
+) -> dict[str, Any]:
     raw = inspection.manifest.metadata.get(_FILE_REFERENCE_INVENTORY_KEY)
-    if not isinstance(raw, dict) or set(raw) != {"version", "count", "sha256"}:
+    try:
+        return normalize_file_reference_inventory(raw)
+    except ValueError as exc:
         raise BackupIntegrityError(
             "backup manifest has no valid local-file reference inventory"
-        )
-    version = raw.get("version")
-    count = raw.get("count")
-    sha256 = raw.get("sha256")
-    if (
-        isinstance(version, bool)
-        or version != _FILE_REFERENCE_INVENTORY_VERSION
-        or isinstance(count, bool)
-        or not isinstance(count, int)
-        or count < 0
-        or not isinstance(sha256, str)
-        or len(sha256) != 64
-        or any(character not in "0123456789abcdef" for character in sha256)
-    ):
-        raise BackupIntegrityError(
-            "backup manifest local-file reference inventory is malformed"
-        )
-    actual = _file_reference_inventory(references)
-    if count != actual["count"] or not secrets.compare_digest(
-        sha256,
-        str(actual["sha256"]),
-    ):
-        raise BackupIntegrityError(
-            "restored local-file references differ from the signed inventory"
-        )
+        ) from exc
 
 
 def _require_copied_file_references(
@@ -322,10 +309,19 @@ def _require_copied_file_references(
             config=storage_config,
         )
         if opened is None or opened.backend != "local" or opened.storage_path is None:
+            try:
+                missing_path = get_storage_file_path(
+                    collection_id,
+                    record_id,
+                    filename,
+                )
+            except Exception:
+                missing_path = storage_root / collection_id / record_id / filename
             if opened is not None:
                 opened.close()
             raise BackupIntegrityError(
-                "database references a local file missing from active storage"
+                "database references a local file missing from active storage: "
+                f"{missing_path}"
             )
         try:
             try:
@@ -345,26 +341,6 @@ def _require_copied_file_references(
                 )
         finally:
             opened.close()
-
-
-@dataclass(frozen=True, slots=True)
-class _RestoreDestinationPreflight:
-    creator_url: str
-    restore_url: str
-    creator_tool_url: URL
-    restore_tool_url: URL
-    target_owner: str
-    creator_info: LibpqConnectionInfo
-    restore_info: LibpqConnectionInfo
-    runtime_info: LibpqConnectionInfo
-    dump_info: LibpqConnectionInfo
-    creator_identity: dict[str, Any]
-    restore_identity: dict[str, Any]
-    runtime_identity: dict[str, Any]
-    creator_hostaddr: str | None
-    restore_hostaddr: str | None
-    fingerprint_sha256: str
-    warnings: tuple[str, ...]
 
 
 async def _to_thread_cleanup_quiescent(
@@ -548,28 +524,65 @@ async def _abort_partial_backup_quiescent(builder: Any) -> None:
         ) from cleanup_error
 
 
+def _restore_engine_connect_args(settings: Any) -> dict[str, float]:
+    """Return bounded asyncpg connection and command timeouts for cutover."""
+    connect_timeout = float(settings.backup_restore_connect_timeout)
+    command_timeout = float(settings.backup_restore_command_timeout)
+    if (
+        not math.isfinite(connect_timeout)
+        or connect_timeout <= 0
+        or not math.isfinite(command_timeout)
+        or command_timeout <= 0
+    ):
+        raise BackupServiceError(
+            500,
+            "backup_restore_timeout_invalid",
+            "The destructive restore PostgreSQL timeouts must be positive.",
+        )
+    return {
+        "timeout": connect_timeout,
+        "command_timeout": command_timeout,
+    }
+
+
+def _create_restore_cutover_engine(
+    settings: Any,
+    connect_args: dict[str, float],
+) -> AsyncEngine:
+    """Create one unpooled engine with the restore cutover time bounds."""
+    return create_async_engine(
+        settings.database_url,
+        poolclass=NullPool,
+        connect_args=dict(connect_args),
+    )
+
+
 class NativeBackupService:
-    """Create signed local sets and validate restores in brand-new targets."""
+    """Create signed local sets and restore them into the active targets."""
 
     def __init__(self, engine: AsyncEngine, settings: Any) -> None:
         self._closed = False
         self.engine = engine
         self.settings = settings
-        self.backup_root = Path(settings.backup_root).expanduser().resolve(strict=False)
-        self.control_dir = Path(settings.backup_control_dir).expanduser().absolute()
-        self.staging_root = Path(settings.backup_staging_root).expanduser().resolve(
-            strict=False
+        self.backup_root = absolute_path_without_symlink_resolution(
+            settings.backup_root
         )
-        configured_target_root = str(
-            getattr(settings, "backup_target_root", "") or ""
-        ).strip()
-        self.target_root = Path(
-            configured_target_root
-            or f"{getattr(settings, 'backup_staging_root')}_targets"
-        ).expanduser().resolve(strict=False)
+        self.control_dir = absolute_path_without_symlink_resolution(
+            settings.backup_control_dir
+        )
+        try:
+            ensure_runtime_backup_roots(settings)
+        except ControlPlaneSafetyError as exc:
+            raise BackupServiceError(
+                500,
+                "backup_roots_invalid",
+                "The native backup directories are missing or unsafe.",
+            ) from exc
         self._validate_roots()
         try:
-            self.control_root = ControlPlaneRoot.open(self.control_dir)
+            self.control_root = ControlPlaneRoot.open(
+                self.control_dir,
+            )
         except ControlPlaneSafetyError as exc:
             raise BackupServiceError(
                 500,
@@ -578,13 +591,8 @@ class NativeBackupService:
             ) from exc
         try:
             self.operations = BackupOperationCoordinator(self.control_root)
-            self.plans = StagingPlanStore(
-                self.control_root,
-                self.staging_root,
-                self.target_root,
-            )
+            self.destructive_journal = DestructiveRestoreJournal(self.control_root)
             self.trust = BackupTrustStore(self.control_root)
-            self.activations = BackupActivationStore(self.control_root)
             self.identity = self._load_identity()
             self.store = LocalBackupStore(
                 self.backup_root,
@@ -600,26 +608,12 @@ class NativeBackupService:
                 exc.code,
                 "The native backup operation coordinator is missing or unsafe.",
             ) from exc
-        except StagingPlanError as exc:
-            self.close()
-            raise BackupServiceError(
-                500,
-                "backup_control_invalid",
-                "The native backup control plane is missing or unsafe.",
-            ) from exc
         except BackupTrustError as exc:
             self.close()
             raise BackupServiceError(
                 500,
                 "backup_control_invalid",
                 "The native backup signer trust store is missing or unsafe.",
-            ) from exc
-        except ActivationError as exc:
-            self.close()
-            raise BackupServiceError(
-                500,
-                "backup_control_invalid",
-                "The native backup activation store is missing or unsafe.",
             ) from exc
         except BackupError as exc:
             self.close()
@@ -639,9 +633,8 @@ class NativeBackupService:
         store = getattr(self, "store", None)
         identity = getattr(self, "identity", None)
         trust = getattr(self, "trust", None)
-        activations = getattr(self, "activations", None)
-        plans = getattr(self, "plans", None)
         operations = getattr(self, "operations", None)
+        destructive_journal = getattr(self, "destructive_journal", None)
         control_root = getattr(self, "control_root", None)
         try:
             if store is not None:
@@ -652,23 +645,19 @@ class NativeBackupService:
                     identity.close()
             finally:
                 try:
-                    if activations is not None:
-                        activations.close()
+                    if trust is not None:
+                        trust.close()
                 finally:
                     try:
-                        if trust is not None:
-                            trust.close()
+                        if operations is not None:
+                            operations.close()
                     finally:
                         try:
-                            if plans is not None:
-                                plans.close()
+                            if destructive_journal is not None:
+                                destructive_journal.close()
                         finally:
-                            try:
-                                if operations is not None:
-                                    operations.close()
-                            finally:
-                                if control_root is not None:
-                                    control_root.close()
+                            if control_root is not None:
+                                control_root.close()
 
     def __enter__(self) -> "NativeBackupService":
         self._require_control_identity_attached()
@@ -921,15 +910,6 @@ class NativeBackupService:
                 filename=transport_filename,
             )
             self._operation_commit_guard(operation_lease)
-        dump_url = self._dump_configuration()
-        try:
-            dump_info = sqlalchemy_url_to_libpq(dump_url)
-        except PostgresBackupError as exc:
-            raise BackupServiceError(
-                409,
-                "dump_database_url_invalid",
-                "The configured dump PostgreSQL DSN is invalid.",
-            ) from exc
 
         local_secret_path: Path | None = None
         explicit_jwt_secret: str | None = None
@@ -974,8 +954,6 @@ class NativeBackupService:
         contract: DatabaseContract | None = None
         source_summary: dict[str, int] | None = None
         source_file_references: tuple[LocalFileReference, ...] | None = None
-        dump_version = ""
-        restore_version = ""
         source_app_name = "PPBase"
         preflight_warnings: list[str] = []
         manifest_created_at: datetime | None = None
@@ -990,10 +968,36 @@ class NativeBackupService:
                         raise BackupServiceError(
                             409,
                             "unsupported_storage_backend",
-                            "Native backup v1 supports the local storage "
+                            "Native backup supports the local storage "
                             "backend only.",
                         )
-                    builder = self.store.begin_set()
+                    # Canonicalizing expected views/indexes uses temporary
+                    # PostgreSQL objects inside savepoints. PostgreSQL forbids
+                    # even TEMP DDL in a READ ONLY transaction, so perform this
+                    # non-persistent reconciliation in its own transaction
+                    # while the write barrier is already held, immediately
+                    # before opening the read-only export snapshot.  The
+                    # transaction is REPEATABLE READ (but still read-write, so
+                    # the temp DDL is allowed) so that validation and the
+                    # fingerprint taken right after it observe one identical
+                    # snapshot — otherwise an external client could mutate an
+                    # already-validated object before the fingerprint records it,
+                    # letting the unvalidated state pass the export re-check.
+                    async with lease.connection.begin():
+                        await lease.connection.execute(
+                            text(
+                                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                            )
+                        )
+                        await set_backup_control_search_path(lease.connection)
+                        await validate_canonical_collection_objects(
+                            lease.connection
+                        )
+                        validated_fingerprint = (
+                            await fingerprint_collection_objects(
+                                lease.connection
+                            )
+                        )
                     async with lease.connection.begin():
                         await lease.connection.execute(
                             text(
@@ -1001,6 +1005,29 @@ class NativeBackupService:
                                 "READ ONLY"
                             )
                         )
+                        # Re-check the validated objects inside the export
+                        # snapshot before the first COPY.  The write barrier does
+                        # not fence external PostgreSQL clients, so a view, index,
+                        # or _collections row could have drifted after validation;
+                        # this REPEATABLE READ read pins the snapshot and fails
+                        # closed on any mismatch.  The search path must match the
+                        # validation transaction: ``pg_get_viewdef`` schema-
+                        # qualifies relations only when they are outside the
+                        # search path, so both fingerprints must resolve names the
+                        # same way or a valid view would look like drift.
+                        await set_backup_control_search_path(lease.connection)
+                        snapshot_fingerprint = (
+                            await fingerprint_collection_objects(
+                                lease.connection
+                            )
+                        )
+                        if snapshot_fingerprint != validated_fingerprint:
+                            raise BackupServiceError(
+                                409,
+                                "schema_drift_during_backup",
+                                "Collection metadata, views, or indexes changed "
+                                "after validation; backup was refused.",
+                            )
                         durable_settings = (
                             await lease.connection.execute(
                                 text(
@@ -1032,80 +1059,52 @@ class NativeBackupService:
                                 "The durable storage settings and live runtime "
                                 "configuration differ; backup was refused.",
                             )
-                        runtime_identity = await self._postgres_server_identity(
+                        database_size = int(
+                            (
+                                await lease.connection.execute(
+                                    text("SELECT pg_catalog.pg_database_size(pg_catalog.current_database())")
+                                )
+                            ).scalar_one()
+                        )
+                        storage_size = await _to_thread_quiescent(
+                            local_tree_size,
+                            Path(storage_config.data_dir).expanduser() / "storage",
+                        )
+                        await _to_thread_quiescent(
+                            require_disk_space,
+                            self.backup_root,
+                            database_size + storage_size,
+                            operation="native backup",
+                        )
+                        contract = await inspect_database_contract(lease.connection)
+                        # Stream the live schema out with COPY on the raw asyncpg
+                        # connection underlying this same REPEATABLE READ, READ ONLY
+                        # transaction — no external binaries and no separate
+                        # exported snapshot.
+                        builder = self.store.begin_set()
+                        builder.create_database_directory()
+                        raw_connection = await lease.connection.get_raw_connection()
+                        pg_conn = raw_connection.driver_connection
+                        migrations_dir = Path(
+                            self.settings.migrations_dir
+                        ).expanduser()
+                        migrations = await collect_applied_migrations(
+                            pg_conn, migrations_dir=migrations_dir
+                        )
+                        source_summary = await self._source_summary(
                             lease.connection
                         )
-                        runtime_role = runtime_identity["role"]
-                        if dump_info.username == runtime_role:
-                            raise PostgresBackupError(
-                                "pg_dump must use a dedicated read-only login "
-                                "distinct from the PPBase runtime role"
-                            )
-                        contract = await inspect_database_contract(lease.connection)
-                        if dump_info.database != contract.database:
-                            raise PostgresBackupError(
-                                "pg_dump DSN must target the active PPBase database"
-                            )
-                        dump_engine = create_async_engine(
-                            dump_url,
-                            poolclass=NullPool,
-                        )
-                        try:
-                            async with dump_engine.connect() as dump_connection:
-                                dump_identity = await self._postgres_server_identity(
-                                    dump_connection
-                                )
-                                if dump_identity["role"] != dump_info.username:
-                                    raise PostgresBackupError(
-                                        "pg_dump DSN login does not match current_user"
-                                    )
-                                if dump_identity["database"] != contract.database:
-                                    raise PostgresBackupError(
-                                        "pg_dump preflight reached a different "
-                                        "database"
-                                    )
-                                if self._server_instance_key(
-                                    dump_identity
-                                ) != self._server_instance_key(runtime_identity):
-                                    raise PostgresBackupError(
-                                        "pg_dump DSN reached a different PostgreSQL "
-                                        "server instance"
-                                    )
-                                dump_report = await preflight_dump_role(
-                                    dump_connection
-                                )
-                                dump_report.require_ok()
-                                preflight_warnings.extend(dump_report.warnings)
-                                await dump_connection.rollback()
-                        finally:
-                            await dump_engine.dispose()
-                        versions = await detect_postgres_versions(
-                            lease.connection,
-                            pg_dump=self.settings.backup_pg_dump_path,
-                            pg_restore=self.settings.backup_pg_restore_path,
-                        )
-                        dump_version = versions.pg_dump.version
-                        restore_version = versions.pg_restore.version
-                        source_summary = await self._source_summary(lease.connection)
                         source_file_references = (
                             await read_canonical_local_file_references(
                                 lease.connection
                             )
                         )
-                        snapshot_id = str(
-                            (
-                                await lease.connection.execute(
-                                    text("SELECT pg_export_snapshot()")
-                                )
-                            ).scalar_one()
-                        )
-                        await run_pg_dump(
-                            dump_url,
-                            builder.database_dump_path,
-                            pg_dump=self.settings.backup_pg_dump_path,
-                            expected_server_major=contract.server_major,
-                            passfile_directory=builder.path,
-                            snapshot_id=snapshot_id,
+                        await export_native_database(
+                            pg_conn,
+                            schema_path=builder.database_schema_path,
+                            copy_path=builder.database_copy_path,
+                            migrations=migrations,
+                            source_postgres_version=contract.server_version_num,
                         )
                     await _to_thread_quiescent(
                         builder.copy_storage,
@@ -1161,6 +1160,12 @@ class NativeBackupService:
                 raise cleanup_cancellation
             if isinstance(exc, BackupServiceError):
                 raise
+            if isinstance(exc, BackupDiskSpaceError):
+                raise BackupServiceError(
+                    507,
+                    "backup_insufficient_disk_space",
+                    str(exc),
+                ) from exc
             if isinstance(exc, (BackupError, PostgresBackupError)):
                 raise self._map_error(exc, operation="create") from exc
             raise BackupServiceError(
@@ -1190,10 +1195,6 @@ class NativeBackupService:
             _FILE_REFERENCE_INVENTORY_KEY: _file_reference_inventory(
                 source_file_references
             ),
-            "postgres_tools": {
-                "pg_dump": dump_version,
-                "pg_restore": restore_version,
-            },
             "jwt_secret": {
                 "mode": (
                     "included_resource"
@@ -1475,50 +1476,6 @@ class NativeBackupService:
             with self.operations.global_exclusive() as operation_lease:
                 backup_id = await self._resolve_backup_reference(backup_id)
                 with self.operations.backup_exclusive(backup_id) as backup_lease:
-                    try:
-                        references = self.plans.validated_references(backup_id)
-                    except StagingPlanError as exc:
-                        raise BackupServiceError(
-                            500,
-                            "backup_control_invalid",
-                            "Staging plan references cannot be inspected safely.",
-                        ) from exc
-                    for plan in references:
-                        try:
-                            statuses = self.activations.statuses_for_plan(
-                                plan.plan_id,
-                                backup_id=backup_id,
-                            )
-                        except ActivationError as exc:
-                            raise BackupServiceError(
-                                500,
-                                "backup_activation_state_invalid",
-                                "Backup activation references cannot be inspected safely.",
-                            ) from exc
-                        if not statuses or any(
-                            status
-                            in {
-                                "restart_scheduled",
-                                "starting",
-                                "rollback_pending",
-                            }
-                            for status in statuses
-                        ):
-                            raise BackupServiceError(
-                                409,
-                                "backup_in_use",
-                                "The backup is still required by a validated "
-                                "restore staging plan.",
-                            )
-                        if any(
-                            status not in {"healthy", "rolled_back"}
-                            for status in statuses
-                        ):
-                            raise BackupServiceError(
-                                500,
-                                "backup_activation_state_invalid",
-                                "A staging plan has an unknown activation status.",
-                            )
                     self._operation_commit_guard(operation_lease, backup_lease)
                     await _delete_backup_atomically(
                         self.store.delete_set,
@@ -1534,683 +1491,6 @@ class NativeBackupService:
         except BackupError as exc:
             raise self._map_error(exc, operation="delete") from exc
 
-    async def create_staging_plan(
-        self,
-        backup_id: str,
-        *,
-        jwt_secret_mode: str,
-        actor_id: str | None,
-    ) -> dict[str, Any]:
-        try:
-            with self.operations.global_exclusive() as operation_lease:
-                backup_id = await self._resolve_backup_reference(backup_id)
-                with self.operations.backup_shared(backup_id) as backup_lease:
-                    result = await self._create_staging_plan_under_lease(
-                        backup_id,
-                        jwt_secret_mode=jwt_secret_mode,
-                        actor_id=actor_id,
-                        backup_lease=backup_lease,
-                    )
-                    self._operation_commit_guard(operation_lease, backup_lease)
-                    return result
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-
-    async def _create_staging_plan_under_lease(
-        self,
-        backup_id: str,
-        *,
-        jwt_secret_mode: str,
-        actor_id: str | None,
-        backup_lease: BackupOperationLease,
-    ) -> dict[str, Any]:
-        self._require_control_identity_attached()
-        try:
-            inspection = await self._trusted_inspection(backup_id)
-            jwt_resource_mode = self._manifest_jwt_secret_mode(inspection)
-            if (
-                jwt_secret_mode == "disaster_recovery"
-                and jwt_resource_mode != "included_resource"
-            ):
-                raise BackupServiceError(
-                    409,
-                    "external_jwt_secret_unverifiable",
-                    "Disaster recovery requires the signed JWT-secret resource; "
-                    "an externally managed secret cannot yet be proven identical.",
-                )
-            contract = self._manifest_contract(inspection)
-            destination = await self._preflight_restore_destination(
-                inspection,
-                contract,
-            )
-        except BackupServiceError:
-            raise
-        except (BackupError, PostgresBackupError) as exc:
-            raise self._map_error(exc, operation="plan") from exc
-
-        manifest_sha256 = hashlib.sha256(
-            inspection.manifest.to_bytes()
-        ).hexdigest()
-        self._require_control_identity_attached()
-        try:
-            plan = self.plans.create(
-                backup_id=backup_id,
-                manifest_sha256=manifest_sha256,
-                destination_fingerprint_sha256=(
-                    destination.fingerprint_sha256
-                ),
-                jwt_secret_mode=jwt_secret_mode,
-                actor_id=actor_id,
-                pre_commit_guard=lambda: self._operation_commit_guard(
-                    backup_lease
-                ),
-            )
-        except StagingPlanError as exc:
-            raise BackupServiceError(
-                400,
-                "invalid_staging_plan",
-                str(exc),
-            ) from exc
-        payload = plan.as_dict()
-        payload["preflightWarnings"] = list(destination.warnings)
-        return payload
-
-    def inspect_staging_plan(self, plan_id: str) -> dict[str, Any]:
-        self._require_control_root_attached()
-        try:
-            return self.plans.inspect(plan_id).as_dict()
-        except StagingPlanError as exc:
-            raise BackupServiceError(
-                404,
-                "staging_plan_not_found",
-                "The sealed staging plan was not found or is invalid.",
-            ) from exc
-
-    async def abandon_staging_plan(
-        self,
-        plan_id: str,
-        *,
-        expected_plan_hash: str,
-        actor_id: str | None,
-    ) -> dict[str, Any]:
-        """Durably retire a quiescent plan so its backup can be released."""
-        self._require_control_identity_attached()
-        try:
-            with self.operations.global_exclusive() as operation_lease:
-                try:
-                    plan = self.plans.inspect(plan_id)
-                except StagingPlanError as exc:
-                    raise BackupServiceError(
-                        409,
-                        "staging_plan_not_abandonable",
-                        str(exc),
-                    ) from exc
-                with self.operations.backup_shared(plan.backup_id) as backup_lease:
-                    try:
-                        statuses = self.activations.statuses_for_plan(
-                            plan.plan_id,
-                            backup_id=plan.backup_id,
-                        )
-                    except ActivationError as exc:
-                        raise BackupServiceError(
-                            500,
-                            "backup_activation_state_invalid",
-                            "The staging plan activation state cannot be inspected safely.",
-                        ) from exc
-                    if any(
-                        status
-                        in {
-                            "restart_scheduled",
-                            "starting",
-                            "rollback_pending",
-                        }
-                        for status in statuses
-                    ):
-                        raise BackupServiceError(
-                            409,
-                            "backup_activation_in_progress",
-                            "A staging plan cannot be abandoned while its "
-                            "activation or rollback is in progress.",
-                        )
-                    self._operation_commit_guard(operation_lease, backup_lease)
-                    try:
-                        abandoned = self.plans.abandon(
-                            plan.plan_id,
-                            expected_plan_hash=expected_plan_hash,
-                            actor_id=actor_id,
-                            pre_commit_guard=lambda: self._operation_commit_guard(
-                                operation_lease,
-                                backup_lease,
-                            ),
-                        )
-                    except StagingPlanError as exc:
-                        raise BackupServiceError(
-                            409,
-                            "staging_plan_not_abandonable",
-                            str(exc),
-                        ) from exc
-                    self._operation_commit_guard(operation_lease, backup_lease)
-                    return abandoned.as_dict()
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-
-    async def execute_staging_plan(
-        self,
-        plan_id: str,
-        *,
-        expected_plan_hash: str,
-    ) -> dict[str, Any]:
-        self._require_control_identity_attached()
-        try:
-            planned = self.plans.inspect(plan_id)
-        except StagingPlanError as exc:
-            raise BackupServiceError(
-                409,
-                "staging_plan_not_executable",
-                str(exc),
-            ) from exc
-        try:
-            with self.operations.global_exclusive() as operation_lease:
-                with self.operations.backup_shared(
-                    planned.backup_id
-                ) as backup_lease:
-                    return await self._execute_staging_plan_under_lease(
-                        plan_id,
-                        expected_plan_hash=expected_plan_hash,
-                        operation_leases=(operation_lease, backup_lease),
-                    )
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-
-    async def activate_staging_plan(
-        self,
-        plan_id: str,
-        *,
-        expected_plan_hash: str,
-        actor_id: str | None,
-        activation_id: str | None = None,
-        resume_token: str | None = None,
-    ) -> PreparedBackupActivation:
-        """Publish a validated target and the durable restart overlay."""
-        self._require_control_identity_attached()
-        try:
-            planned = self.plans.inspect(plan_id)
-        except StagingPlanError as exc:
-            raise BackupServiceError(
-                409,
-                "staging_plan_not_activatable",
-                str(exc),
-            ) from exc
-        operation_contexts = ExitStack()
-        try:
-            operation_lease = operation_contexts.enter_context(
-                self.operations.global_exclusive()
-            )
-            backup_lease = operation_contexts.enter_context(
-                self.operations.backup_shared(planned.backup_id)
-            )
-            try:
-                canonical_plan = self.plans.inspect(plan_id)
-            except StagingPlanError as exc:
-                raise BackupServiceError(
-                    409,
-                    "staging_plan_not_activatable",
-                    "The staging plan changed before activation acquired its leases.",
-                ) from exc
-            if canonical_plan.backup_id != planned.backup_id:
-                raise BackupServiceError(
-                    409,
-                    "staging_plan_changed",
-                    "The staging plan backup changed before activation.",
-                )
-            activation_arguments: dict[str, Any] = {}
-            if activation_id is not None or resume_token is not None:
-                activation_arguments = {
-                    "activation_id": activation_id,
-                    "resume_token": resume_token,
-                }
-            prepared = await self._activate_staging_plan_under_lease(
-                canonical_plan,
-                expected_plan_hash=expected_plan_hash,
-                actor_id=actor_id,
-                operation_leases=(operation_lease, backup_lease),
-                **activation_arguments,
-            )
-            transferred_contexts = operation_contexts.pop_all()
-            try:
-                prepared.cutover_guard.retain_operation_context(
-                    transferred_contexts
-                )
-            except BaseException:
-                try:
-                    self.abandon_prepared_activation(
-                        str(prepared.get("activationId", "")),
-                        error_code="activation_guard_transfer_failed",
-                    )
-                except BaseException:
-                    # ExitStack does not promise implicit cleanup, but its
-                    # generator contexts could still be finalized later. Keep
-                    # the global/backup leases strongly reachable so a failed
-                    # durable rollback remains fail-closed.
-                    _FAILED_CUTOVER_OPERATION_CONTEXTS.append(
-                        transferred_contexts
-                    )
-                    raise
-                transferred_contexts.close()
-                await prepared.cutover_guard.close()
-                raise
-            return prepared
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-        finally:
-            operation_contexts.close()
-
-    async def _activate_staging_plan_under_lease(
-        self,
-        plan: StagingPlan,
-        *,
-        expected_plan_hash: str,
-        actor_id: str | None,
-        activation_id: str | None = None,
-        resume_token: str | None = None,
-        operation_leases: tuple[BackupOperationLease, ...],
-    ) -> PreparedBackupActivation:
-        self._operation_commit_guard(*operation_leases)
-        if plan.plan_hash != expected_plan_hash:
-            raise BackupServiceError(
-                409,
-                "staging_plan_hash_mismatch",
-                "The supplied planHash does not match the sealed staging plan.",
-            )
-        if plan.status != "validated":
-            raise BackupServiceError(
-                409,
-                "staging_plan_not_validated",
-                "Only a validated staging plan can be activated.",
-            )
-        restart_command = get_restart_command()
-        if not restart_command:
-            raise BackupServiceError(
-                409,
-                "backup_activation_restart_unavailable",
-                "PPBase was not started with a reusable restart command.",
-            )
-        if is_restart_scheduled():
-            raise BackupServiceError(
-                409,
-                "backup_activation_restart_pending",
-                "Another PPBase process restart is already pending.",
-            )
-        try:
-            current_activation = self.activations.active()
-        except ActivationError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_activation_state_invalid",
-                "The durable activation state cannot be inspected safely.",
-            ) from exc
-        if current_activation is not None and current_activation.get("status") in {
-            "restart_scheduled",
-            "starting",
-            "rollback_pending",
-        }:
-            raise BackupServiceError(
-                409,
-                "backup_activation_in_progress",
-                "Another backup activation or rollback is already in progress.",
-            )
-
-        inspection = await self._trusted_inspection(plan.backup_id)
-        self._require_plan_manifest(inspection, plan)
-        contract = self._manifest_contract(inspection)
-        destination = await self._preflight_restore_destination(
-            inspection,
-            contract,
-        )
-        if not secrets.compare_digest(
-            destination.fingerprint_sha256,
-            plan.destination_fingerprint_sha256,
-        ):
-            raise BackupServiceError(
-                409,
-                "staging_destination_changed",
-                "The restore destination or PostgreSQL policy changed after validation.",
-            )
-
-        target = await _to_thread_quiescent(
-            self.store.open_existing_staging_data_dir,
-            self.target_root,
-            Path(plan.plan_id) / "data",
-            cancel_cleanup=lambda opened: opened.close(),
-        )
-        target_runtime_url = replace_sqlalchemy_database(
-            self.settings.database_url,
-            plan.target_database,
-        )
-        target_runtime_url_string = target_runtime_url.render_as_string(
-            hide_password=False
-        )
-        target_engine = create_async_engine(target_runtime_url, poolclass=NullPool)
-        cutover_guard: BackupCutoverGuard | None = None
-        cutover_guard_transferred = False
-        cutover_guard_must_remain = False
-        try:
-            if target.path != Path(plan.target_data_dir):
-                raise BackupIntegrityError(
-                    "validated staging data_dir no longer matches the sealed plan"
-                )
-            await _to_thread_quiescent(target.verify_attached)
-            async with target_engine.connect() as connection:
-                identity = await self._postgres_server_identity(connection)
-                if (
-                    identity["role"] != destination.runtime_info.username
-                    or identity["database"] != plan.target_database
-                    or self._server_instance_key(identity)
-                    != self._server_instance_key(destination.runtime_identity)
-                ):
-                    raise PostgresBackupError(
-                        "runtime DSN cannot pin the validated staging database"
-                    )
-                validation = await validate_staged_database(
-                    connection,
-                    expected_database=plan.target_database,
-                    expected_owner=destination.target_owner,
-                    expected_restore_role=destination.restore_info.username,
-                    expected_runtime_role=destination.runtime_info.username,
-                    expected_dump_role=destination.dump_info.username,
-                    expected_contract=contract,
-                )
-                validation.require_valid()
-                references = await read_canonical_local_file_references(connection)
-                _require_manifest_file_reference_inventory(inspection, references)
-                await _to_thread_quiescent(
-                    target.verify_local_file_references,
-                    references,
-                )
-                await connection.rollback()
-                async with AsyncSession(bind=connection, expire_on_commit=False) as session:
-                    async with session.begin():
-                        pending = await get_pending_migrations(
-                            session,
-                            Path(self.settings.migrations_dir).expanduser(),
-                        )
-                if pending:
-                    raise BackupServiceError(
-                        409,
-                        "staging_migrations_changed",
-                        "Migration files changed after staging validation; create a new plan.",
-                    )
-
-            expected_jwt_sha256 = await _to_thread_quiescent(
-                target.read_secret_sha256
-            )
-            signer_fingerprint = hashlib.sha256(
-                inspection.signer_public_key
-            ).hexdigest()
-            previous_database_url = str(self.settings.database_url)
-            previous_dump_database_url = self._dump_configuration()
-            target_dump_database_url = replace_sqlalchemy_database(
-                previous_dump_database_url,
-                plan.target_database,
-            ).render_as_string(hide_password=False)
-            try:
-                previous_data_path = Path(self.settings.data_dir).expanduser().resolve(
-                    strict=True
-                )
-                previous_data_fd = os.open(
-                    previous_data_path,
-                    os.O_RDONLY
-                    | getattr(os, "O_DIRECTORY", 0)
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NOFOLLOW", 0),
-                )
-            except OSError as exc:
-                raise BackupIntegrityError(
-                    "active data_dir cannot be pinned before activation"
-                ) from exc
-            try:
-                previous_data_info = os.fstat(previous_data_fd)
-                if not stat.S_ISDIR(previous_data_info.st_mode):
-                    raise BackupIntegrityError(
-                        "active data_dir is not a directory"
-                    )
-            finally:
-                os.close(previous_data_fd)
-            previous_data_dir = str(previous_data_path)
-            previous_jwt_sha256 = hashlib.sha256(
-                self.settings.get_jwt_secret().encode("utf-8")
-            ).hexdigest()
-            previous_command = replace_serve_command_targets(
-                restart_command,
-                database_url=previous_database_url,
-                data_dir=previous_data_dir,
-            )
-            target_command = replace_serve_command_targets(
-                restart_command,
-                database_url=target_runtime_url_string,
-                data_dir=plan.target_data_dir,
-            )
-
-            def activation_commit_guard() -> None:
-                target.verify_attached()
-                self._operation_commit_guard(*operation_leases)
-
-            retained_barrier = await acquire_retained_backup_write_barrier(
-                self.engine,
-                timeout_seconds=float(self.settings.backup_barrier_timeout),
-            )
-            restart_reservation = reserve_process_restart()
-            if restart_reservation is None:
-                await retained_barrier.close()
-                raise BackupServiceError(
-                    409,
-                    "backup_activation_restart_pending",
-                    "Another PPBase process restart is already pending.",
-                )
-            try:
-                cutover_guard = BackupCutoverGuard(
-                    retained_barrier,
-                    restart_reservation=restart_reservation,
-                )
-            except BaseException:
-                restart_reservation.release()
-                await retained_barrier.close()
-                raise
-            await cutover_guard.verify_held()
-            selected_activation_id = activation_id or secrets.token_hex(16)
-            try:
-                prepared = self.activations.prepare(
-                    activation_id=selected_activation_id,
-                    resume_token=resume_token,
-                    plan_id=plan.plan_id,
-                    backup_id=plan.backup_id,
-                    plan_hash=plan.plan_hash,
-                    manifest_sha256=plan.manifest_sha256,
-                    signer_fingerprint_sha256=signer_fingerprint,
-                    jwt_secret_mode=plan.jwt_secret_mode,
-                    previous_database_url=previous_database_url,
-                    previous_dump_database_url=previous_dump_database_url,
-                    previous_data_dir=previous_data_dir,
-                    previous_restart_command=previous_command,
-                    target_database_url=target_runtime_url_string,
-                    target_dump_database_url=target_dump_database_url,
-                    target_data_dir=plan.target_data_dir,
-                    target_restart_command=target_command,
-                    expected_jwt_sha256=expected_jwt_sha256,
-                    actor_id=actor_id,
-                    previous_data_identity=(
-                        previous_data_info.st_dev,
-                        previous_data_info.st_ino,
-                    ),
-                    expected_previous_jwt_sha256=previous_jwt_sha256,
-                    expected_previous_database_identity={
-                        "role": destination.runtime_identity["role"],
-                        "database": destination.runtime_identity["database"],
-                        "serverAddress": destination.runtime_identity[
-                            "server_address"
-                        ],
-                        "serverPort": destination.runtime_identity["server_port"],
-                        "postmasterStartedAt": destination.runtime_identity[
-                            "postmaster_started_at"
-                        ],
-                        "serverVersionNum": destination.runtime_identity[
-                            "server_version_num"
-                        ],
-                        "databaseOid": destination.runtime_identity[
-                            "database_oid"
-                        ],
-                        "databaseMarker": destination.runtime_identity[
-                            "database_marker"
-                        ],
-                    },
-                    target_data_identity=(
-                        os.fstat(target.fileno()).st_dev,
-                        os.fstat(target.fileno()).st_ino,
-                    ),
-                    expected_database_identity={
-                        "role": identity["role"],
-                        "database": identity["database"],
-                        "serverAddress": identity["server_address"],
-                        "serverPort": identity["server_port"],
-                        "postmasterStartedAt": identity[
-                            "postmaster_started_at"
-                        ],
-                        "serverVersionNum": identity["server_version_num"],
-                        "databaseOid": identity["database_oid"],
-                        "databaseMarker": identity["database_marker"],
-                    },
-                    pre_commit_guard=activation_commit_guard,
-                )
-            except BaseException:
-                try:
-                    visible_activation = self.activations.active()
-                except BaseException:
-                    cutover_guard_must_remain = True
-                    raise
-                if (
-                    visible_activation is not None
-                    and visible_activation.get("activationId")
-                    == selected_activation_id
-                ):
-                    cutover_guard_must_remain = True
-                    try:
-                        self.abandon_prepared_activation(
-                            selected_activation_id,
-                            error_code="activation_publication_failed",
-                        )
-                    except BaseException:
-                        raise
-                    cutover_guard_must_remain = False
-                    await cutover_guard.close()
-                raise
-            cutover_guard_must_remain = True
-            try:
-                await cutover_guard.verify_held()
-            except BaseException:
-                # Publication is already durable.  Never reopen writes until
-                # the journal has durably selected the previous target again.
-                try:
-                    self.abandon_prepared_activation(
-                        str(prepared.get("activationId", "")),
-                        error_code="activation_cutover_guard_lost",
-                    )
-                except BaseException:
-                    # Fail closed if the durable target selection cannot be
-                    # reverted.  The self-retained guard intentionally stays
-                    # alive until process exit or manual recovery.
-                    cutover_guard_must_remain = True
-                    raise
-                cutover_guard_must_remain = False
-                await cutover_guard.close()
-                raise
-            result = PreparedBackupActivation(
-                prepared,
-                cutover_guard=cutover_guard,
-            )
-            cutover_guard_transferred = True
-            return result
-        except BackupServiceError:
-            raise
-        except WriteBarrierTimeoutError as exc:
-            raise BackupServiceError(
-                409,
-                "backup_activation_barrier_timeout",
-                "Timed out waiting for active DB/file mutations to finish.",
-            ) from exc
-        except (WriteBarrierConnectionLostError, WriteBarrierError) as exc:
-            raise BackupServiceError(
-                503,
-                "backup_activation_barrier_lost",
-                "The activation was not accepted because its write barrier was lost.",
-            ) from exc
-        except ActivationError as exc:
-            raise BackupServiceError(
-                409,
-                "backup_activation_state_invalid",
-                str(exc),
-            ) from exc
-        except (BackupError, PostgresBackupError) as exc:
-            raise self._map_error(exc, operation="activation") from exc
-        finally:
-            if (
-                cutover_guard is not None
-                and not cutover_guard_transferred
-                and not cutover_guard_must_remain
-            ):
-                await cutover_guard.close()
-            await target_engine.dispose()
-            target.close()
-
-    def inspect_activation(self, activation_id: str) -> dict[str, Any]:
-        try:
-            return self.activations.public_payload(
-                self.activations.inspect(activation_id)
-            )
-        except ActivationError as exc:
-            raise BackupServiceError(
-                404,
-                "backup_activation_not_found",
-                "The requested backup activation was not found or is invalid.",
-            ) from exc
-
-    def authenticate_activation(self, activation_id: str, resume_token: str) -> bool:
-        return self.activations.authenticate(activation_id, resume_token)
-
-    def get_activation_restart_spec(
-        self,
-        activation_id: str,
-    ) -> tuple[list[str], dict[str, str]]:
-        try:
-            return activation_restart_spec(
-                self.activations.inspect(activation_id)
-            )
-        except ActivationError as exc:
-            raise BackupServiceError(
-                404,
-                "backup_activation_not_found",
-                "The requested backup activation was not found or is invalid.",
-            ) from exc
-
-    def abandon_prepared_activation(
-        self,
-        activation_id: str,
-        *,
-        error_code: str,
-    ) -> dict[str, Any]:
-        """Clear an activation that could not schedule its first restart."""
-        try:
-            self.activations.mark_rollback_pending(
-                activation_id,
-                error_code=error_code,
-            )
-            state = self.activations.mark_rolled_back(activation_id)
-            return self.activations.public_payload(state)
-        except ActivationError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_activation_cancel_failed",
-                "The failed activation could not be cleared safely.",
-            ) from exc
 
     async def restore_local_backup(
         self,
@@ -2219,7 +1499,7 @@ class NativeBackupService:
         actor_id: str | None,
         operation_lease: BackupOperationLease | None = None,
     ) -> dict[str, Any]:
-        """Run SDK disaster recovery under one retained mutation lease."""
+        """Destructively restore the selected backup into the active targets."""
         if operation_lease is None:
             try:
                 with self.operations.global_exclusive() as owned_lease:
@@ -2275,562 +1555,277 @@ class NativeBackupService:
                 "backup_operation_control_invalid",
                 "SDK restore requires the global native backup mutation lease.",
             )
+        restore_id = secrets.token_hex(16)
+        prepared_files: PreparedStorageRestore | None = None
+        cutover_guard: BackupCutoverGuard | None = None
+        database_committed = False
+        cutover_must_remain = False
         try:
+            restore_connect_args = _restore_engine_connect_args(self.settings)
             operation_lease.verify_attached()
             backup_id = await self._resolve_backup_reference(backup_id)
             with self.operations.backup_shared(backup_id) as backup_lease:
-                planned = await self._create_staging_plan_under_lease(
-                    backup_id,
-                    jwt_secret_mode="disaster_recovery",
-                    actor_id=actor_id,
-                    backup_lease=backup_lease,
+                inspection = await self._trusted_inspection(backup_id)
+                contract = self._manifest_contract(inspection)
+                expected_reference_inventory = (
+                    _require_manifest_file_reference_inventory(inspection)
                 )
-                self._operation_commit_guard(operation_lease, backup_lease)
-                plan_id = str(planned["id"])
-                plan_hash = str(planned["planHash"])
-                validated = await self._execute_staging_plan_under_lease(
-                    plan_id,
-                    expected_plan_hash=plan_hash,
-                    operation_leases=(operation_lease, backup_lease),
+                # Validate the native contract (format_version already checked by
+                # the manifest; here contract_version, system_schema_version,
+                # archive completeness and every recorded application-migration
+                # SHA-256) BEFORE any destructive action. A mismatch is refused
+                # while the live database and storage are still untouched. The
+                # descriptor-pinned copy is re-parsed under the write barrier
+                # immediately before the in-process rebuild.
+                await _to_thread_quiescent(
+                    self._validate_native_contract_preflight,
+                    inspection.path / SCHEMA_JSON_RESOURCE,
+                    Path(self.settings.migrations_dir).expanduser(),
                 )
-                if validated.get("status") != "validated":
+
+                preflight_warnings: list[str] = []
+                async with self.engine.connect() as connection:
+                    runtime_identity = await self._postgres_server_identity(connection)
+                    report = await preflight_destructive_restore_role(connection)
+                    report.require_ok()
+                    preflight_warnings.extend(report.warnings)
+                    target_server_major = int(runtime_identity["server_version_num"]) // 10000
+                    if target_server_major < contract.server_major:
+                        raise PostgresBackupError(
+                            "the active PostgreSQL server is older than the backup source"
+                        )
+                    await connection.rollback()
+
+                restore_workspace_bytes = sum(
+                    int(resource.size)
+                    for resource in inspection.manifest.resources
+                )
+                await _to_thread_quiescent(
+                    require_disk_space,
+                    Path(self.settings.data_dir).expanduser(),
+                    restore_workspace_bytes,
+                    operation="destructive native restore",
+                )
+                if self.destructive_journal.read() is not None:
                     raise BackupServiceError(
                         409,
-                        "staging_plan_not_validated",
-                        "Backup restore staging did not reach validated status.",
+                        "backup_restore_recovery_required",
+                        "An interrupted destructive restore must be recovered by restarting PPBase.",
                     )
-                self._operation_commit_guard(operation_lease, backup_lease)
-                try:
-                    validated_plan = self.plans.inspect(plan_id)
-                except StagingPlanError as exc:
+                prepared_files = await _to_thread_quiescent(
+                    prepare_storage_restore,
+                    store=self.store,
+                    inspection=inspection,
+                    settings=self.settings,
+                    journal=self.destructive_journal,
+                    restore_id=restore_id,
+                    file_reference_inventory=expected_reference_inventory,
+                )
+
+                if not get_restart_command():
                     raise BackupServiceError(
                         409,
-                        "staging_plan_not_activatable",
-                        "The validated staging plan is no longer available.",
-                    ) from exc
-                return await self._activate_staging_plan_under_lease(
-                    validated_plan,
-                    expected_plan_hash=plan_hash,
-                    actor_id=actor_id,
-                    operation_leases=(operation_lease, backup_lease),
+                        "backup_restore_restart_unavailable",
+                        "PPBase was not started with a reusable serve command.",
+                    )
+                if is_restart_scheduled():
+                    raise BackupServiceError(
+                        409,
+                        "backup_restore_restart_pending",
+                        "Another PPBase process restart is already pending.",
+                    )
+
+                retained_barrier = await acquire_retained_backup_write_barrier(
+                    self.engine,
+                    timeout_seconds=float(self.settings.backup_barrier_timeout),
+                )
+                restart_reservation = reserve_process_restart()
+                if restart_reservation is None:
+                    await retained_barrier.close()
+                    raise BackupServiceError(
+                        409,
+                        "backup_restore_restart_pending",
+                        "Another PPBase process restart is already pending.",
+                    )
+                cutover_guard = BackupCutoverGuard(
+                    retained_barrier,
+                    restart_reservation=restart_reservation,
+                )
+                await cutover_guard.verify_held()
+                self._operation_commit_guard(operation_lease, backup_lease)
+
+                # Reauthenticate and pin the archive only after all writers are
+                # excluded. No path is reopened between this point and restore.
+                inspection = await self._trusted_inspection(backup_id)
+                refreshed_reference_inventory = (
+                    _require_manifest_file_reference_inventory(inspection)
+                )
+                if refreshed_reference_inventory != expected_reference_inventory:
+                    raise BackupIntegrityError(
+                        "signed local-file reference inventory changed during restore"
+                    )
+                pinned_schema = None
+                pinned_copy = None
+                pinned_schema = await _to_thread_quiescent(
+                    self.store.pin_database_resource,
+                    inspection,
+                    resource_path=SCHEMA_JSON_RESOURCE,
+                    directory=prepared_files.target,
+                    cancel_cleanup=lambda archive: archive.close(),
+                )
+                pinned_copy = await _to_thread_quiescent(
+                    self.store.pin_database_resource,
+                    inspection,
+                    resource_path=DATA_COPY_RESOURCE,
+                    directory=prepared_files.target,
+                    cancel_cleanup=lambda archive: archive.close(),
+                )
+                restore_error: BaseException | None = None
+                try:
+                    # Re-parse the descriptor-pinned schema and re-hash local
+                    # migrations under the retained write barrier. This closes
+                    # the interval between the early path-based preflight and
+                    # the first destructive storage operation.
+                    schema_bytes = os.pread(
+                        pinned_schema.fileno(), pinned_schema.size, 0
+                    )
+                    await _to_thread_quiescent(
+                        self._validate_native_contract_bytes,
+                        schema_bytes,
+                        Path(self.settings.migrations_dir).expanduser(),
+                    )
+                    # Fail closed before entering the blocking swap. If
+                    # cancellation lands after the worker has changed the active
+                    # files, the helper completes a rollback before cancellation
+                    # can escape.
+                    cutover_must_remain = True
+                    try:
+                        await _swap_prepared_storage_or_rollback(prepared_files)
+                    except _StorageSwapRollbackFailed:
+                        raise
+                    except BaseException:
+                        cutover_must_remain = False
+                        raise
+                    try:
+                        # Rebuild the database in-process from the pinned, verified
+                        # schema.json + data.copy inodes — no external binaries are
+                        # involved.
+                        restore_engine = _create_restore_cutover_engine(
+                            self.settings,
+                            restore_connect_args,
+                        )
+                        try:
+                            async with restore_engine.connect() as connection:
+                                raw_connection = (
+                                    await connection.get_raw_connection()
+                                )
+                                pg_conn = raw_connection.driver_connection
+                                # Dup the pinned fd so the SegmentReader's file
+                                # object can close without releasing the pin.
+                                copy_file = os.fdopen(
+                                    os.dup(pinned_copy.fileno()), "rb"
+                                )
+                                try:
+                                    await restore_native_database(
+                                        pg_conn,
+                                        schema_bytes=schema_bytes,
+                                        copy_file=copy_file,
+                                        copy_size=pinned_copy.size,
+                                        restore_id=restore_id,
+                                    )
+                                finally:
+                                    copy_file.close()
+                        finally:
+                            await restore_engine.dispose()
+                    except BaseException as exc:
+                        restore_error = exc
+                finally:
+                    if pinned_schema is not None:
+                        pinned_schema.close()
+                    if pinned_copy is not None:
+                        pinned_copy.close()
+
+                marker_engine = _create_restore_cutover_engine(
+                    self.settings,
+                    restore_connect_args,
+                )
+                try:
+                    async with marker_engine.connect() as connection:
+                        marker = await read_database_restore_marker(connection)
+                        database_committed = marker == restore_id
+                        if database_committed:
+                            await validate_committed_destructive_restore(
+                                self.settings,
+                                connection,
+                                expected_reference_inventory,
+                            )
+                        await connection.rollback()
+                finally:
+                    await marker_engine.dispose()
+
+                if not database_committed:
+                    await _to_thread_quiescent(prepared_files.rollback)
+                    cutover_must_remain = False
+                    await cutover_guard.close()
+                    cutover_guard = None
+                    if restore_error is not None:
+                        raise restore_error
+                    raise PostgresBackupError(
+                        "destructive restore ended without its atomic commit marker"
+                    )
+
+                prepared_files.mark_database_committed()
+                prepared_files.target.close()
+                return PreparedDestructiveRestore(
+                    {
+                        "backupId": backup_id,
+                        "restoreId": restore_id,
+                        "status": "restart_scheduled",
+                        "destructive": True,
+                        "actorId": actor_id,
+                        "preflightWarnings": preflight_warnings,
+                    },
+                    cutover_guard=cutover_guard,
                 )
         except BackupOperationError as exc:
             raise self._map_operation_error(exc) from exc
-
-    async def _execute_staging_plan_under_lease(
-        self,
-        plan_id: str,
-        *,
-        expected_plan_hash: str,
-        operation_leases: tuple[BackupOperationLease, ...] = (),
-    ) -> dict[str, Any]:
-        self._require_control_identity_attached()
-        if operation_leases:
-            self._operation_commit_guard(*operation_leases)
-        try:
-            plan = self.plans.begin_execution(
-                plan_id,
-                expected_plan_hash=expected_plan_hash,
-            )
-        except StagingPlanError as exc:
+        except BackupDiskSpaceError as exc:
             raise BackupServiceError(
-                409,
-                "staging_plan_not_executable",
+                507,
+                "backup_restore_insufficient_disk_space",
                 str(exc),
             ) from exc
-        attempt_id = str(plan.status_data.get("attemptId", ""))
-        if not attempt_id:
-            raise BackupServiceError(
-                500,
-                "staging_attempt_missing",
-                "The durable staging execution attempt is missing.",
-            )
-
-        try:
-            result = await self._execute_started_plan(plan)
-            if operation_leases:
-                self._operation_commit_guard(*operation_leases)
-                terminal_guard: Callable[[], None] = lambda: (
-                    self._operation_commit_guard(*operation_leases)
-                )
-            else:
-                self._require_control_identity_attached()
-                terminal_guard = self._require_control_identity_attached
-            return self.plans.finish(
-                plan.plan_id,
-                status="validated",
-                expected_attempt_id=attempt_id,
-                data=result,
-                pre_commit_guard=terminal_guard,
-            ).as_dict()
-        except BaseException as exc:
-            failure_code = (
-                "staging_cancelled"
-                if isinstance(exc, asyncio.CancelledError)
-                else self._failure_code(exc)
-            )
-            quarantine_error: BaseException | None = None
-            try:
-                self.plans.finish(
-                    plan.plan_id,
-                    status="quarantined",
-                    expected_attempt_id=attempt_id,
-                    data={
-                        "failureCode": failure_code,
-                        "targetDatabase": plan.target_database,
-                        "targetDataDir": plan.target_data_dir,
-                    },
-                )
-            except Exception as persistence_exc:
-                quarantine_error = persistence_exc
-            if quarantine_error is not None:
-                try:
-                    self.plans.abandon_execution(
-                        plan.plan_id,
-                        expected_attempt_id=attempt_id,
-                    )
-                except Exception:
-                    # The lease registry is popped before its descriptor is
-                    # closed, so even a close error cannot leave a false
-                    # in-process owner. Preserve the original operation result.
-                    pass
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                raise BackupServiceError(
-                    500,
-                    "staging_quarantine_persistence_failed",
-                    "Staging failed and its quarantine status could not be "
-                    "persisted safely.",
-                    {
-                        "failureCode": failure_code,
-                        "targetDatabase": plan.target_database,
-                        "targetDataDir": plan.target_data_dir,
-                    },
-                ) from exc
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            if not isinstance(exc, Exception):
-                raise
-            if isinstance(exc, BackupServiceError):
-                raise
-            if isinstance(exc, (BackupError, PostgresBackupError, StagingPlanError)):
-                raise self._map_error(exc, operation="restore") from exc
-            raise BackupServiceError(
-                500,
-                "staging_validation_failed",
-                "Restore staging failed; its new targets were quarantined.",
-                {
-                    "targetDatabase": plan.target_database,
-                    "targetDataDir": plan.target_data_dir,
-                },
-            ) from exc
-
-    async def _execute_started_plan(self, plan: StagingPlan) -> dict[str, Any]:
-        inspection = await self._trusted_inspection(plan.backup_id)
-        self._require_plan_manifest(inspection, plan)
-        contract = self._manifest_contract(inspection)
-        destination = await self._preflight_restore_destination(
-            inspection,
-            contract,
-        )
-        if not secrets.compare_digest(
-            destination.fingerprint_sha256,
-            plan.destination_fingerprint_sha256,
-        ):
+        except WriteBarrierTimeoutError as exc:
             raise BackupServiceError(
                 409,
-                "staging_destination_changed",
-                "The restore destination or PostgreSQL policy changed after "
-                "this plan was sealed.",
-            )
-        restore_url = destination.restore_url
-        target_owner = destination.target_owner
-        restore_info = destination.restore_info
-
-        staging_target = await _to_thread_quiescent(
-            self.store.open_staging_data_dir,
-            self.target_root,
-            Path(plan.plan_id) / "data",
-            cancel_cleanup=lambda target: target.close(),
-        )
-        if staging_target.path != Path(plan.target_data_dir):
-            staging_target.close()
-            raise BackupIntegrityError(
-                "staging filesystem target no longer matches the sealed plan"
-            )
-        try:
-            return await self._restore_into_anchored_target(
-                plan,
-                inspection,
-                contract,
-                destination,
-                staging_target,
-            )
+                "backup_restore_barrier_timeout",
+                "Timed out waiting for active writes and migrations to finish.",
+            ) from exc
+        except (WriteBarrierConnectionLostError, WriteBarrierError) as exc:
+            raise BackupServiceError(
+                503,
+                "backup_restore_barrier_lost",
+                "The destructive restore write barrier was lost.",
+            ) from exc
+        except BackupServiceError:
+            raise
+        except (BackupError, PostgresBackupError, DestructiveRestoreError) as exc:
+            raise self._map_error(exc, operation="restore") from exc
         finally:
-            staging_target.close()
-
-    async def _restore_into_anchored_target(
-        self,
-        plan: StagingPlan,
-        inspection: AuthenticatedBackupInspection,
-        contract: DatabaseContract,
-        destination: _RestoreDestinationPreflight,
-        staging_target: AnchoredStagingDataDir,
-    ) -> dict[str, Any]:
-        creator_url = destination.creator_url
-        restore_url = destination.restore_url
-        target_owner = destination.target_owner
-        restore_info = destination.restore_info
-
-        await _to_thread_quiescent(staging_target.restore_files, inspection)
-        jwt_mode = self._manifest_jwt_secret_mode(inspection)
-        clone_rotation: dict[str, int] | None = None
-        if plan.jwt_secret_mode == "disaster_recovery":
-            if jwt_mode != "included_resource":
-                raise BackupServiceError(
-                    409,
-                    "external_jwt_secret_unverifiable",
-                    "Disaster recovery requires the signed JWT-secret resource; "
-                    "an externally managed secret cannot yet be proven identical.",
-                )
-            await _to_thread_quiescent(staging_target.install_jwt, inspection)
-        else:
-            clone_secret = (generate_clone_jwt_secret() + "\n").encode("ascii")
-            await _to_thread_quiescent(staging_target.write_secret, clone_secret)
-
-        await _to_thread_quiescent(staging_target.verify_attached)
-        created_database = await create_target_database(
-            destination.creator_tool_url,
-            plan.target_database,
-            target_owner=target_owner,
-            restore_role=restore_info.username,
-            runtime_role=destination.runtime_info.username,
-            dump_role=destination.dump_info.username,
-            contract=contract,
-            expected_server_identity=destination.creator_identity,
-            psql=self.settings.backup_psql_path,
-            passfile_factory=staging_target.temporary_file,
-        )
-        target_restore_url = replace_sqlalchemy_database(
-            restore_url,
-            plan.target_database,
-        )
-        target_dump_url = replace_sqlalchemy_database(
-            self._dump_configuration(),
-            plan.target_database,
-        )
-        target_runtime_url = replace_sqlalchemy_database(
-            self.settings.database_url,
-            plan.target_database,
-        )
-        target_restore_tool_url = replace_sqlalchemy_database(
-            destination.restore_tool_url,
-            plan.target_database,
-        )
-        target_marker = created_database.marker_comment
-        target_engine = create_async_engine(target_restore_url, poolclass=NullPool)
-        target_dump_engine = create_async_engine(target_dump_url, poolclass=NullPool)
-        target_runtime_engine = create_async_engine(
-            target_runtime_url,
-            poolclass=NullPool,
-        )
-        migrations_applied: tuple[str, ...] = ()
-        try:
-            async with target_engine.connect() as connection:
-                async with connection.begin():
-                    guard_identity = await self._verify_target_guard_connection(
-                        connection,
-                        target_database=plan.target_database,
-                        expected_restore_role=restore_info.username,
-                        expected_server_identity=destination.restore_identity,
-                        expected_marker=target_marker,
-                    )
-                    guard_backend_pid = int(guard_identity["backend_pid"])
-
-                    inspection = await self._trusted_inspection(plan.backup_id)
-                    self._require_plan_manifest(inspection, plan)
-                    pinned_archive = await _to_thread_quiescent(
-                        self.store.pin_database_dump,
-                        inspection,
-                        directory=staging_target,
-                        cancel_cleanup=lambda archive: archive.close(),
-                    )
-                    try:
-                        restore_task = asyncio.create_task(
-                            run_pg_restore_from_fd(
-                                target_restore_tool_url,
-                                pinned_archive.fileno(),
-                                archive_label=pinned_archive.source_path,
-                                target_owner=target_owner,
-                                pg_restore=self.settings.backup_pg_restore_path,
-                                expected_server_major=contract.server_major,
-                                passfile_factory=staging_target.temporary_file,
-                            )
-                        )
-                        await self._await_restore_with_guard(
-                            restore_task,
-                            connection=connection,
-                            target_database=plan.target_database,
-                            expected_restore_role=restore_info.username,
-                            expected_server_identity=destination.restore_identity,
-                            expected_marker=target_marker,
-                            expected_backend_pid=guard_backend_pid,
-                        )
-                    finally:
-                        pinned_archive.close()
-
-                    await self._verify_target_guard_connection(
-                        connection,
-                        target_database=plan.target_database,
-                        expected_restore_role=restore_info.username,
-                        expected_server_identity=destination.restore_identity,
-                        expected_marker=target_marker,
-                        expected_backend_pid=guard_backend_pid,
-                    )
-                    await _to_thread_quiescent(staging_target.verify_attached)
-
-                    inspection = await self._trusted_inspection(plan.backup_id)
-                    self._require_plan_manifest(inspection, plan)
-
-                    await connection.execute(text(f'SET LOCAL ROLE "{target_owner}"'))
-                    if plan.jwt_secret_mode == "clone":
-                        rotation = await rotate_clone_database_secrets(connection)
-                        clone_rotation = {
-                            "authCollectionCount": rotation.auth_collection_count,
-                            "authRecordCount": rotation.auth_record_count,
-                            "collectionSecretCount": rotation.collection_secret_count,
-                        }
-                    await connection.execute(text("ANALYZE"))
-                    validation = await validate_staged_database(
-                        connection,
-                        expected_database=plan.target_database,
-                        expected_owner=target_owner,
-                        expected_runtime_role=destination.runtime_info.username,
-                        expected_dump_role=destination.dump_info.username,
-                        expected_contract=contract,
-                    )
-                    validation.require_valid()
-                    restored_file_references = (
-                        await read_canonical_local_file_references(connection)
-                    )
-                    _require_manifest_file_reference_inventory(
-                        inspection,
-                        restored_file_references,
-                    )
-                    await _to_thread_quiescent(
-                        staging_target.verify_local_file_references,
-                        restored_file_references,
-                    )
-                    await self._validate_source_summary(
-                        connection,
-                        inspection,
-                        validation.collection_count,
-                        validation.migration_count,
-                    )
-
-                await self._verify_target_guard_connection(
-                    connection,
-                    target_database=plan.target_database,
-                    expected_restore_role=restore_info.username,
-                    expected_server_identity=destination.restore_identity,
-                    expected_marker=target_marker,
-                    expected_backend_pid=guard_backend_pid,
-                )
-                await connection.rollback()
-                migrations_applied = await self._apply_missing_staged_migrations(
-                    connection,
-                    target_owner=target_owner,
-                )
-
-                async with connection.begin():
-                    await self._verify_target_guard_connection(
-                        connection,
-                        target_database=plan.target_database,
-                        expected_restore_role=restore_info.username,
-                        expected_server_identity=destination.restore_identity,
-                        expected_marker=target_marker,
-                        expected_backend_pid=guard_backend_pid,
-                    )
-                    await _to_thread_quiescent(staging_target.verify_attached)
-                    inspection = await self._trusted_inspection(plan.backup_id)
-                    self._require_plan_manifest(inspection, plan)
-
-                    await connection.execute(text(f'SET LOCAL ROLE "{target_owner}"'))
-                    await grant_dump_role_read_access(
-                        connection,
-                        target_owner=target_owner,
-                        dump_role=destination.dump_info.username,
-                    )
-                    await connection.execute(text("ANALYZE"))
-                    validation = await validate_staged_database(
-                        connection,
-                        expected_database=plan.target_database,
-                        expected_owner=target_owner,
-                        expected_runtime_role=destination.runtime_info.username,
-                        expected_dump_role=destination.dump_info.username,
-                        expected_contract=contract,
-                    )
-                    validation.require_valid()
-                    restored_file_references = (
-                        await read_canonical_local_file_references(connection)
-                    )
-                    _require_manifest_file_reference_inventory(
-                        inspection,
-                        restored_file_references,
-                    )
-                    await _to_thread_quiescent(
-                        staging_target.verify_local_file_references,
-                        restored_file_references,
-                    )
-                await self._verify_target_guard_connection(
-                    connection,
-                    target_database=plan.target_database,
-                    expected_restore_role=restore_info.username,
-                    expected_server_identity=destination.restore_identity,
-                    expected_marker=target_marker,
-                    expected_backend_pid=guard_backend_pid,
-                )
-                async with target_runtime_engine.begin() as runtime_connection:
-                    runtime_identity = await self._postgres_server_identity(
-                        runtime_connection
-                    )
-                    if (
-                        runtime_identity["role"] != destination.runtime_info.username
-                        or runtime_identity["database"] != plan.target_database
-                        or int(runtime_identity["database_oid"])
-                        != int(guard_identity["database_oid"])
-                        or not secrets.compare_digest(
-                            str(runtime_identity.get("database_marker") or ""),
-                            target_marker,
-                        )
-                        or self._server_instance_key(runtime_identity)
-                        != self._server_instance_key(destination.runtime_identity)
-                    ):
-                        raise PostgresBackupError(
-                            "retargeted runtime DSN does not pin the restored database"
-                        )
-                    await grant_dump_role_runtime_default_privileges(
-                        runtime_connection,
-                        runtime_role=destination.runtime_info.username,
-                        dump_role=destination.dump_info.username,
-                    )
-                await self._verify_target_guard_connection(
-                    connection,
-                    target_database=plan.target_database,
-                    expected_restore_role=restore_info.username,
-                    expected_server_identity=destination.restore_identity,
-                    expected_marker=target_marker,
-                    expected_backend_pid=guard_backend_pid,
-                )
-                async with target_dump_engine.connect() as dump_connection:
-                    dump_identity = await self._postgres_server_identity(dump_connection)
-                    if (
-                        dump_identity["role"] != destination.dump_info.username
-                        or dump_identity["database"] != plan.target_database
-                        or int(dump_identity["database_oid"])
-                        != int(guard_identity["database_oid"])
-                        or not secrets.compare_digest(
-                            str(dump_identity.get("database_marker") or ""),
-                            target_marker,
-                        )
-                        or self._server_instance_key(dump_identity)
-                        != self._server_instance_key(destination.runtime_identity)
-                    ):
-                        raise PostgresBackupError(
-                            "retargeted dump DSN does not pin the restored database"
-                        )
-                    dump_report = await preflight_dump_role(dump_connection)
-                    dump_report.require_ok()
-                    await dump_connection.rollback()
-                await self._verify_target_guard_connection(
-                    connection,
-                    target_database=plan.target_database,
-                    expected_restore_role=restore_info.username,
-                    expected_server_identity=destination.restore_identity,
-                    expected_marker=target_marker,
-                    expected_backend_pid=guard_backend_pid,
-                )
-        finally:
-            await target_runtime_engine.dispose()
-            await target_dump_engine.dispose()
-            await target_engine.dispose()
-
-        await _to_thread_quiescent(staging_target.verify_attached)
-        return {
-            "targetDatabase": plan.target_database,
-            "targetDataDir": plan.target_data_dir,
-            "validation": validation.to_dict(),
-            "jwtSecretMode": plan.jwt_secret_mode,
-            "cloneRotation": clone_rotation,
-            "migrationsApplied": list(migrations_applied),
-            "activationPerformed": False,
-        }
-
-    async def _apply_missing_staged_migrations(
-        self,
-        connection: Any,
-        *,
-        target_owner: str,
-    ) -> tuple[str, ...]:
-        """Apply local pending migrations only on the isolated target session."""
-        owner = validate_postgres_identifier(target_owner, label="target owner")
-        migrations_dir = Path(self.settings.migrations_dir).expanduser()
-        try:
-            async with migration_lock_on_connection(
-                connection,
-                timeout_seconds=float(self.settings.migration_lock_timeout),
-            ):
-                role_selected = False
-                body_error: BaseException | None = None
+            if prepared_files is not None and not cutover_must_remain:
                 try:
-                    await connection.execute(text(f'SET ROLE "{owner}"'))
-                    await connection.commit()
-                    role_selected = True
-                    applied = await apply_pending_on_connection(
-                        connection,
-                        migrations_dir,
-                    )
-                    async with AsyncSession(
-                        bind=connection,
-                        expire_on_commit=False,
-                    ) as session:
-                        async with session.begin():
-                            remaining = await get_pending_migrations(
-                                session,
-                                migrations_dir,
-                            )
-                    if remaining:
-                        raise PostgresBackupError(
-                            "staged database still has pending migrations after application"
-                        )
-                    return tuple(applied)
-                except BaseException as exc:
-                    body_error = exc
-                    raise
-                finally:
-                    if role_selected and not bool(getattr(connection, "closed", False)):
-                        try:
-                            if connection.in_transaction():
-                                await connection.rollback()
-                            await connection.execute(text("RESET ROLE"))
-                            await connection.commit()
-                        except BaseException as reset_error:
-                            if body_error is None:
-                                raise PostgresBackupError(
-                                    "staged migration role could not be reset safely"
-                                ) from reset_error
-        except asyncio.CancelledError:
-            raise
-        except PostgresBackupError:
-            raise
-        except MigrationLockError as exc:
-            raise PostgresBackupError(
-                "staged database migration lock could not be acquired safely"
-            ) from exc
-        except Exception as exc:
-            raise PostgresBackupError(
-                "staged database migration application failed"
-            ) from exc
+                    prepared_files.cleanup_work_dir()
+                except Exception:
+                    pass
+            # Once PostgreSQL committed, an unexpected verification failure is
+            # fail-closed: the self-retained guard and startup journal stay in
+            # place for explicit process restart recovery.
+            if cutover_guard is not None and not cutover_must_remain:
+                try:
+                    await cutover_guard.close()
+                except Exception:
+                    pass
+
 
     def _load_identity(self) -> BackupIdentity:
         sets_dir = self.backup_root / "sets"
@@ -2911,16 +1906,12 @@ class NativeBackupService:
         named_roots = {
             "backup_root": self.backup_root,
             "backup_control_dir": self.control_dir,
-            "backup_staging_root": self.staging_root,
-            "backup_target_root": self.target_root,
         }
         resolved_roots = {
             label: root.resolve(strict=False)
             for label, root in named_roots.items()
         }
         for label, root in resolved_roots.items():
-            if label == "backup_target_root":
-                continue
             if (
                 root == active_data_dir
                 or root.is_relative_to(active_data_dir)
@@ -2931,17 +1922,6 @@ class NativeBackupService:
                     "unsafe_backup_root",
                     f"{label} must be outside the active data_dir.",
                 )
-        target_root = resolved_roots["backup_target_root"]
-        if target_root == active_data_dir or target_root.is_relative_to(
-            active_data_dir
-        ):
-            raise BackupServiceError(
-                409,
-                "unsafe_backup_root",
-                "backup_target_root must contain isolated targets without being the active data_dir.",
-            )
-        if active_data_dir.is_relative_to(target_root):
-            self._verify_active_target_is_journaled(active_data_dir)
         values = list(resolved_roots.items())
         for index, (left_name, left) in enumerate(values):
             for right_name, right in values[index + 1 :]:
@@ -2951,73 +1931,7 @@ class NativeBackupService:
                         "overlapping_backup_roots",
                         f"{left_name} and {right_name} must not overlap.",
                     )
-        for label, root in (
-            ("backup_staging_root", self.staging_root),
-            ("backup_target_root", self.target_root),
-        ):
-            root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            root_info = root.lstat()
-            if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
-                raise BackupServiceError(
-                    409,
-                    (
-                        "unsafe_staging_root"
-                        if label == "backup_staging_root"
-                        else "unsafe_target_root"
-                    ),
-                    f"{label} must be a private local directory.",
-                )
-            os.chmod(root, 0o700, follow_symlinks=False)
-            if stat.S_IMODE(root.lstat().st_mode) != 0o700:
-                raise BackupServiceError(
-                    409,
-                    (
-                        "unsafe_staging_root"
-                        if label == "backup_staging_root"
-                        else "unsafe_target_root"
-                    ),
-                    f"{label} must have mode 0700.",
-                )
 
-    def _verify_active_target_is_journaled(self, active_data_dir: Path) -> None:
-        control_root: ControlPlaneRoot | None = None
-        store: BackupActivationStore | None = None
-        try:
-            control_root = ControlPlaneRoot.open(
-                self.control_dir,
-                create_missing=False,
-            )
-            store = BackupActivationStore(control_root)
-            state = store.active()
-            if state is None or state.get("selectedTarget") != "target":
-                raise ActivationError("no active target is journaled")
-            expected = Path(str(state.get("targetDataDir", ""))).expanduser().resolve(
-                strict=True
-            )
-            if expected != active_data_dir.resolve(strict=True):
-                raise ActivationError("active target path does not match the journal")
-            info = expected.stat()
-            expected_device = state.get("targetDataDevice")
-            expected_inode = state.get("targetDataInode")
-            if (
-                isinstance(expected_device, bool)
-                or isinstance(expected_inode, bool)
-                or not isinstance(expected_device, int)
-                or not isinstance(expected_inode, int)
-                or (info.st_dev, info.st_ino) != (expected_device, expected_inode)
-            ):
-                raise ActivationError("active target inode does not match the journal")
-        except (ActivationError, ControlPlaneSafetyError, OSError) as exc:
-            raise BackupServiceError(
-                409,
-                "unsafe_backup_root",
-                "The active data_dir under backup_target_root is not the exact durable journaled target.",
-            ) from exc
-        finally:
-            if store is not None:
-                store.close()
-            if control_root is not None:
-                control_root.close()
 
     @staticmethod
     async def _postgres_server_identity(connection: Any) -> dict[str, Any]:
@@ -3059,371 +1973,6 @@ class NativeBackupService:
             ),
         }
 
-    @staticmethod
-    def _server_instance_key(identity: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            identity["server_address"],
-            identity["server_port"],
-            identity["postmaster_started_at"],
-            identity["server_version_num"],
-        )
-
-    @staticmethod
-    async def _pin_restore_tool_url(
-        database_url: str,
-        info: LibpqConnectionInfo,
-    ) -> tuple[URL, str | None]:
-        """Resolve one direct tool endpoint and bind libpq with ``hostaddr``."""
-        parsed = make_url(database_url)
-        forbidden_query = {"hostaddr", "target_session_attrs"}.intersection(
-            parsed.query
-        )
-        if forbidden_query:
-            raise PostgresBackupError(
-                "restore DSNs cannot override hostaddr or target_session_attrs"
-            )
-        host = str(info.host or "localhost")
-        if "," in host or any(character.isspace() for character in host):
-            raise PostgresBackupError(
-                "restore DSNs must use one direct PostgreSQL endpoint"
-            )
-        if host.startswith("/"):
-            return parsed, None
-
-        try:
-            address = ipaddress.ip_address(host).compressed
-        except ValueError:
-            loop = asyncio.get_running_loop()
-            try:
-                resolved = await loop.getaddrinfo(
-                    host,
-                    int(info.port),
-                    family=socket.AF_INET,
-                    type=socket.SOCK_STREAM,
-                )
-                addresses = sorted({str(item[4][0]) for item in resolved})
-                if not addresses:
-                    resolved = await loop.getaddrinfo(
-                        host,
-                        int(info.port),
-                        family=socket.AF_INET6,
-                        type=socket.SOCK_STREAM,
-                    )
-                    addresses = sorted({str(item[4][0]) for item in resolved})
-            except OSError as exc:
-                raise PostgresBackupError(
-                    "restore PostgreSQL endpoint could not be resolved"
-                ) from exc
-            if len(addresses) != 1:
-                raise PostgresBackupError(
-                    "restore DSN hostname must resolve to exactly one address"
-                )
-            address = ipaddress.ip_address(addresses[0]).compressed
-        return parsed.update_query_dict({"hostaddr": address}), address
-
-    async def _preflight_restore_destination(
-        self,
-        inspection: AuthenticatedBackupInspection,
-        contract: DatabaseContract,
-    ) -> _RestoreDestinationPreflight:
-        creator_url, restore_url, target_owner = self._restore_configuration()
-        creator_info = sqlalchemy_url_to_libpq(creator_url)
-        restore_info = sqlalchemy_url_to_libpq(restore_url)
-        runtime_info = sqlalchemy_url_to_libpq(self.settings.database_url)
-        dump_info = sqlalchemy_url_to_libpq(self._dump_configuration())
-        if dump_info.username in {
-            creator_info.username,
-            restore_info.username,
-            runtime_info.username,
-            target_owner,
-        }:
-            raise PostgresBackupError(
-                "dump, creator, restore, runtime, and target owner roles must be distinct"
-            )
-        creator_tool_url, creator_hostaddr = await self._pin_restore_tool_url(
-            creator_url,
-            creator_info,
-        )
-        restore_tool_url, restore_hostaddr = await self._pin_restore_tool_url(
-            restore_url,
-            restore_info,
-        )
-        creator_tool_endpoint = (
-            creator_hostaddr or creator_info.host,
-            creator_info.port,
-        )
-        restore_tool_endpoint = (
-            restore_hostaddr or restore_info.host,
-            restore_info.port,
-        )
-        if creator_tool_endpoint != restore_tool_endpoint:
-            raise PostgresBackupError(
-                "creator and restore tools must use the same direct endpoint"
-            )
-        allowed_extensions = self._allowed_extensions()
-
-        await inspect_pg_restore_archive(
-            inspection.path / "resources" / "database.dump",
-            pg_restore=self.settings.backup_pg_restore_path,
-            expected_server_major=contract.server_major,
-        )
-        creator_engine = create_async_engine(creator_url, poolclass=NullPool)
-        restore_engine = create_async_engine(restore_url, poolclass=NullPool)
-        try:
-            async with creator_engine.connect() as connection:
-                creator_identity = await self._postgres_server_identity(connection)
-                report = await preflight_database_contract(
-                    connection,
-                    contract,
-                    creator_role=creator_info.username,
-                    restore_role=restore_info.username,
-                    runtime_role=runtime_info.username,
-                    target_owner=target_owner,
-                    allowed_extensions=allowed_extensions,
-                )
-                report.require_ok()
-                await connection.rollback()
-            async with self.engine.connect() as connection:
-                runtime_identity = await self._postgres_server_identity(connection)
-                if runtime_identity["role"] != runtime_info.username:
-                    raise PostgresBackupError(
-                        "runtime DSN login does not match current_user"
-                    )
-                if self._server_instance_key(
-                    runtime_identity
-                ) != self._server_instance_key(creator_identity):
-                    raise PostgresBackupError(
-                        "runtime and restore DSNs reached different PostgreSQL "
-                        "server instances"
-                    )
-                await connection.rollback()
-            async with restore_engine.connect() as connection:
-                restore_identity = await self._postgres_server_identity(connection)
-                if restore_identity["role"] != restore_info.username:
-                    raise PostgresBackupError(
-                        "restore DSN login does not match current_user"
-                    )
-                if self._server_instance_key(
-                    restore_identity
-                ) != self._server_instance_key(creator_identity):
-                    raise PostgresBackupError(
-                        "creator and restore DSNs reached different PostgreSQL "
-                        "server instances"
-                    )
-                await connection.rollback()
-        finally:
-            await restore_engine.dispose()
-            await creator_engine.dispose()
-
-        self._require_direct_tool_endpoint(
-            creator_hostaddr,
-            creator_identity,
-        )
-        self._require_direct_tool_endpoint(
-            restore_hostaddr,
-            restore_identity,
-        )
-
-        binding = {
-            "formatVersion": 1,
-            "serverInstance": {
-                "serverAddress": creator_identity["server_address"],
-                "serverPort": creator_identity["server_port"],
-                "postmasterStartedAt": creator_identity[
-                    "postmaster_started_at"
-                ],
-                "serverVersionNum": creator_identity["server_version_num"],
-            },
-            "creator": {
-                "configuredHost": creator_info.host,
-                "configuredPort": creator_info.port,
-                "toolHostAddress": creator_hostaddr,
-                "role": creator_identity["role"],
-                "database": creator_identity["database"],
-            },
-            "restore": {
-                "configuredHost": restore_info.host,
-                "configuredPort": restore_info.port,
-                "toolHostAddress": restore_hostaddr,
-                "role": restore_identity["role"],
-                "database": restore_identity["database"],
-            },
-            "runtime": {
-                "configuredHost": runtime_info.host,
-                "configuredPort": runtime_info.port,
-                "role": runtime_identity["role"],
-                "database": runtime_identity["database"],
-            },
-            "dump": {
-                "configuredHost": dump_info.host,
-                "configuredPort": dump_info.port,
-                "role": dump_info.username,
-            },
-            "targetOwner": target_owner,
-            "allowedExtensions": [
-                {"name": name, "version": version}
-                for name, version in sorted(allowed_extensions.items())
-            ],
-        }
-        fingerprint = hashlib.sha256(
-            _DESTINATION_DOMAIN + canonical_json_bytes(binding)
-        ).hexdigest()
-        return _RestoreDestinationPreflight(
-            creator_url=creator_url,
-            restore_url=restore_url,
-            creator_tool_url=creator_tool_url,
-            restore_tool_url=restore_tool_url,
-            target_owner=target_owner,
-            creator_info=creator_info,
-            restore_info=restore_info,
-            runtime_info=runtime_info,
-            dump_info=dump_info,
-            creator_identity=creator_identity,
-            restore_identity=restore_identity,
-            runtime_identity=runtime_identity,
-            creator_hostaddr=creator_hostaddr,
-            restore_hostaddr=restore_hostaddr,
-            fingerprint_sha256=fingerprint,
-            warnings=tuple(report.warnings),
-        )
-
-    @staticmethod
-    def _require_direct_tool_endpoint(
-        hostaddr: str | None,
-        identity: dict[str, Any],
-    ) -> None:
-        if hostaddr is None:
-            return
-        configured = ipaddress.ip_address(hostaddr)
-        if configured.is_loopback:
-            # Loopback is accepted for a local direct tunnel/NAT such as the
-            # supported Docker test deployment. The hostname still resolves to
-            # one address and both tool roles must share it.
-            return
-        observed_raw = str(identity.get("server_address", "") or "")
-        try:
-            observed = ipaddress.ip_address(observed_raw)
-        except ValueError as exc:
-            raise PostgresBackupError(
-                "restore endpoint could not be proven direct"
-            ) from exc
-        if configured != observed:
-            raise PostgresBackupError(
-                "restore endpoint appears proxied or load-balanced; a direct "
-                "PostgreSQL endpoint is required"
-            )
-
-    async def _verify_target_guard_connection(
-        self,
-        connection: Any,
-        *,
-        target_database: str,
-        expected_restore_role: str,
-        expected_server_identity: dict[str, Any],
-        expected_marker: str,
-        expected_backend_pid: int | None = None,
-    ) -> dict[str, Any]:
-        """Verify that the still-open restore guard pins the exact target."""
-        target = validate_postgres_identifier(
-            target_database,
-            label="target database",
-        )
-        expected_restore = validate_postgres_identifier(
-            expected_restore_role,
-            label="restore role",
-        )
-        if bool(getattr(connection, "closed", False)) or bool(
-            getattr(connection, "invalidated", False)
-        ):
-            raise PostgresBackupError("restore target guard connection was lost")
-        try:
-            restore_identity = await self._postgres_server_identity(connection)
-            observed = await self._read_target_database_marker(connection)
-        except PostgresBackupError:
-            raise
-        except Exception:
-            raise PostgresBackupError(
-                "restore target guard connection was lost or became unverifiable"
-            ) from None
-        if (
-            restore_identity["role"] != expected_restore
-            or restore_identity["database"] != target
-        ):
-            raise PostgresBackupError(
-                "restore target guard reached an unexpected role or database"
-            )
-        if self._server_instance_key(
-            restore_identity
-        ) != self._server_instance_key(expected_server_identity):
-            raise PostgresBackupError(
-                "restore target guard reached a different PostgreSQL server instance"
-            )
-        if expected_backend_pid is not None and int(
-            restore_identity["backend_pid"]
-        ) != int(expected_backend_pid):
-            raise PostgresBackupError(
-                "restore target guard PostgreSQL session changed during restore"
-            )
-        if not secrets.compare_digest(observed, expected_marker):
-            raise PostgresBackupError(
-                "restore target marker changed while the guard was held"
-            )
-        return restore_identity
-
-    async def _await_restore_with_guard(
-        self,
-        restore_task: asyncio.Task[_T],
-        *,
-        connection: Any,
-        target_database: str,
-        expected_restore_role: str,
-        expected_server_identity: dict[str, Any],
-        expected_marker: str,
-        expected_backend_pid: int,
-    ) -> _T:
-        """Supervise pg_restore and stop it before surfacing guard loss."""
-        try:
-            while True:
-                done, _ = await asyncio.wait(
-                    (restore_task,),
-                    timeout=_RESTORE_GUARD_POLL_SECONDS,
-                )
-                if restore_task in done:
-                    return restore_task.result()
-                try:
-                    await asyncio.wait_for(
-                        self._verify_target_guard_connection(
-                            connection,
-                            target_database=target_database,
-                            expected_restore_role=expected_restore_role,
-                            expected_server_identity=expected_server_identity,
-                            expected_marker=expected_marker,
-                            expected_backend_pid=expected_backend_pid,
-                        ),
-                        timeout=_RESTORE_GUARD_VERIFY_TIMEOUT_SECONDS,
-                    )
-                except TimeoutError:
-                    raise PostgresBackupError(
-                        "restore target guard verification timed out"
-                    ) from None
-        except BaseException:
-            await _cancel_task_quiescent(restore_task)
-            raise
-
-    @staticmethod
-    async def _read_target_database_marker(connection: Any) -> str:
-        await set_backup_control_search_path(connection)
-        value = (
-            await connection.execute(
-                text(
-                    "SELECT pg_catalog.shobj_description(d.oid, 'pg_database') "
-                    "FROM pg_catalog.pg_database AS d "
-                    "WHERE d.datname = pg_catalog.current_database()"
-                )
-            )
-        ).scalar_one()
-        return str(value or "")
-
     async def _source_summary(self, connection: Any) -> dict[str, int]:
         row = (
             await connection.execute(
@@ -3442,36 +1991,6 @@ class NativeBackupService:
             "superusers": int(row["superusers"]),
             "migrations": int(row["migrations"]),
         }
-
-    @staticmethod
-    async def _validate_source_summary(
-        connection: Any,
-        inspection: AuthenticatedBackupInspection,
-        collection_count: int,
-        migration_count: int,
-    ) -> None:
-        source_summary = inspection.manifest.metadata.get("database_summary")
-        if not isinstance(source_summary, dict):
-            return
-        if int(source_summary.get("collections", -1)) != collection_count:
-            raise BackupIntegrityError(
-                "restored collection count differs from the manifest"
-            )
-        if int(source_summary.get("migrations", -1)) != migration_count:
-            raise BackupIntegrityError(
-                "restored migration count differs from the manifest"
-            )
-        restored_superusers = int(
-            (
-                await connection.execute(
-                    text('SELECT count(*) FROM public."_superusers"')
-                )
-            ).scalar_one()
-        )
-        if int(source_summary.get("superusers", -1)) != restored_superusers:
-            raise BackupIntegrityError(
-                "restored superuser count differs from the manifest"
-            )
 
     async def _trusted_inspection(
         self,
@@ -3542,83 +2061,38 @@ class NativeBackupService:
         return DatabaseContract.from_dict(raw)
 
     @staticmethod
-    def _manifest_jwt_secret_mode(
-        inspection: BackupInspection | AuthenticatedBackupInspection,
-    ) -> str:
-        raw = inspection.manifest.metadata.get("jwt_secret")
-        mode = raw.get("mode") if isinstance(raw, dict) else None
-        resource_paths = {resource.path for resource in inspection.manifest.resources}
-        has_resource = JWT_SECRET_RESOURCE in resource_paths
-        if mode == "included_resource" and has_resource:
-            return mode
-        if mode == "external_required" and not has_resource:
-            return mode
-        raise BackupIntegrityError(
-            "manifest JWT-secret metadata and signed resources are inconsistent"
+    def _validate_native_contract_preflight(
+        schema_path: Path, migrations_dir: Path
+    ) -> None:
+        """Validate a native (v2) ``schema.json`` before any destructive action.
+
+        Parses the archive contract with the strict, fail-closed loader so a
+        mismatch is refused while the live database and storage are still
+        untouched.  :meth:`DatabaseSchema.from_archive_bytes` enforces the exact
+        ``contract_version`` and ``system_schema_version`` (the manifest already
+        pinned ``format_version``) and the completeness of the COPY segment
+        cover.  It then recomputes every archived application-migration SHA-256
+        against ``migrations_dir`` and refuses a missing, null, symlinked,
+        path-escaping, or mismatched migration — so a divergent migration set is
+        rejected before any destruction (extra unapplied local files are
+        allowed).  Runs off the event loop via ``_to_thread_quiescent`` because
+        it does blocking file IO.
+        """
+        schema_bytes = schema_path.read_bytes()
+        NativeBackupService._validate_native_contract_bytes(
+            schema_bytes,
+            migrations_dir,
         )
 
     @staticmethod
-    def _require_plan_manifest(
-        inspection: AuthenticatedBackupInspection,
-        plan: StagingPlan,
+    def _validate_native_contract_bytes(
+        schema_bytes: bytes, migrations_dir: Path
     ) -> None:
-        manifest_sha256 = hashlib.sha256(
-            inspection.manifest.to_bytes()
-        ).hexdigest()
-        if manifest_sha256 != plan.manifest_sha256:
-            raise BackupIntegrityError(
-                "staging plan no longer matches the signed backup manifest"
-            )
-
-    def _restore_configuration(self) -> tuple[str, str, str]:
-        creator = str(self.settings.backup_creator_database_url or "").strip()
-        restore = str(self.settings.backup_restore_database_url or "").strip()
-        owner = str(self.settings.backup_target_owner or "").strip()
-        if not creator or not restore or not owner:
-            raise BackupServiceError(
-                409,
-                "restore_roles_not_configured",
-                "Restore staging requires separate creator/restore DSNs and a target owner.",
-            )
-        try:
-            creator_info = sqlalchemy_url_to_libpq(creator)
-            restore_info = sqlalchemy_url_to_libpq(restore)
-        except PostgresBackupError as exc:
-            raise BackupServiceError(
-                409,
-                "restore_database_url_invalid",
-                "A configured restore PostgreSQL DSN is invalid.",
-            ) from exc
-        if creator_info.username == restore_info.username:
-            raise BackupServiceError(
-                409,
-                "restore_roles_not_separate",
-                "Creator and restore PostgreSQL login roles must be distinct.",
-            )
-        return creator, restore, owner
-
-    def _dump_configuration(self) -> str:
-        dump_url = str(self.settings.backup_dump_database_url or "").strip()
-        if not dump_url:
-            raise BackupServiceError(
-                409,
-                "dump_role_not_configured",
-                "Backup creation requires a dedicated read-only pg_dump DSN.",
-            )
-        return dump_url
-
-    def _allowed_extensions(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for item in getattr(self.settings, "backup_allowed_extensions", ()) or ():
-            name, separator, version = str(item).partition("=")
-            if not separator or not name or not version or name in result:
-                raise BackupServiceError(
-                    500,
-                    "invalid_extension_allowlist",
-                    "The backup extension allowlist must contain unique name=version entries.",
-                )
-            result[name] = version
-        return result
+        """Validate pinned native-contract bytes and their local migrations."""
+        schema = DatabaseSchema.from_archive_bytes(schema_bytes)
+        verify_migration_hashes_on_disk(
+            schema.migrations, migrations_dir=migrations_dir
+        )
 
     def _trust_status_for_public_key(self, public_key: bytes | None) -> str:
         if public_key is None:
@@ -3757,10 +2231,8 @@ class NativeBackupService:
             return BackupServiceError(
                 409,
                 "backup_integrity_failed",
-                "The signed backup failed integrity verification.",
+                f"The signed backup failed integrity verification: {exc}",
             )
-        if isinstance(exc, StagingPlanError):
-            return BackupServiceError(409, "staging_plan_invalid", str(exc))
         if isinstance(exc, PostgresBackupError):
             return BackupServiceError(
                 409,
@@ -3785,15 +2257,3 @@ class NativeBackupService:
             f"backup_{operation}_failed",
             f"The backup {operation} operation failed.",
         )
-
-    @staticmethod
-    def _failure_code(exc: BaseException) -> str:
-        if isinstance(exc, BackupServiceError):
-            return exc.code
-        if isinstance(exc, BackupIntegrityError):
-            return "backup_integrity_failed"
-        if isinstance(exc, PostgresBackupError):
-            return "postgres_contract_failed"
-        if isinstance(exc, BackupError):
-            return "backup_store_failed"
-        return "staging_validation_failed"

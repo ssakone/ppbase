@@ -141,24 +141,14 @@ def test_flask_like_start_uses_runtime_host_port_for_settings(monkeypatch) -> No
     assert app.state.settings.port == 8091
 
 
-def test_flask_like_start_never_creates_database_during_rollback(
-    monkeypatch,
-) -> None:
+def test_flask_like_start_defers_database_access_to_lifespan(monkeypatch) -> None:
     app_pb = PPBase()
     started: list[bool] = []
 
     monkeypatch.setattr(
-        "ppbase.backup.activation.begin_activation_startup",
-        lambda _settings: {
-            "activationId": "a" * 32,
-            "status": "rollback_pending",
-            "selectedTarget": "previous",
-        },
-    )
-    monkeypatch.setattr(
         "ppbase.db.ensure_db.ensure_database_exists",
         lambda _database_url: pytest.fail(
-            "rollback startup must not create or preflight-mutate a database"
+            "startup must let destructive-restore recovery access PostgreSQL first"
         ),
     )
     monkeypatch.setattr(

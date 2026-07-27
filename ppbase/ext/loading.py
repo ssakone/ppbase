@@ -6,26 +6,33 @@ import importlib
 from typing import Any, Callable
 
 
-def resolve_hook_target(target: str) -> Callable[[Any], Any]:
-    """Resolve a CLI hook target in ``module:function`` format."""
+def validate_hook_target(target: str) -> str:
+    """Validate and normalize a hook target without importing user code."""
     module_name, sep, attr_name = target.partition(":")
     if not sep or not module_name.strip() or not attr_name.strip():
         raise ValueError(
             f"Invalid hook target '{target}'. Expected format: module:function"
         )
+    return f"{module_name.strip()}:{attr_name.strip()}"
+
+
+def resolve_hook_target(target: str) -> Callable[[Any], Any]:
+    """Resolve a CLI hook target in ``module:function`` format."""
+    normalized = validate_hook_target(target)
+    module_name, attr_name = normalized.split(":", 1)
 
     try:
-        module = importlib.import_module(module_name.strip())
+        module = importlib.import_module(module_name)
     except Exception as exc:
         raise ImportError(
-            f"Failed to import hook module '{module_name.strip()}': {exc}"
+            f"Failed to import hook module '{module_name}': {exc}"
         ) from exc
 
     try:
-        target_callable = getattr(module, attr_name.strip())
+        target_callable = getattr(module, attr_name)
     except AttributeError as exc:
         raise AttributeError(
-            f"Hook callable '{attr_name.strip()}' not found in module '{module_name.strip()}'."
+            f"Hook callable '{attr_name}' not found in module '{module_name}'."
         ) from exc
 
     if not callable(target_callable):

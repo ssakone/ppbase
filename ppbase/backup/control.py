@@ -73,11 +73,143 @@ def _assert_safe_ancestor(parent_fd: int) -> os.stat_result:
     return info
 
 
+def ensure_runtime_backup_roots(settings: object) -> None:
+    """Create owned private backup roots without following path symlinks."""
+    for attribute in ("backup_root", "backup_control_dir"):
+        configured = absolute_path_without_symlink_resolution(
+            getattr(settings, attribute)
+        )
+        with ControlPlaneRoot.open(
+            configured,
+            create_missing=True,
+            normalize_private=True,
+        ):
+            pass
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeDirectoryInspection:
+    """Read-only result for one configured runtime backup directory."""
+
+    path: Path
+    exists: bool
+    private: bool
+
+
+def inspect_runtime_backup_root(path: str | Path) -> RuntimeDirectoryInspection:
+    """Inspect a runtime root through a no-follow descriptor walk."""
+    _require_descriptor_confinement()
+    if (
+        os.access not in getattr(os, "supports_dir_fd", set())
+        or os.access not in getattr(os, "supports_effective_ids", set())
+    ):
+        raise ControlPlaneSafetyError(
+            "The platform cannot safely inspect the backup runtime roots."
+        )
+
+    absolute = absolute_path_without_symlink_resolution(path)
+    components = absolute.parts[1:]
+    if not components:
+        raise ControlPlaneSafetyError(
+            "The backup runtime root must be a private 0700 directory."
+        )
+    for component in components:
+        validate_entry_name(component)
+
+    descriptors = [os.open(os.sep, directory_open_flags())]
+    try:
+        for index, component in enumerate(components):
+            current_fd = descriptors[-1]
+            parent_info = _assert_safe_ancestor(current_fd)
+            try:
+                expected = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not os.access(
+                    ".",
+                    os.W_OK | os.X_OK,
+                    dir_fd=current_fd,
+                    effective_ids=True,
+                ):
+                    raise ControlPlaneSafetyError(
+                        "The nearest existing backup root parent is not writable."
+                    )
+                return RuntimeDirectoryInspection(
+                    path=absolute,
+                    exists=False,
+                    private=False,
+                )
+
+            if (
+                stat.S_IMODE(parent_info.st_mode) & stat.S_ISVTX
+                and expected.st_uid != os.geteuid()
+            ):
+                raise ControlPlaneSafetyError(
+                    "The backup control path below a sticky directory must "
+                    "belong to the service user."
+                )
+            if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(
+                expected.st_mode
+            ):
+                raise ControlPlaneSafetyError(
+                    "The backup runtime path contains an unsafe symlink or entry."
+                )
+
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(
+                    component,
+                    directory_open_flags(),
+                    dir_fd=current_fd,
+                )
+                opened = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not same_file_identity(expected, opened)
+                ):
+                    raise ControlPlaneSafetyError(
+                        "The backup runtime path changed while it was opened."
+                    )
+                descriptors.append(child_fd)
+                child_fd = None
+            finally:
+                if child_fd is not None:
+                    os.close(child_fd)
+
+            if index == len(components) - 1:
+                if opened.st_uid != os.geteuid():
+                    raise ControlPlaneSafetyError(
+                        "The backup runtime root must belong to the service user."
+                    )
+                return RuntimeDirectoryInspection(
+                    path=absolute,
+                    exists=True,
+                    private=stat.S_IMODE(opened.st_mode) == 0o700,
+                )
+        raise ControlPlaneSafetyError("The backup runtime root is invalid.")
+    except ControlPlaneSafetyError:
+        raise
+    except OSError as exc:
+        raise ControlPlaneSafetyError(
+            "The backup runtime root cannot be inspected safely."
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def _open_control_root(
     path: Path,
     *,
     create_missing: bool,
     require_private_final: bool = True,
+    normalize_private_final: bool = False,
 ) -> tuple[tuple[int, ...], tuple[str, ...]]:
     """Open a real private control root without following path symlinks."""
     _require_descriptor_confinement()
@@ -156,6 +288,16 @@ def _open_control_root(
                     opened = os.fstat(child_fd)
                     fsync_directory(child_fd)
                     fsync_directory(current_fd)
+                if index == len(components) - 1 and normalize_private_final:
+                    if opened.st_uid != os.geteuid():
+                        raise ControlPlaneSafetyError(
+                            "The backup control root must belong to the service user."
+                        )
+                    if stat.S_IMODE(opened.st_mode) != 0o700:
+                        os.fchmod(child_fd, 0o700)
+                        opened = os.fstat(child_fd)
+                        fsync_directory(child_fd)
+                        fsync_directory(current_fd)
                 if require_private_final and index == len(components) - 1 and (
                     opened.st_uid != os.geteuid()
                     or stat.S_IMODE(opened.st_mode) != 0o700
@@ -313,12 +455,14 @@ class ControlPlaneRoot:
         *,
         create_missing: bool = True,
         require_private: bool = True,
+        normalize_private: bool = False,
     ) -> "ControlPlaneRoot":
         absolute = absolute_path_without_symlink_resolution(path)
         chain_descriptors, entry_names = _open_control_root(
             absolute,
             create_missing=create_missing,
             require_private_final=require_private,
+            normalize_private_final=normalize_private,
         )
         root = cls(
             path=absolute,
