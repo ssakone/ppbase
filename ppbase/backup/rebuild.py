@@ -46,6 +46,7 @@ from ppbase.backup.schema_contract import (
     IndexSpec,
     TableSpec,
     ViewSpec,
+    _classify_default,
     _validate_index_predicate,
     _validate_view_definition,
     introspect_public_schema,
@@ -92,8 +93,9 @@ def _column_ddl(table: TableSpec) -> list[str]:
         piece = f"{_quote_ident(column.name)} {col_type}"
         if not column.nullable:
             piece += " NOT NULL"
-        if column.default is not None:
-            piece += f" DEFAULT {column.default}"
+        default = _classify_default(column.default)
+        if default is not None:
+            piece += f" DEFAULT {default}"
         fragments.append(piece)
     return fragments
 

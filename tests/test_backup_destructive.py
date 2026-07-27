@@ -372,6 +372,70 @@ async def test_recovery_resumes_finalization_after_marker_clear_commit(
 
 
 @pytest.mark.asyncio
+async def test_recovery_keeps_journal_until_workspace_cleanup_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    restore_id = "2" * 32
+    data_dir = Path(settings.data_dir)
+    value = _journal_value(settings, restore_id)
+    value["status"] = "finalizing"
+    (data_dir / "storage").mkdir()
+    (data_dir / ".jwt_secret").write_text("restored-secret", encoding="utf-8")
+    _write_journal(settings, value)
+
+    async def no_marker(_connection: object) -> None:
+        return None
+
+    async def validate(
+        _settings: object,
+        _connection: object,
+        expected_inventory: dict[str, object],
+    ) -> tuple[object, ...]:
+        assert expected_inventory == build_file_reference_inventory(())
+        return ()
+
+    monkeypatch.setattr(destructive, "read_database_restore_marker", no_marker)
+    monkeypatch.setattr(
+        destructive,
+        "validate_committed_destructive_restore",
+        validate,
+    )
+
+    real_rmtree = destructive.shutil.rmtree
+
+    def remove_then_fail(path: Path) -> None:
+        real_rmtree(path)
+        raise OSError("synthetic crash after workspace deletion")
+
+    monkeypatch.setattr(destructive.shutil, "rmtree", remove_then_fail)
+
+    with pytest.raises(OSError, match="synthetic crash"):
+        await recover_interrupted_destructive_restore(settings, object())
+
+    root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+    journal = DestructiveRestoreJournal(root)
+    try:
+        assert journal.read() is not None
+    finally:
+        journal.close()
+        root.close()
+
+    monkeypatch.setattr(destructive.shutil, "rmtree", real_rmtree)
+    result = await recover_interrupted_destructive_restore(settings, object())
+
+    assert result == {"restoreId": restore_id, "outcome": "committed"}
+    root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+    journal = DestructiveRestoreJournal(root)
+    try:
+        assert journal.read() is None
+    finally:
+        journal.close()
+        root.close()
+
+
+@pytest.mark.asyncio
 async def test_recovery_keeps_previous_files_when_signed_inventory_mismatches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

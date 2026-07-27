@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import stat
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -47,6 +48,46 @@ class NativeExportError(BackupError):
 
 class NativeRestoreError(BackupError):
     """Raised when a native (v2) archive fails its pre-restore verification."""
+
+
+def _open_exclusive_binary(path: Path) -> BinaryIO:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return handle
+
+
+def _write_exclusive_fsynced(path: Path, payload: bytes) -> None:
+    with _open_exclusive_binary(path) as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 async def build_public_inventory(
@@ -260,7 +301,7 @@ async def export_native_database(
 
     # 2. Stream every table (name order) into the compressed data.copy sink.
     segments: list[CopySegment] = []
-    with open(copy_path, "wb") as copy_file:
+    with _open_exclusive_binary(copy_path) as copy_file:
         writer = SegmentWriter(copy_file)
         for table in sorted(schema_only.tables, key=lambda t: t.name):
             segment = await export_table_segment(
@@ -271,6 +312,7 @@ async def export_native_database(
             )
             segments.append(segment)
         copy_file.flush()
+        os.fsync(copy_file.fileno())
         data_copy_size = writer.total_size
 
     # 3. Assemble and re-validate the complete archive, then persist schema.json.
@@ -284,7 +326,19 @@ async def export_native_database(
         source_postgres_version=schema_only.source_postgres_version,
     )
     schema.assert_every_table_exported()
-    schema_path.write_bytes(schema.to_canonical_bytes())
+    _write_exclusive_fsynced(schema_path, schema.to_canonical_bytes())
+
+    fsynced_directories: set[Path] = set()
+    for resource_path in (copy_path, schema_path):
+        for directory in (
+            resource_path.parent,
+            resource_path.parent.parent,
+            resource_path.parent.parent.parent,
+        ):
+            if directory in fsynced_directories:
+                continue
+            _fsync_directory(directory)
+            fsynced_directories.add(directory)
     return schema
 
 

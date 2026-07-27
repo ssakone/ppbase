@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import uuid
 from pathlib import Path
 
 import pytest
 
 asyncpg = pytest.importorskip("asyncpg")
+
+import ppbase.backup.native as native_backup  # noqa: E402
 
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
@@ -39,6 +42,71 @@ from ppbase.backup.native import (  # noqa: E402
 )
 from ppbase.backup.schema_contract import DatabaseSchema  # noqa: E402
 from ppbase.db.system_tables import Base  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_export_persists_database_resources_exclusively_and_durably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_schema = DatabaseSchema(
+        tables=(),
+        views=(),
+        indexes=(),
+        migrations=(),
+        segments=(),
+        data_copy_size=0,
+    )
+
+    async def no_copy_settings(_connection: object) -> None:
+        return None
+
+    async def empty_inventory(
+        _connection: object,
+    ) -> tuple[dict[str, str], frozenset[str]]:
+        return {}, frozenset()
+
+    async def empty_canonical(_connection: object) -> dict[str, object]:
+        return {}
+
+    async def introspect(*_args: object, **_kwargs: object) -> DatabaseSchema:
+        return empty_schema
+
+    monkeypatch.setattr(native_backup, "apply_copy_session_settings", no_copy_settings)
+    monkeypatch.setattr(native_backup, "build_public_inventory", empty_inventory)
+    monkeypatch.setattr(native_backup, "build_canonical_tables", empty_canonical)
+    monkeypatch.setattr(native_backup, "introspect_public_schema", introspect)
+
+    fsynced_kinds: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        fsynced_kinds.append("directory" if stat.S_ISDIR(mode) else "file")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(native_backup.os, "fsync", record_fsync)
+
+    set_dir = tmp_path / "set"
+    database_dir = set_dir / "resources" / "database"
+    database_dir.mkdir(parents=True)
+    schema_path = database_dir / "schema.json"
+    copy_path = database_dir / "data.copy"
+
+    await native_backup.export_native_database(
+        object(),
+        schema_path=schema_path,
+        copy_path=copy_path,
+    )
+
+    assert fsynced_kinds.count("file") == 2
+    assert fsynced_kinds.count("directory") == 3
+    with pytest.raises(FileExistsError):
+        await native_backup.export_native_database(
+            object(),
+            schema_path=schema_path,
+            copy_path=copy_path,
+        )
 
 
 def _admin_dsn() -> str:

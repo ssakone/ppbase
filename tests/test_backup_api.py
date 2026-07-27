@@ -9,6 +9,8 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from ppbase.api import backups as backups_api
+from ppbase.app import create_app
+from ppbase.config import Settings
 
 
 class _FakeLease:
@@ -111,6 +113,29 @@ def _api_app() -> FastAPI:
         "id": "admin_1"
     }
     return app
+
+
+@pytest.mark.asyncio
+async def test_restore_maintenance_uses_pocketbase_error_shape() -> None:
+    app = create_app(Settings())
+    app.state.backup_maintenance = True
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post("/api/health")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert response.json() == {
+        "status": 503,
+        "message": (
+            "PPBase is temporarily read-only while a destructive backup "
+            "restore is running."
+        ),
+        "data": {},
+    }
 
 
 def test_backup_readiness_reports_per_operation_blockers(

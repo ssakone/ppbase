@@ -349,7 +349,7 @@ def create_app(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "code": "backup_restore_maintenance",
+                    "status": 503,
                     "message": (
                         "PPBase is temporarily read-only while a destructive "
                         "backup restore is running."

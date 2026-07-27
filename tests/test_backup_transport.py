@@ -707,9 +707,9 @@ def test_unknown_manifest_version_and_member_set_are_rejected(tmp_path: Path) ->
 
     manifest = parse_canonical_json(values["manifest.json"])
     assert isinstance(manifest, dict)
-    # format_version 1 (legacy dump) and 2 (native logical) are both supported;
-    # use a version the reader has never heard of to exercise the reject path.
-    manifest["format_version"] = 999
+    # Native logical format v2 is the only supported manifest version. Legacy
+    # v1 archives must fail closed before their resource set is considered.
+    manifest["format_version"] = 1
     unsupported_manifest = canonical_json_bytes(manifest)
     values["manifest.json"] = unsupported_manifest
     values["manifest.sig"] = source.identity.sign_manifest(unsupported_manifest)

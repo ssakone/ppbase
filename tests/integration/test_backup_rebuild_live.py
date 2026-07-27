@@ -36,6 +36,7 @@ from ppbase.backup.schema_contract import (
     ColumnSpec,
     IndexKeySpec,
     IndexSpec,
+    SchemaContractError,
     TableSpec,
     ViewSpec,
 )
@@ -72,6 +73,14 @@ def test_create_table_sql_is_fully_quoted_and_allowlisted() -> None:
         'PRIMARY KEY ("id"), '
         'UNIQUE ("title"))'
     )
+
+
+def test_create_table_sql_revalidates_default_before_emission() -> None:
+    table = _table()
+    object.__setattr__(table.columns[1], "default", "0; DROP TABLE posts")
+
+    with pytest.raises(SchemaContractError, match="not a reproducible"):
+        _create_table_sql(table)
 
 
 def test_create_index_sql_preserves_ordering_include_and_predicate() -> None:

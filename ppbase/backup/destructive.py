@@ -708,7 +708,6 @@ async def recover_interrupted_destructive_restore(
             os.fsync(data_fd)
         finally:
             os.close(data_fd)
-        journal.clear()
         try:
             shutil.rmtree(work_dir)
         except FileNotFoundError:
@@ -718,6 +717,7 @@ async def recover_interrupted_destructive_restore(
         except OSError:
             pass
         _fsync_directory(data_dir)
+        journal.clear()
         return {"restoreId": restore_id, "outcome": outcome}
     finally:
         journal.close()

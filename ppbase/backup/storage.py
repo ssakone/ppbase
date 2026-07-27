@@ -1221,9 +1221,7 @@ def _scan_file_tree(
         os.close(root_fd)
 
 
-def _required_database_resources(
-    format_version: int = BACKUP_FORMAT_VERSION,
-) -> frozenset[str]:
+def _required_database_resources() -> frozenset[str]:
     """Return the mandatory database resource paths for a backup set.
 
     The native COPY format is the only supported baseline, so a backup always
@@ -1236,7 +1234,6 @@ def _scan_resource_tree(
     resource_root: Path,
     *,
     repair_permissions: bool,
-    format_version: int = BACKUP_FORMAT_VERSION,
 ) -> tuple[BackupResource, ...]:
     resources = _scan_file_tree(
         resource_root,
@@ -1244,7 +1241,7 @@ def _scan_resource_tree(
         repair_permissions=repair_permissions,
     )
     paths = {resource.path for resource in resources}
-    missing = _required_database_resources(format_version) - paths
+    missing = _required_database_resources() - paths
     if missing:
         raise BackupStateError(
             "backup set is missing its database resources: "
@@ -1978,7 +1975,6 @@ class BackupSetBuilder:
         resources = _scan_resource_tree(
             self.path / RESOURCES_DIRNAME,
             repair_permissions=True,
-            format_version=self.format_version,
         )
         _fsync_directory(self.path)
         self._state = "prepared"
@@ -2426,7 +2422,6 @@ class LocalBackupStore:
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
-                format_version=prepared.format_version,
             )
             if current_resources != prepared.resources:
                 raise BackupIntegrityError(
@@ -2561,7 +2556,6 @@ class LocalBackupStore:
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
-                format_version=manifest.format_version,
             )
             if (
                 current_resources != prepared.resources
@@ -3270,7 +3264,6 @@ class LocalBackupStore:
             actual_resources = _scan_resource_tree(
                 set_path / RESOURCES_DIRNAME,
                 repair_permissions=False,
-                format_version=manifest.format_version,
             )
             if actual_resources != manifest.resources:
                 raise BackupIntegrityError("backup resource checksum validation failed")

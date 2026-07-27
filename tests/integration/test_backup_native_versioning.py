@@ -312,5 +312,5 @@ def test_v2_required_resources_are_copy_pair_only() -> None:
     from ppbase.backup.models import DATA_COPY_RESOURCE, SCHEMA_JSON_RESOURCE
     from ppbase.backup.storage import _required_database_resources
 
-    required = _required_database_resources(BACKUP_FORMAT_VERSION)
+    required = _required_database_resources()
     assert required == frozenset({SCHEMA_JSON_RESOURCE, DATA_COPY_RESOURCE})

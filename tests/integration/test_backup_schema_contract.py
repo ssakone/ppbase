@@ -21,6 +21,7 @@ import uuid
 
 import pytest
 
+from ppbase.backup.canonical import _LITERAL_DEFAULTS, _field_column_spec
 from ppbase.backup.copy_format import COMPRESSION_ZLIB, CopySegment
 from ppbase.backup.schema_contract import (
     ColumnSpec,
@@ -36,11 +37,31 @@ from ppbase.backup.schema_contract import (
     introspect_public_schema,
     normalize_column_type,
 )
+from ppbase.models.field_types import FieldDefinition, FieldType
 
 
 def _col(name: str, coltype: str = "text", *, nullable: bool = False,
          default: str | None = None) -> ColumnSpec:
     return ColumnSpec(name=name, type=coltype, nullable=nullable, default=default)
+
+
+def test_number_defaults_match_pg_get_expr_rendering() -> None:
+    floating = _field_column_spec(
+        FieldDefinition(name="amount", type=FieldType.NUMBER)
+    )
+    integer = _field_column_spec(
+        FieldDefinition(
+            name="count",
+            type=FieldType.NUMBER,
+            options={"onlyInt": True},
+        )
+    )
+
+    assert floating.default == "'0'::double precision"
+    assert integer.default == "0"
+    assert _LITERAL_DEFAULTS[("0", "double precision")] == (
+        "'0'::double precision"
+    )
 
 
 # ---------------------------------------------------------------------------
