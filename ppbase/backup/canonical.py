@@ -214,10 +214,7 @@ def _field_column_spec(field: FieldDefinition) -> ColumnSpec:
         if options.get("onlyInt", False):
             return ColumnSpec(name=name, type="integer", nullable=False, default="0")
         return ColumnSpec(
-            name=name,
-            type="double precision",
-            nullable=False,
-            default="'0'::double precision",
+            name=name, type="double precision", nullable=False, default="0"
         )
     if field_type == FieldType.BOOL:
         return ColumnSpec(name=name, type="boolean", nullable=False, default="false")

@@ -253,6 +253,42 @@ async def test_canonical_contract_accepts_matching_view_and_custom_index(
     await _validate_collection_contract(engine)
 
 
+async def test_canonical_contract_accepts_schema_manager_float_default(
+    canonical_validation_database: dict[str, object],
+) -> None:
+    """Raw collection DDL and ORM system defaults have distinct renderings."""
+    engine = canonical_validation_database["engine"]
+    schema = [{"name": "amount", "type": "number"}]
+    collection = SimpleNamespace(
+        name="float_values",
+        type="base",
+        schema=schema,
+        options={},
+    )
+    await schema_manager.create_collection_table(engine, collection)
+    async with engine.begin() as connection:  # type: ignore[union-attr]
+        await connection.execute(
+            text(
+                'INSERT INTO "_collections" (id, name, type, schema) '
+                "VALUES (:id, 'float_values', 'base', CAST(:schema AS jsonb))"
+            ),
+            {"id": secrets.token_hex(7), "schema": json.dumps(schema)},
+        )
+        default = await connection.scalar(
+            text(
+                "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) "
+                "FROM pg_catalog.pg_attribute AS a "
+                "JOIN pg_catalog.pg_attrdef AS d "
+                "ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+                "WHERE a.attrelid = 'public.float_values'::regclass "
+                "AND a.attname = 'amount'"
+            )
+        )
+
+    assert default == "0"
+    await _validate_collection_contract(engine)
+
+
 async def test_canonical_contract_refuses_extra_index(
     canonical_validation_database: dict[str, object],
 ) -> None:

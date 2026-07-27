@@ -45,7 +45,7 @@ def _col(name: str, coltype: str = "text", *, nullable: bool = False,
     return ColumnSpec(name=name, type=coltype, nullable=nullable, default=default)
 
 
-def test_number_defaults_match_pg_get_expr_rendering() -> None:
+def test_number_defaults_preserve_collection_and_orm_rendering() -> None:
     floating = _field_column_spec(
         FieldDefinition(name="amount", type=FieldType.NUMBER)
     )
@@ -57,7 +57,11 @@ def test_number_defaults_match_pg_get_expr_rendering() -> None:
         )
     )
 
-    assert floating.default == "'0'::double precision"
+    # Collection columns come from schema_manager's raw
+    # ``DOUBLE PRECISION DEFAULT 0`` DDL and introspect as ``0``. System-table
+    # Float defaults emitted through SQLAlchemy introspect with an explicit
+    # quoted cast; the two canonical paths must remain distinct.
+    assert floating.default == "0"
     assert integer.default == "0"
     assert _LITERAL_DEFAULTS[("0", "double precision")] == (
         "'0'::double precision"
