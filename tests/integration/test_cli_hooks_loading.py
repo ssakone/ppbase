@@ -74,15 +74,13 @@ def test_load_hooks_errors_are_explicit() -> None:
         _load_deferred_extensions(app)
 
 
-def test_serve_layout_creates_private_backup_roots_without_changing_data_dir(
+def test_serve_layout_creates_only_backups_without_changing_data_dir(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     settings = Settings(
         data_dir=str(project / "pb_data"),
-        backup_root=str(project / "pb_backups"),
-        backup_control_dir=str(project / "pb_backup_control"),
     )
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -91,12 +89,9 @@ def test_serve_layout_creates_private_backup_roots_without_changing_data_dir(
     ensure_runtime_backup_roots(settings)
 
     assert data_dir.stat().st_mode & 0o777 == 0o755
-    for path in (
-        Path(settings.backup_root),
-        Path(settings.backup_control_dir),
-    ):
-        assert path.is_dir()
-        assert path.stat().st_mode & 0o777 == 0o700
+    assert (data_dir / "backups").is_dir()
+    assert not (project / "pb_backup_control").exists()
+    assert not (project / "pb_backups").exists()
 
 
 def test_load_hooks_queues_user_import_until_app_materialization(

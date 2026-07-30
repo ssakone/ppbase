@@ -1,11 +1,10 @@
-import type { BackupReadiness, BackupReadinessWarning } from '../api/types'
+import type { BackupReadiness } from '../api/types'
 
 // Backup and restore run against PPBASE_DATABASE_URL. The native engine speaks
 // the PostgreSQL wire protocol directly, so there are no external client tools
 // to check; the API reports only operational blockers here (local storage and
-// automatic restart). Role-hardening guidance remains advisory.
+// automatic restart).
 export interface BackupReadinessView {
-  warnings: BackupReadinessWarning[]
   createReady: boolean
   createMissing: string[]
   restoreReady: boolean
@@ -33,7 +32,6 @@ export function buildBackupReadinessView(
   }
 
   return {
-    warnings: [...(readiness.warnings || [])],
     createReady,
     createMissing,
     restoreReady,

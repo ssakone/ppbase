@@ -20,7 +20,6 @@ import { RecordActionsMenu } from '@/components/record-actions-menu'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { useRecord, useCreateRecord, useUpdateRecord, useDeleteRecord } from '@/hooks/use-records'
 import { useCollections } from '@/hooks/use-collections'
-import { changeAdminPassword } from '@/api/endpoints/admins'
 import type { Collection, Field, RecordModel } from '@/api/types'
 
 interface RecordEditorProps {
@@ -44,7 +43,10 @@ function getFields(collection: Collection): Field[] {
   if (!isAuthCollection) return fields
 
   const existing = new Set(fields.map((field) => field.name))
-  const missingAuthFields = AUTH_SYSTEM_FIELDS.filter((field) => !existing.has(field.name))
+  const authSystemFields = collection.name === '_superusers'
+    ? AUTH_SYSTEM_FIELDS.filter((field) => field.name === 'email')
+    : AUTH_SYSTEM_FIELDS
+  const missingAuthFields = authSystemFields.filter((field) => !existing.has(field.name))
 
   return [...fields, ...missingAuthFields]
 }
@@ -180,10 +182,10 @@ export function RecordEditor({
 
     setIsChangingPassword(true)
     try {
-      await changeAdminPassword(recordId, {
+      await updateMutation.mutateAsync({ id: recordId, data: {
         password: newPassword,
         passwordConfirm: confirmPassword,
-      })
+      } })
       toast.success('Password changed successfully. Please log in again.')
       // Clear auth and redirect to login
       localStorage.removeItem('ppbase_token')

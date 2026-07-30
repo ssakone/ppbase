@@ -1,18 +1,8 @@
 """Native PPBase backup primitives.
 
-The package deliberately separates resource preparation (performed while the
-write barrier is held) from signing and sealing (performed only after the lease
-has been verified and released successfully).
+The package separates resource preparation performed under the write barrier
+from durable ZIP publication after the operation lease is revalidated.
 """
-
-from ppbase.backup.identity import (
-    MANIFEST_SIGNATURE_DOMAIN,
-    BackupIdentity,
-    BackupIdentityError,
-    BackupIdentityMissingError,
-    public_key_fingerprint,
-    verify_manifest_signature,
-)
 from ppbase.backup.models import (
     BACKUP_FORMAT,
     BACKUP_FORMAT_VERSION,
@@ -31,17 +21,12 @@ from ppbase.backup.models import (
 )
 from ppbase.backup.storage import (
     JWT_SECRET_RESOURCE,
-    AuthenticatedBackupInspection,
     BackupDeletionUncertainError,
     BackupSetBuilder,
     LocalBackupStore,
     PinnedBackupArchive,
     PreparedBackupSet,
-)
-from ppbase.backup.trust import (
-    BackupTrustError,
-    BackupTrustStore,
-    TrustedBackupSigner,
+    VerifiedBackupInspection,
 )
 
 
@@ -49,14 +34,9 @@ __all__ = [
     "BACKUP_FORMAT",
     "BACKUP_FORMAT_VERSION",
     "JWT_SECRET_RESOURCE",
-    "MANIFEST_SIGNATURE_DOMAIN",
-    "AuthenticatedBackupInspection",
     "BackupAlreadyExistsError",
     "BackupDeletionUncertainError",
     "BackupError",
-    "BackupIdentity",
-    "BackupIdentityError",
-    "BackupIdentityMissingError",
     "BackupInspection",
     "BackupIntegrityError",
     "BackupManifest",
@@ -66,14 +46,10 @@ __all__ = [
     "BackupSetBuilder",
     "BackupSetSummary",
     "BackupStateError",
-    "BackupTrustError",
-    "BackupTrustStore",
     "BackupUnsafeSourceError",
     "LocalBackupStore",
     "PinnedBackupArchive",
     "PreparedBackupSet",
-    "TrustedBackupSigner",
+    "VerifiedBackupInspection",
     "canonical_json_bytes",
-    "public_key_fingerprint",
-    "verify_manifest_signature",
 ]

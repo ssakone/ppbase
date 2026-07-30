@@ -16,7 +16,7 @@ PPBase is a Python reimplementation of [PocketBase](https://pocketbase.io/) back
 | [Auth Guards](./auth.md) | Auth helpers, superuser checks |
 | [Realtime / SSE](./realtime.md) | Subscribe hooks, message events |
 | [Storage & Assets](./storage.md) | Local vs S3/R2 storage, public dir, file URLs |
-| [Native Backup & Restore](./native-backup-restore.md) | Signed ZIPs, A→B trust, destructive in-place restore, restart and cron |
+| [Native Backup & Restore](./native-backup-restore.md) | PocketBase-style ZIP storage, destructive in-place restore, restart and cron |
 | [Multi-file Projects](./multi-file.md) | Organising hooks across files |
 
 ## Architecture at a glance
@@ -88,7 +88,7 @@ All settings use the `PPBASE_` prefix:
 | `PPBASE_DATABASE_URL` | `postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase` | PostgreSQL DSN |
 | `PPBASE_HOST` | `0.0.0.0` | Bind host |
 | `PPBASE_PORT` | `8090` | Bind port |
-| `PPBASE_DATA_DIR` | `./pb_data` | Data directory (local storage + project secret file) |
+| `PPBASE_DATA_DIR` | `./pb_data` | Local files, project secret and backup ZIPs under `backups/` |
 | `PPBASE_DEV` | `false` | Enable debug mode + Swagger UI |
 | `PPBASE_LOG_LEVEL` | `INFO` | Uvicorn log level |
 | `PPBASE_ORIGINS` | `*` | CORS allowed origins (comma-separated) |
@@ -98,8 +98,6 @@ All settings use the `PPBASE_` prefix:
 | `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | PostgreSQL migration-lock timeout in seconds |
 | `PPBASE_PUBLIC_DIR` | _(none)_ | Optional directory served as static files at `/` |
 | `PPBASE_MIGRATIONS_DIR` | `pb_migrations` | Directory where migration files live |
-| `PPBASE_BACKUP_ROOT` | `./pb_backups` | Native backup sets root, created by `serve` |
-| `PPBASE_BACKUP_CONTROL_DIR` | `./pb_backup_control` | Ed25519 identity, trust and restore-control root, created by `serve` |
 | `PPBASE_BACKUP_MAX_UPLOAD_BYTES` | `21474836480` | Maximum native backup ZIP upload size (20 GiB) |
 | `PPBASE_STORAGE_BACKEND` | `local` | `local` or `s3` |
 | `PPBASE_S3_ENDPOINT` | _(none)_ | S3-compatible endpoint (AWS/Cloudflare R2/MinIO) |

@@ -46,23 +46,9 @@ class Settings(BaseSettings):
     s3_force_path_style: bool = False
 
     # ---- Native backup / destructive restore ----
-    # Canonical sets and control-plane state intentionally live outside the
-    # restored business ``data_dir``. Only ``data_dir/storage`` is copied.
-    backup_root: str = "./pb_backups"
-    backup_control_dir: str = "./pb_backup_control"
-    # Legacy isolated-restore settings remain accepted so existing environment
-    # files still load. The normal backup/restore and provisioning paths ignore
-    # them.
-    backup_staging_root: str = "./pb_restore_staging"
-    backup_target_root: str = ""
     backup_barrier_timeout: float = 300.0
     backup_restore_connect_timeout: float = 60.0
     backup_restore_command_timeout: float = 21_600.0
-    # Legacy multi-role restore settings are parsed only for configuration
-    # compatibility. Destructive in-place restore ignores them.
-    backup_creator_database_url: str = ""
-    backup_restore_database_url: str = ""
-    backup_target_owner: str = ""
     backup_allowed_extensions: list[str] = ["plpgsql=1.0"]
     # ZIP transport is bounded independently from the ordinary API body
     # setting because database backups are expected to be substantially larger.

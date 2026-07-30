@@ -316,11 +316,11 @@ class TestAuthWithPassword:
         )
         assert resp.status_code == 404, resp.text
 
-    async def test_auth_with_password_superusers_blocked(
+    async def test_auth_with_password_superusers_uses_standard_auth_route(
         self,
         app_client: AsyncClient,
     ):
-        """_superusers collection is blocked for user auth."""
+        """_superusers authenticates through the standard auth-record route."""
         resp = await app_client.post(
             "/api/collections/_superusers/auth-with-password",
             json={
@@ -328,7 +328,11 @@ class TestAuthWithPassword:
                 "password": "adminpass123",
             },
         )
-        assert resp.status_code == 404, resp.text
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["token"]
+        assert body["record"]["collectionName"] == "_superusers"
+        assert body["record"]["email"] == "admin@test.com"
 
     async def test_auth_with_password_empty_fields(
         self,
@@ -857,6 +861,7 @@ class TestEmailVerification:
         self,
         app_client: AsyncClient,
         auth_collection: dict,
+        admin_token: str,
     ):
         """Confirm verification with a valid token sets verified=true."""
         # Register a fresh user
@@ -900,6 +905,7 @@ class TestEmailVerification:
         # Verify the record is now verified
         view_resp = await app_client.get(
             f"/api/collections/users/records/{user['id']}",
+            headers={"Authorization": admin_token},
         )
         assert view_resp.status_code == 200
         assert view_resp.json()["verified"] is True
@@ -1265,6 +1271,7 @@ class TestEndToEndFlows:
         self,
         app_client: AsyncClient,
         auth_collection: dict,
+        admin_token: str,
     ):
         """Register → Request verification → Confirm → verified=true."""
         import uuid
@@ -1317,6 +1324,7 @@ class TestEndToEndFlows:
         # Check record is verified
         view_resp = await app_client.get(
             f"/api/collections/users/records/{user['id']}",
+            headers={"Authorization": admin_token},
         )
         assert view_resp.status_code == 200
         assert view_resp.json()["verified"] is True

@@ -189,24 +189,23 @@ def automatic_backup_filename(app_name: str, minute: datetime) -> str:
 async def _prune_automatic_backups(service: Any, max_keep: int) -> None:
     if max_keep == 0:
         return
-    summaries = await asyncio.to_thread(service.store.list_sets)
+    archives = await asyncio.to_thread(service.archive_store.list)
     automatic = [
-        summary
-        for summary in summaries
-        if summary.manifest is not None
-        and summary.manifest.metadata.get("created_by") == AUTOMATIC_BACKUP_ACTOR
+        archive
+        for archive in archives
+        if archive.key.startswith(_AUTOMATIC_FILENAME_PREFIX)
     ]
     automatic.sort(
-        key=lambda item: str(item.created_at or ""),
+        key=lambda item: item.modified,
         reverse=True,
     )
-    for summary in automatic[max_keep:]:
+    for archive in automatic[max_keep:]:
         try:
-            await service.delete_local_backup(summary.backup_id)
+            await service.delete_local_backup(archive.key)
         except Exception:
             logger.exception(
                 "Failed to prune automatic native backup %s",
-                summary.backup_id,
+                archive.key,
             )
 
 

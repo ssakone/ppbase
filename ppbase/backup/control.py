@@ -42,6 +42,179 @@ def absolute_path_without_symlink_resolution(path: str | Path) -> Path:
     return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
 
 
+@dataclass(slots=True)
+class RuntimeDataRoot:
+    """Pinned descriptor for the existing PPBase ``data_dir`` trust boundary."""
+
+    path: Path
+    _descriptor: int
+    _identity: tuple[int, int]
+
+    @classmethod
+    def open(
+        cls,
+        path: str | Path,
+        *,
+        create_missing: bool = True,
+    ) -> "RuntimeDataRoot":
+        selected = Path(path).expanduser()
+        try:
+            if create_missing:
+                selected.mkdir(parents=True, exist_ok=True)
+            resolved = selected.resolve(strict=True)
+            visible = resolved.lstat()
+            if not stat.S_ISDIR(visible.st_mode) or resolved.is_symlink():
+                raise ControlPlaneSafetyError(
+                    "The PPBase data directory is not a safe directory."
+                )
+            descriptor = os.open(resolved, directory_open_flags())
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not same_file_identity(visible, opened)
+            ):
+                os.close(descriptor)
+                raise ControlPlaneSafetyError(
+                    "The PPBase data directory changed while it was opened."
+                )
+        except ControlPlaneSafetyError:
+            raise
+        except (FileNotFoundError, OSError) as exc:
+            raise ControlPlaneSafetyError(
+                "The PPBase data directory cannot be opened safely."
+            ) from exc
+        return cls(
+            path=resolved,
+            _descriptor=descriptor,
+            _identity=(opened.st_dev, opened.st_ino),
+        )
+
+    def fileno(self) -> int:
+        if self._descriptor < 0:
+            raise ControlPlaneSafetyError("The PPBase data directory is closed.")
+        return self._descriptor
+
+    def verify_attached(self) -> None:
+        descriptor = self.fileno()
+        try:
+            visible = self.path.lstat()
+            opened = os.fstat(descriptor)
+        except OSError as exc:
+            raise ControlPlaneSafetyError(
+                "The PPBase data directory was detached."
+            ) from exc
+        if (
+            self.path.is_symlink()
+            or not stat.S_ISDIR(visible.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or not same_file_identity(visible, opened)
+            or (opened.st_dev, opened.st_ino) != self._identity
+        ):
+            raise ControlPlaneSafetyError(
+                "The PPBase data directory was detached or substituted."
+            )
+
+    def open_child_directory(
+        self,
+        name: str,
+        *,
+        create_missing: bool,
+    ) -> int:
+        """Open one real child directory without imposing a new mode policy."""
+        self.verify_attached()
+        validate_entry_name(name)
+        parent_fd = self.fileno()
+        parent_info = os.fstat(parent_fd)
+        created = False
+        try:
+            try:
+                expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create_missing:
+                    raise ControlPlaneSafetyError(
+                        f"The PPBase data directory entry {name!r} is missing."
+                    )
+                try:
+                    os.mkdir(
+                        name,
+                        mode=stat.S_IMODE(parent_info.st_mode),
+                        dir_fd=parent_fd,
+                    )
+                    created = True
+                except FileExistsError:
+                    pass
+                expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+                raise ControlPlaneSafetyError(
+                    f"The PPBase data directory entry {name!r} is unsafe."
+                )
+            descriptor = os.open(name, directory_open_flags(), dir_fd=parent_fd)
+            opened = os.fstat(descriptor)
+            if created:
+                os.fchmod(descriptor, stat.S_IMODE(parent_info.st_mode))
+                os.fsync(descriptor)
+                os.fsync(parent_fd)
+                opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not same_file_identity(expected, opened)
+                or opened.st_uid != parent_info.st_uid
+            ):
+                os.close(descriptor)
+                raise ControlPlaneSafetyError(
+                    f"The PPBase data directory entry {name!r} changed while opening."
+                )
+            self.verify_attached()
+            return descriptor
+        except ControlPlaneSafetyError:
+            raise
+        except OSError as exc:
+            raise ControlPlaneSafetyError(
+                f"The PPBase data directory entry {name!r} cannot be opened safely."
+            ) from exc
+
+    def verify_child_directory(self, name: str, descriptor: int) -> None:
+        self.verify_attached()
+        try:
+            visible = os.stat(name, dir_fd=self.fileno(), follow_symlinks=False)
+            opened = os.fstat(descriptor)
+            parent = os.fstat(self.fileno())
+        except OSError as exc:
+            raise ControlPlaneSafetyError(
+                f"The PPBase data directory entry {name!r} was detached."
+            ) from exc
+        if (
+            stat.S_ISLNK(visible.st_mode)
+            or not stat.S_ISDIR(visible.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or not same_file_identity(visible, opened)
+            or opened.st_uid != parent.st_uid
+        ):
+            raise ControlPlaneSafetyError(
+                f"The PPBase data directory entry {name!r} was substituted."
+            )
+        self.verify_attached()
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        self._descriptor = -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    def __enter__(self) -> "RuntimeDataRoot":
+        self.verify_attached()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+
 def _require_descriptor_confinement() -> None:
     required = {os.open, os.mkdir, os.stat}
     if (
@@ -74,17 +247,16 @@ def _assert_safe_ancestor(parent_fd: int) -> os.stat_result:
 
 
 def ensure_runtime_backup_roots(settings: object) -> None:
-    """Create owned private backup roots without following path symlinks."""
-    for attribute in ("backup_root", "backup_control_dir"):
-        configured = absolute_path_without_symlink_resolution(
-            getattr(settings, attribute)
-        )
-        with ControlPlaneRoot.open(
-            configured,
+    """Create only the PocketBase-style ``data_dir/backups`` runtime layout."""
+    with RuntimeDataRoot.open(getattr(settings, "data_dir")) as data_root:
+        backups_fd = data_root.open_child_directory(
+            "backups",
             create_missing=True,
-            normalize_private=True,
-        ):
-            pass
+        )
+        try:
+            data_root.verify_child_directory("backups", backups_fd)
+        finally:
+            os.close(backups_fd)
 
 
 @dataclass(frozen=True, slots=True)

@@ -133,58 +133,15 @@ export interface HealthStatus {
   message: string
   data: {
     version?: string
+    canBackup?: boolean
     [key: string]: unknown
   }
 }
 
-export type BackupTrustStatus =
-  | 'trusted_local'
-  | 'trusted_external'
-  | 'authenticated_untrusted'
-  | 'revoked'
-  | 'invalid'
-  | 'unknown'
-
-export type BackupIntegrityStatus = 'valid' | 'invalid' | 'unchecked' | string
-
 export interface BackupListItem {
-  id: string
   key: string
-  filename?: string | null
-  size?: number | null
-  totalSize?: number | null
-  createdAt?: string | null
-  modified?: string | null
-  status?: string
-  integrityStatus?: BackupIntegrityStatus
-  authenticated?: boolean
-  trustStatus?: BackupTrustStatus
-  signerFingerprintSha256?: string | null
-  resourceCount?: number | null
-  errorCode?: string | null
-}
-
-export interface BackupResource {
-  path: string
   size: number
-  sha256: string
-}
-
-export interface BackupInspection extends BackupListItem {
-  signerPublicKey?: string
-  resourcesVerified?: boolean
-  metadata?: Record<string, unknown>
-  resources?: BackupResource[]
-  resourceOffset?: number
-  resourceLimit?: number
-  resourcesReturned?: number
-  hasMoreResources?: boolean
-}
-
-export interface BackupIdentity {
-  algorithm: 'Ed25519' | string
-  publicKey: string
-  fingerprintSha256: string
+  modified: string
 }
 
 export interface BackupReadinessCheck {
@@ -192,35 +149,16 @@ export interface BackupReadinessCheck {
   missing: string[]
 }
 
-export interface BackupReadinessWarning {
-  code: string
-  name: string
-  detail: string
-}
-
 // Operational readiness surfaced by the Dashboard. The destructive restore
-// path runs against PPBASE_DATABASE_URL and never requires provisioning; only
+// path runs against PPBASE_DATABASE_URL; only
 // concrete runtime prerequisites reported in create/restore block an action.
 export interface BackupReadiness {
   create?: BackupReadinessCheck
   restore?: BackupReadinessCheck
   restart?: BackupReadinessCheck
   storage?: BackupReadinessCheck
-  controlPlane?: BackupReadinessCheck
   storageBackend?: string
-  warnings?: BackupReadinessWarning[]
   onboarding?: Record<string, unknown>
-}
-
-export interface BackupTrustEntry {
-  fingerprintSha256: string
-  publicKey?: string
-  label?: string | null
-  approvedAt?: string | null
-  approvedBy?: string | null
-  actorId?: string | null
-  status?: string
-  trustStatus?: string
 }
 
 export interface OAuth2ProviderConfig {

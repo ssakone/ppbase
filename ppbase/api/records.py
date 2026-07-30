@@ -81,7 +81,10 @@ def _prepare_rule_context(
     # Auth context for the rule engine ---
     if token_payload is None:
         auth_ctx: dict[str, Any] | None = None
-    elif token_payload.get("type") == "admin":
+    elif token_payload.get("type") == "admin" or (
+        token_payload.get("type") == "authRecord"
+        and token_payload.get("collectionName") == "_superusers"
+    ):
         auth_ctx = {
             "is_admin": True,
             "@request.auth.id": token_payload.get("id", ""),
@@ -722,13 +725,6 @@ async def _apply_batch_create(
     query: dict[str, str],
     all_collections: list[Any],
 ) -> tuple[int, Any] | JSONResponse:
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot create _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
-
     event = RecordRequestEvent(
         app=request.app,
         request=request,
@@ -867,13 +863,6 @@ async def _apply_batch_update(
     query: dict[str, str],
     all_collections: list[Any],
 ) -> tuple[int, Any] | JSONResponse:
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot update _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
-
     event = RecordRequestEvent(
         app=request.app,
         request=request,
@@ -1006,13 +995,6 @@ async def _apply_batch_delete(
     query: dict[str, str],
     all_collections: list[Any],
 ) -> tuple[int, Any] | JSONResponse:
-    if collection.name == "_superusers":
-        return _error_response(
-            400,
-            "You cannot delete _superusers records via the records API. "
-            "Use the admin auth endpoints instead.",
-        )
-
     event = RecordRequestEvent(
         app=request.app,
         request=request,
@@ -1455,12 +1437,6 @@ async def api_create_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
-        if collection.name == "_superusers":
-            return _error_response(
-                400,
-                "You cannot create _superusers records via the records API. "
-                "Use the admin auth endpoints instead.",
-            )
         event = RecordRequestEvent(
             app=request.app,
             request=request,
@@ -1694,12 +1670,6 @@ async def api_update_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
-        if collection.name == "_superusers":
-            return _error_response(
-                400,
-                "You cannot update _superusers records via the records API. "
-                "Use the admin auth endpoints instead.",
-            )
         event = RecordRequestEvent(
             app=request.app,
             request=request,
@@ -1785,12 +1755,6 @@ async def api_delete_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
-        if collection.name == "_superusers":
-            return _error_response(
-                400,
-                "You cannot delete _superusers records via the records API. "
-                "Use the admin auth endpoints instead.",
-            )
         event = RecordRequestEvent(
             app=request.app,
             request=request,

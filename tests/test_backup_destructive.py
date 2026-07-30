@@ -11,7 +11,7 @@ import pytest
 
 import ppbase.backup.destructive as destructive
 import ppbase.backup.service as backup_service
-from ppbase.backup.control import ControlPlaneRoot
+from ppbase.backup.control import RuntimeDataRoot
 from ppbase.backup.destructive import (
     build_file_reference_inventory,
     DestructiveRestoreError,
@@ -147,14 +147,11 @@ async def test_storage_swap_rollback_failure_is_explicitly_fail_closed() -> None
 def _settings(tmp_path: Path) -> SimpleNamespace:
     data_dir = tmp_path / "pb_data"
     data_dir.mkdir(mode=0o700)
-    return SimpleNamespace(
-        data_dir=str(data_dir),
-        backup_control_dir=str(tmp_path / "pb_backup_control"),
-    )
+    return SimpleNamespace(data_dir=str(data_dir))
 
 
 def _write_journal(settings: SimpleNamespace, value: dict[str, object]) -> None:
-    root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+    root = RuntimeDataRoot.open(Path(settings.data_dir))
     journal = DestructiveRestoreJournal(root)
     try:
         journal.write(value)
@@ -201,13 +198,13 @@ async def test_recovery_rejects_database_marker_without_journal(
 
 
 @pytest.mark.asyncio
-async def test_recovery_normalizes_owned_control_root_before_opening_journal(
+async def test_recovery_preserves_data_dir_mode_without_control_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
-    control_root = Path(settings.backup_control_dir)
-    control_root.mkdir(mode=0o755)
+    data_dir = Path(settings.data_dir)
+    os.chmod(data_dir, 0o755)
 
     async def no_marker(_connection: object) -> None:
         return None
@@ -217,7 +214,8 @@ async def test_recovery_normalizes_owned_control_root_before_opening_journal(
     result = await recover_interrupted_destructive_restore(settings, object())
 
     assert result is None
-    assert stat.S_IMODE(control_root.lstat().st_mode) == 0o700
+    assert stat.S_IMODE(data_dir.lstat().st_mode) == 0o755
+    assert not (tmp_path / "pb_backup_control").exists()
 
 
 @pytest.mark.asyncio
@@ -306,7 +304,7 @@ async def test_recovery_finalizes_files_when_database_commit_marker_matches(
         return restore_id
 
     async def clear(_connection: object, selected_restore_id: str) -> None:
-        root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+        root = RuntimeDataRoot.open(Path(settings.data_dir))
         journal = DestructiveRestoreJournal(root)
         try:
             persisted = journal.read()
@@ -435,7 +433,7 @@ async def test_recovery_keeps_journal_until_workspace_cleanup_finishes(
     with pytest.raises(OSError, match="synthetic crash"):
         await recover_interrupted_destructive_restore(settings, object())
 
-    root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+    root = RuntimeDataRoot.open(Path(settings.data_dir))
     journal = DestructiveRestoreJournal(root)
     try:
         assert journal.read() is not None
@@ -447,7 +445,7 @@ async def test_recovery_keeps_journal_until_workspace_cleanup_finishes(
     result = await recover_interrupted_destructive_restore(settings, object())
 
     assert result == {"restoreId": restore_id, "outcome": "committed"}
-    root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+    root = RuntimeDataRoot.open(Path(settings.data_dir))
     journal = DestructiveRestoreJournal(root)
     try:
         assert journal.read() is None
@@ -457,7 +455,7 @@ async def test_recovery_keeps_journal_until_workspace_cleanup_finishes(
 
 
 @pytest.mark.asyncio
-async def test_recovery_keeps_previous_files_when_signed_inventory_mismatches(
+async def test_recovery_keeps_previous_files_when_backup_inventory_mismatches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -491,7 +489,7 @@ async def test_recovery_keeps_previous_files_when_signed_inventory_mismatches(
 
     with pytest.raises(
         DestructiveRestoreError,
-        match="differ from the signed inventory",
+        match="differ from the backup inventory",
     ):
         await recover_interrupted_destructive_restore(settings, object())
 
@@ -499,7 +497,7 @@ async def test_recovery_keeps_previous_files_when_signed_inventory_mismatches(
     assert old_secret.is_file()
     assert (data_dir / "storage").is_dir()
     assert Path(str(value["workDir"])).is_dir()
-    root = ControlPlaneRoot.open(Path(settings.backup_control_dir))
+    root = RuntimeDataRoot.open(Path(settings.data_dir))
     journal = DestructiveRestoreJournal(root)
     try:
         assert journal.read() is not None

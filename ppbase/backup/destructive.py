@@ -17,12 +17,13 @@ from typing import Any
 from sqlalchemy import text
 
 from ppbase.backup.control import (
-    ControlPlaneRoot,
     ControlPlaneSafetyError,
-    absolute_path_without_symlink_resolution,
+    RuntimeDataRoot,
+    open_flags,
+    same_file_identity,
 )
 from ppbase.backup.models import canonical_json_bytes
-from ppbase.backup.storage import AnchoredStagingDataDir, AuthenticatedBackupInspection
+from ppbase.backup.storage import AnchoredStagingDataDir, VerifiedBackupInspection
 from ppbase.services.file_references import (
     LocalFileReference,
     read_canonical_local_file_references,
@@ -33,8 +34,7 @@ from ppbase.services.file_storage import (
 )
 
 
-_JOURNAL_DIR = "destructive-restores"
-_JOURNAL_FILE = "active.json"
+_JOURNAL_FILE = ".ppbase-restore.json"
 _RESTORE_ROOT = ".ppbase-restore"
 _CONTROL_SCHEMA = "_ppbase_restore_control"
 _CONTROL_TABLE = "commits"
@@ -55,7 +55,7 @@ class DestructiveRestoreError(RuntimeError):
 
 
 def normalize_file_reference_inventory(value: Any) -> dict[str, Any]:
-    """Return one canonical, structurally valid signed reference inventory."""
+    """Return one canonical, structurally valid reference inventory."""
     if not isinstance(value, dict) or set(value) != {"version", "count", "sha256"}:
         raise ValueError("local-file reference inventory has an invalid shape")
     version = value.get("version")
@@ -100,7 +100,7 @@ def file_reference_inventory_matches(
     expected: dict[str, Any],
     references: tuple[LocalFileReference, ...],
 ) -> bool:
-    """Compare restored references with an inventory authenticated pre-cutover."""
+    """Compare restored references with the verified pre-cutover inventory."""
     try:
         normalized = normalize_file_reference_inventory(expected)
     except ValueError:
@@ -143,39 +143,54 @@ def _ensure_private_directory(path: Path) -> None:
 
 
 class DestructiveRestoreJournal:
-    """Single durable in-flight restore record below the backup control root."""
+    """Single durable in-flight restore record directly below ``data_dir``."""
 
     def __init__(
         self,
-        control_root: ControlPlaneRoot,
+        data_root: RuntimeDataRoot,
         *,
         create_missing: bool = True,
     ) -> None:
-        self._root = control_root
-        self._directory_fd = control_root.open_private_directory(
-            _JOURNAL_DIR,
-            label="The destructive restore journal",
-            create_missing=create_missing,
-        )
+        del create_missing
+        self._root = data_root
+        self._closed = False
 
     def close(self) -> None:
-        descriptor = self._directory_fd
-        self._directory_fd = -1
-        if descriptor >= 0:
-            os.close(descriptor)
+        self._closed = True
 
-    def _require_open(self) -> None:
-        if self._directory_fd < 0:
+    def _require_open(self) -> int:
+        if self._closed:
             raise DestructiveRestoreError("destructive restore journal is closed")
         self._root.verify_attached()
+        return self._root.fileno()
+
+    @staticmethod
+    def _validate_file(info: os.stat_result) -> None:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size <= 0
+            or info.st_size > 32 * 1024
+        ):
+            raise DestructiveRestoreError(
+                "restore journal has an invalid file shape"
+            )
 
     def read(self) -> dict[str, Any] | None:
-        self._require_open()
+        directory_fd = self._require_open()
         try:
+            expected = os.stat(
+                _JOURNAL_FILE,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            self._validate_file(expected)
             descriptor = os.open(
                 _JOURNAL_FILE,
-                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=self._directory_fd,
+                open_flags(os.O_RDONLY),
+                dir_fd=directory_fd,
             )
         except FileNotFoundError:
             return None
@@ -183,11 +198,15 @@ class DestructiveRestoreJournal:
             raise DestructiveRestoreError("restore journal cannot be opened safely") from exc
         try:
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > 32 * 1024:
-                raise DestructiveRestoreError("restore journal has an invalid file shape")
+            self._validate_file(info)
+            if not same_file_identity(expected, info):
+                raise DestructiveRestoreError(
+                    "restore journal changed while it was opened"
+                )
             payload = os.read(descriptor, 32 * 1024 + 1)
         finally:
             os.close(descriptor)
+        self._root.verify_attached()
         try:
             value = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -197,53 +216,76 @@ class DestructiveRestoreJournal:
         return value
 
     def write(self, value: dict[str, Any]) -> None:
-        self._require_open()
+        directory_fd = self._require_open()
         payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(payload) > 32 * 1024:
             raise DestructiveRestoreError("restore journal exceeds its size limit")
-        temporary = f".active-{secrets.token_hex(12)}.tmp"
+        temporary = f".ppbase-restore-{secrets.token_hex(12)}.tmp"
         descriptor: int | None = None
         try:
             descriptor = os.open(
                 temporary,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+                open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
                 0o600,
-                dir_fd=self._directory_fd,
+                dir_fd=directory_fd,
             )
-            os.write(descriptor, payload)
+            view = memoryview(payload)
+            offset = 0
+            while offset < len(view):
+                written = os.write(descriptor, view[offset:])
+                if written <= 0:
+                    raise OSError("short restore journal write")
+                offset += written
+            os.fchmod(descriptor, 0o600)
             os.fsync(descriptor)
+            temporary_info = os.fstat(descriptor)
+            self._validate_file(temporary_info)
             os.close(descriptor)
             descriptor = None
             os.replace(
                 temporary,
                 _JOURNAL_FILE,
-                src_dir_fd=self._directory_fd,
-                dst_dir_fd=self._directory_fd,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
             )
-            os.fsync(self._directory_fd)
+            published = os.stat(
+                _JOURNAL_FILE,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            self._validate_file(published)
+            if not same_file_identity(temporary_info, published):
+                raise DestructiveRestoreError(
+                    "restore journal changed while it was published"
+                )
+            os.fsync(directory_fd)
+            self._root.verify_attached()
         except OSError as exc:
             raise DestructiveRestoreError("restore journal cannot be persisted safely") from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                os.unlink(temporary, dir_fd=self._directory_fd)
+                os.unlink(temporary, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
 
     def clear(self) -> None:
-        self._require_open()
+        directory_fd = self._require_open()
         try:
-            os.unlink(_JOURNAL_FILE, dir_fd=self._directory_fd)
+            visible = os.stat(
+                _JOURNAL_FILE,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            self._validate_file(visible)
+            os.unlink(_JOURNAL_FILE, dir_fd=directory_fd)
         except FileNotFoundError:
             return
         except OSError as exc:
             raise DestructiveRestoreError("restore journal cannot be cleared safely") from exc
-        os.fsync(self._directory_fd)
+        os.fsync(directory_fd)
+        self._root.verify_attached()
 
 
 @dataclass(slots=True)
@@ -418,7 +460,7 @@ def _remove_entry_at(directory_fd: int, name: str, display_path: Path) -> None:
 def prepare_storage_restore(
     *,
     store: Any,
-    inspection: AuthenticatedBackupInspection,
+    inspection: VerifiedBackupInspection,
     settings: Any,
     journal: DestructiveRestoreJournal,
     restore_id: str,
@@ -430,7 +472,7 @@ def prepare_storage_restore(
         )
     except ValueError as exc:
         raise DestructiveRestoreError(
-            "signed local-file reference inventory is invalid"
+            "backup local-file reference inventory is invalid"
         ) from exc
     data_dir = Path(settings.data_dir).expanduser().resolve(strict=True)
     data_info = data_dir.lstat()
@@ -559,7 +601,7 @@ async def validate_committed_destructive_restore(
         )
     except ValueError as exc:
         raise DestructiveRestoreError(
-            "restore journal has no valid signed local-file reference inventory"
+            "restore journal has no valid local-file reference inventory"
         ) from exc
 
     try:
@@ -570,7 +612,7 @@ async def validate_committed_destructive_restore(
         ) from exc
     if not file_reference_inventory_matches(normalized_inventory, references):
         raise DestructiveRestoreError(
-            "restored local-file references differ from the signed inventory"
+            "restored local-file references differ from the backup inventory"
         )
 
     try:
@@ -613,23 +655,21 @@ async def recover_interrupted_destructive_restore(
     connection: Any,
 ) -> dict[str, Any] | None:
     """Finish or roll back the sole in-flight file permutation during startup."""
-    control_path = absolute_path_without_symlink_resolution(
-        settings.backup_control_dir
-    )
+    data_path = Path(settings.data_dir).expanduser()
     try:
-        control_path.lstat()
-    except FileNotFoundError:
-        if await read_database_restore_marker(connection) is not None:
+        data_root = RuntimeDataRoot.open(data_path, create_missing=False)
+    except ControlPlaneSafetyError as exc:
+        marker = await read_database_restore_marker(connection)
+        if not data_path.exists() and marker is None:
+            return None
+        if marker is not None:
             raise DestructiveRestoreError(
                 "database restore marker exists without its filesystem journal"
-            )
-        return None
-    control_root = ControlPlaneRoot.open(
-        control_path,
-        create_missing=False,
-        normalize_private=True,
-    )
-    journal = DestructiveRestoreJournal(control_root)
+            ) from exc
+        raise DestructiveRestoreError(
+            "the PPBase data directory cannot be opened for restore recovery"
+        ) from exc
+    journal = DestructiveRestoreJournal(data_root)
     try:
         state = journal.read()
         if state is None:
@@ -674,7 +714,7 @@ async def recover_interrupted_destructive_restore(
                 )
             except ValueError as exc:
                 raise DestructiveRestoreError(
-                    "committed restore journal has no valid signed file-reference inventory"
+                    "committed restore journal has no valid file-reference inventory"
                 ) from exc
             await validate_committed_destructive_restore(
                 settings,
@@ -727,7 +767,7 @@ async def recover_interrupted_destructive_restore(
         return {"restoreId": restore_id, "outcome": outcome}
     finally:
         journal.close()
-        control_root.close()
+        data_root.close()
 
 
 def destructive_restore_control_schema() -> str:

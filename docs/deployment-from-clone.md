@@ -67,8 +67,9 @@ Start PPBase:
   --port 8090
 ```
 
-`serve` creates `pb_backups` and `pb_backup_control` automatically when their
-configured paths are absent, using the same directory policy as `pb_data`.
+`serve` creates `pb_data/backups` automatically; ZIPs and their metadata
+sidecars live below the data directory, matching PocketBase's local layout.
+No separate backup-control directory is required.
 
 ## 3. Verify backup and restore readiness
 
@@ -82,24 +83,22 @@ With the server running:
   --server http://127.0.0.1:8090
 ```
 
-Confirm `backupReady: true` and `restoreReady: true`. A
-`runtime_superuser` warning is informational when the configured PostgreSQL
-role is intentionally a superuser.
+Confirm `backupReady: true` and `restoreReady: true`.
 
 ## 4. Move a backup to a fresh target
 
-1. Create and download a signed ZIP from the source Dashboard.
+1. Create and download a ZIP from the source Dashboard.
 2. Start the fresh target and create a temporary target superuser if needed to
    access its Dashboard.
 3. Upload the source ZIP on the target.
-4. Compare and approve the exact Ed25519 source fingerprint.
-5. Confirm the destructive restore and wait for PPBase to restart.
-6. Sign in with a superuser contained in the source archive.
+4. Confirm the destructive restore and wait for PPBase to restart.
+5. Sign in with a superuser contained in the source archive.
 
 Restore replaces the managed database, local file storage, `_superusers` and
 the project-local JWT secret. The temporary target superuser therefore
-disappears unless it also existed in the source archive. The target keeps its
-own `pb_backup_control`, Ed25519 identity and signer approvals.
+disappears unless it also existed in the source archive. The selected ZIP
+remains in the target's `pb_data/backups`. PPBase uses only temporary recovery
+state directly below `pb_data` while the restore is in progress.
 
 After restore, verify:
 
@@ -107,7 +106,7 @@ After restore, verify:
 - the expected source superuser can sign in;
 - expected records and uploaded files are present;
 - `backup doctor` is ready;
-- a new backup can be created and inspected on the restored target.
+- a new backup can be created and downloaded from the restored target.
 
 ## 5. Upload a large ZIP without a public intermediary
 

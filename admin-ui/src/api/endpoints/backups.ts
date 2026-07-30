@@ -1,10 +1,7 @@
 import { apiClient, type UploadProgress } from '../client'
 import type {
-  BackupIdentity,
-  BackupInspection,
   BackupListItem,
   BackupReadiness,
-  BackupTrustEntry,
 } from '../types'
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -28,36 +25,16 @@ export function getBackupErrorMessage(error: unknown, fallback: string): string 
   return code ? `${fallback} (${code})` : fallback
 }
 
-export function backupKey(backup: Pick<BackupListItem, 'id' | 'key'>): string {
-  return backup.id || backup.key
+export function backupKey(backup: Pick<BackupListItem, 'key'>): string {
+  return backup.key
 }
 
 export async function listBackups(): Promise<BackupListItem[]> {
-  const items = await apiClient.request<BackupListItem[]>('GET', '/api/backups')
-  return items.map((item) => ({
-    ...item,
-    id: item.id || item.key,
-    key: item.key || item.id,
-  }))
+  return apiClient.request<BackupListItem[]>('GET', '/api/backups')
 }
 
-export function createBackup(name?: string): Promise<BackupInspection> {
-  return apiClient.request<BackupInspection>('POST', '/api/backups', { name: name || null })
-}
-
-export function inspectBackup(
-  id: string,
-  resourceOffset = 0,
-  resourceLimit = 100,
-): Promise<BackupInspection> {
-  const query = new URLSearchParams({
-    resourceOffset: String(resourceOffset),
-    resourceLimit: String(resourceLimit),
-  })
-  return apiClient.request<BackupInspection>(
-    'GET',
-    `/api/backups/${encodeURIComponent(id)}?${query.toString()}`,
-  )
+export function createBackup(name?: string): Promise<void> {
+  return apiClient.request<void>('POST', '/api/backups', { name: name || null })
 }
 
 export function deleteBackup(id: string): Promise<void> {
@@ -68,10 +45,10 @@ export function uploadBackup(
   file: File,
   onProgress?: (progress: UploadProgress) => void,
   signal?: AbortSignal,
-): Promise<BackupInspection> {
+): Promise<void> {
   const form = new FormData()
   form.set('file', file)
-  return apiClient.requestFormDataWithProgress<BackupInspection>(
+  return apiClient.requestFormDataWithProgress<void>(
     'POST',
     '/api/backups/upload',
     form,
@@ -96,34 +73,8 @@ export async function downloadBackup(id: string, filename?: string | null): Prom
   anchor.remove()
 }
 
-export function getBackupIdentity(): Promise<BackupIdentity> {
-  return apiClient.request<BackupIdentity>('GET', '/api/backups/identity')
-}
-
 export function getBackupReadiness(): Promise<BackupReadiness> {
   return apiClient.request<BackupReadiness>('GET', '/api/backups/readiness')
-}
-
-export function listBackupTrust(): Promise<BackupTrustEntry[]> {
-  return apiClient.request<BackupTrustEntry[]>('GET', '/api/backups/trusted-signers')
-}
-
-export function approveBackupSigner(
-  id: string,
-  fingerprintSha256: string,
-): Promise<BackupTrustEntry | BackupInspection> {
-  return apiClient.request<BackupTrustEntry | BackupInspection>(
-    'POST',
-    `/api/backups/${encodeURIComponent(id)}/trust`,
-    { fingerprintSha256 },
-  )
-}
-
-export function revokeBackupSigner(fingerprint: string): Promise<void> {
-  return apiClient.request<void>(
-    'DELETE',
-    `/api/backups/trusted-signers/${encodeURIComponent(fingerprint)}`,
-  )
 }
 
 /**

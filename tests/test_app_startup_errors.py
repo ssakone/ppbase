@@ -63,7 +63,6 @@ def _fake_app(tmp_path: Path) -> SimpleNamespace:
         jwt_secret="startup-test-secret",
         migrations_dir=str(tmp_path),
         apply_migrations_on_start=True,
-        backup_control_dir=str(tmp_path / "missing-control"),
     )
     return SimpleNamespace(
         state=SimpleNamespace(settings=settings, extension_registry=None)

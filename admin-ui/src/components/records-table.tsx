@@ -60,7 +60,10 @@ function getSchemaFields(collection: Collection, records: RecordModel[]): Field[
   const attachAuthSystemFields = (base: Field[]): Field[] => {
     if (collection.type !== 'auth') return base
     const existing = new Set(base.map((f) => f.name))
-    const authFields = AUTH_SYSTEM_FIELDS.filter((f) => !existing.has(f.name))
+    const availableAuthFields = collection.name === '_superusers'
+      ? AUTH_SYSTEM_FIELDS.filter((field) => field.name === 'email')
+      : AUTH_SYSTEM_FIELDS
+    const authFields = availableAuthFields.filter((f) => !existing.has(f.name))
     return [...authFields, ...base]
   }
 

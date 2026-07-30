@@ -20,6 +20,7 @@ import os
 import secrets
 import shutil
 import tempfile
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,6 +64,15 @@ def _admin_base() -> str:
     else:
         base = "postgresql+asyncpg://ppbase:ppbase@localhost:5433/postgres"
     return base.rsplit("/", 1)[0]
+
+
+def _backup_archive_path(settings: Settings, key: str) -> Path:
+    return Path(settings.data_dir) / "backups" / key
+
+
+def _read_backup_member(settings: Settings, key: str, member: str) -> bytes:
+    with zipfile.ZipFile(_backup_archive_path(settings, key)) as archive:
+        return archive.read(member)
 
 
 async def _can_create_database(base: str) -> bool:
@@ -445,8 +455,6 @@ async def seeded_v2_backup() -> AsyncIterator[dict[str, object]]:
     settings = Settings(
         database_url=url,
         data_dir=str(data_dir),
-        backup_root=str(tmp / "pb_backups"),
-        backup_control_dir=str(tmp / "pb_control"),
         jwt_secret="",
         auto_migrate=False,
     )
@@ -474,7 +482,7 @@ async def seeded_v2_backup() -> AsyncIterator[dict[str, object]]:
             "url": url,
             "settings": settings,
             "engine": engine,
-            "backup_id": str(backup["id"]),
+            "backup_id": str(backup["key"]),
             "storage_file": storage_file,
         }
     finally:
@@ -492,13 +500,12 @@ async def test_native_v2_backup_is_format_version_two(
 ) -> None:
     settings = seeded_v2_backup["settings"]
     backup_id = str(seeded_v2_backup["backup_id"])
-    set_dir = Path(settings.backup_root) / "sets" / backup_id  # type: ignore[attr-defined]
-    resources = set_dir / "resources"
-    # v2 writes schema.json + data.copy under resources/database/ and never a
-    # pg_dump custom archive.
-    assert (resources / "database" / "schema.json").is_file()
-    assert (resources / "database" / "data.copy").is_file()
-    assert not (resources / "database.dump").exists()
+    with zipfile.ZipFile(_backup_archive_path(settings, backup_id)) as archive:  # type: ignore[arg-type]
+        names = set(archive.namelist())
+    assert "backup.json" in names
+    assert SCHEMA_JSON_RESOURCE in names
+    assert DATA_COPY_RESOURCE in names
+    assert "resources/database.dump" not in names
 
 
 async def test_native_v2_destructive_restore_round_trip(
@@ -604,8 +611,6 @@ async def test_native_v2_zip_round_trip_without_pg_binaries(
     settings = Settings(
         database_url=url,
         data_dir=str(data_dir),
-        backup_root=str(tmp / "pb_backups"),
-        backup_control_dir=str(tmp / "pb_control"),
         jwt_secret="",
         auto_migrate=False,
     )
@@ -626,7 +631,7 @@ async def test_native_v2_zip_round_trip_without_pg_binaries(
         service = NativeBackupService(engine, settings)
         try:
             backup = await service.create_local_backup(actor_id=None)
-            backup_id = str(backup["id"])
+            backup_id = str(backup["key"])
 
             # The project secret was persisted and carried into the backup.
             assert (data_dir / ".jwt_secret").is_file()
@@ -640,17 +645,19 @@ async def test_native_v2_zip_round_trip_without_pg_binaries(
             zip_bytes = buffer.getvalue()
             assert zip_bytes[:2] == b"PK"
 
-            # 3. Delete the canonical set so the re-import cannot alias it.
+            # 3. Delete the stored ZIP so the re-upload exercises persistence.
             await service.delete_local_backup(backup_id)
-            set_dir = Path(settings.backup_root) / "sets" / backup_id
-            assert not set_dir.exists()
+            assert not _backup_archive_path(settings, backup_id).exists()
 
-            # 4. Re-import the ZIP; the manifest carries the same identity plus
-            #    the copy-pair resources and the included JWT secret.
-            inspection = await service.upload_local_backup(io.BytesIO(zip_bytes))
-            assert inspection["id"] == backup_id
-            assert inspection["metadata"]["jwt_secret"]["mode"] == "included_resource"
-            resource_paths = {res["path"] for res in inspection["resources"]}
+            # 4. Re-upload the same ZIP. Upload stores it without extraction;
+            #    backup.json and checksums are validated when restore starts.
+            uploaded = await service.upload_local_backup(
+                io.BytesIO(zip_bytes),
+                filename=backup_id,
+            )
+            assert uploaded["key"] == backup_id
+            with zipfile.ZipFile(_backup_archive_path(settings, backup_id)) as archive:
+                resource_paths = set(archive.namelist())
             assert SCHEMA_JSON_RESOURCE in resource_paths
             assert DATA_COPY_RESOURCE in resource_paths
             assert JWT_SECRET_RESOURCE_PATH in resource_paths
@@ -752,8 +759,6 @@ async def test_native_v2_refuses_unmanaged_registered_table() -> None:
     settings = Settings(
         database_url=url,
         data_dir=str(data_dir),
-        backup_root=str(tmp / "pb_backups"),
-        backup_control_dir=str(tmp / "pb_control"),
         jwt_secret="",
         auto_migrate=False,
     )
@@ -791,8 +796,8 @@ async def test_native_v2_refuses_unmanaged_registered_table() -> None:
             service.close()
 
         # Nothing was sealed: the backup failed closed.
-        sets_dir = Path(settings.backup_root) / "sets"
-        published = list(sets_dir.glob("*")) if sets_dir.exists() else []
+        backups_dir = Path(settings.data_dir) / "backups"
+        published = list(backups_dir.glob("*.zip")) if backups_dir.exists() else []
         assert published == []
     finally:
         await engine.dispose()
@@ -832,8 +837,6 @@ async def _provisioned_backup_env(prefix: str) -> AsyncIterator[dict[str, object
     settings = Settings(
         database_url=url,
         data_dir=str(data_dir),
-        backup_root=str(tmp / "pb_backups"),
-        backup_control_dir=str(tmp / "pb_control"),
         jwt_secret="",
         auto_migrate=False,
     )
@@ -898,8 +901,8 @@ async def test_native_v2_refuses_divergent_view_via_create_path() -> None:
         finally:
             service.close()
 
-        sets_dir = Path(settings.backup_root) / "sets"
-        published = list(sets_dir.glob("*")) if sets_dir.exists() else []
+        backups_dir = Path(settings.data_dir) / "backups"
+        published = list(backups_dir.glob("*.zip")) if backups_dir.exists() else []
         assert published == []
 
 
@@ -952,8 +955,8 @@ async def test_native_v2_refuses_metadata_drift_during_backup(
         assert excinfo.value.code == "schema_drift_during_backup"
         assert calls["n"] == 2
 
-        sets_dir = Path(settings.backup_root) / "sets"
-        published = list(sets_dir.glob("*")) if sets_dir.exists() else []
+        backups_dir = Path(settings.data_dir) / "backups"
+        published = list(backups_dir.glob("*.zip")) if backups_dir.exists() else []
         assert published == []
 
 
@@ -1005,8 +1008,8 @@ async def test_native_v2_refuses_drift_between_validation_and_fingerprint(
         assert excinfo.value.code == "schema_drift_during_backup"
         assert state["injected"] is True
 
-        sets_dir = Path(settings.backup_root) / "sets"
-        published = list(sets_dir.glob("*")) if sets_dir.exists() else []
+        backups_dir = Path(settings.data_dir) / "backups"
+        published = list(backups_dir.glob("*.zip")) if backups_dir.exists() else []
         assert published == []
 
 
@@ -1047,9 +1050,8 @@ async def test_native_v2_accepts_matching_view_via_create_path() -> None:
         finally:
             service.close()
 
-        assert backup["id"]
-        set_dir = Path(settings.backup_root) / "sets" / str(backup["id"])
-        assert (set_dir / "resources" / "database" / "schema.json").is_file()
+        assert backup["key"]
+        assert _backup_archive_path(settings, str(backup["key"])).is_file()
 
 
 # The physical column order of ``reordered`` (id, created, updated, alpha, beta,
@@ -1137,9 +1139,13 @@ async def test_native_v2_accepts_reordered_columns_and_keeps_physical_order() ->
         finally:
             service.close()
 
-        set_dir = Path(settings.backup_root) / "sets" / str(backup["id"])
-        schema_path = set_dir / "resources" / "database" / "schema.json"
-        schema = DatabaseSchema.from_canonical_bytes(schema_path.read_bytes())
+        schema = DatabaseSchema.from_canonical_bytes(
+            _read_backup_member(
+                settings,
+                str(backup["key"]),
+                SCHEMA_JSON_RESOURCE,
+            )
+        )
 
         table = next(t for t in schema.tables if t.name == "reordered")
         # schema.json preserves the live PostgreSQL physical order, not the
@@ -1168,7 +1174,7 @@ async def test_native_v2_reordered_collection_destructive_round_trip() -> None:
             backup = await service.create_local_backup(actor_id=None)
         finally:
             service.close()
-        backup_id = str(backup["id"])
+        backup_id = str(backup["key"])
 
         # Mutate away from the backup contents before restoring.
         async with engine.begin() as connection:  # type: ignore[union-attr]
@@ -1246,7 +1252,7 @@ async def test_native_v2_destructive_restore_round_trip_with_view() -> None:
             backup = await service.create_local_backup(actor_id=None)
         finally:
             service.close()
-        backup_id = str(backup["id"])
+        backup_id = str(backup["key"])
 
         # Drop the view and mutate the base data away from the backup contents.
         async with engine.begin() as connection:  # type: ignore[union-attr]

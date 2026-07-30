@@ -1,12 +1,12 @@
-"""Application orchestration for signed backup and destructive restore."""
+"""Application orchestration for native backup and destructive restore."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
 import math
 import os
+import shutil
+import tempfile
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -19,8 +19,8 @@ from sqlalchemy.pool import NullPool
 
 from ppbase import __version__
 from ppbase.backup.control import (
-    ControlPlaneRoot,
     ControlPlaneSafetyError,
+    RuntimeDataRoot,
     absolute_path_without_symlink_resolution,
     ensure_runtime_backup_roots,
 )
@@ -28,6 +28,7 @@ from ppbase.backup.canonical import (
     fingerprint_collection_objects,
     validate_canonical_collection_objects,
 )
+from ppbase.backup.archive_store import BackupArchiveStore, validate_backup_key
 from ppbase.backup.destructive import (
     build_file_reference_inventory,
     DestructiveRestoreError,
@@ -43,18 +44,11 @@ from ppbase.backup.disk import (
     local_tree_size,
     require_disk_space,
 )
-from ppbase.backup.identity import (
-    BackupIdentity,
-    BackupIdentityError,
-    BackupIdentityMissingError,
-)
 from ppbase.backup.models import (
     BackupError,
-    BackupInspection,
     BackupIntegrityError,
     BackupManifest,
     BackupNotFoundError,
-    BackupSetSummary,
     format_manifest_timestamp,
 )
 from ppbase.backup.operations import (
@@ -80,10 +74,8 @@ from ppbase.backup.schema_contract import DatabaseSchema
 from ppbase.backup.storage import (
     DATA_COPY_RESOURCE,
     SCHEMA_JSON_RESOURCE,
-    AuthenticatedBackupInspection,
-    BackupDeleteCancelledError,
+    VerifiedBackupInspection,
     BackupDeletionUncertainError,
-    BackupDeleteGate,
     BackupSealCancelledError,
     BackupSealGate,
     LocalBackupStore,
@@ -93,14 +85,11 @@ from ppbase.backup.transport import (
     BackupTransportLimits,
     PinnedBackupZip,
     PreparedBackupImport,
-    backup_transport_filename,
     backup_transport_filename_from_parts,
-    backup_transport_size,
     materialize_backup_zip,
     prepare_backup_zip_import,
     validate_backup_transport_filename,
 )
-from ppbase.backup.trust import BackupTrustError, BackupTrustStore
 from ppbase.services.async_utils import (
     to_thread_quiescent as _to_thread_quiescent,
 )
@@ -131,8 +120,6 @@ from ppbase.services.write_barrier import (
 
 
 _FILE_REFERENCE_INVENTORY_KEY = "local_file_reference_inventory"
-BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT = 100
-BACKUP_INSPECTION_MAX_RESOURCE_LIMIT = 250
 _T = TypeVar("_T")
 _RETAINED_CUTOVER_GUARDS: set["BackupCutoverGuard"] = set()
 
@@ -276,7 +263,7 @@ def _file_reference_inventory(
 
 
 def _require_manifest_file_reference_inventory(
-    inspection: AuthenticatedBackupInspection,
+    inspection: VerifiedBackupInspection,
 ) -> dict[str, Any]:
     raw = inspection.manifest.metadata.get(_FILE_REFERENCE_INVENTORY_KEY)
     try:
@@ -448,50 +435,6 @@ async def _finalize_backup_atomically(
         return result
 
 
-async def _delete_backup_atomically(
-    function: Callable[..., None],
-    /,
-    *args: Any,
-    delete_gate: BackupDeleteGate,
-    **kwargs: Any,
-) -> None:
-    """Choose cancellation or a completed durable delete, never both."""
-    worker = asyncio.create_task(
-        asyncio.to_thread(
-            function,
-            *args,
-            delete_gate=delete_gate,
-            **kwargs,
-        )
-    )
-    try:
-        await asyncio.shield(worker)
-        return
-    except asyncio.CancelledError as cancellation:
-        deletion_prevented = await _thread_result_while_resolving_cancellation(
-            delete_gate.cancel
-        )
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                break
-        try:
-            worker.result()
-        except BaseException as worker_error:
-            if deletion_prevented and isinstance(
-                worker_error,
-                BackupDeleteCancelledError,
-            ):
-                raise cancellation
-            raise
-        if deletion_prevented:  # pragma: no cover - gate invariant
-            raise cancellation
-        return
-
-
 class BackupServiceError(RuntimeError):
     """Stable HTTP-facing error without credentials or subprocess output."""
 
@@ -558,20 +501,18 @@ def _create_restore_cutover_engine(
 
 
 class NativeBackupService:
-    """Create signed local sets and restore them into the active targets."""
+    """Create native backups and restore them into the active targets."""
 
     def __init__(self, engine: AsyncEngine, settings: Any) -> None:
         self._closed = False
         self.engine = engine
         self.settings = settings
         self.backup_root = absolute_path_without_symlink_resolution(
-            settings.backup_root
-        )
-        self.control_dir = absolute_path_without_symlink_resolution(
-            settings.backup_control_dir
+            Path(settings.data_dir).expanduser() / "backups"
         )
         try:
             ensure_runtime_backup_roots(settings)
+            self.data_root = RuntimeDataRoot.open(settings.data_dir)
         except ControlPlaneSafetyError as exc:
             raise BackupServiceError(
                 500,
@@ -580,24 +521,14 @@ class NativeBackupService:
             ) from exc
         self._validate_roots()
         try:
-            self.control_root = ControlPlaneRoot.open(
-                self.control_dir,
-            )
-        except ControlPlaneSafetyError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_control_invalid",
-                "The native backup control plane is missing or unsafe.",
-            ) from exc
-        try:
-            self.operations = BackupOperationCoordinator(self.control_root)
-            self.destructive_journal = DestructiveRestoreJournal(self.control_root)
-            self.trust = BackupTrustStore(self.control_root)
-            self.identity = self._load_identity()
-            self.store = LocalBackupStore(
-                self.backup_root,
-                identity=self.identity,
-            )
+            self.archive_store = BackupArchiveStore(settings.data_dir)
+            self.operations = BackupOperationCoordinator(self.data_root)
+            self.destructive_journal = DestructiveRestoreJournal(self.data_root)
+            self.workspace_root = Path(
+                tempfile.mkdtemp(prefix="ppbase-backup-workspace-")
+            ).resolve(strict=True)
+            os.chmod(self.workspace_root, 0o700, follow_symlinks=False)
+            self.store = LocalBackupStore(self.workspace_root)
         except BackupServiceError:
             self.close()
             raise
@@ -607,13 +538,6 @@ class NativeBackupService:
                 500,
                 exc.code,
                 "The native backup operation coordinator is missing or unsafe.",
-            ) from exc
-        except BackupTrustError as exc:
-            self.close()
-            raise BackupServiceError(
-                500,
-                "backup_control_invalid",
-                "The native backup signer trust store is missing or unsafe.",
             ) from exc
         except BackupError as exc:
             self.close()
@@ -631,22 +555,22 @@ class NativeBackupService:
             return
         self._closed = True
         store = getattr(self, "store", None)
-        identity = getattr(self, "identity", None)
-        trust = getattr(self, "trust", None)
+        archive_store = getattr(self, "archive_store", None)
+        workspace_root = getattr(self, "workspace_root", None)
         operations = getattr(self, "operations", None)
         destructive_journal = getattr(self, "destructive_journal", None)
-        control_root = getattr(self, "control_root", None)
+        data_root = getattr(self, "data_root", None)
         try:
             if store is not None:
                 store.close()
         finally:
             try:
-                if identity is not None:
-                    identity.close()
+                if archive_store is not None:
+                    archive_store.close()
             finally:
                 try:
-                    if trust is not None:
-                        trust.close()
+                    if workspace_root is not None and workspace_root.exists():
+                        shutil.rmtree(workspace_root)
                 finally:
                     try:
                         if operations is not None:
@@ -656,11 +580,11 @@ class NativeBackupService:
                             if destructive_journal is not None:
                                 destructive_journal.close()
                         finally:
-                            if control_root is not None:
-                                control_root.close()
+                            if data_root is not None:
+                                data_root.close()
 
     def __enter__(self) -> "NativeBackupService":
-        self._require_control_identity_attached()
+        self._require_runtime_attached()
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -669,77 +593,23 @@ class NativeBackupService:
     def __del__(self) -> None:
         self.close()
 
-    def get_identity(self) -> dict[str, Any]:
-        self._require_control_identity_attached()
-        encoded_key = base64.urlsafe_b64encode(
-            self.identity.public_key_bytes
-        ).decode("ascii").rstrip("=")
-        result = {
-            "algorithm": "Ed25519",
-            "publicKey": encoded_key,
-            "fingerprintSha256": self.identity.fingerprint_sha256,
-        }
-        self._require_control_identity_attached()
-        return result
-
-    def list_trusted_signers(self) -> list[dict[str, Any]]:
-        """List explicitly approved external Ed25519 identities."""
-        self._require_control_identity_attached()
-        try:
-            result = [record.to_dict() for record in self.trust.list()]
-            self._require_control_identity_attached()
-            return result
-        except BackupTrustError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_trust_store_invalid",
-                "The backup signer trust store is missing or unsafe.",
-            ) from exc
-
-    async def _backup_reference_summaries(self) -> list[BackupSetSummary]:
-        """Return one attached snapshot used for ID/SDK-key resolution."""
-        self._require_control_identity_attached()
-        try:
-            summaries = await _to_thread_quiescent(self.store.list_sets)
-        except BackupError as exc:
-            raise self._map_error(exc, operation="resolve") from exc
-        self._require_control_identity_attached()
-        return summaries
-
-    @staticmethod
-    def _backup_summary_aliases(summary: BackupSetSummary) -> set[str]:
-        aliases = {str(summary.backup_id)}
-        if summary.manifest is not None:
-            aliases.add(backup_transport_filename(summary.manifest))
-        return aliases
-
     async def _resolve_backup_reference(self, reference: str) -> str:
-        """Resolve an exact internal ID or PocketBase-visible ZIP key."""
-        if not isinstance(reference, str) or not reference:
+        """Resolve the exact PocketBase-visible ZIP key."""
+        try:
+            key = validate_backup_key(reference)
+        except ValueError:
             raise BackupServiceError(
                 404,
                 "backup_not_found",
-                "The sealed local backup was not found.",
+                "The local backup was not found.",
             )
-        summaries = await self._backup_reference_summaries()
-        matches = {
-            str(summary.backup_id)
-            for summary in summaries
-            if reference in self._backup_summary_aliases(summary)
-        }
-        if not matches:
+        if not await _to_thread_quiescent(self.archive_store.exists, key):
             raise BackupServiceError(
                 404,
                 "backup_not_found",
-                "The sealed local backup was not found.",
+                "The local backup was not found.",
             )
-        if len(matches) != 1:
-            raise BackupServiceError(
-                409,
-                "backup_reference_ambiguous",
-                "The backup reference matches more than one sealed backup.",
-            )
-        return matches.pop()
+        return key
 
     async def _assert_backup_aliases_available(
         self,
@@ -747,120 +617,20 @@ class NativeBackupService:
         backup_id: str | None,
         filename: str,
     ) -> None:
-        """Refuse additions that would make an ID-or-key route ambiguous."""
-        candidate_aliases = {filename}
-        if backup_id is not None:
-            candidate_aliases.add(backup_id)
-        for summary in await self._backup_reference_summaries():
-            collisions = candidate_aliases & self._backup_summary_aliases(summary)
-            if collisions:
-                raise BackupServiceError(
-                    409,
-                    "backup_reference_conflict",
-                    "A sealed backup already uses this backup ID or ZIP filename.",
-                    {"reference": sorted(collisions)[0]},
-                )
-
-    async def approve_backup_signer(
-        self,
-        backup_id: str,
-        *,
-        expected_fingerprint_sha256: str,
-        actor_id: str | None,
-    ) -> dict[str, Any]:
-        """Approve only the exact signer embedded in one verified backup."""
-        self._require_control_identity_attached()
-        try:
-            with self.operations.global_exclusive() as operation_lease:
-                backup_id = await self._resolve_backup_reference(backup_id)
-                with self.operations.backup_shared(backup_id) as backup_lease:
-                    inspection = await _to_thread_quiescent(
-                        self.store.inspect_set,
-                        backup_id,
-                        expected_public_key=None,
-                        verify_resources=True,
-                    )
-                    actual_fingerprint = inspection.manifest.signer_fingerprint_sha256
-                    if not secrets.compare_digest(
-                        actual_fingerprint,
-                        str(expected_fingerprint_sha256 or ""),
-                    ):
-                        raise BackupServiceError(
-                            409,
-                            "backup_signer_approval_mismatch",
-                            "The confirmed fingerprint does not match the verified backup signer.",
-                            {"signerFingerprintSha256": actual_fingerprint},
-                        )
-                    self._operation_commit_guard(operation_lease, backup_lease)
-                    if secrets.compare_digest(
-                        inspection.signer_public_key,
-                        self.identity.public_key_bytes,
-                    ):
-                        return {
-                            "backupId": backup_id,
-                            "algorithm": "Ed25519",
-                            "fingerprintSha256": actual_fingerprint,
-                            "publicKey": base64.urlsafe_b64encode(
-                                inspection.signer_public_key
-                            ).decode("ascii").rstrip("="),
-                            "approvedAt": None,
-                            "actorId": actor_id,
-                            "trustStatus": "trusted_local",
-                        }
-                    record = await _to_thread_quiescent(
-                        self.trust.approve,
-                        inspection.signer_public_key,
-                        actor_id=actor_id,
-                    )
-                    self._operation_commit_guard(operation_lease, backup_lease)
-                    return {"backupId": backup_id, **record.to_dict()}
-        except BackupServiceError:
-            raise
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-        except BackupTrustError as exc:
+        """Refuse a duplicate PocketBase-visible ZIP key."""
+        del backup_id
+        if await _to_thread_quiescent(self.archive_store.exists, filename):
             raise BackupServiceError(
-                500,
-                "backup_trust_store_invalid",
-                "The backup signer approval could not be persisted safely.",
-            ) from exc
-        except BackupError as exc:
-            raise self._map_error(exc, operation="inspect") from exc
-
-    def revoke_backup_signer(self, fingerprint_sha256: str) -> bool:
-        """Revoke one external signer approval without touching its backups."""
-        self._require_control_identity_attached()
-        if (
-            not isinstance(fingerprint_sha256, str)
-            or len(fingerprint_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in fingerprint_sha256
+                409,
+                "backup_reference_conflict",
+                "A backup already uses this ZIP filename.",
+                {"reference": filename},
             )
-        ):
-            raise BackupServiceError(
-                422,
-                "backup_signer_fingerprint_invalid",
-                "The signer fingerprint SHA-256 is invalid.",
-            )
-        try:
-            with self.operations.global_exclusive() as operation_lease:
-                revoked = self.trust.revoke(fingerprint_sha256)
-                self._operation_commit_guard(operation_lease)
-                return revoked
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-        except BackupTrustError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_trust_store_invalid",
-                "The backup signer approval could not be revoked safely.",
-            ) from exc
 
     @contextmanager
     def mutation_operation(self) -> Any:
         """Return the single cross-worker mutation context for API streaming."""
-        self._require_control_identity_attached()
+        self._require_runtime_attached()
         try:
             with self.operations.global_exclusive() as lease:
                 yield lease
@@ -903,7 +673,7 @@ class NativeBackupService:
         transport_filename: str | None = None,
         operation_lease: BackupOperationLease,
     ) -> dict[str, Any]:
-        self._require_control_identity_attached()
+        self._require_runtime_attached()
         if transport_filename is not None:
             await self._assert_backup_aliases_available(
                 backup_id=None,
@@ -955,8 +725,8 @@ class NativeBackupService:
         source_summary: dict[str, int] | None = None
         source_file_references: tuple[LocalFileReference, ...] | None = None
         source_app_name = "PPBase"
-        preflight_warnings: list[str] = []
         manifest_created_at: datetime | None = None
+        candidate_filename: str | None = None
         jwt_secret_included = False
         try:
             async with backup_write_barrier(
@@ -1184,7 +954,7 @@ class NativeBackupService:
             raise BackupServiceError(
                 500,
                 "backup_creation_failed",
-                "Backup preparation did not produce its signed metadata.",
+                "Backup preparation did not produce its metadata.",
             )
         metadata = {
             "ppbase_version": __version__,
@@ -1203,7 +973,6 @@ class NativeBackupService:
                 )
             },
             "created_by": actor_id,
-            "preflight_warnings": preflight_warnings,
         }
         if transport_filename is not None:
             metadata["transport"] = {"filename": transport_filename}
@@ -1214,140 +983,70 @@ class NativeBackupService:
                 seal_gate=BackupSealGate(),
                 metadata=metadata,
                 created_at=manifest_created_at,
-                identity_guard=lambda: self._operation_commit_guard(
+                pre_commit_guard=lambda: self._operation_commit_guard(
                     operation_lease
                 ),
             )
         except BackupError as exc:
             raise self._map_error(exc, operation="seal") from exc
-        return self._inspection_dict(inspection)
-
-    async def list_local_backups(self) -> list[dict[str, Any]]:
-        self._require_control_identity_attached()
-        try:
-            summaries = await _to_thread_quiescent(self.store.list_sets)
-            self._require_control_identity_attached()
-            result: list[dict[str, Any]] = []
-            for item in summaries:
-                filename = (
-                    backup_transport_filename(item.manifest)
-                    if item.manifest is not None
-                    else None
-                )
-                trust_status = (
-                    self._trust_status_for_public_key(item.signer_public_key)
-                    if item.integrity_status == "valid"
-                    and item.signer_public_key is not None
-                    else "invalid"
-                )
-                authenticated = trust_status in {"trusted_local", "trusted_external"}
-                result.append({
-                    "id": item.backup_id,
-                    "key": filename or item.backup_id,
-                    "createdAt": item.created_at,
-                    "modified": item.created_at,
-                    "signerFingerprintSha256": item.signer_fingerprint_sha256,
-                    "resourceCount": item.resource_count,
-                    "totalSize": item.total_size,
-                    "size": (
-                        backup_transport_size(item.manifest)
-                        if item.manifest is not None
-                        else None
-                    ),
-                    "filename": filename,
-                    "status": (
-                        "invalid"
-                        if item.integrity_status != "valid"
-                        else "sealed"
-                        if authenticated
-                        else "quarantined"
-                    ),
-                    "authenticated": authenticated,
-                    "signatureVerified": item.integrity_status == "valid",
-                    "trustStatus": trust_status,
-                    "integrityStatus": item.integrity_status,
-                    "errorCode": item.error_code,
-                })
-            return result
-        except BackupTrustError as exc:
+        if candidate_filename is None:  # pragma: no cover - guarded above
             raise BackupServiceError(
                 500,
-                "backup_trust_store_invalid",
-                "The backup signer trust store is missing or unsafe.",
-            ) from exc
+                "backup_creation_failed",
+                "Backup creation did not produce a ZIP filename.",
+            )
+        pinned: PinnedBackupZip | None = None
+        try:
+            pinned = await _to_thread_quiescent(
+                materialize_backup_zip,
+                self.store,
+                inspection.manifest.backup_id,
+                chunk_size=int(self.settings.backup_transport_chunk_size),
+                cancel_cleanup=lambda archive: archive.close(),
+            )
+            self._operation_commit_guard(operation_lease)
+            archive = await _to_thread_quiescent(
+                self.archive_store.publish_pinned,
+                pinned,
+                candidate_filename,
+            )
+            pinned = None
+            self._operation_commit_guard(operation_lease)
+            return archive.to_dict()
+        except BackupTransportError as exc:
+            raise self._map_transport_error(exc) from exc
+        except BackupError as exc:
+            raise self._map_error(exc, operation="create") from exc
+        finally:
+            if pinned is not None:
+                pinned.close()
+
+    async def list_local_backups(self) -> list[dict[str, Any]]:
+        self._require_runtime_attached()
+        try:
+            archives = await _to_thread_quiescent(self.archive_store.list)
+            self._require_runtime_attached()
+            return [archive.to_dict() for archive in archives]
         except BackupError as exc:
             raise self._map_error(exc, operation="list") from exc
-
-    async def inspect_local_backup(
-        self,
-        backup_id: str,
-        *,
-        resource_offset: int = 0,
-        resource_limit: int = BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT,
-    ) -> dict[str, Any]:
-        self._validate_inspection_resource_page(resource_offset, resource_limit)
-        backup_id = await self._resolve_backup_reference(backup_id)
-        try:
-            with self.operations.backup_shared(backup_id) as backup_lease:
-                result = await self._inspect_local_backup_under_lease(
-                    backup_id,
-                    resource_offset=resource_offset,
-                    resource_limit=resource_limit,
-                )
-                self._operation_commit_guard(backup_lease)
-                return result
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-
-    async def _inspect_local_backup_under_lease(
-        self,
-        backup_id: str,
-        *,
-        resource_offset: int = 0,
-        resource_limit: int = BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT,
-    ) -> dict[str, Any]:
-        self._validate_inspection_resource_page(resource_offset, resource_limit)
-        self._require_control_identity_attached()
-        try:
-            inspection = await _to_thread_quiescent(
-                self.store.inspect_set,
-                backup_id,
-                expected_public_key=None,
-                verify_resources=True,
-            )
-            self._require_control_identity_attached()
-        except BackupError as exc:
-            raise self._map_error(exc, operation="inspect") from exc
-        return self._inspection_dict(
-            inspection,
-            resource_offset=resource_offset,
-            resource_limit=resource_limit,
-        )
 
     async def materialize_local_backup_zip(
         self,
         backup_id: str,
     ) -> PinnedBackupZip:
-        self._require_control_identity_attached()
+        self._require_runtime_attached()
         backup_id = await self._resolve_backup_reference(backup_id)
         leases = ExitStack()
         try:
             backup_lease = leases.enter_context(
                 self.operations.backup_shared(backup_id)
             )
-            materialization_lease = leases.enter_context(
-                self.operations.backup_materialization_exclusive(backup_id)
-            )
             pinned = await _to_thread_quiescent(
-                materialize_backup_zip,
-                self.store,
+                self.archive_store.pin,
                 backup_id,
-                expected_public_key=None,
-                chunk_size=int(self.settings.backup_transport_chunk_size),
                 cancel_cleanup=lambda archive: archive.close(),
             )
             try:
-                self._operation_commit_guard(materialization_lease)
                 self._operation_commit_guard(backup_lease)
                 retained_leases = leases.pop_all()
                 try:
@@ -1372,6 +1071,7 @@ class NativeBackupService:
         self,
         source: BinaryIO,
         *,
+        filename: str,
         operation_lease: BackupOperationLease | None = None,
     ) -> dict[str, Any]:
         if operation_lease is None:
@@ -1379,12 +1079,14 @@ class NativeBackupService:
                 with self.operations.global_exclusive() as owned_lease:
                     return await self._upload_local_backup_under_lease(
                         source,
+                        filename=filename,
                         operation_lease=owned_lease,
                     )
             except BackupOperationError as exc:
                 raise self._map_operation_error(exc) from exc
         return await self._upload_local_backup_under_lease(
             source,
+            filename=filename,
             operation_lease=operation_lease,
         )
 
@@ -1392,6 +1094,7 @@ class NativeBackupService:
         self,
         source: BinaryIO,
         *,
+        filename: str,
         operation_lease: BackupOperationLease,
     ) -> dict[str, Any]:
         if operation_lease.scope != "global" or operation_lease.mode != "exclusive":
@@ -1401,7 +1104,61 @@ class NativeBackupService:
                 "Upload requires the global native backup mutation lease.",
             )
         operation_lease.verify_attached()
-        self._require_control_identity_attached()
+        self._require_runtime_attached()
+        try:
+            selected = validate_backup_transport_filename(filename)
+            await self._assert_backup_aliases_available(
+                backup_id=None,
+                filename=selected,
+            )
+            archive = await _to_thread_quiescent(
+                self.archive_store.publish,
+                source,
+                selected,
+                require_zip_suffix=True,
+                sniff_zip=True,
+                max_size=int(self.settings.backup_max_upload_bytes),
+            )
+            self._operation_commit_guard(operation_lease)
+            return archive.to_dict()
+        except ValueError as exc:
+            raise BackupServiceError(
+                422,
+                "backup_filename_invalid",
+                "The uploaded backup filename must be a safe .zip basename.",
+            ) from exc
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+        except BackupTransportError as exc:
+            raise self._map_transport_error(exc) from exc
+        except BackupError as exc:
+            raise self._map_error(exc, operation="upload") from exc
+
+    async def delete_local_backup(self, backup_id: str) -> None:
+        self._require_runtime_attached()
+        try:
+            with self.operations.global_exclusive() as operation_lease:
+                backup_id = await self._resolve_backup_reference(backup_id)
+                with self.operations.backup_exclusive(backup_id) as backup_lease:
+                    self._operation_commit_guard(operation_lease, backup_lease)
+                    await _to_thread_quiescent(
+                        self.archive_store.delete,
+                        backup_id,
+                    )
+                    self._operation_commit_guard(operation_lease, backup_lease)
+        except BackupOperationError as exc:
+            raise self._map_operation_error(exc) from exc
+        except BackupError as exc:
+            raise self._map_error(exc, operation="delete") from exc
+
+    async def _extract_archive_for_restore(
+        self,
+        backup_key: str,
+        *,
+        operation_lease: BackupOperationLease,
+        backup_lease: BackupOperationLease,
+    ) -> VerifiedBackupInspection:
+        """Validate one stored ZIP into the private per-service workspace."""
         try:
             limits = BackupTransportLimits.from_settings(self.settings)
         except (AttributeError, TypeError, ValueError) as exc:
@@ -1411,53 +1168,43 @@ class NativeBackupService:
                 "The native backup ZIP limits are invalid.",
             ) from exc
 
+        pinned: PinnedBackupZip | None = None
         prepared_import: PreparedBackupImport | None = None
         finalized = False
         try:
+            pinned = await _to_thread_quiescent(
+                self.archive_store.pin,
+                backup_key,
+                cancel_cleanup=lambda archive: archive.close(),
+            )
             prepared_import = await _to_thread_quiescent(
                 prepare_backup_zip_import,
                 self.store,
-                source,
-                expected_public_key=None,
+                pinned._handle,
                 limits=limits,
                 cancel_cleanup=lambda prepared: prepared.abort(),
             )
-            operation_lease.verify_attached()
-            self._require_control_identity_attached()
-            imported_manifest = BackupManifest.from_bytes(
-                prepared_import.manifest_bytes
+            self._operation_commit_guard(operation_lease, backup_lease)
+            manifest = BackupManifest.from_bytes(prepared_import.manifest_bytes)
+            await _finalize_backup_atomically(
+                self.store.finalize_imported_set,
+                prepared_import.prepared,
+                manifest_bytes=prepared_import.manifest_bytes,
+                seal_gate=BackupSealGate(),
+                pre_commit_guard=lambda: self._operation_commit_guard(
+                    operation_lease,
+                    backup_lease,
+                ),
             )
-            await self._assert_backup_aliases_available(
-                backup_id=imported_manifest.backup_id,
-                filename=backup_transport_filename(imported_manifest),
-            )
-            operation_lease.verify_attached()
-            self._require_control_identity_attached()
-            with self.operations.backup_exclusive(
-                prepared_import.prepared.backup_id
-            ) as backup_lease:
-                inspection = await _finalize_backup_atomically(
-                    self.store.finalize_imported_set,
-                    prepared_import.prepared,
-                    manifest_bytes=prepared_import.manifest_bytes,
-                    signature=prepared_import.signature,
-                    signer_public_key=prepared_import.signer_public_key,
-                    expected_public_key=prepared_import.signer_public_key,
-                    seal_gate=BackupSealGate(),
-                    identity_guard=lambda: self._operation_commit_guard(
-                        operation_lease,
-                        backup_lease,
-                    ),
-                )
             finalized = True
-            return self._inspection_dict(inspection)
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
+            verified = await self._verified_inspection(manifest.backup_id)
+            self._operation_commit_guard(operation_lease, backup_lease)
+            return verified
         except BackupTransportError as exc:
             raise self._map_transport_error(exc) from exc
-        except BackupError as exc:
-            raise self._map_error(exc, operation="upload") from exc
         finally:
+            if pinned is not None:
+                pinned.close()
             if prepared_import is not None and not finalized:
                 try:
                     await _to_thread_cleanup_quiescent(prepared_import.abort)
@@ -1466,30 +1213,9 @@ class NativeBackupService:
                 except BaseException as cleanup_error:
                     raise BackupServiceError(
                         500,
-                        "backup_upload_partial_cleanup_failed",
-                        "The rejected upload could not be removed safely.",
+                        "backup_restore_workspace_cleanup_failed",
+                        "The rejected backup workspace could not be removed safely.",
                     ) from cleanup_error
-
-    async def delete_local_backup(self, backup_id: str) -> None:
-        self._require_control_identity_attached()
-        try:
-            with self.operations.global_exclusive() as operation_lease:
-                backup_id = await self._resolve_backup_reference(backup_id)
-                with self.operations.backup_exclusive(backup_id) as backup_lease:
-                    self._operation_commit_guard(operation_lease, backup_lease)
-                    await _delete_backup_atomically(
-                        self.store.delete_set,
-                        backup_id,
-                        delete_gate=BackupDeleteGate(),
-                        pre_commit_guard=lambda: self._operation_commit_guard(
-                            operation_lease,
-                            backup_lease,
-                        ),
-                    )
-        except BackupOperationError as exc:
-            raise self._map_operation_error(exc) from exc
-        except BackupError as exc:
-            raise self._map_error(exc, operation="delete") from exc
 
 
     async def restore_local_backup(
@@ -1563,9 +1289,14 @@ class NativeBackupService:
         try:
             restore_connect_args = _restore_engine_connect_args(self.settings)
             operation_lease.verify_attached()
-            backup_id = await self._resolve_backup_reference(backup_id)
-            with self.operations.backup_shared(backup_id) as backup_lease:
-                inspection = await self._trusted_inspection(backup_id)
+            backup_key = await self._resolve_backup_reference(backup_id)
+            with self.operations.backup_shared(backup_key) as backup_lease:
+                inspection = await self._extract_archive_for_restore(
+                    backup_key,
+                    operation_lease=operation_lease,
+                    backup_lease=backup_lease,
+                )
+                workspace_backup_id = inspection.manifest.backup_id
                 contract = self._manifest_contract(inspection)
                 expected_reference_inventory = (
                     _require_manifest_file_reference_inventory(inspection)
@@ -1583,12 +1314,10 @@ class NativeBackupService:
                     Path(self.settings.migrations_dir).expanduser(),
                 )
 
-                preflight_warnings: list[str] = []
                 async with self.engine.connect() as connection:
                     runtime_identity = await self._postgres_server_identity(connection)
                     report = await preflight_destructive_restore_role(connection)
                     report.require_ok()
-                    preflight_warnings.extend(report.warnings)
                     target_server_major = int(runtime_identity["server_version_num"]) // 10000
                     if target_server_major < contract.server_major:
                         raise PostgresBackupError(
@@ -1654,15 +1383,15 @@ class NativeBackupService:
                 await cutover_guard.verify_held()
                 self._operation_commit_guard(operation_lease, backup_lease)
 
-                # Reauthenticate and pin the archive only after all writers are
-                # excluded. No path is reopened between this point and restore.
-                inspection = await self._trusted_inspection(backup_id)
+                # Reverify and pin the extracted workspace only after all writers
+                # are excluded. No resource path is reopened during rebuild.
+                inspection = await self._verified_inspection(workspace_backup_id)
                 refreshed_reference_inventory = (
                     _require_manifest_file_reference_inventory(inspection)
                 )
                 if refreshed_reference_inventory != expected_reference_inventory:
                     raise BackupIntegrityError(
-                        "signed local-file reference inventory changed during restore"
+                        "local-file reference inventory changed during restore"
                     )
                 pinned_schema = None
                 pinned_copy = None
@@ -1778,12 +1507,11 @@ class NativeBackupService:
                 prepared_files.target.close()
                 return PreparedDestructiveRestore(
                     {
-                        "backupId": backup_id,
+                        "backupId": backup_key,
                         "restoreId": restore_id,
                         "status": "restart_scheduled",
                         "destructive": True,
                         "actorId": actor_id,
-                        "preflightWarnings": preflight_warnings,
                     },
                     cutover_guard=cutover_guard,
                 )
@@ -1826,42 +1554,7 @@ class NativeBackupService:
                 except Exception:
                     pass
 
-
-    def _load_identity(self) -> BackupIdentity:
-        sets_dir = self.backup_root / "sets"
-        has_sealed_set = False
-        if sets_dir.is_dir() and not sets_dir.is_symlink():
-            try:
-                has_sealed_set = any(
-                    entry.is_dir(follow_symlinks=False)
-                    and not entry.name.startswith(".")
-                    and (Path(entry.path) / "SEALED").is_file()
-                    for entry in os.scandir(sets_dir)
-                )
-            except OSError as exc:
-                raise BackupServiceError(
-                    500,
-                    "backup_store_unreadable",
-                    "The local backup store cannot be inspected safely.",
-                ) from exc
-        try:
-            if has_sealed_set:
-                return BackupIdentity.load_existing_at(self.control_root)
-            return BackupIdentity.load_or_create_at(self.control_root)
-        except BackupIdentityMissingError as exc:
-            raise BackupServiceError(
-                409,
-                "backup_identity_missing",
-                "Sealed backups exist but their local signing identity is missing.",
-            ) from exc
-        except BackupIdentityError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_identity_invalid",
-                "The local backup signing identity is missing or unsafe.",
-            ) from exc
-
-    def _require_control_root_attached(self) -> None:
+    def _require_runtime_root_attached(self) -> None:
         if self._closed:
             raise BackupServiceError(
                 500,
@@ -1869,25 +1562,16 @@ class NativeBackupService:
                 "The native backup service is closed.",
             )
         try:
-            self.control_root.verify_attached()
+            self.data_root.verify_attached()
         except ControlPlaneSafetyError as exc:
             raise BackupServiceError(
                 500,
-                "backup_control_detached",
-                "The native backup control plane is detached or unsafe.",
+                "backup_runtime_detached",
+                "The PPBase data directory is detached or unsafe.",
             ) from exc
 
-    def _require_control_identity_attached(self) -> None:
-        self._require_control_root_attached()
-        try:
-            self.identity.verify_attached()
-        except BackupIdentityError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_identity_invalid",
-                "The local backup signing identity is detached or unsafe.",
-            ) from exc
-        self._require_control_root_attached()
+    def _require_runtime_attached(self) -> None:
+        self._require_runtime_root_attached()
 
     def _operation_commit_guard(
         self,
@@ -1895,7 +1579,7 @@ class NativeBackupService:
     ) -> None:
         for lease in leases:
             lease.verify_attached()
-        self._require_control_identity_attached()
+        self._require_runtime_attached()
         for lease in leases:
             lease.verify_attached()
 
@@ -1903,36 +1587,14 @@ class NativeBackupService:
         active_data_dir = Path(self.settings.data_dir).expanduser().resolve(
             strict=False
         )
-        named_roots = {
-            "backup_root": self.backup_root,
-            "backup_control_dir": self.control_dir,
-        }
-        resolved_roots = {
-            label: root.resolve(strict=False)
-            for label, root in named_roots.items()
-        }
-        for label, root in resolved_roots.items():
-            if (
-                root == active_data_dir
-                or root.is_relative_to(active_data_dir)
-                or active_data_dir.is_relative_to(root)
-            ):
-                raise BackupServiceError(
-                    409,
-                    "unsafe_backup_root",
-                    f"{label} must be outside the active data_dir.",
-                )
-        values = list(resolved_roots.items())
-        for index, (left_name, left) in enumerate(values):
-            for right_name, right in values[index + 1 :]:
-                if left == right or left.is_relative_to(right) or right.is_relative_to(left):
-                    raise BackupServiceError(
-                        409,
-                        "overlapping_backup_roots",
-                        f"{left_name} and {right_name} must not overlap.",
-                    )
-
-
+        expected_backup_root = active_data_dir / "backups"
+        backup_root = self.backup_root.resolve(strict=False)
+        if backup_root != expected_backup_root:
+            raise BackupServiceError(
+                409,
+                "unsafe_backup_root",
+                "The local backup root must be pb_data/backups.",
+            )
     @staticmethod
     async def _postgres_server_identity(connection: Any) -> dict[str, Any]:
         await set_backup_control_search_path(connection)
@@ -1992,68 +1654,24 @@ class NativeBackupService:
             "migrations": int(row["migrations"]),
         }
 
-    async def _trusted_inspection(
+    async def _verified_inspection(
         self,
         backup_id: str,
-    ) -> AuthenticatedBackupInspection:
-        self._require_control_identity_attached()
+    ) -> VerifiedBackupInspection:
+        self._require_runtime_attached()
         try:
-            unsigned_capability = await _to_thread_quiescent(
-                self.store.inspect_set,
-                backup_id,
-                expected_public_key=None,
-                verify_resources=True,
-            )
-            signer_public_key = unsigned_capability.signer_public_key
-            if secrets.compare_digest(
-                signer_public_key,
-                self.identity.public_key_bytes,
-            ):
-                approved_public_key = self.identity.public_key_bytes
-            else:
-                fingerprint = unsigned_capability.manifest.signer_fingerprint_sha256
-                approved_public_key = await _to_thread_quiescent(
-                    self.trust.approved_public_key,
-                    fingerprint,
-                )
-                if approved_public_key is None or not secrets.compare_digest(
-                    approved_public_key,
-                    signer_public_key,
-                ):
-                    encoded_key = base64.urlsafe_b64encode(
-                        signer_public_key
-                    ).decode("ascii").rstrip("=")
-                    raise BackupServiceError(
-                        409,
-                        "backup_signer_untrusted",
-                        "The backup is signed correctly, but its external signer has not been approved.",
-                        {
-                            "signerFingerprintSha256": fingerprint,
-                            "signerPublicKey": encoded_key,
-                            "trustStatus": "authenticated_untrusted",
-                        },
-                    )
             inspection = await _to_thread_quiescent(
-                self.store.authenticate_set,
+                self.store.verify_set,
                 backup_id,
-                approved_public_key=approved_public_key,
             )
-            self._require_control_identity_attached()
+            self._require_runtime_attached()
             return inspection
-        except BackupServiceError:
-            raise
-        except BackupTrustError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_trust_store_invalid",
-                "The backup signer trust store is missing or unsafe.",
-            ) from exc
         except BackupError as exc:
             raise self._map_error(exc, operation="inspect") from exc
 
     @staticmethod
     def _manifest_contract(
-        inspection: BackupInspection | AuthenticatedBackupInspection,
+        inspection: VerifiedBackupInspection,
     ) -> DatabaseContract:
         raw = inspection.manifest.metadata.get("database_contract")
         if not isinstance(raw, dict):
@@ -2094,97 +1712,6 @@ class NativeBackupService:
             schema.migrations, migrations_dir=migrations_dir
         )
 
-    def _trust_status_for_public_key(self, public_key: bytes | None) -> str:
-        if public_key is None:
-            return "invalid"
-        if secrets.compare_digest(public_key, self.identity.public_key_bytes):
-            return "trusted_local"
-        fingerprint = hashlib.sha256(public_key).hexdigest()
-        try:
-            approved = self.trust.approved_public_key(fingerprint)
-        except BackupTrustError as exc:
-            raise BackupServiceError(
-                500,
-                "backup_trust_store_invalid",
-                "The backup signer trust store is missing or unsafe.",
-            ) from exc
-        if approved is not None and secrets.compare_digest(approved, public_key):
-            return "trusted_external"
-        return "authenticated_untrusted"
-
-    @staticmethod
-    def _validate_inspection_resource_page(
-        resource_offset: int,
-        resource_limit: int,
-    ) -> None:
-        if (
-            isinstance(resource_offset, bool)
-            or not isinstance(resource_offset, int)
-            or resource_offset < 0
-            or isinstance(resource_limit, bool)
-            or not isinstance(resource_limit, int)
-            or resource_limit < 1
-            or resource_limit > BACKUP_INSPECTION_MAX_RESOURCE_LIMIT
-        ):
-            raise BackupServiceError(
-                422,
-                "backup_inspection_page_invalid",
-                "Backup resource pagination is outside the supported bounds.",
-                data={
-                    "maximumResourceLimit": BACKUP_INSPECTION_MAX_RESOURCE_LIMIT,
-                },
-            )
-
-    def _inspection_dict(
-        self,
-        inspection: BackupInspection,
-        *,
-        resource_offset: int = 0,
-        resource_limit: int = BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT,
-    ) -> dict[str, Any]:
-        self._validate_inspection_resource_page(resource_offset, resource_limit)
-        manifest = inspection.manifest
-        resource_count = len(manifest.resources)
-        resource_page = manifest.resources[
-            resource_offset : resource_offset + resource_limit
-        ]
-        filename = backup_transport_filename(manifest)
-        signer = base64.urlsafe_b64encode(
-            inspection.signer_public_key
-        ).decode("ascii").rstrip("=")
-        trust_status = self._trust_status_for_public_key(inspection.signer_public_key)
-        authenticated = trust_status in {"trusted_local", "trusted_external"}
-        return {
-            "id": manifest.backup_id,
-            "key": filename,
-            "createdAt": manifest.created_at,
-            "modified": manifest.created_at,
-            "status": "sealed" if authenticated else "quarantined",
-            "authenticated": authenticated,
-            "signatureVerified": True,
-            "trustStatus": trust_status,
-            "signerFingerprintSha256": manifest.signer_fingerprint_sha256,
-            "signerPublicKey": signer,
-            "resourcesVerified": inspection.resources_verified,
-            "resourceCount": resource_count,
-            "resourceOffset": resource_offset,
-            "resourceLimit": resource_limit,
-            "resourcesReturned": len(resource_page),
-            "hasMoreResources": resource_offset + len(resource_page) < resource_count,
-            "totalSize": manifest.total_size,
-            "size": backup_transport_size(manifest),
-            "filename": filename,
-            "metadata": dict(manifest.metadata),
-            "resources": [
-                {
-                    "path": resource.path,
-                    "size": resource.size,
-                    "sha256": resource.sha256,
-                }
-                for resource in resource_page
-            ],
-        }
-
     @staticmethod
     def _map_operation_error(exc: BackupOperationError) -> BackupServiceError:
         status_code = 500 if isinstance(exc, BackupOperationSafetyError) else 409
@@ -2198,8 +1725,6 @@ class NativeBackupService:
     def _map_transport_error(exc: BackupTransportError) -> BackupServiceError:
         if exc.code == "pocketbase_backup_unsupported":
             status_code = 422
-        elif exc.code == "backup_signer_untrusted":
-            status_code = 409
         elif exc.code in {
             "backup_upload_too_large",
             "backup_zip_too_many_entries",
@@ -2231,7 +1756,7 @@ class NativeBackupService:
             return BackupServiceError(
                 409,
                 "backup_integrity_failed",
-                f"The signed backup failed integrity verification: {exc}",
+                f"The backup failed integrity verification: {exc}",
             )
         if isinstance(exc, PostgresBackupError):
             return BackupServiceError(
