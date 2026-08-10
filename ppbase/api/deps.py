@@ -110,6 +110,8 @@ async def get_optional_auth(
         )
         coll = (await session.execute(stmt)).scalars().first()
         if coll is None:
+            # PocketBase ignores invalid tokens in its optional-auth middleware.
+            # Protected routes will still reject the resulting anonymous request.
             return None
 
         table_name = coll.name
