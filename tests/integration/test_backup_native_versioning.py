@@ -70,7 +70,6 @@ def test_unknown_format_version_refused() -> None:
         BackupManifest(
             backup_id="b1",
             created_at="2024-01-01T00:00:00.000000Z",
-            signer_fingerprint_sha256="0" * 64,
             resources=(),
             metadata={},
             format_version=3,
@@ -96,7 +95,6 @@ def test_v2_manifest_rejects_unknown_resource() -> None:
         BackupManifest(
             backup_id="b1",
             created_at="2024-01-01T00:00:00.000000Z",
-            signer_fingerprint_sha256="0" * 64,
             resources=resources,
             metadata={},
             format_version=BACKUP_FORMAT_VERSION,

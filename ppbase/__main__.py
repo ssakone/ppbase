@@ -20,7 +20,6 @@ import json
 import os
 import signal
 import shutil
-import stat
 import subprocess
 import sys
 import time
@@ -396,94 +395,10 @@ def _cmd_create_admin(args: argparse.Namespace) -> None:
     asyncio.run(_create())
 
 
-def _read_bootstrap_dsn(args: argparse.Namespace) -> str:
-    """Read the ephemeral cluster-admin DSN without accepting it on argv."""
-    environment_name = "PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL"
-    value = str(os.environ.get(environment_name, "") or "").strip()
-    path_value = str(getattr(args, "bootstrap_dsn_file", "") or "").strip()
-    if value and path_value:
-        raise ValueError(
-            f"Use either {environment_name} or --bootstrap-dsn-file, not both."
-        )
-    if path_value:
-        path = Path(path_value).expanduser().absolute()
-        info = path.lstat()
-        if path.is_symlink() or not stat.S_ISREG(info.st_mode):
-            raise ValueError("Bootstrap DSN file must be a regular non-symlink file.")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            raise ValueError("Bootstrap DSN file must have mode 0600.")
-        value = path.read_text(encoding="utf-8").strip()
-    if not value:
-        value = getpass.getpass("Ephemeral PostgreSQL bootstrap DSN: ").strip()
-    if not value:
-        raise ValueError("A PostgreSQL bootstrap DSN is required.")
-    return value
-
-
-def _cmd_init(args: argparse.Namespace) -> None:
-    """Initialize a complete PostgreSQL-backed PPBase project."""
-    from ppbase.backup.provision import (
-        BackupProvisionError,
-        build_postgres_init_plan,
-        execute_postgres_init,
-    )
-    from ppbase.config import Settings
-
-    if args.resource != "postgres":
-        print("Usage: ppbase init postgres --plan|--execute --name <project>")
-        raise SystemExit(1)
-
-    settings = Settings()
-    updates = {
-        field: value
-        for field, value in (
-            ("data_dir", args.data_dir),
-            ("backup_root", args.backup_root),
-            ("backup_control_dir", args.backup_control_dir),
-        )
-        if value is not None
-    }
-    if updates:
-        settings = settings.model_copy(update=updates)
-
-    async def run() -> None:
-        bootstrap = _read_bootstrap_dsn(args)
-        if args.plan:
-            plan = await build_postgres_init_plan(
-                settings,
-                bootstrap_database_url=bootstrap,
-                project_name=args.name,
-                secret_sink=args.output_env,
-            )
-            print(json.dumps(plan, indent=2, sort_keys=True))
-            if not plan["executable"]:
-                raise SystemExit(2)
-            return
-        if not args.execute:
-            raise BackupProvisionError("Select exactly one of --plan or --execute.")
-        if not args.output_env:
-            raise BackupProvisionError(
-                "--output-env is required as the mode-0600 runtime credential sink"
-            )
-        result = await execute_postgres_init(
-            settings,
-            bootstrap_database_url=bootstrap,
-            project_name=args.name,
-            secret_sink=args.output_env,
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-
-    try:
-        asyncio.run(run())
-    except (BackupProvisionError, ValueError, OSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(3) from exc
-
-
 def _cmd_backup(args: argparse.Namespace) -> None:
     """Diagnose native backup readiness."""
-    from ppbase.backup.provision import (
-        BackupProvisionError,
+    from ppbase.backup.doctor import (
+        BackupDoctorError,
         backup_doctor,
         doctor_human,
     )
@@ -502,7 +417,7 @@ def _cmd_backup(args: argparse.Namespace) -> None:
 
     async def run() -> None:
         if args.action != "doctor":
-            raise BackupProvisionError("Use ppbase backup doctor.")
+            raise BackupDoctorError("Use ppbase backup doctor.")
         report = await backup_doctor(settings, server_url=args.server)
         print(json.dumps(report, sort_keys=True) if args.json else doctor_human(report))
         if not report["ready"]:
@@ -510,7 +425,7 @@ def _cmd_backup(args: argparse.Namespace) -> None:
 
     try:
         asyncio.run(run())
-    except (BackupProvisionError, ValueError, OSError) as exc:
+    except (BackupDoctorError, ValueError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(3) from exc
 
@@ -825,44 +740,6 @@ def main() -> None:
     admin_parser.add_argument("--password", type=str, default=None)
     admin_parser.add_argument("--db", type=str, default=None, help="Database URL")
 
-    # autonomous PostgreSQL onboarding
-    init_parser = subparsers.add_parser(
-        "init",
-        help="Initialize a new PPBase project",
-    )
-    init_subs = init_parser.add_subparsers(dest="resource")
-    init_postgres = init_subs.add_parser(
-        "postgres",
-        help="Create one application database, runtime role, and private roots",
-    )
-    init_mode = init_postgres.add_mutually_exclusive_group(required=True)
-    init_mode.add_argument("--plan", action="store_true", help="Read-only plan")
-    init_mode.add_argument("--execute", action="store_true", help="Execute the plan")
-    init_postgres.add_argument(
-        "--name",
-        required=True,
-        help="Conservative PostgreSQL project/database name",
-    )
-    init_postgres.add_argument(
-        "--output-env",
-        default=None,
-        help="Exclusive mode-0600 env file for PPBASE_DATABASE_URL",
-    )
-    init_postgres.add_argument(
-        "--bootstrap-dsn-file",
-        default=None,
-        help="Mode-0600 file containing the ephemeral PostgreSQL superuser DSN",
-    )
-    init_paths = init_postgres.add_argument_group("advanced path overrides")
-    init_paths.add_argument("--data-dir", default=None, help="Override ./pb_data")
-    init_paths.add_argument(
-        "--backup-root", default=None, help="Override ./pb_backups"
-    )
-    init_paths.add_argument(
-        "--backup-control-dir",
-        default=None,
-        help="Override ./pb_backup_control",
-    )
     # native backup doctor
     backup_parser = subparsers.add_parser(
         "backup",
@@ -943,7 +820,6 @@ def main() -> None:
         "status": _cmd_status,
         "db": _cmd_db,
         "create-admin": _cmd_create_admin,
-        "init": _cmd_init,
         "backup": _cmd_backup,
         "migrate": _cmd_migrate,
     }

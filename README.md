@@ -55,12 +55,9 @@ running PostgreSQL 17 on port 5433. PPBase itself, including native
 backup/restore, does not depend on Docker; set `PPBASE_DATABASE_URL` to use an
 existing PostgreSQL server instead.
 
-Native backup and destructive restore both use `PPBASE_DATABASE_URL`. Backup
-requires the runtime role to read `public`. Restore additionally checks that
-the runtime is a superuser or owns the active database and `public`, and that
-the running `serve` process can restart. The default `ppbase db start`
-deployment satisfies those conditions. `ppbase init postgres` remains optional
-onboarding for creating one fresh database and runtime role. See
+Native backup and destructive restore both use `PPBASE_DATABASE_URL`. Restore
+verifies the connected database before replacement and requires the running
+`serve` process to restart. See
 [Native Backup & Restore](docs/native-backup-restore.md) for details.
 
 The installed `ppbase` console command and `python -m ppbase` are equivalent.
@@ -72,8 +69,8 @@ python -m ppbase serve
 ```
 
 The server starts at **http://localhost:8090**. Admin UI is at **http://localhost:8090/_/**.
-On first startup PPBase creates `pb_backups` and `pb_backup_control`
-automatically with the same normal directory policy used by `pb_data`.
+PPBase creates the PocketBase-compatible `pb_data/backups` archive directory
+automatically. No separate backup-control directory is required.
 
 ### 5. Create an admin account
 
@@ -97,12 +94,6 @@ python -m ppbase db stop            # stop container
 python -m ppbase db restart         # restart container
 python -m ppbase db status          # check container status
 
-# Optional: create one fresh database and its runtime role
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
-  ppbase init postgres --plan --name <project> --output-env ./ppbase.env
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
-  ppbase init postgres --execute --name <project> --output-env ./ppbase.env
-
 # Check live backup/restore readiness
 ppbase backup doctor --db "$PPBASE_DATABASE_URL" --dir "$PPBASE_DATA_DIR" --server http://127.0.0.1:8090
 
@@ -117,11 +108,10 @@ python -m ppbase migrate create add_posts
 python -m ppbase migrate snapshot
 ```
 
-Backup and restore use the same `PPBASE_DATABASE_URL` role that runs `serve`.
-A superuser application role is accepted unchanged with the non-blocking
-`runtime_superuser` warning. `backup doctor` reports `backupReady` and
-`restoreReady` separately, and its exit code tracks backup creation readiness
-so a restore-only ownership or restart blocker does not disable backups.
+Backup and restore use the same `PPBASE_DATABASE_URL` connection as `serve`.
+`backup doctor` reports `backupReady` and `restoreReady` separately, and its
+exit code tracks backup creation readiness so a restore-only database or
+restart blocker does not disable backups.
 
 The `--db` value used by doctor and its `--dir` compatibility override must
 match the database and `data_dir` used by `serve`. If PostgreSQL
@@ -133,12 +123,13 @@ the backup's contents, and restarts. Startup recovery then finalizes the file
 inventory before applying any newer migrations. It does not merge records or
 files. The restored archive also replaces `_superusers` and the project-local
 JWT secret: target-only admins disappear, source admins return, and operators
-should sign in again with a superuser contained in the archive. The target's
-`pb_backup_control` is not restored, so its Ed25519 identity and approved
-external signers remain local to that server. A pre-commit failure restores the
-previous files and rolls back the database transaction; after commit, PPBase
-stays fenced until startup recovery has verified and finalized the matching
-files.
+should sign in again with a superuser contained in the archive. The selected
+ZIP remains available under `pb_data/backups`. During a restore, PPBase keeps a
+small temporary journal directly in `pb_data` and locks the existing runtime
+directories; the journal is removed after recovery completes. A pre-commit
+failure restores the previous files and rolls back the database transaction;
+after commit, PPBase stays fenced until startup recovery has verified and
+finalized the matching files.
 See [Native Backup & Restore](docs/native-backup-restore.md).
 
 A shell script (`ppctl.sh`) is also available:
@@ -277,13 +268,12 @@ All settings use the `PPBASE_` environment variable prefix:
 | `PPBASE_DATABASE_URL` | `postgresql+asyncpg://ppbase:ppbase@localhost:5433/ppbase` | PostgreSQL connection |
 | `PPBASE_PORT` | `8090` | Server port |
 | `PPBASE_HOST` | `0.0.0.0` | Bind address |
+| `PPBASE_DATA_DIR` | `./pb_data` | Local files, project secret and backup ZIPs under `backups/` |
 | `PPBASE_MIGRATIONS_DIR` | `./pb_migrations` | Consumer application's migration directory |
 | `PPBASE_AUTO_MIGRATE` | `true` | Legacy fallback for startup application and file generation |
 | `PPBASE_APPLY_MIGRATIONS_ON_START` | inherits legacy setting | Apply pending files before serving traffic |
 | `PPBASE_GENERATE_MIGRATIONS` | inherits legacy setting | Generate files after Dashboard collection changes |
 | `PPBASE_MIGRATION_LOCK_TIMEOUT` | `30` | Seconds to wait for another instance's migration lock |
-| `PPBASE_BACKUP_ROOT` | `./pb_backups` | Automatically created local native-backup sets root |
-| `PPBASE_BACKUP_CONTROL_DIR` | `./pb_backup_control` | Automatically created local Ed25519 identity, trust and restore-control root |
 | `PPBASE_BACKUP_MAX_UPLOAD_BYTES` | `21474836480` | Maximum native backup ZIP upload size (20 GiB) |
 
 ## Development

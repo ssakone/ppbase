@@ -1,4 +1,4 @@
-"""Standard-ZIP transport for immutable native PPBase backup sets."""
+"""Standard ZIP transport for native PPBase backups."""
 
 from __future__ import annotations
 
@@ -17,11 +17,6 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from typing import BinaryIO, Callable, Iterator
 
-from ppbase.backup.identity import (
-    ED25519_PUBLIC_KEY_SIZE,
-    ED25519_SIGNATURE_SIZE,
-    verify_manifest_signature,
-)
 from ppbase.backup.models import (
     BackupError,
     BackupIntegrityError,
@@ -32,19 +27,13 @@ from ppbase.backup.models import (
 from ppbase.backup.storage import (
     MANIFEST_FILENAME,
     SEALED_FILENAME,
-    SIGNATURE_FILENAME,
-    SIGNER_PUBLIC_KEY_FILENAME,
     BackupSetBuilder,
     LocalBackupStore,
     PreparedBackupSet,
 )
 
 
-_ENVELOPE_NAMES = (
-    MANIFEST_FILENAME,
-    SIGNATURE_FILENAME,
-    SIGNER_PUBLIC_KEY_FILENAME,
-)
+_ENVELOPE_NAMES = (MANIFEST_FILENAME,)
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _SAFE_APP_SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -206,13 +195,11 @@ class PinnedBackupZip:
 
 @dataclass(slots=True)
 class PreparedBackupImport:
-    """A fully verified hidden partial set awaiting its SEALED commit."""
+    """A fully verified hidden workspace awaiting publication."""
 
     builder: BackupSetBuilder
     prepared: PreparedBackupSet
     manifest_bytes: bytes
-    signature: bytes
-    signer_public_key: bytes
 
     def abort(self) -> None:
         self.builder.abort()
@@ -274,61 +261,10 @@ def backup_transport_filename(manifest: BackupManifest) -> str:
 
 def _zip_info(name: str) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(filename=name, date_time=_ZIP_TIMESTAMP)
-    info.compress_type = zipfile.ZIP_STORED
+    info.compress_type = zipfile.ZIP_DEFLATED
     info.create_system = 3
     info.external_attr = (stat.S_IFREG | 0o600) << 16
     return info
-
-
-def _zip_filename_size(name: str) -> int:
-    try:
-        return len(name.encode("ascii"))
-    except UnicodeEncodeError:
-        return len(name.encode("utf-8"))
-
-
-def backup_transport_size(manifest: BackupManifest) -> int:
-    """Return the exact byte size emitted by :func:`materialize_backup_zip`.
-
-    The transport deliberately uses stored members, fixed metadata and no
-    archive comment. Resource writers always reserve a ZIP64 local header so
-    their size can grow beyond 2 GiB without buffering. The calculation also
-    mirrors Python's central-directory and ZIP64 end-record thresholds.
-    """
-    members = [
-        (MANIFEST_FILENAME, len(manifest.to_bytes()), False),
-        (SIGNATURE_FILENAME, ED25519_SIGNATURE_SIZE, False),
-        (SIGNER_PUBLIC_KEY_FILENAME, ED25519_PUBLIC_KEY_SIZE, False),
-        *((resource.path, resource.size, True) for resource in manifest.resources),
-    ]
-    local_size = 0
-    central_size = 0
-    for name, size, force_zip64 in members:
-        filename_size = _zip_filename_size(name)
-        header_offset = local_size
-        local_zip64 = force_zip64 or size * 1.05 > zipfile.ZIP64_LIMIT
-        local_extra_size = 20 if local_zip64 else 0
-        local_size += zipfile.sizeFileHeader + filename_size + local_extra_size + size
-
-        central_zip64_values = 0
-        if size > zipfile.ZIP64_LIMIT:
-            central_zip64_values += 2
-        if header_offset > zipfile.ZIP64_LIMIT:
-            central_zip64_values += 1
-        central_extra_size = (
-            4 + 8 * central_zip64_values if central_zip64_values else 0
-        )
-        central_size += zipfile.sizeCentralDir + filename_size + central_extra_size
-
-    requires_zip64_end = (
-        len(members) > zipfile.ZIP_FILECOUNT_LIMIT
-        or local_size > zipfile.ZIP64_LIMIT
-        or central_size > zipfile.ZIP64_LIMIT
-    )
-    end_size = zipfile.sizeEndCentDir
-    if requires_zip64_end:
-        end_size += zipfile.sizeEndCentDir64 + zipfile.sizeEndCentDir64Locator
-    return local_size + central_size + end_size
 
 
 def _open_relative_regular_file(set_fd: int, member_name: str) -> int:
@@ -423,7 +359,6 @@ def materialize_backup_zip(
     store: LocalBackupStore,
     backup_id: str,
     *,
-    expected_public_key: bytes | None,
     chunk_size: int,
 ) -> PinnedBackupZip:
     """Build a complete verified ZIP without persisting it canonically."""
@@ -431,7 +366,6 @@ def materialize_backup_zip(
         raise ValueError("chunk_size must be a positive integer")
     inspection = store.inspect_set(
         backup_id,
-        expected_public_key=expected_public_key,
         verify_resources=True,
     )
     handle: BinaryIO | None = None
@@ -461,45 +395,19 @@ def materialize_backup_zip(
             MANIFEST_FILENAME,
             maximum_size=_MAX_MANIFEST_BYTES,
         )
-        signature = _read_exact_member(
-            set_fd,
-            SIGNATURE_FILENAME,
-            maximum_size=ED25519_SIGNATURE_SIZE,
-        )
-        signer_public_key = _read_exact_member(
-            set_fd,
-            SIGNER_PUBLIC_KEY_FILENAME,
-            maximum_size=ED25519_PUBLIC_KEY_SIZE,
-        )
-        if manifest_bytes != inspection.manifest.to_bytes() or not secrets.compare_digest(
-            signer_public_key,
-            inspection.signer_public_key,
-        ):
+        if manifest_bytes != inspection.manifest.to_bytes():
             raise BackupIntegrityError(
                 "backup envelope changed before ZIP materialization"
-            )
-        fingerprint = verify_manifest_signature(
-            manifest_bytes,
-            signature,
-            signer_public_key,
-        )
-        if not secrets.compare_digest(
-            fingerprint,
-            inspection.manifest.signer_fingerprint_sha256,
-        ):
-            raise BackupIntegrityError(
-                "backup envelope signer fingerprint changed before ZIP materialization"
             )
 
         with zipfile.ZipFile(
             handle,
             mode="w",
-            compression=zipfile.ZIP_STORED,
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=1,
             allowZip64=True,
         ) as archive:
             archive.writestr(_zip_info(MANIFEST_FILENAME), manifest_bytes)
-            archive.writestr(_zip_info(SIGNATURE_FILENAME), signature)
-            archive.writestr(_zip_info(SIGNER_PUBLIC_KEY_FILENAME), signer_public_key)
 
             for resource in inspection.manifest.resources:
                 source_fd = _open_relative_regular_file(set_fd, resource.path)
@@ -545,13 +453,8 @@ def materialize_backup_zip(
         os.fsync(handle.fileno())
         size = handle.seek(0, os.SEEK_END)
         handle.seek(0)
-        if size != backup_transport_size(inspection.manifest):
-            raise BackupIntegrityError(
-                "backup ZIP layout differs from its deterministic transport size"
-            )
         confirmed = store.inspect_set(
             backup_id,
-            expected_public_key=expected_public_key,
             verify_resources=True,
         )
         if confirmed.manifest != inspection.manifest:
@@ -570,7 +473,7 @@ def materialize_backup_zip(
     except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
         raise BackupTransportError(
             "backup_zip_creation_failed",
-            "The signed backup could not be materialized as a ZIP.",
+            "The backup could not be materialized as a ZIP.",
         ) from exc
     finally:
         if set_fd is not None:
@@ -991,7 +894,7 @@ def _verify_zip_resource(
                 if size > resource.size:
                     raise BackupTransportError(
                         "backup_resource_size_mismatch",
-                        "A ZIP resource exceeds its signed size.",
+                        "A ZIP resource exceeds its declared size.",
                     )
                 digest.update(chunk)
     except BackupTransportError:
@@ -1010,12 +913,12 @@ def _verify_zip_resource(
     if size != resource.size:
         raise BackupTransportError(
             "backup_resource_size_mismatch",
-            "A ZIP resource size differs from the signed manifest.",
+            "A ZIP resource size differs from backup.json.",
         )
     if not secrets.compare_digest(digest.hexdigest(), resource.sha256):
         raise BackupTransportError(
             "backup_resource_checksum_mismatch",
-            "A ZIP resource checksum differs from the signed manifest.",
+            "A ZIP resource checksum differs from backup.json.",
         )
 
 
@@ -1023,7 +926,6 @@ def prepare_backup_zip_import(
     store: LocalBackupStore,
     source: BinaryIO,
     *,
-    expected_public_key: bytes | None,
     limits: BackupTransportLimits,
 ) -> PreparedBackupImport:
     """Validate and extract one ZIP into a hidden store-owned partial set."""
@@ -1073,7 +975,7 @@ def prepare_backup_zip_import(
                 if required not in members:
                     raise BackupTransportError(
                         "backup_zip_envelope_missing",
-                        "The ZIP is missing its signed PPBase envelope.",
+                        "The ZIP is missing backup.json.",
                     )
             manifest_bytes = _read_zip_member(
                 archive,
@@ -1081,28 +983,6 @@ def prepare_backup_zip_import(
                 maximum_size=_MAX_MANIFEST_BYTES,
                 chunk_size=limits.chunk_size,
             )
-            signature = _read_zip_member(
-                archive,
-                members[SIGNATURE_FILENAME],
-                maximum_size=ED25519_SIGNATURE_SIZE,
-                chunk_size=limits.chunk_size,
-            )
-            signer_public_key = _read_zip_member(
-                archive,
-                members[SIGNER_PUBLIC_KEY_FILENAME],
-                maximum_size=ED25519_PUBLIC_KEY_SIZE,
-                chunk_size=limits.chunk_size,
-            )
-            if len(signature) != ED25519_SIGNATURE_SIZE:
-                raise BackupTransportError(
-                    "backup_signature_invalid",
-                    "The ZIP contains an invalid Ed25519 signature.",
-                )
-            if len(signer_public_key) != ED25519_PUBLIC_KEY_SIZE:
-                raise BackupTransportError(
-                    "backup_signer_invalid",
-                    "The ZIP contains an invalid Ed25519 public key.",
-                )
             try:
                 manifest = BackupManifest.from_bytes(manifest_bytes)
             except BackupManifestError as exc:
@@ -1115,31 +995,12 @@ def prepare_backup_zip_import(
                     code,
                     "The ZIP manifest is invalid or unsupported.",
                 ) from exc
-            try:
-                fingerprint = verify_manifest_signature(
-                    manifest_bytes,
-                    signature,
-                    signer_public_key,
-                )
-            except BackupError as exc:
-                raise BackupTransportError(
-                    "backup_signature_invalid",
-                    "The ZIP manifest signature is invalid.",
-                ) from exc
-            if not secrets.compare_digest(
-                fingerprint,
-                manifest.signer_fingerprint_sha256,
-            ):
-                raise BackupTransportError(
-                    "backup_signer_invalid",
-                    "The ZIP signer fingerprint is inconsistent.",
-                )
             expected_names = set(_ENVELOPE_NAMES)
             expected_names.update(resource.path for resource in manifest.resources)
             if set(members) != expected_names or SEALED_FILENAME in members:
                 raise BackupTransportError(
                     "backup_zip_members_invalid",
-                    "The ZIP members do not exactly match the signed manifest.",
+                    "The ZIP members do not exactly match backup.json.",
                 )
             resource_infos: dict[str, tuple[BackupResource, zipfile.ZipInfo]] = {}
             for resource in manifest.resources:
@@ -1147,25 +1008,9 @@ def prepare_backup_zip_import(
                 if info.file_size != resource.size:
                     raise BackupTransportError(
                         "backup_resource_size_mismatch",
-                        "A ZIP resource size differs from the signed manifest.",
+                        "A ZIP resource size differs from backup.json.",
                     )
                 resource_infos[resource.path] = (resource, info)
-
-            if expected_public_key is not None and not secrets.compare_digest(
-                signer_public_key,
-                expected_public_key,
-            ):
-                for resource in manifest.resources:
-                    _verify_zip_resource(
-                        archive,
-                        resource_infos[resource.path][1],
-                        resource,
-                        chunk_size=limits.chunk_size,
-                    )
-                raise BackupTransportError(
-                    "backup_signer_untrusted",
-                    "The ZIP is signed correctly but its signer is not trusted locally.",
-                )
 
             builder = store.begin_set(
                 manifest.backup_id,
@@ -1198,8 +1043,6 @@ def prepare_backup_zip_import(
                 builder=builder,
                 prepared=prepared,
                 manifest_bytes=manifest_bytes,
-                signature=signature,
-                signer_public_key=signer_public_key,
             )
     except BackupTransportError:
         if builder is not None:
@@ -1210,7 +1053,7 @@ def prepare_backup_zip_import(
             builder.abort()
         raise BackupTransportError(
             "backup_integrity_failed",
-            "The uploaded ZIP failed signed resource verification.",
+            "The uploaded ZIP failed resource verification.",
         ) from exc
     except BackupError:
         if builder is not None:

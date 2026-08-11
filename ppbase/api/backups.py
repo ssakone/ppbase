@@ -9,19 +9,17 @@ import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response, StreamingResponse
 from pydantic import (
     BaseModel,
-    Field,
     ValidationError,
     field_validator,
 )
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 from starlette.datastructures import FormData, UploadFile
@@ -29,8 +27,6 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ppbase.api.deps import get_optional_auth, get_session, require_admin
 from ppbase.backup.service import (
-    BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT,
-    BACKUP_INSPECTION_MAX_RESOURCE_LIMIT,
     BackupServiceError,
     NativeBackupService,
 )
@@ -275,21 +271,8 @@ class BackupCreateBody(BaseModel):
 
 
 
-class BackupTrustApproveBody(BaseModel):
-    fingerprint_sha256: str = Field(
-        alias="fingerprintSha256",
-        min_length=64,
-        max_length=64,
-        pattern=r"^[a-f0-9]{64}$",
-    )
-
-    model_config = {"populate_by_name": True, "extra": "forbid"}
-
-
 def _backup_readiness(
     settings: Any,
-    *,
-    warnings: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Return non-secret deployment readiness for Dashboard guidance."""
     storage_backend = str(
@@ -309,14 +292,14 @@ def _backup_readiness(
     storage_missing = [] if storage_backend == "local" else [
         "local business-file storage backend"
     ]
-    control_missing: list[str] = []
-    for value, label in (
-        (getattr(settings, "backup_root", ""), "PPBASE_BACKUP_ROOT"),
-        (getattr(settings, "backup_control_dir", ""), "PPBASE_BACKUP_CONTROL_DIR"),
+    backup_path = Path(str(settings.data_dir)).expanduser() / "backups"
+    if backup_path.exists() and (
+        not backup_path.is_dir() or backup_path.is_symlink()
     ):
-        path = Path(str(value)).expanduser()
-        if path.exists() and (not path.is_dir() or path.is_symlink()):
-            control_missing.append(f"safe directory: {label}")
+        missing = "safe directory: pb_data/backups"
+        create_missing.append(missing)
+        restore_missing.append(missing)
+        storage_missing.append(missing)
     return {
         "create": {
             "configured": not create_missing,
@@ -334,12 +317,7 @@ def _backup_readiness(
             "configured": not storage_missing,
             "missing": storage_missing,
         },
-        "controlPlane": {
-            "configured": not control_missing,
-            "missing": control_missing,
-        },
         "storageBackend": storage_backend,
-        "warnings": list(warnings or []),
         "onboarding": {
             "recommended": "automatic",
             "productionCommand": "ppbase backup doctor",
@@ -347,36 +325,6 @@ def _backup_readiness(
             "doctorCommand": "ppbase backup doctor",
         },
     }
-
-
-async def _runtime_readiness_warnings(
-    session: AsyncSession,
-) -> list[dict[str, str]]:
-    """Report non-blocking security compatibility for the live runtime role."""
-    is_superuser = bool(
-        await session.scalar(
-            text(
-                "SELECT runtime_role.rolsuper "
-                "FROM pg_catalog.pg_roles AS runtime_role "
-                "WHERE runtime_role.rolname = SESSION_USER"
-            )
-        )
-    )
-    if is_superuser:
-        return [
-            {
-                "code": "runtime_superuser",
-                "name": "runtime_role",
-                "detail": "Backup and restore use the active PostgreSQL superuser runtime.",
-            }
-        ]
-    return [
-        {
-            "code": "runtime_database_role",
-            "name": "runtime_role",
-            "detail": "Backup and restore use PPBASE_DATABASE_URL by default.",
-        }
-    ]
 
 
 async def _require_backup_admin(
@@ -392,7 +340,7 @@ async def _authorize_backup_read(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """Select tokenized download or ordinary superuser inspection auth."""
+    """Authorize a PocketBase-compatible backup ZIP download."""
     if "token" in request.query_params:
         token = str(request.query_params.get("token", "") or "").strip()
         token_auth = await verify_file_token(session, token) if token else None
@@ -413,12 +361,12 @@ async def _authorize_backup_read(
                 },
             )
         await session.rollback()
-        return {"mode": "download", "auth": token_auth}
+        return token_auth
 
     auth = await get_optional_auth(request, session)
     admin = await require_admin(auth)
     await session.rollback()
-    return {"mode": "inspect", "auth": admin}
+    return admin
 
 
 def _service(request: Request) -> NativeBackupService:
@@ -719,40 +667,20 @@ def _validate_body(model: type[BaseModel], payload: Any) -> BaseModel:
         raise RequestValidationError(exc.errors(), body=payload) from exc
 
 
-@router.get("/identity")
-async def get_backup_identity(
-    request: Request,
-    _admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
-    try:
-        with _service(request) as service:
-            return service.get_identity()
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-
-
 @router.get("/readiness")
 async def get_backup_readiness(
     request: Request,
     _admin: dict[str, Any] = Depends(_require_backup_admin),
-    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    try:
-        warnings = await _runtime_readiness_warnings(session)
-    finally:
-        await session.rollback()
-    return _backup_readiness(
-        request.app.state.settings,
-        warnings=warnings,
-    )
+    return _backup_readiness(request.app.state.settings)
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_204_NO_CONTENT)
 async def create_local_backup(
     request: Request,
     admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
-    """Create and seal one local backup synchronously."""
+) -> Response:
+    """Create one local backup synchronously."""
     payload = await _read_control_json(request, allow_empty=True)
     if payload is None:
         payload = {}
@@ -760,28 +688,31 @@ async def create_local_backup(
     assert isinstance(body, BackupCreateBody)
     try:
         with _service(request) as service:
-            return await service.create_local_backup(
+            await service.create_local_backup(
                 actor_id=_actor_id(admin),
                 transport_filename=body.name,
             )
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
     except BackupServiceError as exc:
         _raise_backup_error(exc)
 
 
-@router.post("/upload", status_code=status.HTTP_201_CREATED)
+@router.post("/upload", status_code=status.HTTP_204_NO_CONTENT)
 async def upload_local_backup(
     request: Request,
     _admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
+) -> Response:
     form: FormData | None = None
     try:
         with _service(request) as service:
             with service.mutation_operation() as operation_lease:
                 form, upload = await _read_backup_upload(request)
-                return await service.upload_local_backup(
+                await service.upload_local_backup(
                     upload.file,
+                    filename=str(upload.filename or ""),
                     operation_lease=operation_lease,
                 )
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
     except BackupServiceError as exc:
         _raise_backup_error(exc)
     finally:
@@ -801,82 +732,14 @@ async def list_local_backups(
         _raise_backup_error(exc)
 
 
-@router.get("/trusted-signers")
-async def list_trusted_backup_signers(
-    request: Request,
-    _admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> list[dict[str, Any]]:
-    try:
-        with _service(request) as service:
-            return service.list_trusted_signers()
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-
-
-@router.post("/{backup_id}/trust")
-async def approve_backup_signer(
-    backup_id: str,
-    request: Request,
-    admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> dict[str, Any]:
-    payload = await _read_control_json(request)
-    body = _validate_body(BackupTrustApproveBody, payload)
-    if not isinstance(body, BackupTrustApproveBody):  # pragma: no cover
-        raise RuntimeError("Invalid backup trust approval model")
-    try:
-        with _service(request) as service:
-            return await service.approve_backup_signer(
-                backup_id,
-                expected_fingerprint_sha256=body.fingerprint_sha256,
-                actor_id=_actor_id(admin),
-            )
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-
-
-@router.delete(
-    "/trusted-signers/{fingerprint_sha256}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def revoke_backup_signer(
-    fingerprint_sha256: str,
-    request: Request,
-    _admin: dict[str, Any] = Depends(_require_backup_admin),
-) -> Response:
-    try:
-        with _service(request) as service:
-            service.revoke_backup_signer(fingerprint_sha256)
-    except BackupServiceError as exc:
-        _raise_backup_error(exc)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
 @router.get("/{backup_id}")
 async def inspect_or_download_local_backup(
     backup_id: str,
     request: Request,
-    access: dict[str, Any] = Depends(_authorize_backup_read),
-    resource_offset: Annotated[
-        int,
-        Query(alias="resourceOffset", ge=0),
-    ] = 0,
-    resource_limit: Annotated[
-        int,
-        Query(
-            alias="resourceLimit",
-            ge=1,
-            le=BACKUP_INSPECTION_MAX_RESOURCE_LIMIT,
-        ),
-    ] = BACKUP_INSPECTION_DEFAULT_RESOURCE_LIMIT,
+    _access: dict[str, Any] = Depends(_authorize_backup_read),
 ) -> Any:
     try:
         with _service(request) as service:
-            if access.get("mode") != "download":
-                return await service.inspect_local_backup(
-                    backup_id,
-                    resource_offset=resource_offset,
-                    resource_limit=resource_limit,
-                )
             pinned = await service.materialize_local_backup_zip(backup_id)
     except BackupServiceError as exc:
         _raise_backup_error(exc)

@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from ppbase import __version__
+from ppbase.backup.operations import backup_operation_available
 from ppbase.services.process_control import can_self_restart
 
 router = APIRouter()
 
 
 @router.get("")
-async def health_check():
+async def health_check(request: Request):
     """Return a simple health status."""
-    return {"code": 200, "message": "API is healthy.", "data": {"version": __version__}}
+    return {
+        "code": 200,
+        "message": "API is healthy.",
+        "data": {
+            "version": __version__,
+            "canBackup": backup_operation_available(
+                request.app.state.settings.data_dir
+            ),
+        },
+    }
 
 
 @router.get("/backup-restart")

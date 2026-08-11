@@ -4,7 +4,7 @@ These tests exercise the *current* destructive restore flow end-to-end against
 a real PostgreSQL server:
 
 * build and seed a small PPBase database,
-* create a signed local backup,
+* create a local backup ZIP,
 * drive :meth:`NativeBackupService.restore_local_backup`, which is the same
   entry point the ``POST /backups/{id}/restore-destructive`` endpoint calls.
 
@@ -42,6 +42,7 @@ import json
 import os
 import secrets
 import tempfile
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -174,7 +175,7 @@ async def _drop_throwaway_database(base_url: str, url: str) -> None:
 async def seeded_backup(
     destructive_restore_cluster: str,
 ) -> Iterator[dict[str, object]]:
-    """Bootstrap a fresh database, seed it, and create one signed backup.
+    """Bootstrap a fresh database, seed it, and create one backup ZIP.
 
     Yields a mapping with everything a test needs to drive and verify a
     destructive restore. All process-control state and temporary directories
@@ -203,8 +204,6 @@ async def seeded_backup(
     settings = Settings(
         database_url=url,
         data_dir=str(data_dir),
-        backup_root=str(tmp / "pb_backups"),
-        backup_control_dir=str(tmp / "pb_control"),
         jwt_secret="",
         auto_migrate=False,
     )
@@ -231,7 +230,7 @@ async def seeded_backup(
         backup = await service.create_local_backup(actor_id=None)
     finally:
         service.close()
-    backup_id = str(backup["id"])
+    backup_id = str(backup["key"])
 
     payload = {
         "url": url,
@@ -269,8 +268,8 @@ async def test_invalid_archive_rejected_before_mutation(
 ) -> None:
     """A corrupt archive must be rejected before any active target changes.
 
-    This is the core verify-before-mutate acceptance criterion: the signed
-    resource checksum is validated up front, so a tampered ``data.copy``
+    This is the core verify-before-mutate acceptance criterion: the resource
+    checksum is validated up front, so a tampered ``data.copy``
     aborts the restore while the live database and its sentinel row are left
     completely untouched.
     """
@@ -279,18 +278,23 @@ async def test_invalid_archive_rejected_before_mutation(
     engine = seeded_backup["engine"]
     backup_id = str(seeded_backup["backup_id"])
 
-    # Corrupt the signed native COPY payload inside the sealed backup set.
-    dump_path = (
-        Path(settings.backup_root)  # type: ignore[attr-defined]
-        / "sets"
-        / backup_id
-        / DATA_COPY_RESOURCE
+    # Corrupt the native COPY payload while leaving backup.json unchanged, so
+    # restore must reject the resource checksum before mutating active state.
+    archive_path = (  # type: ignore[attr-defined]
+        Path(settings.data_dir) / "backups" / backup_id
     )
-    raw = bytearray(dump_path.read_bytes())
-    assert raw, "unexpectedly empty database COPY resource"
-    for index in range(len(raw)):
-        raw[index] ^= 0xFF
-    dump_path.write_bytes(bytes(raw))
+    rewritten_path = archive_path.with_name(f".{archive_path.name}.corrupt")
+    with zipfile.ZipFile(archive_path, "r") as source:
+        members = [(info, source.read(info.filename)) for info in source.infolist()]
+    with zipfile.ZipFile(rewritten_path, "w") as target:
+        for info, payload in members:
+            if info.filename == DATA_COPY_RESOURCE:
+                raw = bytearray(payload)
+                assert raw, "unexpectedly empty database COPY resource"
+                raw[0] ^= 0xFF
+                payload = bytes(raw)
+            target.writestr(info, payload)
+    os.replace(rewritten_path, archive_path)
 
     service = NativeBackupService(engine, settings)  # type: ignore[arg-type]
     try:
@@ -301,8 +305,7 @@ async def test_invalid_archive_rejected_before_mutation(
 
     # The restore must have failed for an integrity reason and reserved no
     # restart (nothing was cut over).
-    message = str(excinfo.value).lower()
-    assert "integrity" in message or "checksum" in message, excinfo.value
+    assert excinfo.value.code == "backup_integrity_failed"
     assert not process_control.is_restart_scheduled()
 
     # The live database is unchanged: the sentinel row is still present and the

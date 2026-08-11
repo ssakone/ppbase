@@ -110,16 +110,9 @@ async def get_optional_auth(
         )
         coll = (await session.execute(stmt)).scalars().first()
         if coll is None:
-            # Token claims a collection that doesn't exist - reject explicitly.
-            # PocketBase returns 404 when the referenced collection is missing.
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "status": 404,
-                    "message": f"Missing collection with id \"{collection_id}\".",
-                    "data": {},
-                },
-            )
+            # PocketBase ignores invalid tokens in its optional-auth middleware.
+            # Protected routes will still reject the resulting anonymous request.
+            return None
 
         table_name = coll.name
         sql = _text(

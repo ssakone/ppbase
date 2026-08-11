@@ -48,7 +48,7 @@ JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 def _immutable_collection(*_args: Any, **_kwargs: Any) -> None:
-    raise TypeError("signed manifest metadata is immutable")
+    raise TypeError("backup metadata is immutable")
 
 
 class _FrozenDict(dict[str, JsonValue]):
@@ -96,7 +96,7 @@ class BackupManifestError(BackupError):
 
 
 class BackupIntegrityError(BackupError):
-    """Raised when a sealed backup fails signature or checksum validation."""
+    """Raised when a backup fails checksum or structural validation."""
 
 
 class BackupNotFoundError(BackupError):
@@ -224,7 +224,7 @@ def _reject_sensitive_metadata(value: JsonValue, *, path: str = "$.metadata") ->
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Encode the strict, NFC-normalized canonical JSON used for signatures."""
+    """Encode strict, NFC-normalized canonical JSON for stable checksums."""
     normalized = _normalize_json(value)
     try:
         encoded = json.dumps(
@@ -358,11 +358,10 @@ class BackupResource:
 
 @dataclass(frozen=True, slots=True)
 class BackupManifest:
-    """Versioned signed description of a canonical local backup set."""
+    """Versioned description of one native PPBase backup archive."""
 
     backup_id: str
     created_at: str
-    signer_fingerprint_sha256: str
     resources: tuple[BackupResource, ...]
     metadata: Mapping[str, JsonValue]
     format: str = BACKUP_FORMAT
@@ -384,11 +383,6 @@ class BackupManifest:
             raise BackupManifestError(
                 f"unsupported backup format version: {self.format_version}"
             )
-        if not isinstance(self.signer_fingerprint_sha256, str) or not (
-            _SHA256_PATTERN.fullmatch(self.signer_fingerprint_sha256)
-        ):
-            raise BackupManifestError("signer fingerprint must be a SHA-256 hex value")
-
         resources = tuple(self.resources)
         if any(not isinstance(resource, BackupResource) for resource in resources):
             raise BackupManifestError("manifest resources must be resource objects")
@@ -432,10 +426,6 @@ class BackupManifest:
             "format_version": self.format_version,
             "metadata": dict(self.metadata),
             "resources": [resource.to_dict() for resource in self.resources],
-            "signing": {
-                "algorithm": "Ed25519",
-                "fingerprint_sha256": self.signer_fingerprint_sha256,
-            },
         }
 
     def to_bytes(self) -> bytes:
@@ -453,19 +443,9 @@ class BackupManifest:
             "format_version",
             "metadata",
             "resources",
-            "signing",
         }
         if set(value) != expected_fields:
             raise BackupManifestError("manifest has unknown or missing fields")
-
-        signing = value["signing"]
-        if not isinstance(signing, Mapping) or set(signing) != {
-            "algorithm",
-            "fingerprint_sha256",
-        }:
-            raise BackupManifestError("manifest signing descriptor is invalid")
-        if signing["algorithm"] != "Ed25519":
-            raise BackupManifestError("manifest signing algorithm must be Ed25519")
 
         raw_resources = value["resources"]
         if not isinstance(raw_resources, list):
@@ -480,7 +460,6 @@ class BackupManifest:
             format_version=value["format_version"],
             metadata=value["metadata"],
             resources=resources,
-            signer_fingerprint_sha256=signing["fingerprint_sha256"],
         )
 
 
@@ -490,21 +469,18 @@ class BackupSetSummary:
 
     backup_id: str
     created_at: str | None
-    signer_fingerprint_sha256: str | None
     resource_count: int | None
     total_size: int | None
     app_name: str | None
     manifest: BackupManifest | None
     integrity_status: str
     error_code: str | None
-    signer_public_key: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class BackupInspection:
-    """A sealed set whose signature and, optionally, resources were verified."""
+    """A backup whose metadata and, optionally, resources were verified."""
 
     path: Path
     manifest: BackupManifest
-    signer_public_key: bytes
     resources_verified: bool

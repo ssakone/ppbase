@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from ppbase.api import backups as backups_api
 from ppbase.app import create_app
 from ppbase.config import Settings
+from ppbase.backup.transport import PinnedBackupZip
 
 
 class _FakeLease:
@@ -108,11 +110,167 @@ class _FakeBackupService:
 def _api_app() -> FastAPI:
     app = FastAPI()
     app.state.backup_maintenance = False
+    app.state.settings = SimpleNamespace(
+        backup_max_upload_bytes=1024 * 1024,
+        backup_multipart_overhead_bytes=64 * 1024,
+        backup_transport_chunk_size=64 * 1024,
+        data_dir="pb_data",
+        storage_backend="local",
+    )
     app.include_router(backups_api.router, prefix="/api")
     app.dependency_overrides[backups_api._require_backup_admin] = lambda: {
         "id": "admin_1"
     }
+    app.dependency_overrides[backups_api._authorize_backup_read] = lambda: {
+        "id": "admin_1"
+    }
     return app
+
+
+class _FakePocketBaseBackupService:
+    def __init__(self) -> None:
+        self.created_name: str | None = None
+        self.uploaded_name: str | None = None
+        self.uploaded_payload: bytes | None = None
+        self.operation_context = _FakeOperationContext()
+
+    def __enter__(self) -> "_FakePocketBaseBackupService":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def mutation_operation(self) -> _FakeOperationContext:
+        return self.operation_context
+
+    async def create_local_backup(
+        self,
+        *,
+        actor_id: str | None,
+        transport_filename: str | None,
+    ) -> dict[str, object]:
+        assert actor_id == "admin_1"
+        self.created_name = transport_filename
+        return {
+            "key": transport_filename or "generated.zip",
+            "size": 4,
+            "modified": "2026-07-29T12:00:00.000Z",
+        }
+
+    async def upload_local_backup(
+        self,
+        source: Any,
+        *,
+        filename: str,
+        operation_lease: _FakeLease,
+    ) -> dict[str, object]:
+        assert operation_lease is self.operation_context.lease
+        self.uploaded_name = filename
+        self.uploaded_payload = source.read()
+        return {
+            "key": filename,
+            "size": len(self.uploaded_payload),
+            "modified": "2026-07-29T12:00:00.000Z",
+        }
+
+    async def list_local_backups(self) -> list[dict[str, object]]:
+        return [
+            {
+                "key": "one.zip",
+                "size": 123,
+                "modified": "2026-07-29T12:00:00.000Z",
+            }
+        ]
+
+    async def materialize_local_backup_zip(self, key: str) -> PinnedBackupZip:
+        assert key == "one.zip"
+        payload = b"PK\x03\x04"
+        return PinnedBackupZip(
+            filename=key,
+            size=len(payload),
+            _handle=BytesIO(payload),
+        )
+
+
+def test_identity_and_trust_control_routes_are_removed() -> None:
+    paths = {route.path for route in backups_api.router.routes}
+
+    assert "/backups/identity" not in paths
+    assert "/backups/trusted-signers" not in paths
+    assert not any(path.endswith("/trust") for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_create_backup_returns_pocketbase_204(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _FakePocketBaseBackupService()
+    monkeypatch.setattr(backups_api, "_service", lambda _request: service)
+    app = _api_app()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/api/backups",
+            json={"name": "requested.zip"},
+        )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert service.created_name == "requested.zip"
+
+
+@pytest.mark.asyncio
+async def test_upload_backup_returns_204_and_preserves_filename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _FakePocketBaseBackupService()
+    monkeypatch.setattr(backups_api, "_service", lambda _request: service)
+    app = _api_app()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/api/backups/upload",
+            files={"file": ("imported.zip", b"PK\x03\x04payload", "application/zip")},
+        )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert service.uploaded_name == "imported.zip"
+    assert service.uploaded_payload == b"PK\x03\x04payload"
+
+
+@pytest.mark.asyncio
+async def test_list_and_get_backup_use_pocketbase_archive_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _FakePocketBaseBackupService()
+    monkeypatch.setattr(backups_api, "_service", lambda _request: service)
+    app = _api_app()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        listed = await client.get("/api/backups")
+        downloaded = await client.get("/api/backups/one.zip")
+
+    assert listed.status_code == 200
+    assert listed.json() == [
+        {
+            "key": "one.zip",
+            "size": 123,
+            "modified": "2026-07-29T12:00:00.000Z",
+        }
+    ]
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"] == "application/zip"
+    assert downloaded.content == b"PK\x03\x04"
 
 
 @pytest.mark.asyncio
@@ -147,8 +305,7 @@ def test_backup_readiness_reports_per_operation_blockers(
     payload = backups_api._backup_readiness(
         SimpleNamespace(
             storage_backend="local",
-            backup_root=str(tmp_path / "backups"),
-            backup_control_dir=str(tmp_path / "control"),
+            data_dir=str(tmp_path / "data"),
         )
     )
 

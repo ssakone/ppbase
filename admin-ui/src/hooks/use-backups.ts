@@ -1,49 +1,38 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  approveBackupSigner,
   createBackup,
   deleteBackup,
-  getBackupIdentity,
   getBackupReadiness,
-  inspectBackup,
   listBackups,
-  listBackupTrust,
   restoreBackupDestructive,
-  revokeBackupSigner,
   uploadBackup,
 } from '@/api/endpoints/backups'
+import { getHealth } from '@/api/endpoints/health'
 import type { UploadProgress } from '@/api/client'
+import { BACKUP_STATUS_POLL_MS } from '@/lib/backup-operation-view'
 
 export function useBackups() {
   return useQuery({ queryKey: ['backups'], queryFn: listBackups, retry: false })
-}
-
-export function useBackup(id?: string, resourceOffset = 0, resourceLimit = 100) {
-  return useQuery({
-    queryKey: ['backups', id, 'resources', resourceOffset, resourceLimit],
-    queryFn: () => inspectBackup(id!, resourceOffset, resourceLimit),
-    enabled: !!id,
-    retry: false,
-  })
-}
-
-export function useBackupIdentity() {
-  return useQuery({ queryKey: ['backup-identity'], queryFn: getBackupIdentity, retry: false })
 }
 
 export function useBackupReadiness() {
   return useQuery({ queryKey: ['backup-readiness'], queryFn: getBackupReadiness, retry: false })
 }
 
-export function useBackupTrust() {
-  return useQuery({ queryKey: ['backup-trust'], queryFn: listBackupTrust, retry: false })
+export function useBackupOperationAvailability() {
+  return useQuery({
+    queryKey: ['health'],
+    queryFn: getHealth,
+    retry: false,
+    refetchInterval: BACKUP_STATUS_POLL_MS,
+    refetchOnWindowFocus: true,
+  })
 }
 
 function useInvalidateBackups() {
   const queryClient = useQueryClient()
   return () => {
     void queryClient.invalidateQueries({ queryKey: ['backups'] })
-    void queryClient.invalidateQueries({ queryKey: ['backup-trust'] })
   }
 }
 
@@ -67,22 +56,6 @@ export function useUploadBackup() {
 export function useDeleteBackup() {
   const invalidate = useInvalidateBackups()
   return useMutation({ mutationFn: (id: string) => deleteBackup(id), onSuccess: invalidate })
-}
-
-export function useApproveBackupSigner() {
-  const invalidate = useInvalidateBackups()
-  return useMutation({
-    mutationFn: ({ id, fingerprintSha256 }: {
-      id: string
-      fingerprintSha256: string
-    }) => approveBackupSigner(id, fingerprintSha256),
-    onSuccess: invalidate,
-  })
-}
-
-export function useRevokeBackupSigner() {
-  const invalidate = useInvalidateBackups()
-  return useMutation({ mutationFn: revokeBackupSigner, onSuccess: invalidate })
 }
 
 export function useRestoreBackupDestructive() {

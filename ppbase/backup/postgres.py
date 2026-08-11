@@ -244,7 +244,6 @@ class PreflightReport:
     """Non-mutating contract check result."""
 
     errors: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -557,33 +556,29 @@ async def preflight_destructive_restore_role(
         await connection.execute(
             text(
                 """
-                SELECT current_user AS role,
-                       runtime_role.rolsuper AS is_superuser,
+                SELECT active_role.rolsuper AS is_superuser,
                        pg_catalog.pg_has_role(
-                           runtime_role.oid,
+                           active_role.oid,
                            database.datdba,
                            'USAGE'
                        ) AS owns_database,
                        pg_catalog.pg_has_role(
-                           runtime_role.oid,
+                           active_role.oid,
                            namespace.nspowner,
                            'USAGE'
                        ) AS owns_schema
-                FROM pg_catalog.pg_roles AS runtime_role
+                FROM pg_catalog.pg_roles AS active_role
                 JOIN pg_catalog.pg_database AS database
                   ON database.datname = pg_catalog.current_database()
                 JOIN pg_catalog.pg_namespace AS namespace
                   ON namespace.nspname = 'public'
-                WHERE runtime_role.rolname = current_user
+                WHERE active_role.rolname = current_user
                 """
             )
         )
     ).mappings().one()
-    role = str(row["role"])
     if bool(row["is_superuser"]):
-        return PreflightReport(
-            warnings=("destructive restore uses the PostgreSQL runtime superuser",)
-        )
+        return PreflightReport()
 
     errors: list[str] = []
     if not bool(row["owns_database"]):

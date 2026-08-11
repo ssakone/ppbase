@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -49,13 +50,13 @@ def test_automatic_backup_filename_is_deterministic_and_safe() -> None:
 async def test_due_automatic_backup_reuses_native_engine_and_closes_service() -> None:
     calls: list[dict[str, object]] = []
 
-    class FakeStore:
+    class FakeArchiveStore:
         @staticmethod
-        def list_sets():
+        def list():
             return []
 
     class FakeService:
-        store = FakeStore()
+        archive_store = FakeArchiveStore()
 
         async def create_local_backup(self, **kwargs):
             calls.append(kwargs)
@@ -84,4 +85,60 @@ async def test_due_automatic_backup_reuses_native_engine_and_closes_service() ->
             "transport_filename": "ppbase_auto_ppbase_20260718T120000Z.zip",
         },
         {"closed": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_due_automatic_backup_prunes_only_older_automatic_zip_keys() -> None:
+    calls: list[object] = []
+
+    class FakeArchiveStore:
+        @staticmethod
+        def list():
+            return [
+                SimpleNamespace(
+                    key="ppbase_auto_demo_20260718T120000Z.zip",
+                    modified="2026-07-18T12:00:00.000Z",
+                ),
+                SimpleNamespace(
+                    key="manual.zip",
+                    modified="2026-07-18T13:00:00.000Z",
+                ),
+                SimpleNamespace(
+                    key="ppbase_auto_demo_20260718T110000Z.zip",
+                    modified="2026-07-18T11:00:00.000Z",
+                ),
+            ]
+
+    class FakeService:
+        archive_store = FakeArchiveStore()
+
+        async def create_local_backup(self, **kwargs):
+            calls.append(kwargs)
+
+        async def delete_local_backup(self, backup_key):
+            calls.append(backup_key)
+
+        def close(self):
+            calls.append("closed")
+
+    await create_due_automatic_backup(
+        object(),  # type: ignore[arg-type]
+        object(),
+        AutomaticBackupSettings(
+            cron="0 * * * *",
+            max_keep=1,
+            app_name="Demo",
+        ),
+        datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+        service_factory=lambda _engine, _settings: FakeService(),
+    )
+
+    assert calls == [
+        {
+            "actor_id": AUTOMATIC_BACKUP_ACTOR,
+            "transport_filename": "ppbase_auto_demo_20260718T120000Z.zip",
+        },
+        "ppbase_auto_demo_20260718T110000Z.zip",
+        "closed",
     ]

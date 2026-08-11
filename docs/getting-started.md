@@ -49,32 +49,8 @@ python -m ppbase db restart  # restart
 
 > **Custom PostgreSQL?** Set `PPBASE_DATABASE_URL` to your connection string and skip this step.
 
-Docker is not required by PPBase itself or by native backup/restore.
-
-### Optional: initialize a fresh PostgreSQL project
-
-This step is optional. PPBase native backup and restore use
-`PPBASE_DATABASE_URL` with no extra provisioning. Restore additionally verifies
-that the runtime owns the active database and `public` (or is a superuser) and
-that the live server can restart. Use the autonomous onboarding command only
-when you want a fresh application database and its limited runtime role created
-for you. Its bootstrap DSN must be a PostgreSQL superuser, is ephemeral, and is
-never written to the generated file:
-
-```bash
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
-  ppbase init postgres --plan --name myapp --output-env ./ppbase.env
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://cluster-admin:...@db/postgres' \
-  ppbase init postgres --execute --name myapp --output-env ./ppbase.env
-```
-
-The execute command creates only the `myapp` database, its limited runtime role
-and a mode-`0600` env file containing `PPBASE_DATABASE_URL`. It also creates
-PPBase's default `pb_data`, backup and control directories as private `0700`
-directories. Repeating the same command with the same env file is a no-op and
-preserves its credentials and inode. Use the advanced path flags only when the
-deployment cannot use the PPBase defaults, and expose the same custom paths
-through their `PPBASE_*` variables when starting the service.
+Docker is not required by PPBase itself or by native backup/restore. Configure
+`PPBASE_DATABASE_URL`, then start PPBase normally.
 
 ## Create your first admin
 
@@ -117,9 +93,8 @@ Or using the shell helper:
 
 Open **http://127.0.0.1:8090/_/** in your browser to access the Admin UI.
 
-The first `serve` automatically creates `pb_backups` and
-`pb_backup_control` using the same normal directory policy as `pb_data`. No
-preparatory filesystem command is required for the defaults.
+The first `serve` automatically creates `pb_data/backups`. No separate control
+directory or preparatory filesystem command is required for the defaults.
 
 When deploying directly from a source clone, build the assets once after clone
 and rebuild them after Admin UI changes before restarting PPBase:

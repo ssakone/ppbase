@@ -1087,7 +1087,7 @@ async def test_introspect_rejects_index_storage_parameters() -> None:
 # NOTE: A non-default index tablespace is refused by the same guard exercised
 # by ``test_introspect_rejects_index_storage_parameters`` (a sibling boolean
 # check on ``ic.reltablespace <> 0`` right beside ``ic.reloptions``). It has no
-# live test because provisioning a real tablespace requires a superuser, a
+# live test because creating a real tablespace requires a superuser, a
 # server-accessible directory, and non-transactional ``CREATE TABLESPACE`` DDL,
 # none of which are portable against the shared developer database. Naming the
 # default tablespace explicitly stores ``reltablespace = 0``, so it cannot stand

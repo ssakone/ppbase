@@ -33,8 +33,6 @@ export PPBASE_PORT='8090'
 export PPBASE_JWT_SECRET='replace-with-strong-secret'
 export PPBASE_ORIGINS='https://app.example.com,https://admin.example.com'
 export PPBASE_DATA_DIR='/var/lib/ppbase'
-export PPBASE_BACKUP_ROOT='/var/lib/ppbase-backups'
-export PPBASE_BACKUP_CONTROL_DIR='/var/lib/ppbase-backup-control'
 export PPBASE_MIGRATIONS_DIR='/srv/ppbase/pb_migrations'
 export PPBASE_APPLY_MIGRATIONS_ON_START='true'
 export PPBASE_GENERATE_MIGRATIONS='false'
@@ -153,33 +151,14 @@ rollback; it is not a substitute for the PostgreSQL backup below.
 
 ## 6) Backups
 
-Use the signed native workflow documented in
+Use the native ZIP workflow documented in
 [Native Backup & Restore](./native-backup-restore.md). Backup and restore use
-`PPBASE_DATABASE_URL` with the same role that runs `serve`; no separate
-provisioning is required. Restore readiness is stricter than backup readiness:
-the runtime must be a superuser or own the database and `public`, and the live
-server must expose its reusable restart command.
-
-The `init postgres` command below is optional. It creates one fresh project
-database, its runtime role and safe filesystem roots. The native backup engine
-uses the runtime role over the wire, so no separate dump role or credential is
-needed:
-
-```bash
-# Optional fresh-project onboarding (runtime role only)
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
-  ppbase init postgres --plan --name myapp --output-env /etc/ppbase/myapp.env
-PPBASE_POSTGRES_BOOTSTRAP_DATABASE_URL='postgresql+asyncpg://...' \
-  ppbase init postgres --execute --name myapp --output-env /etc/ppbase/myapp.env
-```
-
-The execute command requires an ephemeral PostgreSQL superuser DSN. The init
-output is exclusive mode `0600` and contains only `PPBASE_DATABASE_URL`.
-Bootstrap credentials are never persisted. Normal `serve` startup creates
-`PPBASE_BACKUP_ROOT` and `PPBASE_BACKUP_CONTROL_DIR` automatically with the
-same directory policy as `PPBASE_DATA_DIR`. Internal sets and identity material
-retain restricted permissions, including mode `0600` for the Ed25519 private
-key.
+`PPBASE_DATABASE_URL` with the same connection as `serve`. Restore readiness is
+stricter than backup readiness because the live server must expose its reusable
+restart command and the connected database must pass the restore preflight.
+Normal `serve` startup creates `<PPBASE_DATA_DIR>/backups`. Each visible backup is a ZIP
+accompanied by a local `.zip.attrs` metadata sidecar; the sidecar is managed by
+PPBase and is not a separate backup.
 
 Before relying on the workflow, rehearse a full restore on a staging host:
 create a backup, restore it destructively, and confirm the server restarts and
@@ -201,9 +180,7 @@ partial/SKIP because a standalone doctor process cannot observe the restart
 configuration injected into the server process.
 
 For an existing application, `backup doctor` accepts `--dir` as a compatibility
-override matching `serve`. A PostgreSQL superuser runtime is supported without
-mutation across backup and restore; doctor and the Dashboard report the
-non-blocking `runtime_superuser` warning.
+override matching `serve`.
 
 The selected database and `data_dir` are one inseparable runtime target. If the
 database references a local business file that is absent from
@@ -226,8 +203,9 @@ failure remains fenced until PPBase is restarted and recovery succeeds.
 The restored database includes `_superusers`. Any admin created only on the
 target before restore is replaced by the source archive's superusers; reconnect
 with a source credential after restart, or run `ppbase create-admin` if no
-usable superuser exists. The target's `PPBASE_BACKUP_CONTROL_DIR` is preserved,
-so its Ed25519 identity and trust approvals do not move with the archive.
+usable superuser exists. The selected archive remains in
+`<data_dir>/backups`. Restore recovery uses a temporary journal directly in
+`data_dir` and directory locks that leave no permanent control directory.
 
 The signed JWT resource is restored to `data_dir/.jwt_secret`. An explicit
 deployment-level `PPBASE_JWT_SECRET` still overrides that file after restart;
@@ -252,8 +230,8 @@ After deploy, verify:
 - File upload/download works (`/api/files/...`)
 - `ppbase backup doctor --server http://127.0.0.1:8090` reports backup and
   restore readiness
-- A rehearsal restore accepts the expected source superuser and leaves the
-  target Ed25519 control-plane identity intact
+- A rehearsal restore accepts the expected source superuser and allows a new
+  backup to be created afterward
 
 ## 8) Security hardening
 

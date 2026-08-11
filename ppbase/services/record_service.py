@@ -155,7 +155,21 @@ def _get_schema_fields(collection: CollectionRecord) -> list[FieldDefinition]:
     Handles both nested-options and flat-format schemas gracefully.
     """
     raw: list[dict[str, Any]] = collection.schema or []
-    return [FieldDefinition(**_normalize_field(f)) for f in raw]
+    fields: list[FieldDefinition] = []
+    for definition in raw:
+        normalized = _normalize_field(definition)
+        if (
+            collection.name == "_superusers"
+            and normalized.get("name") == "avatar"
+            and normalized.get("type") == FieldType.NUMBER
+        ):
+            normalized = dict(normalized)
+            normalized["options"] = {
+                **dict(normalized.get("options") or {}),
+                "onlyInt": True,
+            }
+        fields.append(FieldDefinition(**normalized))
+    return fields
 
 
 def _get_hidden_fields(fields: list[FieldDefinition]) -> set[str]:
@@ -190,6 +204,11 @@ def _table_name(collection: CollectionRecord) -> str:
 def _collection_type(collection: CollectionRecord) -> str:
     """Return a normalized collection type string."""
     return str(getattr(collection, "type", "base") or "base").strip().lower()
+
+
+_AUTH_COLUMNS_HANDLED_SEPARATELY = frozenset(
+    {"email", "email_visibility", "emailVisibility", "verified"}
+)
 
 
 async def _notify_record_change(
@@ -688,15 +707,23 @@ async def create_record(
             else:
                 columns["email"] = email_str
 
-        # Auth system column defaults
-        if "email_visibility" not in data:
-            columns["email_visibility"] = False
+        # Regular auth collections expose these columns; PPBase's dedicated
+        # _superusers table intentionally doesn't store them.
+        if collection.name == "_superusers":
+            data.pop("email_visibility", None)
+            data.pop("emailVisibility", None)
+            data.pop("verified", None)
         else:
-            columns["email_visibility"] = bool(data.pop("email_visibility", False))
-        if "verified" not in data:
-            columns["verified"] = False
-        else:
-            columns["verified"] = bool(data.pop("verified", False))
+            if "email_visibility" not in data:
+                columns["email_visibility"] = False
+            else:
+                columns["email_visibility"] = bool(
+                    data.pop("email_visibility", False)
+                )
+            if "verified" not in data:
+                columns["verified"] = False
+            else:
+                columns["verified"] = bool(data.pop("verified", False))
 
     # Build field map for file handling
     field_map = {f.name: f for f in schema_fields}
@@ -750,6 +777,11 @@ async def create_record(
         for field_def in schema_fields:
             # Skip autodate fields -- we handle created/updated ourselves
             if field_def.type == FieldType.AUTODATE:
+                continue
+            if (
+                col_type == "auth"
+                and field_def.name in _AUTH_COLUMNS_HANDLED_SEPARATELY
+            ):
                 continue
 
             value = data.get(field_def.name)
@@ -924,13 +956,18 @@ async def update_record(
                 else:
                     updates["email"] = email_str
 
-        # Handle camelCase-to-snake_case for auth system columns
-        if "email_visibility" in data:
-            updates["email_visibility"] = bool(data.pop("email_visibility"))
-        elif "emailVisibility" in data:
-            updates["email_visibility"] = bool(data.pop("emailVisibility"))
-        if "verified" in data:
-            updates["verified"] = bool(data.pop("verified"))
+        # Handle camelCase-to-snake_case for regular auth system columns.
+        if collection.name == "_superusers":
+            data.pop("email_visibility", None)
+            data.pop("emailVisibility", None)
+            data.pop("verified", None)
+        else:
+            if "email_visibility" in data:
+                updates["email_visibility"] = bool(data.pop("email_visibility"))
+            elif "emailVisibility" in data:
+                updates["email_visibility"] = bool(data.pop("emailVisibility"))
+            if "verified" in data:
+                updates["verified"] = bool(data.pop("verified"))
 
     field_map = {f.name: f for f in schema_fields}
 

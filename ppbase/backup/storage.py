@@ -1,4 +1,4 @@
-"""Private local storage for immutable, signed native backup sets."""
+"""Private local storage for checksummed native backup workspaces."""
 
 from __future__ import annotations
 
@@ -21,13 +21,6 @@ from ppbase.backup.control import (
     ControlPlaneSafetyError,
     absolute_path_without_symlink_resolution,
     verify_directory_attached_at,
-)
-from ppbase.backup.identity import (
-    ED25519_PUBLIC_KEY_SIZE,
-    ED25519_SIGNATURE_SIZE,
-    BackupIdentity,
-    BackupIdentityError,
-    verify_manifest_signature,
 )
 from ppbase.backup.models import (
     BACKUP_FORMAT_VERSION,
@@ -57,9 +50,7 @@ from ppbase.core.storage_safety import (
 )
 
 
-MANIFEST_FILENAME = "manifest.json"
-SIGNATURE_FILENAME = "manifest.sig"
-SIGNER_PUBLIC_KEY_FILENAME = "signer.pub"
+MANIFEST_FILENAME = "backup.json"
 SEALED_FILENAME = "SEALED"
 RESOURCES_DIRNAME = "resources"
 FILES_DIRNAME = "files"
@@ -1278,11 +1269,10 @@ class PreparedBackupSet:
 
 
 @dataclass(frozen=True, slots=True)
-class AuthenticatedBackupInspection:
-    """Store-issued capability proving approval of the exact signer key."""
+class VerifiedBackupInspection:
+    """Store-issued capability for a checksummed backup workspace."""
 
     inspection: BackupInspection
-    approved_public_key: bytes
     _store_token: object = field(repr=False, compare=False)
 
     @property
@@ -1292,10 +1282,6 @@ class AuthenticatedBackupInspection:
     @property
     def manifest(self) -> BackupManifest:
         return self.inspection.manifest
-
-    @property
-    def signer_public_key(self) -> bytes:
-        return self.inspection.signer_public_key
 
     @property
     def resources_verified(self) -> bool:
@@ -1400,10 +1386,10 @@ class AnchoredStagingDataDir:
 
     def restore_files(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
     ) -> Path:
-        """Restore authenticated business files through the pinned descriptor."""
-        return self._store.restore_files_to(authenticated, self)
+        """Restore checksum-verified business files through the pinned descriptor."""
+        return self._store.restore_files_to(verified, self)
 
     def verify_local_file_references(
         self,
@@ -1475,10 +1461,10 @@ class AnchoredStagingDataDir:
 
     def install_jwt(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
     ) -> Path:
-        """Install the authenticated disaster-recovery JWT secret."""
-        return self._store.restore_jwt_secret_to(authenticated, self)
+        """Install the checksum-verified disaster-recovery JWT secret."""
+        return self._store.restore_jwt_secret_to(verified, self)
 
     def write_secret(
         self,
@@ -1545,7 +1531,7 @@ class AnchoredStagingDataDir:
             self.verify_attached()
 
     def close(self) -> None:
-        """Release the capability; restored directories remain quarantined."""
+        """Release the capability; restored directories remain isolated."""
         if self._closed:
             return
         self._closed = True
@@ -1744,7 +1730,7 @@ class BackupSetBuilder:
         self._jwt_secret_copied = True
 
     def write_jwt_secret(self, secret: str) -> None:
-        """Persist an explicitly configured JWT secret as a signed resource."""
+        """Persist an explicitly configured JWT secret as a backup resource."""
         if self._jwt_secret_copied:
             raise BackupStateError("JWT secret was already copied")
         self._require_building()
@@ -1937,7 +1923,7 @@ class BackupSetBuilder:
                 size += len(payload)
                 if size > resource.size:
                     raise BackupIntegrityError(
-                        "imported resource exceeds its signed size"
+                        "imported resource exceeds its declared size"
                     )
                 digest.update(payload)
                 _write_all(destination_fd, payload)
@@ -1947,7 +1933,7 @@ class BackupSetBuilder:
                 resource.sha256,
             ):
                 raise BackupIntegrityError(
-                    "imported resource differs from the signed manifest"
+                    "imported resource differs from backup.json"
                 )
             os.fsync(destination_fd)
             os.fsync(current_fd)
@@ -2009,42 +1995,16 @@ class BackupSetBuilder:
 
 
 class LocalBackupStore:
-    """Canonical local backup set store; transport is intentionally separate."""
+    """Canonical checksummed workspace store used by native backup operations."""
 
     def __init__(
         self,
         root: str | Path,
-        identity: BackupIdentity | None = None,
-        identity_guard: Callable[[], None] | None = None,
     ) -> None:
         self._closed = False
-        self._owned_control_root: ControlPlaneRoot | None = None
-        self._owns_identity = False
         self.root = _ensure_runtime_directory(Path(root))
         self.sets_dir = self.root / "sets"
         _ensure_private_directory(self.sets_dir)
-        if identity is None:
-            try:
-                control_root = ControlPlaneRoot.open(self.root / "control")
-            except ControlPlaneSafetyError as exc:
-                raise BackupIdentityError(str(exc)) from exc
-            try:
-                identity = BackupIdentity.load_or_create_in_root(control_root)
-            except BaseException:
-                control_root.close()
-                raise
-            self._owned_control_root = control_root
-            self._owns_identity = True
-        self.identity = identity
-        self._identity_guard = (
-            identity_guard
-            if identity_guard is not None
-            else (
-                self.identity.verify_attached
-                if self.identity.control_plane_attached
-                else None
-            )
-        )
         self._capability_token = object()
         _fsync_directory(self.root)
 
@@ -2052,14 +2012,6 @@ class LocalBackupStore:
         if getattr(self, "_closed", True):
             return
         self._closed = True
-        control_root = self._owned_control_root
-        self._owned_control_root = None
-        try:
-            if self._owns_identity:
-                self.identity.close()
-        finally:
-            if control_root is not None:
-                control_root.close()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -2067,8 +2019,6 @@ class LocalBackupStore:
 
     def __enter__(self) -> "LocalBackupStore":
         self._require_open()
-        if self._identity_guard is not None:
-            self._identity_guard()
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -2223,14 +2173,14 @@ class LocalBackupStore:
 
     def restore_files_to(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
         target: AnchoredStagingDataDir,
     ) -> Path:
         """Restore business files into a descriptor-anchored staging target."""
         self._require_open()
         target._require_store(self)
         target.verify_attached()
-        inspection = self._reinspect(authenticated)
+        inspection = self._reinspect(verified)
         source = inspection.path / RESOURCES_DIRNAME / FILES_DIRNAME
 
         try:
@@ -2311,14 +2261,14 @@ class LocalBackupStore:
 
     def restore_jwt_secret_to(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
         target: AnchoredStagingDataDir,
     ) -> Path:
-        """Install a signed DR JWT secret through the pinned data-dir FD."""
+        """Install a checksum-verified JWT secret through the pinned data-dir FD."""
         self._require_open()
         target._require_store(self)
         target.verify_attached()
-        inspection = self._reinspect(authenticated)
+        inspection = self._reinspect(verified)
         matches = [
             resource
             for resource in inspection.manifest.resources
@@ -2382,8 +2332,6 @@ class LocalBackupStore:
             raise BackupStateError(
                 f"unsupported backup format version: {format_version}"
             )
-        if self._identity_guard is not None:
-            self._identity_guard()
         selected_id = validate_backup_id(backup_id or self._generate_backup_id())
         final_path = self.sets_dir / selected_id
         if _path_exists(final_path):
@@ -2414,18 +2362,17 @@ class LocalBackupStore:
         metadata: Mapping[str, JsonValue] | None = None,
         created_at: datetime | None = None,
         seal_gate: BackupSealGate | None = None,
-        identity_guard: Callable[[], None] | None = None,
+        pre_commit_guard: Callable[[], None] | None = None,
     ) -> BackupInspection:
-        """Revalidate, sign, publish and finally seal a prepared set."""
+        """Revalidate, publish and finally seal a prepared workspace."""
         self._require_open()
         prepared_identity = self._validate_prepared_location(prepared)
         final_path: Path | None = None
         final_identity: tuple[int, int] | None = None
         sealed_committed = False
-        effective_identity_guard = identity_guard or self._identity_guard
         try:
-            if effective_identity_guard is not None:
-                effective_identity_guard()
+            if pre_commit_guard is not None:
+                pre_commit_guard()
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
@@ -2438,7 +2385,6 @@ class LocalBackupStore:
             manifest = BackupManifest(
                 backup_id=prepared.backup_id,
                 created_at=format_manifest_timestamp(created_at or datetime.now(UTC)),
-                signer_fingerprint_sha256=self.identity.fingerprint_sha256,
                 resources=current_resources,
                 metadata=metadata or {},
                 format_version=prepared.format_version,
@@ -2448,23 +2394,16 @@ class LocalBackupStore:
                 raise BackupStateError(
                     "generated backup manifest exceeds its size limit"
                 )
-            signature = self.identity.sign_manifest(manifest_bytes)
-            if effective_identity_guard is not None:
-                effective_identity_guard()
+            if pre_commit_guard is not None:
+                pre_commit_guard()
 
             _write_exclusive(prepared.path / MANIFEST_FILENAME, manifest_bytes)
-            _write_exclusive(prepared.path / SIGNATURE_FILENAME, signature)
-            _write_exclusive(
-                prepared.path / SIGNER_PUBLIC_KEY_FILENAME,
-                self.identity.public_key_bytes,
-            )
             _fsync_directory(prepared.path)
 
             final_path, final_identity = self._publish_unsealed(prepared)
             inspection = self._inspect_set_path(
                 prepared.backup_id,
                 final_path,
-                expected_public_key=self.identity.public_key_bytes,
                 verify_resources=True,
                 sealed=False,
             )
@@ -2472,7 +2411,7 @@ class LocalBackupStore:
             def seal() -> None:
                 self._publish_seal(
                     final_path,
-                    pre_commit_guard=effective_identity_guard,
+                    pre_commit_guard=pre_commit_guard,
                 )
 
             if seal_gate is None:
@@ -2505,61 +2444,26 @@ class LocalBackupStore:
         prepared: PreparedBackupSet,
         *,
         manifest_bytes: bytes,
-        signature: bytes,
-        signer_public_key: bytes,
-        expected_public_key: bytes,
         seal_gate: BackupSealGate | None = None,
-        identity_guard: Callable[[], None] | None = None,
+        pre_commit_guard: Callable[[], None] | None = None,
     ) -> BackupInspection:
-        """Publish an exact, already-signed transport envelope without re-signing."""
+        """Publish an imported checksummed backup workspace."""
         self._require_open()
         prepared_identity = self._validate_prepared_location(prepared)
         final_path: Path | None = None
         final_identity: tuple[int, int] | None = None
         sealed_committed = False
-        effective_identity_guard = identity_guard or self._identity_guard
         try:
-            if effective_identity_guard is not None:
-                effective_identity_guard()
+            if pre_commit_guard is not None:
+                pre_commit_guard()
             if not isinstance(manifest_bytes, bytes) or len(manifest_bytes) > _MAX_MANIFEST_BYTES:
                 raise BackupIntegrityError("imported manifest exceeds its size limit")
-            if not isinstance(signature, bytes) or len(signature) != ED25519_SIGNATURE_SIZE:
-                raise BackupIntegrityError("imported Ed25519 signature is invalid")
-            if (
-                not isinstance(signer_public_key, bytes)
-                or len(signer_public_key) != ED25519_PUBLIC_KEY_SIZE
-            ):
-                raise BackupIntegrityError("imported Ed25519 public key is invalid")
-            if (
-                not isinstance(expected_public_key, bytes)
-                or len(expected_public_key) != ED25519_PUBLIC_KEY_SIZE
-                or not secrets.compare_digest(
-                    signer_public_key,
-                    expected_public_key,
-                )
-            ):
-                raise BackupIntegrityError(
-                    "backup signer does not match the expected key"
-                )
 
             manifest = BackupManifest.from_bytes(manifest_bytes)
             if manifest.backup_id != prepared.backup_id:
                 raise BackupIntegrityError(
                     "imported manifest backup_id does not match its destination"
                 )
-            fingerprint = verify_manifest_signature(
-                manifest_bytes,
-                signature,
-                signer_public_key,
-            )
-            if not secrets.compare_digest(
-                fingerprint,
-                manifest.signer_fingerprint_sha256,
-            ):
-                raise BackupIntegrityError(
-                    "imported manifest signer fingerprint is inconsistent"
-                )
-
             current_resources = _scan_resource_tree(
                 prepared.path / RESOURCES_DIRNAME,
                 repair_permissions=False,
@@ -2569,24 +2473,18 @@ class LocalBackupStore:
                 or current_resources != manifest.resources
             ):
                 raise BackupIntegrityError(
-                    "imported resources differ from the signed manifest"
+                    "imported resources differ from backup.json"
                 )
 
-            if effective_identity_guard is not None:
-                effective_identity_guard()
+            if pre_commit_guard is not None:
+                pre_commit_guard()
             _write_exclusive(prepared.path / MANIFEST_FILENAME, manifest_bytes)
-            _write_exclusive(prepared.path / SIGNATURE_FILENAME, signature)
-            _write_exclusive(
-                prepared.path / SIGNER_PUBLIC_KEY_FILENAME,
-                signer_public_key,
-            )
             _fsync_directory(prepared.path)
 
             final_path, final_identity = self._publish_unsealed(prepared)
             inspection = self._inspect_set_path(
                 prepared.backup_id,
                 final_path,
-                expected_public_key=expected_public_key,
                 verify_resources=True,
                 sealed=False,
             )
@@ -2594,7 +2492,7 @@ class LocalBackupStore:
             def seal() -> None:
                 self._publish_seal(
                     final_path,
-                    pre_commit_guard=effective_identity_guard,
+                    pre_commit_guard=pre_commit_guard,
                 )
 
             if seal_gate is None:
@@ -2633,8 +2531,6 @@ class LocalBackupStore:
         self._require_open()
         selected_id = validate_backup_id(backup_id)
         self._reconcile_deleting_sets()
-        if self._identity_guard is not None:
-            self._identity_guard()
         storage_root: ControlPlaneRoot | None = None
         sets_fd: int | None = None
         selected_fd: int | None = None
@@ -2887,8 +2783,6 @@ class LocalBackupStore:
 
             def detach() -> None:
                 nonlocal committed, placeholder_created
-                if self._identity_guard is not None:
-                    self._identity_guard()
                 if pre_commit_guard is not None:
                     pre_commit_guard()
                 verify_sets_attached()
@@ -3136,11 +3030,9 @@ class LocalBackupStore:
                 storage_root.close()
 
     def list_sets(self) -> list[BackupSetSummary]:
-        """List structurally authenticated sealed sets, never partial sets."""
+        """List structurally valid sealed workspaces, never partial sets."""
         self._require_open()
         self._reconcile_deleting_sets()
-        if self._identity_guard is not None:
-            self._identity_guard()
         summaries: list[BackupSetSummary] = []
         try:
             with os.scandir(self.sets_dir) as iterator:
@@ -3163,7 +3055,6 @@ class LocalBackupStore:
             try:
                 inspection = self.inspect_set(
                     backup_id,
-                    expected_public_key=None,
                     verify_resources=False,
                 )
             except (BackupError, OSError):
@@ -3171,8 +3062,6 @@ class LocalBackupStore:
                     BackupSetSummary(
                         backup_id=backup_id,
                         created_at=None,
-                        signer_fingerprint_sha256=None,
-                        signer_public_key=None,
                         resource_count=None,
                         total_size=None,
                         app_name=None,
@@ -3187,8 +3076,6 @@ class LocalBackupStore:
                 BackupSetSummary(
                     backup_id=manifest.backup_id,
                     created_at=manifest.created_at,
-                    signer_fingerprint_sha256=manifest.signer_fingerprint_sha256,
-                    signer_public_key=inspection.signer_public_key,
                     resource_count=len(manifest.resources),
                     total_size=manifest.total_size,
                     app_name=(
@@ -3200,18 +3087,15 @@ class LocalBackupStore:
                     error_code=None,
                 )
             )
-        if self._identity_guard is not None:
-            self._identity_guard()
         return summaries
 
     def inspect_set(
         self,
         backup_id: str,
         *,
-        expected_public_key: bytes | None = None,
         verify_resources: bool = True,
     ) -> BackupInspection:
-        """Verify canonical manifest, detached signature and resource checksums."""
+        """Verify backup.json and, optionally, all resource checksums."""
         self._require_open()
         selected_id = validate_backup_id(backup_id)
         set_path = self.sets_dir / selected_id
@@ -3220,7 +3104,6 @@ class LocalBackupStore:
         return self._inspect_set_path(
             selected_id,
             set_path,
-            expected_public_key=expected_public_key,
             verify_resources=verify_resources,
             sealed=True,
         )
@@ -3230,7 +3113,6 @@ class LocalBackupStore:
         selected_id: str,
         set_path: Path,
         *,
-        expected_public_key: bytes | None,
         verify_resources: bool,
         sealed: bool,
     ) -> BackupInspection:
@@ -3241,29 +3123,9 @@ class LocalBackupStore:
             set_path / MANIFEST_FILENAME,
             maximum_size=_MAX_MANIFEST_BYTES,
         )
-        signature = _read_regular_file(
-            set_path / SIGNATURE_FILENAME,
-            maximum_size=ED25519_SIGNATURE_SIZE,
-        )
-        public_key = _read_regular_file(
-            set_path / SIGNER_PUBLIC_KEY_FILENAME,
-            maximum_size=ED25519_PUBLIC_KEY_SIZE,
-        )
         manifest = BackupManifest.from_bytes(manifest_bytes)
         if manifest.backup_id != selected_id:
             raise BackupIntegrityError("manifest backup_id does not match its directory")
-        if expected_public_key is not None and not secrets.compare_digest(
-            public_key,
-            expected_public_key,
-        ):
-            raise BackupIntegrityError("backup signer does not match the expected key")
-        fingerprint = verify_manifest_signature(
-            manifest_bytes,
-            signature,
-            public_key,
-        )
-        if fingerprint != manifest.signer_fingerprint_sha256:
-            raise BackupIntegrityError("manifest signer fingerprint is inconsistent")
 
         if verify_resources:
             actual_resources = _scan_resource_tree(
@@ -3275,39 +3137,24 @@ class LocalBackupStore:
         return BackupInspection(
             path=set_path,
             manifest=manifest,
-            signer_public_key=public_key,
             resources_verified=verify_resources,
         )
 
-    def authenticate_set(
-        self,
-        backup_id: str,
-        *,
-        approved_public_key: bytes,
-    ) -> AuthenticatedBackupInspection:
-        """Issue a restore capability after explicit signer-key approval."""
+    def verify_set(self, backup_id: str) -> VerifiedBackupInspection:
+        """Issue a restore capability after complete checksum verification."""
         self._require_open()
-        if (
-            not isinstance(approved_public_key, bytes)
-            or len(approved_public_key) != ED25519_PUBLIC_KEY_SIZE
-        ):
-            raise BackupIntegrityError(
-                "approved Ed25519 public key must contain exactly 32 bytes"
-            )
         inspection = self.inspect_set(
             backup_id,
-            expected_public_key=approved_public_key,
             verify_resources=True,
         )
-        return AuthenticatedBackupInspection(
+        return VerifiedBackupInspection(
             inspection=inspection,
-            approved_public_key=approved_public_key,
             _store_token=self._capability_token,
         )
 
     def pin_database_resource(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
         *,
         resource_path: str,
         directory: str | Path | AnchoredStagingDataDir,
@@ -3324,20 +3171,20 @@ class LocalBackupStore:
                 "only native database resources may be pinned by path"
             )
         return self._pin_manifest_resource(
-            authenticated,
+            verified,
             resource_path=resource_path,
             directory=directory,
         )
 
     def _pin_manifest_resource(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
         *,
         resource_path: str,
         directory: str | Path | AnchoredStagingDataDir,
     ) -> PinnedBackupArchive:
         self._require_open()
-        inspection = self._reinspect(authenticated)
+        inspection = self._reinspect(verified)
         matches = [
             resource
             for resource in inspection.manifest.resources
@@ -3423,7 +3270,7 @@ class LocalBackupStore:
             actual_sha256 = digest.hexdigest()
             if size != expected.size or actual_sha256 != expected.sha256:
                 raise BackupIntegrityError(
-                    "pinned restore resource differs from the signed manifest"
+                    "pinned restore resource differs from backup.json"
                 )
             handle.seek(0)
             if anchored_target is not None:
@@ -3452,12 +3299,12 @@ class LocalBackupStore:
 
     def restore_files(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
         target_data_dir: str | Path,
     ) -> Path:
-        """Restore files only from a store-issued authenticated capability."""
+        """Restore files only from a store-issued verified capability."""
         self._require_open()
-        inspection = self._reinspect(authenticated)
+        inspection = self._reinspect(verified)
         source = inspection.path / RESOURCES_DIRNAME / FILES_DIRNAME
         target = Path(target_data_dir)
         if _path_exists(target):
@@ -3499,12 +3346,12 @@ class LocalBackupStore:
 
     def restore_jwt_secret(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
         target_data_dir: str | Path,
     ) -> Path:
         """Install the preserved JWT secret for disaster-recovery mode only."""
         self._require_open()
-        inspection = self._reinspect(authenticated)
+        inspection = self._reinspect(verified)
         matches = [
             resource
             for resource in inspection.manifest.resources
@@ -3708,21 +3555,20 @@ class LocalBackupStore:
 
     def _reinspect(
         self,
-        authenticated: AuthenticatedBackupInspection,
+        verified: VerifiedBackupInspection,
     ) -> BackupInspection:
-        if not isinstance(authenticated, AuthenticatedBackupInspection):
+        if not isinstance(verified, VerifiedBackupInspection):
             raise BackupStateError(
-                "restore requires an authenticated backup capability"
+                "restore requires a verified backup capability"
             )
-        if authenticated._store_token is not self._capability_token:
+        if verified._store_token is not self._capability_token:
             raise BackupStateError("backup capability belongs to another store")
-        inspection = authenticated.inspection
+        inspection = verified.inspection
         expected_path = self.sets_dir / inspection.manifest.backup_id
         if inspection.path != expected_path:
             raise BackupStateError("backup inspection belongs to another store")
         return self.inspect_set(
             inspection.manifest.backup_id,
-            expected_public_key=authenticated.approved_public_key,
             verify_resources=True,
         )
 
@@ -3732,8 +3578,6 @@ class LocalBackupStore:
     ) -> tuple[Path, tuple[int, int]]:
         expected_children = {
             MANIFEST_FILENAME,
-            SIGNATURE_FILENAME,
-            SIGNER_PUBLIC_KEY_FILENAME,
             RESOURCES_DIRNAME,
         }
         with os.scandir(prepared.path) as iterator:
@@ -3831,8 +3675,6 @@ class LocalBackupStore:
     def _validate_set_layout(set_path: Path, *, sealed: bool) -> None:
         expected_children = {
             MANIFEST_FILENAME,
-            SIGNATURE_FILENAME,
-            SIGNER_PUBLIC_KEY_FILENAME,
             RESOURCES_DIRNAME,
         }
         if sealed:

@@ -1,44 +1,33 @@
-"""Cross-worker operation leases for the native backup subsystem.
+"""Cross-process leases anchored to the existing PPBase data directories.
 
-The coordinator uses a fixed pool of empty lock files below the
-descriptor-anchored backup control plane. ``flock`` provides process-crash
-cleanup while retained directory descriptors and attachment checks prevent a
-stale coordinator from continuing in a renamed or substituted lock namespace.
-The fixed slots bound inode use even when arbitrary nonexistent backup IDs are
-requested; hash collisions only serialize otherwise independent operations.
+No lock namespace is created on disk. Global mutations lock the already-open
+``data_dir`` directory, while backup use locks the existing
+``data_dir/backups`` directory. ``flock`` releases automatically when a process
+exits or crashes.
 """
 
 from __future__ import annotations
 
 import errno
 import fcntl
-import hashlib
 import os
 import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator, Literal
 
+from ppbase.backup.archive_store import validate_backup_key
 from ppbase.backup.control import (
-    ControlPlaneRoot,
     ControlPlaneSafetyError,
-    open_flags,
+    RuntimeDataRoot,
+    directory_open_flags,
     same_file_identity,
-    verify_directory_attached_at,
 )
-from ppbase.backup.models import BackupManifestError, validate_backup_id
 
-
-_OPERATIONS_DIRECTORY = "operations"
-_GLOBAL_LOCK_FILENAME = "global.lock"
-_NAMESPACE_INITIALIZATION_LOCK_FILENAME = "namespace-init.lock"
-_NAMESPACE_READY_FILENAME = "namespace-v1.ready"
-_BACKUP_LOCK_DOMAIN = b"PPBASE-NATIVE-BACKUP-OPERATION-LEASE-V1\0"
-_MATERIALIZATION_LOCK_DOMAIN = b"PPBASE-NATIVE-BACKUP-MATERIALIZATION-LEASE-V1\0"
-_LOCK_SLOT_COUNT = 128
 
 LeaseMode = Literal["shared", "exclusive"]
 LeaseScope = Literal["global", "backup", "materialization"]
+_LockTarget = Literal["data", "backups"]
 
 
 class BackupOperationError(RuntimeError):
@@ -50,7 +39,7 @@ class BackupOperationError(RuntimeError):
 
 
 class BackupOperationSafetyError(BackupOperationError):
-    """The operation-lock namespace or one of its files is unsafe."""
+    """The runtime directory lock target is detached or unsafe."""
 
     def __init__(self, message: str) -> None:
         super().__init__("backup_operation_control_invalid", message)
@@ -67,27 +56,27 @@ class BackupOperationBusyError(BackupOperationError):
 
 
 class BackupInUseError(BackupOperationError):
-    """The requested backup cannot acquire its shared or exclusive lease."""
+    """The backup archive directory is already in incompatible use."""
 
     def __init__(self) -> None:
         super().__init__(
             "backup_in_use",
-            "The selected backup is currently in use.",
+            "A local backup is currently in use.",
         )
 
 
 class BackupMaterializationBusyError(BackupOperationError):
-    """The same backup is already being materialized for download."""
+    """A backup download is already being prepared."""
 
     def __init__(self) -> None:
         super().__init__(
             "backup_download_in_progress",
-            "The selected backup is already being prepared for download.",
+            "A local backup is already being prepared for download.",
         )
 
 
 class BackupOperationTargetError(BackupOperationError):
-    """A per-backup lease was requested for an invalid backup identifier."""
+    """A scoped lease was requested for an invalid backup key."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -96,413 +85,54 @@ class BackupOperationTargetError(BackupOperationError):
         )
 
 
-def _validate_lock_file_structure(info: os.stat_result) -> None:
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or info.st_nlink != 1
-        or info.st_size != 0
-    ):
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file is unsafe."
-        )
-
-
-def _validate_private_lock_file(info: os.stat_result) -> None:
-    _validate_lock_file_structure(info)
-    if stat.S_IMODE(info.st_mode) != 0o600:
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file is unsafe."
-        )
-
-
-def _normalize_restrictive_lock_file_mode_at(
-    operations_fd: int,
-    lock_name: str,
-    expected: os.stat_result,
-) -> os.stat_result:
-    """Repair only crash-created owner permissions without following links."""
-    _validate_lock_file_structure(expected)
-    mode = stat.S_IMODE(expected.st_mode)
-    if mode == 0o600:
-        return expected
-    if mode & ~0o600:
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file is unsafe."
-        )
-
+def _validate_backup_reference(value: str) -> str:
     try:
-        os.chmod(
-            lock_name,
-            0o600,
-            dir_fd=operations_fd,
-            follow_symlinks=False,
-        )
-        visible_after = os.stat(
-            lock_name,
-            dir_fd=operations_fd,
-            follow_symlinks=False,
-        )
-    except OSError as exc:
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file cannot be normalized safely."
-        ) from exc
-    _validate_private_lock_file(visible_after)
-    if not same_file_identity(expected, visible_after):
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file changed during normalization."
-        )
-    return visible_after
+        return validate_backup_key(value)
+    except ValueError as exc:
+        raise BackupOperationTargetError() from exc
 
 
-def _verify_operations_attachment(
-    control_root: ControlPlaneRoot,
-    operations_fd: int,
-) -> None:
+def _open_independent_directory(descriptor: int) -> int:
+    """Open the pinned directory again with an independent flock domain."""
+    opened: int | None = None
     try:
-        control_root.verify_attached()
-        verify_directory_attached_at(
-            control_root.fileno(),
-            _OPERATIONS_DIRECTORY,
-            operations_fd,
-            label="The backup operations directory",
-        )
-        control_root.verify_attached()
-    except ControlPlaneSafetyError as exc:
-        raise BackupOperationSafetyError(
-            "The native backup operations directory was detached or substituted."
-        ) from exc
-    except OSError as exc:
-        raise BackupOperationSafetyError(
-            "The native backup operations directory cannot be verified safely."
-        ) from exc
-
-
-def _verify_lock_attachment(
-    control_root: ControlPlaneRoot,
-    operations_fd: int,
-    lock_name: str,
-    lock_fd: int,
-) -> None:
-    _verify_operations_attachment(control_root, operations_fd)
-    try:
-        visible = os.stat(
-            lock_name,
-            dir_fd=operations_fd,
-            follow_symlinks=False,
-        )
-        opened = os.fstat(lock_fd)
-        _validate_private_lock_file(visible)
-        _validate_private_lock_file(opened)
-        if not same_file_identity(visible, opened):
+        expected = os.fstat(descriptor)
+        opened = os.open(".", directory_open_flags(), dir_fd=descriptor)
+        actual = os.fstat(opened)
+        if (
+            not stat.S_ISDIR(expected.st_mode)
+            or not stat.S_ISDIR(actual.st_mode)
+            or not same_file_identity(expected, actual)
+        ):
             raise BackupOperationSafetyError(
-                "A native backup operation lock file was substituted."
+                "The native backup lock target changed while it was opened."
             )
-
-        # Re-read the named entry after validating the open inode.  This catches
-        # rename/substitution races at both acquisition and release boundaries.
-        visible_after = os.stat(
-            lock_name,
-            dir_fd=operations_fd,
-            follow_symlinks=False,
-        )
-        _validate_private_lock_file(visible_after)
-        if not same_file_identity(visible_after, opened):
-            raise BackupOperationSafetyError(
-                "A native backup operation lock file was substituted."
-            )
-    except BackupOperationSafetyError:
-        raise
-    except OSError as exc:
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file cannot be verified safely."
-        ) from exc
-    _verify_operations_attachment(control_root, operations_fd)
-
-
-def _open_lock_file_at(
-    operations_fd: int,
-    lock_name: str,
-    *,
-    create_missing: bool,
-) -> int:
-    descriptor: int | None = None
-    try:
-        if create_missing:
-            try:
-                descriptor = os.open(
-                    lock_name,
-                    open_flags(os.O_RDWR | os.O_CREAT | os.O_EXCL),
-                    0o600,
-                    dir_fd=operations_fd,
-                )
-            except FileExistsError:
-                descriptor = None
-            else:
-                os.fchmod(descriptor, 0o600)
-
-        if descriptor is None:
-            expected = os.stat(
-                lock_name,
-                dir_fd=operations_fd,
-                follow_symlinks=False,
-            )
-            if create_missing:
-                expected = _normalize_restrictive_lock_file_mode_at(
-                    operations_fd,
-                    lock_name,
-                    expected,
-                )
-            else:
-                _validate_private_lock_file(expected)
-            descriptor = os.open(
-                lock_name,
-                open_flags(os.O_RDWR),
-                dir_fd=operations_fd,
-            )
-            opened = os.fstat(descriptor)
-            _validate_private_lock_file(opened)
-            if not same_file_identity(expected, opened):
-                raise BackupOperationSafetyError(
-                    "A native backup operation lock file changed while opening."
-                )
-
-        opened = os.fstat(descriptor)
-        visible = os.stat(
-            lock_name,
-            dir_fd=operations_fd,
-            follow_symlinks=False,
-        )
-        _validate_private_lock_file(opened)
-        _validate_private_lock_file(visible)
-        if not same_file_identity(opened, visible):
-            raise BackupOperationSafetyError(
-                "A native backup operation lock file changed while opening."
-            )
-        if create_missing:
-            # The namespace directory is fsynced only after every expected
-            # file is present.  Flush reused inodes too so a crash-recovered
-            # chmod or earlier file creation is durable before that boundary.
-            os.fsync(descriptor)
-        result = descriptor
-        descriptor = None
+        result = opened
+        opened = None
         return result
     except BackupOperationSafetyError:
         raise
     except OSError as exc:
         raise BackupOperationSafetyError(
-            "A native backup operation lock file cannot be opened safely."
+            "The native backup lock target cannot be opened safely."
         ) from exc
     finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        # The bounded slot files are intentionally persistent. Persistence
-        # gives every worker a stable inode and avoids split lock domains caused
-        # by unlinking a file that another process still holds.
-
-
-def _lock_slot_filename(
-    backup_id: str,
-    *,
-    domain: bytes,
-    prefix: str,
-) -> str:
-    try:
-        selected_id = validate_backup_id(backup_id)
-    except BackupManifestError as exc:
-        raise BackupOperationTargetError() from exc
-    digest = hashlib.sha256(domain + selected_id.encode("ascii")).digest()
-    slot = int.from_bytes(digest[:8], "big") % _LOCK_SLOT_COUNT
-    return f"{prefix}-slot-{slot:03d}.lock"
-
-
-def _backup_lock_filename(backup_id: str) -> str:
-    return _lock_slot_filename(
-        backup_id,
-        domain=_BACKUP_LOCK_DOMAIN,
-        prefix="backup",
-    )
-
-
-def _materialization_lock_filename(backup_id: str) -> str:
-    return _lock_slot_filename(
-        backup_id,
-        domain=_MATERIALIZATION_LOCK_DOMAIN,
-        prefix="materialize",
-    )
-
-
-def _lock_namespace_filenames() -> Iterator[str]:
-    yield _GLOBAL_LOCK_FILENAME
-    for prefix in ("backup", "materialize"):
-        for slot in range(_LOCK_SLOT_COUNT):
-            yield f"{prefix}-slot-{slot:03d}.lock"
-
-
-def _open_optional_lock_file_at(
-    operations_fd: int,
-    lock_name: str,
-) -> int | None:
-    try:
-        visible = os.stat(
-            lock_name,
-            dir_fd=operations_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise BackupOperationSafetyError(
-            "A native backup operation lock file cannot be inspected safely."
-        ) from exc
-    _validate_lock_file_structure(visible)
-    mode = stat.S_IMODE(visible.st_mode)
-    if mode != 0o600:
-        if mode & ~0o600:
-            raise BackupOperationSafetyError(
-                "A native backup operation lock file is unsafe."
-            )
-        # A crash may leave the final marker at a stricter owner-only mode.
-        # Treat it as unpublished so the flock-protected slow path repairs it
-        # only after validating and flushing the complete namespace again.
-        return None
-    return _open_lock_file_at(
-        operations_fd,
-        lock_name,
-        create_missing=False,
-    )
-
-
-def _namespace_is_ready(
-    control_root: ControlPlaneRoot,
-    operations_fd: int,
-) -> bool:
-    ready_fd = _open_optional_lock_file_at(
-        operations_fd,
-        _NAMESPACE_READY_FILENAME,
-    )
-    if ready_fd is None:
-        return False
-    try:
-        _verify_lock_attachment(
-            control_root,
-            operations_fd,
-            _NAMESPACE_READY_FILENAME,
-            ready_fd,
-        )
-        return True
-    finally:
-        try:
-            os.close(ready_fd)
-        except OSError:
-            pass
-
-
-def _initialize_lock_namespace(
-    control_root: ControlPlaneRoot,
-    operations_fd: int,
-) -> None:
-    """Publish the bounded namespace once, then use a constant-time fast path."""
-    _verify_operations_attachment(control_root, operations_fd)
-    if _namespace_is_ready(control_root, operations_fd):
-        return
-
-    initialization_fd: int | None = None
-    locked = False
-    try:
-        initialization_fd = _open_lock_file_at(
-            operations_fd,
-            _NAMESPACE_INITIALIZATION_LOCK_FILENAME,
-            create_missing=True,
-        )
-        _verify_lock_attachment(
-            control_root,
-            operations_fd,
-            _NAMESPACE_INITIALIZATION_LOCK_FILENAME,
-            initialization_fd,
-        )
-        fcntl.flock(initialization_fd, fcntl.LOCK_EX)
-        locked = True
-        _verify_lock_attachment(
-            control_root,
-            operations_fd,
-            _NAMESPACE_INITIALIZATION_LOCK_FILENAME,
-            initialization_fd,
-        )
-        if _namespace_is_ready(control_root, operations_fd):
-            return
-
-        # Initialization is deliberately restartable while holding the stable
-        # namespace lock.  A process may have crashed after publishing any
-        # subset of these files; safe existing inodes are validated and reused
-        # by ``_open_lock_file_at`` while only missing files are created.
-        for lock_name in _lock_namespace_filenames():
-            lock_fd = _open_lock_file_at(
-                operations_fd,
-                lock_name,
-                create_missing=True,
-            )
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-
-        # Make the complete slot namespace durable before publishing the ready
-        # marker.  Its presence is the constant-time fast-path contract used by
-        # later coordinators, so it must always be the final namespace entry.
-        os.fsync(operations_fd)
-        ready_fd = _open_lock_file_at(
-            operations_fd,
-            _NAMESPACE_READY_FILENAME,
-            create_missing=True,
-        )
-        try:
-            _verify_lock_attachment(
-                control_root,
-                operations_fd,
-                _NAMESPACE_READY_FILENAME,
-                ready_fd,
-            )
-        finally:
-            try:
-                os.close(ready_fd)
-            except OSError:
-                pass
-        os.fsync(operations_fd)
-    except BackupOperationSafetyError:
-        raise
-    except OSError as exc:
-        raise BackupOperationSafetyError(
-            "The native backup operation lock namespace cannot be initialized "
-            "safely."
-        ) from exc
-    finally:
-        if initialization_fd is not None:
-            if locked:
-                try:
-                    fcntl.flock(initialization_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            try:
-                os.close(initialization_fd)
-            except OSError:
-                pass
-    _verify_operations_attachment(control_root, operations_fd)
+        if opened is not None:
+            os.close(opened)
 
 
 @dataclass(slots=True)
 class BackupOperationLease:
-    """One held nonblocking filesystem lease; callers must close it."""
+    """One held nonblocking directory lease; callers must close it."""
 
     scope: LeaseScope
     mode: LeaseMode
     backup_id: str | None
-    _control_root: ControlPlaneRoot = field(repr=False, compare=False)
-    _operations_fd: int = field(repr=False, compare=False)
-    _lock_name: str = field(repr=False, compare=False)
+    _coordinator: "BackupOperationCoordinator" = field(
+        repr=False,
+        compare=False,
+    )
+    _target: _LockTarget = field(repr=False, compare=False)
     _lock_fd: int = field(repr=False, compare=False)
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
 
@@ -522,32 +152,21 @@ class BackupOperationLease:
             raise BackupOperationSafetyError(
                 "The native backup operation lease is closed."
             )
-        _verify_lock_attachment(
-            self._control_root,
-            self._operations_fd,
-            self._lock_name,
-            self._lock_fd,
-        )
+        self._coordinator.verify_lease(self._target, self._lock_fd)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        lock_fd = self._lock_fd
-        operations_fd = self._operations_fd
+        descriptor = self._lock_fd
         self._lock_fd = -1
-        self._operations_fd = -1
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError:
             pass
         finally:
             try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            try:
-                os.close(operations_fd)
+                os.close(descriptor)
             except OSError:
                 pass
 
@@ -560,82 +179,95 @@ class BackupOperationLease:
 
 
 class BackupOperationCoordinator:
-    """Coordinate native-backup mutations and per-set use across workers."""
+    """Coordinate native-backup operations without creating lock files."""
 
-    def __init__(self, control_root: ControlPlaneRoot) -> None:
-        if not isinstance(control_root, ControlPlaneRoot):
+    def __init__(
+        self,
+        data_root: RuntimeDataRoot,
+        *,
+        create_missing: bool = True,
+    ) -> None:
+        if not isinstance(data_root, RuntimeDataRoot):
             raise BackupOperationSafetyError(
-                "A descriptor-anchored backup control root is required."
+                "A descriptor-anchored PPBase data directory is required."
             )
-        self._control_root = control_root
-        self._operations_fd = -1
+        self._data_root = data_root
+        self._backups_fd = -1
         self._closed = False
         try:
-            operations_fd = control_root.open_private_directory(
-                _OPERATIONS_DIRECTORY,
-                label="The backup operations directory",
-                create_missing=True,
+            self._backups_fd = data_root.open_child_directory(
+                "backups",
+                create_missing=create_missing,
             )
-            self._operations_fd = operations_fd
-            _verify_operations_attachment(control_root, operations_fd)
-            _initialize_lock_namespace(control_root, operations_fd)
+            self.verify_attached()
         except ControlPlaneSafetyError as exc:
             self.close()
             raise BackupOperationSafetyError(
-                "The native backup operations directory is missing or unsafe."
+                "The PPBase backup directory is missing or unsafe."
             ) from exc
         except BaseException:
             self.close()
             raise
 
     def _require_open(self) -> None:
-        if self._closed or self._operations_fd < 0:
+        if self._closed or self._backups_fd < 0:
             raise BackupOperationSafetyError(
                 "The native backup operation coordinator is closed."
             )
 
     def fileno(self) -> int:
         self._require_open()
-        return self._operations_fd
+        return self._backups_fd
 
     def verify_attached(self) -> None:
         self._require_open()
-        _verify_operations_attachment(
-            self._control_root,
-            self._operations_fd,
+        try:
+            self._data_root.verify_attached()
+            self._data_root.verify_child_directory("backups", self._backups_fd)
+        except ControlPlaneSafetyError as exc:
+            raise BackupOperationSafetyError(
+                "The PPBase backup directories were detached or substituted."
+            ) from exc
+
+    def _target_fd(self, target: _LockTarget) -> int:
+        self.verify_attached()
+        return (
+            self._data_root.fileno()
+            if target == "data"
+            else self._backups_fd
         )
+
+    def verify_lease(self, target: _LockTarget, lock_fd: int) -> None:
+        expected_fd = self._target_fd(target)
+        try:
+            expected = os.fstat(expected_fd)
+            opened = os.fstat(lock_fd)
+        except OSError as exc:
+            raise BackupOperationSafetyError(
+                "The native backup operation lease was detached."
+            ) from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not same_file_identity(expected, opened)
+        ):
+            raise BackupOperationSafetyError(
+                "The native backup operation lease was substituted."
+            )
+        self.verify_attached()
 
     def _acquire(
         self,
         *,
         scope: LeaseScope,
         mode: LeaseMode,
-        lock_name: str,
+        target: _LockTarget,
         backup_id: str | None,
     ) -> BackupOperationLease:
-        self.verify_attached()
-        operations_fd: int | None = None
+        target_fd = self._target_fd(target)
         lock_fd: int | None = None
         locked = False
         try:
-            try:
-                operations_fd = os.dup(self._operations_fd)
-            except OSError as exc:
-                raise BackupOperationSafetyError(
-                    "The native backup operations descriptor cannot be duplicated."
-                ) from exc
-            _verify_operations_attachment(self._control_root, operations_fd)
-            lock_fd = _open_lock_file_at(
-                operations_fd,
-                lock_name,
-                create_missing=False,
-            )
-            _verify_lock_attachment(
-                self._control_root,
-                operations_fd,
-                lock_name,
-                lock_fd,
-            )
+            lock_fd = _open_independent_directory(target_fd)
             flock_mode = (
                 fcntl.LOCK_SH if mode == "shared" else fcntl.LOCK_EX
             ) | fcntl.LOCK_NB
@@ -652,22 +284,15 @@ class BackupOperationCoordinator:
                     "The native backup operation lease cannot be acquired safely."
                 ) from exc
             locked = True
-            _verify_lock_attachment(
-                self._control_root,
-                operations_fd,
-                lock_name,
-                lock_fd,
-            )
+            self.verify_lease(target, lock_fd)
             lease = BackupOperationLease(
                 scope=scope,
                 mode=mode,
                 backup_id=backup_id,
-                _control_root=self._control_root,
-                _operations_fd=operations_fd,
-                _lock_name=lock_name,
+                _coordinator=self,
+                _target=target,
                 _lock_fd=lock_fd,
             )
-            operations_fd = None
             lock_fd = None
             return lease
         finally:
@@ -677,23 +302,15 @@ class BackupOperationCoordinator:
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)
                     except OSError:
                         pass
-                try:
-                    os.close(lock_fd)
-                except OSError:
-                    pass
-            if operations_fd is not None:
-                try:
-                    os.close(operations_fd)
-                except OSError:
-                    pass
+                os.close(lock_fd)
 
     @contextmanager
     def global_exclusive(self) -> Iterator[BackupOperationLease]:
-        """Acquire the single nonblocking native-backup mutation lease."""
+        """Acquire the single nonblocking mutation lease on ``data_dir``."""
         lease = self._acquire(
             scope="global",
             mode="exclusive",
-            lock_name=_GLOBAL_LOCK_FILENAME,
+            target="data",
             backup_id=None,
         )
         try:
@@ -703,13 +320,13 @@ class BackupOperationCoordinator:
 
     @contextmanager
     def backup_shared(self, backup_id: str) -> Iterator[BackupOperationLease]:
-        """Acquire nonblocking shared use of one canonical backup set."""
-        lock_name = _backup_lock_filename(backup_id)
+        """Acquire shared use of the local backup archive directory."""
+        selected = _validate_backup_reference(backup_id)
         lease = self._acquire(
             scope="backup",
             mode="shared",
-            lock_name=lock_name,
-            backup_id=backup_id,
+            target="backups",
+            backup_id=selected,
         )
         try:
             yield lease
@@ -718,13 +335,13 @@ class BackupOperationCoordinator:
 
     @contextmanager
     def backup_exclusive(self, backup_id: str) -> Iterator[BackupOperationLease]:
-        """Acquire nonblocking exclusive mutation of one canonical backup set."""
-        lock_name = _backup_lock_filename(backup_id)
+        """Acquire exclusive mutation of the local backup archive directory."""
+        selected = _validate_backup_reference(backup_id)
         lease = self._acquire(
             scope="backup",
             mode="exclusive",
-            lock_name=lock_name,
-            backup_id=backup_id,
+            target="backups",
+            backup_id=selected,
         )
         try:
             yield lease
@@ -736,13 +353,13 @@ class BackupOperationCoordinator:
         self,
         backup_id: str,
     ) -> Iterator[BackupOperationLease]:
-        """Single-flight creation of a temporary ZIP for one backup."""
-        lock_name = _materialization_lock_filename(backup_id)
+        """Acquire single-flight preparation of a local backup download."""
+        selected = _validate_backup_reference(backup_id)
         lease = self._acquire(
             scope="materialization",
             mode="exclusive",
-            lock_name=lock_name,
-            backup_id=backup_id,
+            target="backups",
+            backup_id=selected,
         )
         try:
             yield lease
@@ -753,8 +370,8 @@ class BackupOperationCoordinator:
         if getattr(self, "_closed", True):
             return
         self._closed = True
-        descriptor = self._operations_fd
-        self._operations_fd = -1
+        descriptor = self._backups_fd
+        self._backups_fd = -1
         if descriptor >= 0:
             try:
                 os.close(descriptor)
@@ -770,3 +387,23 @@ class BackupOperationCoordinator:
 
     def __del__(self) -> None:
         self.close()
+
+
+def backup_operation_available(data_dir: str | os.PathLike[str]) -> bool:
+    """Return whether a global backup mutation lease is available now.
+
+    This is a read-only status probe, not a reservation.  It opens the runtime
+    roots without creating missing entries, briefly attempts the same
+    inter-process lock used by create/upload/restore, and releases it
+    immediately.
+    """
+    try:
+        with RuntimeDataRoot.open(data_dir, create_missing=False) as data_root:
+            with BackupOperationCoordinator(
+                data_root,
+                create_missing=False,
+            ) as coordinator:
+                with coordinator.global_exclusive():
+                    return True
+    except (BackupOperationError, ControlPlaneSafetyError, OSError):
+        return False

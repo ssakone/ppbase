@@ -220,10 +220,10 @@ class TestDefaultUsersE2E:
         assert view.status_code == 200
         assert view.json()["verified"] is True
 
-    async def test_superusers_blocked_from_records_api(
+    async def test_superusers_records_create_requires_superuser(
         self, app_client: AsyncClient
     ):
-        """The _superusers collection should not be accessible via records create API."""
+        """Anonymous callers cannot create a superuser record."""
         resp = await app_client.post(
             "/api/collections/_superusers/records",
             json={
@@ -232,7 +232,43 @@ class TestDefaultUsersE2E:
                 "passwordConfirm": "securepass123",
             },
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 403
+
+    async def test_superusers_records_crud_matches_pocketbase(
+        self, app_client: AsyncClient, admin_token: str
+    ):
+        """Superusers are managed through the standard auth-record API."""
+        email = f"superuser_{uuid.uuid4().hex[:8]}@example.com"
+        headers = {"Authorization": admin_token}
+        created = await app_client.post(
+            "/api/collections/_superusers/records",
+            headers=headers,
+            json={
+                "email": email,
+                "password": "securepass123",
+                "passwordConfirm": "securepass123",
+            },
+        )
+        assert created.status_code == 200, created.text
+        record = created.json()
+        assert record["collectionName"] == "_superusers"
+        assert record["email"] == email
+        assert record["avatar"] == 0
+
+        updated_email = f"updated_{email}"
+        updated = await app_client.patch(
+            f"/api/collections/_superusers/records/{record['id']}",
+            headers=headers,
+            json={"email": updated_email},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["email"] == updated_email
+
+        deleted = await app_client.delete(
+            f"/api/collections/_superusers/records/{record['id']}",
+            headers=headers,
+        )
+        assert deleted.status_code == 204, deleted.text
 
     async def test_auth_methods_on_bootstrapped_users(
         self, app_client: AsyncClient
