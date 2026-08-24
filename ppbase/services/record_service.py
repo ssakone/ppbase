@@ -9,6 +9,7 @@ from __future__ import annotations
 import json as _json
 import logging
 import mimetypes
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -241,6 +242,9 @@ _SUPERUSERS_HIDDEN_COLUMNS = frozenset(
 RelationResolver = dict[str, dict[str, Any]]
 RelationIndex = dict[str, Any]
 _RELATION_INDEX_CACHE: dict[int, tuple[tuple[tuple[str, str, str, str], ...], RelationIndex]] = {}
+_DOTTED_FILTER_PATH_RE = re.compile(
+    r"(?<![@A-Za-z0-9_:.])[A-Za-z_][A-Za-z0-9_:]*(?:\.[A-Za-z_][A-Za-z0-9_:]*)+"
+)
 
 
 def _collection_field_metadata(collection: CollectionRecord) -> dict[str, dict[str, Any]]:
@@ -384,6 +388,55 @@ async def _build_collection_resolver(engine: AsyncEngine) -> RelationIndex:
     return await _build_relation_index(engine)
 
 
+async def _build_filter_resolvers(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    filter_expression: str,
+) -> tuple[RelationIndex, RelationIndex | None]:
+    """Return schema metadata required to parse a collection filter.
+
+    Simple filters only need the current collection fields. Dotted paths and
+    ``@collection`` references still receive the cached cross-collection index.
+    """
+    relation_resolver = _build_relation_index_from_collections([collection])
+    collection_resolver = None
+
+    if _filter_needs_relation_index(filter_expression):
+        relation_resolver = await _build_relation_index(engine)
+    if "@collection." in filter_expression:
+        collection_resolver = relation_resolver
+
+    return relation_resolver, collection_resolver
+
+
+def _filter_needs_relation_index(filter_expression: str) -> bool:
+    """Return whether a filter contains a relation or collection path."""
+    unquoted: list[str] = []
+    quote: str | None = None
+    escaped = False
+
+    for char in filter_expression:
+        if quote is not None:
+            unquoted.append(" ")
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            unquoted.append(" ")
+        else:
+            unquoted.append(char)
+
+    expression = re.sub(r"//[^\n]*", "", "".join(unquoted))
+    return "@collection." in expression or bool(
+        _DOTTED_FILTER_PATH_RE.search(expression)
+    )
+
+
 # ---------------------------------------------------------------------------
 # List records
 # ---------------------------------------------------------------------------
@@ -414,16 +467,11 @@ async def list_records(
     where_sql = "1=1"
     params: dict[str, Any] = {}
     if filter_str:
-        # Only resolve relations when the filter contains a dotted path
-        relation_resolver = None
-        collection_resolver = None
-        relation_index = None
-        if "." in filter_str or "@collection." in filter_str:
-            relation_index = await _build_relation_index(engine)
-        if "." in filter_str:
-            relation_resolver = relation_index
-        if "@collection." in filter_str:
-            collection_resolver = relation_index
+        relation_resolver, collection_resolver = await _build_filter_resolvers(
+            engine,
+            collection,
+            filter_str,
+        )
         where_sql, params = parse_filter(
             filter_str,
             request_context,
@@ -1438,16 +1486,11 @@ async def check_record_rule(
     Returns True if the record matches the rule, False otherwise.
     """
     table = _table_name(collection)
-    # Resolve relation fields for dotted paths in the rule
-    relation_resolver = None
-    collection_resolver = None
-    relation_index = None
-    if "." in rule_filter or "@collection." in rule_filter:
-        relation_index = await _build_relation_index(engine)
-    if "." in rule_filter:
-        relation_resolver = relation_index
-    if "@collection." in rule_filter:
-        collection_resolver = relation_index
+    relation_resolver, collection_resolver = await _build_filter_resolvers(
+        engine,
+        collection,
+        rule_filter,
+    )
     where_sql, params = parse_filter(
         rule_filter,
         request_context,
