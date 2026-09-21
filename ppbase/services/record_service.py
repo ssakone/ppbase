@@ -159,6 +159,17 @@ def _get_schema_fields(collection: CollectionRecord) -> list[FieldDefinition]:
     fields: list[FieldDefinition] = []
     for definition in raw:
         normalized = _normalize_field(definition)
+        if _collection_type(collection) == "auth" and normalized.get("name") in {
+            "id",
+            "email",
+            "emailVisibility",
+            "email_visibility",
+            "verified",
+            "password",
+            "tokenKey",
+            "token_key",
+        }:
+            continue
         if (
             collection.name == "_superusers"
             and normalized.get("name") == "avatar"
@@ -208,7 +219,17 @@ def _collection_type(collection: CollectionRecord) -> str:
 
 
 _AUTH_COLUMNS_HANDLED_SEPARATELY = frozenset(
-    {"email", "email_visibility", "emailVisibility", "verified"}
+    {
+        "email",
+        "email_visibility",
+        "emailVisibility",
+        "verified",
+        "password",
+        "passwordConfirm",
+        "oldPassword",
+        "tokenKey",
+        "token_key",
+    }
 )
 
 
@@ -709,7 +730,12 @@ async def create_record(
     # --- Auth collection: password & system columns ---
     col_type = _collection_type(collection)
     if col_type == "auth":
-        from ppbase.services.auth_service import generate_token_key, hash_password
+        from ppbase.services.auth_service import (
+            generate_token_key,
+            get_password_cost,
+            hash_password,
+            validate_password_value,
+        )
 
         # Reject client-supplied internal columns
         data.pop("password_hash", None)
@@ -718,24 +744,35 @@ async def create_record(
         password = data.pop("password", None)
         password_confirm = data.pop("passwordConfirm", None)
 
-        if not password:
+        if password is None or password == "":
             errors["password"] = {
                 "code": "validation_required",
                 "message": "Cannot be blank.",
             }
-        elif len(password) < 8:
-            errors["password"] = {
-                "code": "validation_length_out_of_range",
-                "message": "The length must be between 8 and 72.",
-            }
-        elif password_confirm != password:
-            errors["passwordConfirm"] = {
-                "code": "validation_values_mismatch",
-                "message": "Values don't match.",
-            }
+        else:
+            try:
+                password = validate_password_value(collection, password)
+            except FieldValidationError as exc:
+                errors[exc.field_name] = {
+                    "code": exc.code,
+                    "message": exc.message,
+                }
+            if password_confirm is None or password_confirm == "":
+                errors["passwordConfirm"] = {
+                    "code": "validation_required",
+                    "message": "Cannot be blank.",
+                }
+            elif password_confirm != password:
+                errors["passwordConfirm"] = {
+                    "code": "validation_values_mismatch",
+                    "message": "Values don't match.",
+                }
 
         if not errors:
-            columns["password_hash"] = hash_password(password)
+            columns["password_hash"] = hash_password(
+                password,
+                cost=get_password_cost(collection),
+            )
             columns["token_key"] = generate_token_key()
 
         # Auth system column: email (required for auth, from data)
@@ -960,7 +997,12 @@ async def update_record(
     # --- Auth collection: password update handling ---
     col_type = _collection_type(collection)
     if col_type == "auth":
-        from ppbase.services.auth_service import generate_token_key, hash_password
+        from ppbase.services.auth_service import (
+            generate_token_key,
+            get_password_cost,
+            hash_password,
+            validate_password_value,
+        )
 
         # Strip internal columns from client data
         data.pop("password_hash", None)
@@ -968,21 +1010,42 @@ async def update_record(
 
         password = data.pop("password", None)
         password_confirm = data.pop("passwordConfirm", None)
+        old_password = data.pop("oldPassword", None)
 
         if password is not None:
-            if len(password) < 8:
+            if password == "":
                 errors["password"] = {
-                    "code": "validation_length_out_of_range",
-                    "message": "The length must be between 8 and 72.",
+                    "code": "validation_required",
+                    "message": "Cannot be blank.",
+                }
+            else:
+                try:
+                    password = validate_password_value(collection, password)
+                except FieldValidationError as exc:
+                    errors[exc.field_name] = {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+            if password_confirm is None or password_confirm == "":
+                errors["passwordConfirm"] = {
+                    "code": "validation_required",
+                    "message": "Cannot be blank.",
                 }
             elif password_confirm != password:
                 errors["passwordConfirm"] = {
                     "code": "validation_values_mismatch",
                     "message": "Values don't match.",
                 }
-            else:
-                updates["password_hash"] = hash_password(password)
+            if not errors:
+                updates["password_hash"] = hash_password(
+                    password,
+                    cost=get_password_cost(collection),
+                )
                 updates["token_key"] = generate_token_key()
+
+        # ``oldPassword`` is checked by the API layer when a self-update is
+        # attempted without manage access.  Keep it out of regular field data.
+        del old_password
 
         # Handle email update with format validation
         if "email" in data:
@@ -1003,6 +1066,7 @@ async def update_record(
                     }
                 else:
                     updates["email"] = email_str
+                    updates["token_key"] = generate_token_key()
 
         # Handle camelCase-to-snake_case for regular auth system columns.
         if collection.name == "_superusers":

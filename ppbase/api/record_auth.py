@@ -34,6 +34,12 @@ from ppbase.ext.registry import (
     HOOK_RECORD_AUTH_REQUEST,
     HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
     HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
+    HOOK_RECORD_REQUEST_VERIFICATION_REQUEST,
+    HOOK_RECORD_CONFIRM_VERIFICATION_REQUEST,
+    HOOK_RECORD_REQUEST_PASSWORD_RESET_REQUEST,
+    HOOK_RECORD_CONFIRM_PASSWORD_RESET_REQUEST,
+    HOOK_RECORD_REQUEST_EMAIL_CHANGE_REQUEST,
+    HOOK_RECORD_CONFIRM_EMAIL_CHANGE_REQUEST,
     HOOK_RECORD_REQUEST_OTP_REQUEST,
     get_extension_registry,
 )
@@ -362,11 +368,9 @@ def _build_rule_request_context(
     auth_info: dict[str, Any] = {}
     if auth_payload:
         auth_info = {
-            "id": auth_payload.get("id", ""),
-            "email": auth_payload.get("email", ""),
-            "type": auth_payload.get("type", ""),
-            "collectionId": auth_payload.get("collectionId", ""),
-            "collectionName": auth_payload.get("collectionName", ""),
+            key: value
+            for key, value in auth_payload.items()
+            if key not in {"password_hash", "token_key", "_raw_token"}
         }
 
     headers_info: dict[str, str] = {}
@@ -558,6 +562,13 @@ async def api_auth_with_password(
     if err:
         return err
 
+    password_auth = (collection.options or {}).get("passwordAuth", {}) or {}
+    if not bool(password_auth.get("enabled", True)):
+        return _error_response(
+            403,
+            "The collection is not configured to allow password authentication.",
+        )
+
     try:
         body = await request.json()
     except Exception:
@@ -631,6 +642,12 @@ async def api_auth_with_password(
             request,
             context="password",
             data=payload,
+            auth_payload={
+                **result["record"],
+                "type": "auth",
+                "collectionId": collection.id,
+                "collectionName": collection.name,
+            },
         )
         if not await _passes_auth_rule(
             engine,
@@ -639,7 +656,7 @@ async def api_auth_with_password(
             rule_request_context,
         ):
             return _error_response(
-                400,
+                403,
                 "Failed to authenticate.",
                 _AUTH_INVALID_CREDENTIALS_DATA,
             )
@@ -1095,6 +1112,19 @@ async def api_auth_refresh(
     if err:
         return err
 
+    if auth is not None:
+        auth_type = auth.get("type")
+        if auth_type in {"auth", "authRecord"} and auth.get("collectionId") != collection.id:
+            return _error_response(
+                403,
+                f"The request requires auth record from {collection.name} collection.",
+            )
+        if auth_type == "admin" and collection.name != "_superusers":
+            return _error_response(
+                403,
+                f"The request requires auth record from {collection.name} collection.",
+            )
+
     event = RecordAuthRequestEvent(
         app=request.app,
         request=request,
@@ -1126,6 +1156,7 @@ async def api_auth_refresh(
         if payload is None:
             return _error_response(401, "The request requires valid auth token to be set.")
 
+        payload["_raw_token"] = token_str
         e.payload = payload
         result = await auth_refresh(engine, collection, payload, settings)
         if result is None:
@@ -1134,7 +1165,7 @@ async def api_auth_refresh(
         rule_request_context = _build_rule_request_context(
             request,
             context="default",
-            auth_payload=payload,
+            auth_payload=auth or payload,
         )
         if not await _passes_auth_rule(
             engine,
@@ -1142,7 +1173,10 @@ async def api_auth_refresh(
             result["record"]["id"],
             rule_request_context,
         ):
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(
+                403,
+                "The request doesn't satisfy the collection requirements to authenticate.",
+            )
 
         expand_str = request.query_params.get("expand", "")
         if expand_str and result.get("record"):
@@ -1301,23 +1335,39 @@ async def api_request_verification(
     except Exception:
         return _error_response(400, "Invalid JSON body.")
 
-    email = body.get("email", "").strip()
-    if not email:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"email": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="requestVerification",
+        auth_method="requestVerification",
+        body=body,
+        email=str(body.get("email", "") or ""),
+    )
 
-    settings = request.app.state.settings
-    base_url = await _resolve_public_base_url(request, engine)
+    async def _default_request_verification(e: RecordAuthRequestEvent) -> Response:
+        email = str(e.email if e.email is not None else e.body.get("email", "")).strip()
+        if not email:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"email": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
 
-    from ppbase.services.record_auth_service import request_verification as _req_verif
+        settings = request.app.state.settings
+        base_url = await _resolve_public_base_url(request, engine)
+        from ppbase.services.record_auth_service import request_verification as _req_verif
 
-    await _req_verif(engine, collection, email, settings, base_url=base_url)
+        await _req_verif(engine, collection, email, settings, base_url=base_url)
+        return Response(status_code=204)
 
-    # Always 204 to avoid enumeration
-    return Response(status_code=204)
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_REQUEST_VERIFICATION_REQUEST,
+        event,
+        _default_request_verification,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1345,27 +1395,44 @@ async def api_confirm_verification(
     except Exception:
         return _error_response(400, "Invalid JSON body.")
 
-    token = body.get("token", "").strip()
-    if not token:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"token": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="confirmVerification",
+        auth_method="confirmVerification",
+        body=body,
+        token=str(body.get("token", "") or ""),
+    )
 
-    settings = request.app.state.settings
+    async def _default_confirm_verification(e: RecordAuthRequestEvent) -> Response:
+        token = str(e.token if e.token is not None else e.body.get("token", "")).strip()
+        if not token:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"token": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
 
-    from ppbase.services.record_auth_service import confirm_verification as _confirm_verif
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import confirm_verification as _confirm_verif
 
-    ok = await _confirm_verif(engine, collection, token, settings)
-    if not ok:
-        return _error_response(
-            400,
-            "Failed to confirm verification.",
-            {"token": {"code": "validation_invalid_token", "message": "Invalid or expired token."}},
-        )
+        ok = await _confirm_verif(engine, collection, token, settings)
+        if not ok:
+            return _error_response(
+                400,
+                "Failed to confirm verification.",
+                {"token": {"code": "validation_invalid_token", "message": "Invalid or expired token."}},
+            )
+        return Response(status_code=204)
 
-    return Response(status_code=204)
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_CONFIRM_VERIFICATION_REQUEST,
+        event,
+        _default_confirm_verification,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1393,22 +1460,39 @@ async def api_request_password_reset(
     except Exception:
         return _error_response(400, "Invalid JSON body.")
 
-    email = body.get("email", "").strip()
-    if not email:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"email": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="requestPasswordReset",
+        auth_method="requestPasswordReset",
+        body=body,
+        email=str(body.get("email", "") or ""),
+    )
 
-    settings = request.app.state.settings
-    base_url = await _resolve_public_base_url(request, engine)
+    async def _default_request_password_reset(e: RecordAuthRequestEvent) -> Response:
+        email = str(e.email if e.email is not None else e.body.get("email", "")).strip()
+        if not email:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"email": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
 
-    from ppbase.services.record_auth_service import request_password_reset as _req_reset
+        settings = request.app.state.settings
+        base_url = await _resolve_public_base_url(request, engine)
+        from ppbase.services.record_auth_service import request_password_reset as _req_reset
 
-    await _req_reset(engine, collection, email, settings, base_url=base_url)
+        await _req_reset(engine, collection, email, settings, base_url=base_url)
+        return Response(status_code=204)
 
-    return Response(status_code=204)
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_REQUEST_PASSWORD_RESET_REQUEST,
+        event,
+        _default_request_password_reset,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1436,33 +1520,50 @@ async def api_confirm_password_reset(
     except Exception:
         return _error_response(400, "Invalid JSON body.")
 
-    token = body.get("token", "").strip()
-    password = body.get("password", "")
-    password_confirm = body.get("passwordConfirm", "")
-
-    if not token:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"token": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    settings = request.app.state.settings
-
-    from ppbase.services.record_auth_service import confirm_password_reset as _confirm_reset
-
-    ok, errors = await _confirm_reset(
-        engine, collection, token, password, password_confirm, settings
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="confirmPasswordReset",
+        auth_method="confirmPasswordReset",
+        body=body,
+        token=str(body.get("token", "") or ""),
+        password=str(body.get("password", "") or ""),
+        password_confirm=str(body.get("passwordConfirm", "") or ""),
     )
 
-    if not ok:
-        return _error_response(
-            400,
-            "Failed to confirm password reset.",
-            errors or {},
+    async def _default_confirm_password_reset(e: RecordAuthRequestEvent) -> Response:
+        token = str(e.token if e.token is not None else e.body.get("token", "")).strip()
+        password = str(e.password if e.password is not None else e.body.get("password", ""))
+        password_confirm = str(
+            e.password_confirm
+            if e.password_confirm is not None
+            else e.body.get("passwordConfirm", "")
         )
+        if not token:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"token": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
 
-    return Response(status_code=204)
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import confirm_password_reset as _confirm_reset
+
+        ok, errors = await _confirm_reset(
+            engine, collection, token, password, password_confirm, settings
+        )
+        if not ok:
+            return _error_response(400, "Failed to confirm password reset.", errors or {})
+        return Response(status_code=204)
+
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_CONFIRM_PASSWORD_RESET_REQUEST,
+        event,
+        _default_confirm_password_reset,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1486,7 +1587,7 @@ async def api_request_email_change(
     if err:
         return err
 
-    if auth is None or auth.get("type") != "authRecord":
+    if auth is None or auth.get("type") not in {"auth", "authRecord"}:
         return _error_response(
             401,
             "The request requires valid record authorization token to be set.",
@@ -1541,23 +1642,43 @@ async def api_request_email_change(
             {"newEmail": {"code": "validation_required", "message": "Cannot be blank."}},
         )
 
-    base_url = await _resolve_public_base_url(request, engine)
-    ok, errors = await _request_email_change(
-        engine,
-        collection,
-        record_id,
-        new_email,
-        settings,
-        base_url=base_url,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        auth=auth,
+        method="requestEmailChange",
+        auth_method="requestEmailChange",
+        body=body,
+        record={"id": record_id},
+        new_email=new_email,
     )
-    if not ok:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            errors or {},
-        )
 
-    return Response(status_code=204)
+    async def _default_request_email_change(e: RecordAuthRequestEvent) -> Response:
+        base_url = await _resolve_public_base_url(request, engine)
+        ok, errors = await _request_email_change(
+            engine,
+            collection,
+            record_id,
+            str(e.new_email if e.new_email is not None else e.body.get("newEmail", "")).strip(),
+            settings,
+            base_url=base_url,
+        )
+        if not ok:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                errors or {},
+            )
+        return Response(status_code=204)
+
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_REQUEST_EMAIL_CHANGE_REQUEST,
+        event,
+        _default_request_email_change,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1585,39 +1706,49 @@ async def api_confirm_email_change(
     except Exception:
         return _error_response(400, "Invalid JSON body.")
 
-    token = str(body.get("token", "")).strip()
-    password = body.get("password", "")
-
-    if not token:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"token": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    if not password:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            {"password": {"code": "validation_required", "message": "Cannot be blank."}},
-        )
-
-    settings = request.app.state.settings
-
-    from ppbase.services.record_auth_service import confirm_email_change as _confirm_email_change
-
-    ok, errors = await _confirm_email_change(
-        engine,
-        collection,
-        token,
-        password,
-        settings,
+    event = RecordAuthRequestEvent(
+        app=request.app,
+        request=request,
+        collection=collection,
+        collection_id_or_name=collectionIdOrName,
+        method="confirmEmailChange",
+        auth_method="confirmEmailChange",
+        body=body,
+        token=str(body.get("token", "") or ""),
+        password=str(body.get("password", "") or ""),
     )
-    if not ok:
-        return _error_response(
-            400,
-            "Something went wrong while processing your request.",
-            errors or {},
-        )
 
-    return Response(status_code=204)
+    async def _default_confirm_email_change(e: RecordAuthRequestEvent) -> Response:
+        token = str(e.token if e.token is not None else e.body.get("token", "")).strip()
+        password = str(e.password if e.password is not None else e.body.get("password", ""))
+        if not token:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"token": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
+        if not password:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                {"password": {"code": "validation_required", "message": "Cannot be blank."}},
+            )
+
+        settings = request.app.state.settings
+        from ppbase.services.record_auth_service import confirm_email_change as _confirm_email_change
+
+        ok, errors = await _confirm_email_change(engine, collection, token, password, settings)
+        if not ok:
+            return _error_response(
+                400,
+                "Something went wrong while processing your request.",
+                errors or {},
+            )
+        return Response(status_code=204)
+
+    return await _trigger_record_auth_request_hook(
+        request,
+        HOOK_RECORD_CONFIRM_EMAIL_CHANGE_REQUEST,
+        event,
+        _default_confirm_email_change,
+    )

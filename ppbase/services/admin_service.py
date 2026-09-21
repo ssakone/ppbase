@@ -14,6 +14,7 @@ from ppbase.db.system_tables import SuperuserRecord
 from ppbase.services.auth_service import (
     create_admin_token,
     generate_token_key,
+    get_password_cost,
     hash_password,
     verify_password,
 )
@@ -94,10 +95,14 @@ async def create_admin(
     avatar: int = 0,
 ) -> SuperuserRecord:
     """Create a new admin record."""
+    superusers_collection = await _get_superusers_collection(session)
     admin = SuperuserRecord(
         id=generate_id(),
         email=email,
-        password_hash=hash_password(password),
+        password_hash=hash_password(
+            password,
+            cost=get_password_cost(superusers_collection),
+        ),
         token_key=generate_token_key(),
         avatar=avatar,
         created=datetime.now(timezone.utc),
@@ -120,8 +125,13 @@ async def update_admin(
 
     if "email" in data:
         admin.email = data["email"]
+        admin.token_key = generate_token_key()
     if "password" in data and data["password"]:
-        admin.password_hash = hash_password(data["password"])
+        superusers_collection = await _get_superusers_collection(session)
+        admin.password_hash = hash_password(
+            data["password"],
+            cost=get_password_cost(superusers_collection),
+        )
         admin.token_key = generate_token_key()
     if "avatar" in data:
         admin.avatar = data["avatar"]

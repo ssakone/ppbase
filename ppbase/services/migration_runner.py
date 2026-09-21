@@ -33,6 +33,7 @@ from ppbase.db.schema_manager import (
     update_collection_table,
 )
 from ppbase.db.system_tables import CollectionRecord, MigrationRecord
+from ppbase.services.auth_service import normalize_auth_password_schema
 
 logger = logging.getLogger(__name__)
 
@@ -580,6 +581,12 @@ class MigrationApp:
                 is_superusers=definition.get("name") == "_superusers"
             )
             options = _merge_auth_options(defaults, {}, options)
+            schema, options = normalize_auth_password_schema(
+                definition.get("schema", []),
+                options,
+            )
+        else:
+            schema = definition.get("schema", [])
 
         raw_collection_id = definition.get("id")
         collection_id = (
@@ -592,7 +599,7 @@ class MigrationApp:
             name=definition["name"],
             type=collection_type,
             system=definition.get("system", False),
-            schema=definition.get("schema", []),
+            schema=schema,
             indexes=definition.get("indexes", []),
             list_rule=definition.get("listRule"),
             view_rule=definition.get("viewRule"),
@@ -687,6 +694,18 @@ class MigrationApp:
                 {},
             )
             flag_modified(record, "options")
+
+        if record.type == "auth":
+            normalized_schema, normalized_options = normalize_auth_password_schema(
+                record.schema,
+                record.options,
+            )
+            if normalized_schema != record.schema:
+                record.schema = normalized_schema
+                flag_modified(record, "schema")
+            if normalized_options != record.options:
+                record.options = normalized_options
+                flag_modified(record, "options")
 
         record.updated = datetime.now(timezone.utc)
         await self._session.flush()

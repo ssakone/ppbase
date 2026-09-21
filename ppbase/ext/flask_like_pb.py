@@ -26,6 +26,12 @@ from ppbase.ext.registry import (
     HOOK_REALTIME_SUBSCRIBE_REQUEST,
     HOOK_RECORD_AUTH_REFRESH_REQUEST,
     HOOK_RECORD_AUTH_REQUEST,
+    HOOK_RECORD_REQUEST_VERIFICATION_REQUEST,
+    HOOK_RECORD_CONFIRM_VERIFICATION_REQUEST,
+    HOOK_RECORD_REQUEST_PASSWORD_RESET_REQUEST,
+    HOOK_RECORD_CONFIRM_PASSWORD_RESET_REQUEST,
+    HOOK_RECORD_REQUEST_EMAIL_CHANGE_REQUEST,
+    HOOK_RECORD_CONFIRM_EMAIL_CHANGE_REQUEST,
     HOOK_RECORD_AUTH_WITH_OAUTH2_REQUEST,
     HOOK_RECORD_AUTH_WITH_PASSWORD_REQUEST,
     HOOK_RECORD_AUTH_WITH_OTP_REQUEST,
@@ -1118,6 +1124,24 @@ class FlaskLikePB:
             priority=priority,
             middleware=middleware,
         )
+
+    def on_record_request_verification_request(self, *collections: str, id: str | None = None, priority: int = 0, middleware: HookHandler | Sequence[HookHandler] | None = None):
+        return self._hook_decorator(HOOK_RECORD_REQUEST_VERIFICATION_REQUEST, collections=collections, id=id, priority=priority, middleware=middleware)
+
+    def on_record_confirm_verification_request(self, *collections: str, id: str | None = None, priority: int = 0, middleware: HookHandler | Sequence[HookHandler] | None = None):
+        return self._hook_decorator(HOOK_RECORD_CONFIRM_VERIFICATION_REQUEST, collections=collections, id=id, priority=priority, middleware=middleware)
+
+    def on_record_request_password_reset_request(self, *collections: str, id: str | None = None, priority: int = 0, middleware: HookHandler | Sequence[HookHandler] | None = None):
+        return self._hook_decorator(HOOK_RECORD_REQUEST_PASSWORD_RESET_REQUEST, collections=collections, id=id, priority=priority, middleware=middleware)
+
+    def on_record_confirm_password_reset_request(self, *collections: str, id: str | None = None, priority: int = 0, middleware: HookHandler | Sequence[HookHandler] | None = None):
+        return self._hook_decorator(HOOK_RECORD_CONFIRM_PASSWORD_RESET_REQUEST, collections=collections, id=id, priority=priority, middleware=middleware)
+
+    def on_record_request_email_change_request(self, *collections: str, id: str | None = None, priority: int = 0, middleware: HookHandler | Sequence[HookHandler] | None = None):
+        return self._hook_decorator(HOOK_RECORD_REQUEST_EMAIL_CHANGE_REQUEST, collections=collections, id=id, priority=priority, middleware=middleware)
+
+    def on_record_confirm_email_change_request(self, *collections: str, id: str | None = None, priority: int = 0, middleware: HookHandler | Sequence[HookHandler] | None = None):
+        return self._hook_decorator(HOOK_RECORD_CONFIRM_EMAIL_CHANGE_REQUEST, collections=collections, id=id, priority=priority, middleware=middleware)
 
     def on_file_download_request(
         self, *collections: str, id: str | None = None, priority: int = 0,

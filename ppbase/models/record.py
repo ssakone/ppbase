@@ -87,7 +87,7 @@ def build_record_response(
         auth_type = request_auth.get("type")
         if auth_type == "admin":
             return True
-        if auth_type != "authRecord":
+        if auth_type not in {"auth", "authRecord"}:
             return False
         auth_id = str(request_auth.get("id", "") or "")
         row_id = str(row.get("id", "") or "")

@@ -129,11 +129,11 @@ async def test_auth_record_file_token_round_trip_uses_collection_file_secret() -
 
     assert claims["for"] == "file"
     assert claims["id"] == record_id
-    assert claims["type"] == "authRecord"
+    assert claims["type"] == "auth"
     assert claims["collectionId"] == collection.id
     assert verified == {
         "id": record_id,
-        "type": "authRecord",
+        "type": "auth",
         "collectionId": collection.id,
         "collectionName": collection.name,
     }

@@ -82,7 +82,7 @@ def _prepare_rule_context(
     if token_payload is None:
         auth_ctx: dict[str, Any] | None = None
     elif token_payload.get("type") == "admin" or (
-        token_payload.get("type") == "authRecord"
+        token_payload.get("type") in {"auth", "authRecord"}
         and token_payload.get("collectionName") == "_superusers"
     ):
         auth_ctx = {
@@ -103,11 +103,9 @@ def _prepare_rule_context(
     auth_info: dict[str, Any] = {}
     if token_payload:
         auth_info = {
-            "id": token_payload.get("id", ""),
-            "email": token_payload.get("email", ""),
-            "type": token_payload.get("type", ""),
-            "collectionId": token_payload.get("collectionId", ""),
-            "collectionName": token_payload.get("collectionName", ""),
+            key: value
+            for key, value in token_payload.items()
+            if key not in {"password_hash", "token_key", "_raw_token"}
         }
 
     headers_info: dict[str, str] = {}
@@ -252,7 +250,7 @@ def _is_self_auth_target(
 ) -> bool:
     if not auth_payload:
         return False
-    if auth_payload.get("type") != "authRecord":
+    if auth_payload.get("type") not in {"auth", "authRecord"}:
         return False
     return (
         auth_payload.get("collectionId") == getattr(collection, "id", "")
@@ -273,6 +271,8 @@ async def _has_manage_access_for_auth_record(
 
     options = getattr(collection, "options", None) or {}
     manage_rule = options.get("manageRule")
+    if manage_rule in (None, ""):
+        return False
     rule_result = check_rule(manage_rule, auth_ctx)
     if rule_result is True:
         return True
@@ -285,6 +285,27 @@ async def _has_manage_access_for_auth_record(
         str(rule_result),
         request_context,
     )
+
+
+async def _check_old_password(
+    engine: Any,
+    collection: Any,
+    record_id: str,
+    old_password: Any,
+) -> bool:
+    """Validate the current password for a self-service password change."""
+    from ppbase.services.auth_service import verify_password
+
+    if not isinstance(old_password, str) or not old_password:
+        return False
+    table = getattr(collection, "name", "")
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(f'SELECT "password_hash" FROM "{table}" WHERE "id" = :id LIMIT 1'),
+            {"id": record_id},
+        )
+        row = result.mappings().first()
+    return bool(row and verify_password(old_password, str(row.get("password_hash", ""))))
 
 
 # ---------------------------------------------------------------------------
@@ -928,7 +949,22 @@ async def _apply_batch_update(
                             403,
                             "The authorized record model is not allowed to perform this action.",
                         )
-
+                    if "password" in managed_keys and not await _check_old_password(
+                        engine,
+                        collection,
+                        target_record_id,
+                        payload.get("oldPassword"),
+                    ):
+                        return _error_response(
+                            400,
+                            "Failed to update record.",
+                            {
+                                "oldPassword": {
+                                    "code": "validation_invalid_old_password",
+                                    "message": "Missing or invalid old password.",
+                                }
+                            },
+                        )
         try:
             record = await update_record(
                 engine,
@@ -1626,6 +1662,22 @@ async def api_update_record(
                         return _error_response(
                             403,
                             "The authorized record model is not allowed to perform this action.",
+                        )
+                    if "password" in managed_keys and not await _check_old_password(
+                        active_engine,
+                        collection,
+                        target_record_id,
+                        payload.get("oldPassword"),
+                    ):
+                        return _error_response(
+                            400,
+                            "Failed to update record.",
+                            {
+                                "oldPassword": {
+                                    "code": "validation_invalid_old_password",
+                                    "message": "Missing or invalid old password.",
+                                }
+                            },
                         )
 
         try:

@@ -34,6 +34,7 @@ from ppbase.models.collection import (
     CollectionResponse,
     CollectionUpdate,
 )
+from ppbase.services.auth_service import normalize_auth_password_schema
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,38 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
         else:
             merged[key] = value
     return merged
+
+
+def _validate_auth_configuration(
+    collection_type: str,
+    schema: list[dict[str, Any]] | None,
+    indexes: list[str] | None,
+    options: dict[str, Any] | None,
+) -> None:
+    """Validate the generic auth options required by PocketBase semantics."""
+    if collection_type != "auth":
+        return
+    password_auth = (options or {}).get("passwordAuth", {}) or {}
+    if not password_auth.get("enabled", True):
+        return
+
+    identity_fields = password_auth.get("identityFields", ["email"])
+    if not isinstance(identity_fields, list) or not identity_fields:
+        raise ValueError("Password authentication requires at least one identity field.")
+
+    field_names = {
+        str(item.get("name"))
+        for item in (schema or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    index_sql = [str(item).lower() for item in (indexes or [])]
+    for field in dict.fromkeys(str(value) for value in identity_fields):
+        if field == "email":
+            continue  # PPBase owns the auth email unique index.
+        if field not in field_names:
+            raise ValueError(f"Identity field '{field}' does not exist in the collection schema.")
+        if not any("unique" in statement and field.lower() in statement for statement in index_sql):
+            raise ValueError(f"Identity field '{field}' must have a unique index.")
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +479,8 @@ async def create_collection(
             generate_default_auth_options(is_superusers=False),
             options,
         )
+        data.schema, options = normalize_auth_password_schema(data.schema, options)
+    _validate_auth_configuration(data.type, data.schema, data.indexes, options)
 
     now = datetime.now(timezone.utc)
     collection_id = (
@@ -599,6 +634,25 @@ async def update_collection(
             existing_options,
         )
         flag_modified(record, "options")
+
+    if (record.type or "base") == "auth":
+        normalized_schema, normalized_options = normalize_auth_password_schema(
+            record.schema,
+            record.options,
+        )
+        if normalized_schema != record.schema:
+            record.schema = normalized_schema
+            flag_modified(record, "schema")
+        if normalized_options != record.options:
+            record.options = normalized_options
+            flag_modified(record, "options")
+
+    _validate_auth_configuration(
+        record.type or "base",
+        record.schema if isinstance(record.schema, list) else [],
+        record.indexes if isinstance(record.indexes, list) else [],
+        record.options if isinstance(record.options, dict) else {},
+    )
 
     record.updated = datetime.now(timezone.utc)
 
@@ -783,6 +837,10 @@ async def _import_collections_impl(
                     existing_options,
                 )
                 record.options = _deep_merge_dicts(merged_options, incoming_options)
+                record.schema, record.options = normalize_auth_password_schema(
+                    record.schema,
+                    record.options,
+                )
             else:
                 record.options = incoming_options
             record.updated = datetime.now(timezone.utc)
@@ -828,13 +886,19 @@ async def _import_collections_impl(
                     generate_default_auth_options(is_superusers=False),
                     import_options,
                 )
+                import_schema, import_options = normalize_auth_password_schema(
+                    coll_data.get("schema", []),
+                    import_options,
+                )
+            else:
+                import_schema = coll_data.get("schema", [])
 
             create_data = CollectionCreate(
                 id=coll_data.get("id"),
                 name=name,
                 type=import_type,
                 system=coll_data.get("system", False),
-                schema=coll_data.get("schema", []),
+                schema=import_schema,
                 indexes=coll_data.get("indexes", []),
                 listRule=coll_data.get("listRule"),
                 viewRule=coll_data.get("viewRule"),

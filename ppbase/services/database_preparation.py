@@ -20,7 +20,10 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from ppbase.db.bootstrap import bootstrap_system_collections
 from ppbase.db.system_tables import Base, CollectionRecord
-from ppbase.services.auth_service import generate_default_auth_options
+from ppbase.services.auth_service import (
+    generate_default_auth_options,
+    normalize_auth_password_schema,
+)
 from ppbase.services.migration_runner import (
     apply_pending_on_connection,
     migration_lock,
@@ -50,6 +53,13 @@ async def _backfill_auth_options(session: AsyncSession) -> None:
             is_superusers=collection.name == "_superusers"
         )
         merged = _deep_merge_dicts(defaults, existing)
+        normalized_schema, merged = normalize_auth_password_schema(
+            collection.schema,
+            merged,
+        )
+        if normalized_schema != collection.schema:
+            collection.schema = normalized_schema
+            flag_modified(collection, "schema")
         if merged != existing:
             collection.options = merged
             flag_modified(collection, "options")

@@ -73,7 +73,7 @@ async def create_file_token_for_auth(
             file_duration,
         )
 
-    if auth_type == "authRecord":
+    if auth_type in {"auth", "authRecord"}:
         collection_id = str(auth_payload.get("collectionId", "") or "")
         if not collection_id:
             raise ValueError("Missing collectionId.")
@@ -96,7 +96,7 @@ async def create_file_token_for_auth(
         )
         payload = {
             "id": auth_id,
-            "type": "authRecord",
+            "type": "auth",
             "collectionId": auth_collection.id,
             "for": "file",
         }
@@ -154,7 +154,7 @@ async def verify_file_token(
             "type": "admin",
         }
 
-    if token_type == "authRecord":
+    if token_type in {"auth", "authRecord"}:
         collection_id = str(unverified.get("collectionId", "") or "")
         if not collection_id:
             return None
@@ -185,7 +185,7 @@ async def verify_file_token(
             return None
         return {
             "id": token_id,
-            "type": "authRecord",
+            "type": "auth",
             "collectionId": auth_collection.id,
             "collectionName": auth_collection.name,
         }

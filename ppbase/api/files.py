@@ -693,7 +693,7 @@ async def _resolve_file_token_event_context(
         }
         return collection, record
 
-    if auth_type == "authRecord":
+    if auth_type in {"auth", "authRecord"}:
         collection_id = str(auth_payload.get("collectionId", "") or "")
         if not collection_id:
             return None, None

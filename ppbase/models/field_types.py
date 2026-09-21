@@ -537,7 +537,11 @@ def _validate_password(field: FieldDefinition, value: Any) -> str:
     val = str(value) if value is not None else ""
     opts = field.options
     min_len = opts.get("min", 8)
+    if min_len in (None, "", 0):
+        min_len = 8
     max_len = opts.get("max", 71)  # bcrypt limit
+    if max_len in (None, "", 0):
+        max_len = 71
     pattern = opts.get("pattern")
 
     if field.required and not val:

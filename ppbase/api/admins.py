@@ -102,16 +102,23 @@ async def init_admin(
             },
         )
 
-    if len(body.password) < 8:
+    from ppbase.models.field_types import FieldValidationError
+    from ppbase.services.auth_service import validate_password_value
+    from ppbase.services.admin_service import _get_superusers_collection
+
+    superusers_collection = await _get_superusers_collection(session)
+    try:
+        validate_password_value(superusers_collection, body.password)
+    except FieldValidationError as exc:
         raise HTTPException(
             status_code=400,
             detail={
                 "status": 400,
-                "message": "Password must be at least 8 characters.",
+                "message": "An error occurred while validating the submitted data.",
                 "data": {
                     "password": {
-                        "code": "validation_length_out_of_range",
-                        "message": "The length must be at least 8 characters.",
+                        "code": exc.code,
+                        "message": exc.message,
                     }
                 },
             },
@@ -216,7 +223,24 @@ async def create_admin(
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new admin (admin auth required)."""
-    from ppbase.services.admin_service import _admin_to_dict
+    from ppbase.models.field_types import FieldValidationError
+    from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
+    from ppbase.services.auth_service import validate_password_value
+
+    try:
+        validate_password_value(
+            await _get_superusers_collection(session),
+            body.password,
+        )
+    except FieldValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": 400,
+                "message": "An error occurred while validating the submitted data.",
+                "data": {"password": {"code": exc.code, "message": exc.message}},
+            },
+        )
 
     admin = await admin_service.create_admin(
         session, body.email, body.password, body.avatar
@@ -331,16 +355,23 @@ async def change_password(
             },
         )
 
-    if len(body.password) < 8:
+    from ppbase.models.field_types import FieldValidationError
+    from ppbase.services.auth_service import validate_password_value
+    try:
+        validate_password_value(
+            await admin_service._get_superusers_collection(session),
+            body.password,
+        )
+    except FieldValidationError as exc:
         raise HTTPException(
             status_code=400,
             detail={
                 "status": 400,
-                "message": "Password must be at least 8 characters.",
+                "message": "An error occurred while validating the submitted data.",
                 "data": {
                     "password": {
-                        "code": "validation_length_out_of_range",
-                        "message": "The length must be at least 8 characters.",
+                        "code": exc.code,
+                        "message": exc.message,
                     }
                 },
             },

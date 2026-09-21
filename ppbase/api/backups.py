@@ -347,7 +347,7 @@ async def _authorize_backup_read(
         is_superuser = token_auth is not None and (
             token_auth.get("type") == "admin"
             or (
-                token_auth.get("type") == "authRecord"
+            token_auth.get("type") in {"auth", "authRecord"}
                 and token_auth.get("collectionName") == "_superusers"
             )
         )

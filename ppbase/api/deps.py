@@ -92,12 +92,16 @@ async def get_optional_auth(
             full_secret = admin.token_key + secret  # fallback
         try:
             payload = jwt.decode(token, full_secret, algorithms=["HS256"])
+            payload = dict(payload)
+            payload.setdefault("collectionId", su_coll.id if su_coll is not None else "")
+            payload.setdefault("collectionName", "_superusers")
+            payload.setdefault("email", admin.email)
             return payload
         except jwt.InvalidTokenError:
             return None
 
     # For auth record tokens, do full verification with the record's token_key
-    if token_type == "authRecord":
+    if token_type in {"auth", "authRecord"}:
         collection_id = unverified.get("collectionId")
         if not collection_id:
             return None
@@ -132,6 +136,15 @@ async def get_optional_auth(
         full_secret = record_token_key + auth_secret
         try:
             payload = jwt.decode(token, full_secret, algorithms=["HS256"])
+            payload = dict(payload)
+            payload["collectionName"] = coll.name
+            for key, value in row.items():
+                if key in {"password_hash", "token_key"}:
+                    continue
+                if key == "email_visibility":
+                    payload["emailVisibility"] = value
+                else:
+                    payload[key] = value
             return payload
         except jwt.InvalidTokenError:
             return None
@@ -166,7 +179,7 @@ async def require_admin(
         return auth
 
     # Auth record tokens from _superusers collection are also admin-level
-    if token_type == "authRecord":
+    if token_type in {"auth", "authRecord"}:
         collection_name = auth.get("collectionName", "")
         if collection_name == "_superusers":
             return auth
@@ -210,7 +223,7 @@ async def require_record_auth(
                 "data": {},
             },
         )
-    if auth.get("type") != "authRecord":
+    if auth.get("type") not in {"auth", "authRecord"}:
         raise HTTPException(
             status_code=403,
             detail={

@@ -248,6 +248,28 @@ def _parse_fields(raw: Any) -> list[FieldDefinition]:
     return fields
 
 
+def _parse_physical_fields(collection: Any) -> list[FieldDefinition]:
+    """Return schema fields that have their own physical PostgreSQL columns.
+
+    Auth system fields are represented in the public collection schema for
+    PocketBase compatibility, but PPBase stores them in its managed columns
+    (``password_hash``, ``token_key`` and the auth metadata columns).
+    """
+    fields = _parse_fields(getattr(collection, "schema", None))
+    if _collection_type(collection) != "auth":
+        return fields
+    system_names = {
+        "email",
+        "emailVisibility",
+        "email_visibility",
+        "verified",
+        "password",
+        "tokenKey",
+        "token_key",
+    }
+    return [field for field in fields if field.name not in system_names]
+
+
 def _field_indexes(
     table_name: str,
     fields: list[FieldDefinition],
@@ -340,13 +362,11 @@ def _managed_indexes(collection: Any) -> dict[str, str]:
             f'ON "public"."{table_name}" ("email") WHERE "email" != \'\''
         )
         indexes[token_name] = (
-            f'CREATE INDEX IF NOT EXISTS "{token_name}" '
+            f'CREATE UNIQUE INDEX IF NOT EXISTS "{token_name}" '
             f'ON "public"."{table_name}" ("token_key")'
         )
 
-    indexes.update(
-        _field_indexes(table_name, _parse_fields(collection.schema))
-    )
+    indexes.update(_field_indexes(table_name, _parse_physical_fields(collection)))
     return indexes
 
 
@@ -1175,7 +1195,7 @@ async def create_collection_table(
         return
 
     # Parse schema field definitions
-    fields = _parse_fields(collection.schema)
+    fields = _parse_physical_fields(collection)
 
     # Build column definitions
     parts: list[str] = [
@@ -1272,16 +1292,26 @@ async def update_collection_table(
         return
 
     # Parse old and new field definitions
-    def _fields_by_identity(raw: Any) -> dict[str, FieldDefinition]:
+    def _fields_by_identity(raw: Any, collection_type: str) -> dict[str, FieldDefinition]:
         result: dict[str, FieldDefinition] = {}
         for fdef in _parse_fields(raw):
+            if collection_type == "auth" and fdef.name in {
+                "email",
+                "emailVisibility",
+                "email_visibility",
+                "verified",
+                "password",
+                "tokenKey",
+                "token_key",
+            }:
+                continue
             # Key by field id if available, else by name
             key = fdef.id if fdef.id else fdef.name
             result[key] = fdef
         return result
 
-    old_fields = _fields_by_identity(old_collection.schema)
-    new_fields = _fields_by_identity(new_collection.schema)
+    old_fields = _fields_by_identity(old_collection.schema, old_type)
+    new_fields = _fields_by_identity(new_collection.schema, new_type)
 
     old_keys = set(old_fields.keys())
     new_keys = set(new_fields.keys())
@@ -1388,7 +1418,7 @@ async def _recreate_field_indexes(
     """Drop and recreate field-level indexes for a collection."""
     table_name = _safe_name(collection.name)
 
-    fields = _parse_fields(collection.schema)
+    fields = _parse_physical_fields(collection)
 
     index_stmts: list[tuple[str, str]] = []
     for f in fields:

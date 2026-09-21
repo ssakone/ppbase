@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import secrets
 import string
 import time
@@ -10,14 +11,165 @@ from typing import Any
 import bcrypt
 import jwt
 
+from ppbase.models.field_types import FieldDefinition, FieldType, validate_field_value
+
 # Alphabet for token key generation
 _TOKEN_KEY_ALPHABET = string.ascii_letters + string.digits
+AUTH_TOKEN_TYPE = "auth"
+LEGACY_AUTH_TOKEN_TYPES = frozenset({AUTH_TOKEN_TYPE, "authRecord"})
+DEFAULT_PASSWORD_MIN_LENGTH = 8
+DEFAULT_PASSWORD_MAX_LENGTH = 71
+DEFAULT_BCRYPT_COST = 10
 
 
-def hash_password(password: str) -> str:
+def normalize_auth_password_schema(
+    schema: Any,
+    options: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Materialize legacy ``minPasswordLength`` into the auth password field.
+
+    PocketBase's pre-v0.23 migration converted the legacy option into the
+    system ``password`` field's ``min`` value.  The option is not a runtime
+    setting in current PocketBase, so it is consumed once and removed.
+    Existing password field definitions always win over the legacy option.
+    """
+    normalized_schema = copy.deepcopy(schema) if isinstance(schema, list) else []
+    normalized_options = copy.deepcopy(options) if isinstance(options, dict) else {}
+
+    legacy_value = normalized_options.pop("minPasswordLength", None)
+    password_field_index: int | None = None
+    for index, raw in enumerate(normalized_schema):
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("name") == "password" and raw.get("type") == FieldType.PASSWORD:
+            password_field_index = index
+            break
+
+    if password_field_index is not None:
+        normalized_schema[password_field_index] = _normalise_schema_field(
+            normalized_schema[password_field_index]
+        )
+    else:
+        try:
+            minimum = int(
+                legacy_value if legacy_value is not None else DEFAULT_PASSWORD_MIN_LENGTH
+            )
+        except (TypeError, ValueError):
+            minimum = DEFAULT_PASSWORD_MIN_LENGTH
+        if minimum < 1 or minimum > DEFAULT_PASSWORD_MAX_LENGTH:
+            minimum = DEFAULT_PASSWORD_MIN_LENGTH
+
+        normalized_schema.append(
+            {
+                "id": "password_field",
+                "name": "password",
+                "type": "password",
+                "required": True,
+                "system": True,
+                "hidden": True,
+                "presentable": False,
+                "options": {
+                    "min": minimum,
+                    "max": 0,
+                    "cost": DEFAULT_BCRYPT_COST,
+                    "pattern": "",
+                },
+            }
+        )
+
+    return normalized_schema, normalized_options
+
+
+def _normalise_schema_field(definition: dict[str, Any]) -> dict[str, Any]:
+    """Normalise flat PocketBase field options into PPBase's nested shape."""
+    core_keys = {
+        "id",
+        "name",
+        "type",
+        "required",
+        "system",
+        "hidden",
+        "presentable",
+        "options",
+    }
+    extra = {key: value for key, value in definition.items() if key not in core_keys}
+    result = {key: value for key, value in definition.items() if key in core_keys}
+    existing = result.pop("options", None)
+    if not isinstance(existing, dict):
+        existing = {}
+    if extra or "options" in definition:
+        result["options"] = {**extra, **existing}
+
+    # PocketBase's initPasswordField() enforces these system properties on an
+    # existing password field while leaving Min/Max/Pattern/Cost untouched.
+    # This is deliberately separate from the legacy minPasswordLength import:
+    # once a password field exists, that option must never override it.
+    result["name"] = "password"
+    result["type"] = FieldType.PASSWORD
+    result["required"] = True
+    result["system"] = True
+    result["hidden"] = True
+    result["presentable"] = False
+    return result
+
+
+def get_password_field(collection: Any | None = None) -> FieldDefinition:
+    """Return the effective password field definition for an auth collection.
+
+    PocketBase stores password constraints on the system ``password`` field.
+    Older PPBase collections don't persist that system field in ``schema``;
+    those collections use the same default constraints as PocketBase.
+    """
+    schema = getattr(collection, "schema", None) if collection is not None else None
+    if isinstance(collection, dict):
+        schema = collection.get("schema")
+
+    if isinstance(schema, list):
+        for raw in schema:
+            if not isinstance(raw, dict):
+                continue
+            # Match the actual PocketBase lookup semantics: resolve the
+            # password field by its original name and type first.  Do not
+            # normalize an arbitrary earlier business field before deciding
+            # whether it is the system password field.
+            if raw.get("name") != "password" or raw.get("type") != FieldType.PASSWORD:
+                continue
+            return FieldDefinition(**_normalise_schema_field(raw))
+
+    return FieldDefinition(
+        name="password",
+        type=FieldType.PASSWORD,
+        required=True,
+        system=True,
+        hidden=True,
+        options={
+            "min": DEFAULT_PASSWORD_MIN_LENGTH,
+            "max": DEFAULT_PASSWORD_MAX_LENGTH,
+        },
+    )
+
+
+def validate_password_value(collection: Any | None, password: Any) -> str:
+    """Validate and return a plain password using the collection field rules."""
+    return validate_field_value(get_password_field(collection), password)
+
+
+def get_password_cost(collection: Any | None) -> int:
+    """Return the configured bcrypt cost, falling back to bcrypt's default."""
+    options = get_password_field(collection).options or {}
+    try:
+        cost = int(options.get("cost", DEFAULT_BCRYPT_COST))
+    except (TypeError, ValueError):
+        cost = DEFAULT_BCRYPT_COST
+    if cost < 4 or cost > 31:
+        return DEFAULT_BCRYPT_COST
+    return cost
+
+
+def hash_password(password: str, *, cost: int | None = None) -> str:
     """Hash a plaintext password using bcrypt."""
     pwd_bytes = password.encode("utf-8")
-    salt = bcrypt.gensalt(rounds=12)
+    salt = bcrypt.gensalt(rounds=cost or DEFAULT_BCRYPT_COST)
     return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
 
 
@@ -37,9 +189,16 @@ def generate_token_key(length: int = 50) -> str:
 def generate_default_auth_options(*, is_superusers: bool = False) -> dict:
     """Generate default PocketBase-compatible auth options with per-collection secrets."""
     return {
+        "authAlert": {
+            "enabled": True,
+            "emailTemplate": {
+                "subject": "Login from a new location",
+                "body": "We noticed a login to your {APP_NAME} account from a new location: {ALERT_INFO}",
+            },
+        },
         "authToken": {
             "secret": generate_token_key(50),
-            "duration": 86400 if is_superusers else 604800,  # 1 day / 7 days
+            "duration": 86400 if is_superusers else 432000,  # 1 day / 5 days
         },
         "passwordResetToken": {
             "secret": generate_token_key(50),
@@ -47,7 +206,7 @@ def generate_default_auth_options(*, is_superusers: bool = False) -> dict:
         },
         "verificationToken": {
             "secret": generate_token_key(50),
-            "duration": 259200,  # 3 days
+            "duration": 86400,  # 1 day
         },
         "emailChangeToken": {
             "secret": generate_token_key(50),
@@ -68,7 +227,7 @@ def generate_default_auth_options(*, is_superusers: bool = False) -> dict:
         },
         "mfa": {
             "enabled": False,
-            "duration": 1800,
+            "duration": 600,
         },
         "otp": {
             "enabled": False,
@@ -77,6 +236,18 @@ def generate_default_auth_options(*, is_superusers: bool = False) -> dict:
         },
         "authRule": "",
         "manageRule": None,
+        "verificationTemplate": {
+            "subject": "Verify your {APP_NAME} email",
+            "body": "Click on the button below to verify your email address: {TOKEN}",
+        },
+        "resetPasswordTemplate": {
+            "subject": "Reset your {APP_NAME} password",
+            "body": "Click on the button below to reset your password: {TOKEN}",
+        },
+        "confirmEmailChangeTemplate": {
+            "subject": "Confirm your {APP_NAME} new email address",
+            "body": "Click on the button below to confirm your new email address: {TOKEN}",
+        },
     }
 
 
@@ -100,9 +271,9 @@ def get_collection_token_config(collection, token_type: str) -> tuple[str, int]:
 
     # Default durations by token type
     default_durations = {
-        'authToken': 604800,        # 7 days
+        'authToken': 432000,        # 5 days
         'passwordResetToken': 1800,  # 30 min
-        'verificationToken': 259200, # 3 days
+        'verificationToken': 86400, # 1 day
         'emailChangeToken': 1800,
         'fileToken': 180,
     }
@@ -193,7 +364,7 @@ def create_record_auth_token(
 
     payload = {
         "id": record_id,
-        "type": "authRecord",
+        "type": AUTH_TOKEN_TYPE,
         "collectionId": collection_id,
         "refreshable": bool(refreshable),
     }

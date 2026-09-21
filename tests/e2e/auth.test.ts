@@ -406,7 +406,7 @@ describe('Auth Collection Flows', () => {
     expect(data.record.email).toBe(email);
 
     const payload = JSON.parse(atob(data.token.split('.')[1]));
-    expect(payload.type).toBe('authRecord');
+    expect(payload.type).toBe('auth');
     expect(payload.collectionId).toBe(authCollection.id);
     expect(payload.refreshable).toBe(false);
 
@@ -1120,7 +1120,7 @@ describe('Auth Collection Flows', () => {
     const parts = authData.token.split('.');
     const payload = JSON.parse(atob(parts[1]));
 
-    expect(payload.type).toBe('authRecord');
+    expect(payload.type).toBe('auth');
     expect(payload.id).toBe(authData.record.id);
     expect(payload.collectionId).toBe(authCollection.id);
   });

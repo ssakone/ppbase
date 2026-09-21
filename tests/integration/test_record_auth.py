@@ -268,7 +268,7 @@ class TestAuthWithPassword:
         decoded = pyjwt.decode(
             data["token"], options={"verify_signature": False}
         )
-        assert decoded["type"] == "authRecord"
+        assert decoded["type"] == "auth"
         assert decoded["id"] == login_user["id"]
 
     async def test_auth_with_password_invalid_credentials(

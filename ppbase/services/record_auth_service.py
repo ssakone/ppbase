@@ -12,11 +12,11 @@ import string
 from datetime import datetime, timezone
 from typing import Any
 
+from ppbase.models.field_types import _EMAIL_RE, FieldValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.db.system_tables import CollectionRecord
-from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services.auth_service import (
     create_email_change_token,
     create_password_reset_token,
@@ -24,7 +24,9 @@ from ppbase.services.auth_service import (
     create_verification_token,
     generate_token_key,
     get_collection_token_config,
+    get_password_cost,
     hash_password,
+    validate_password_value,
     verify_password,
     verify_purpose_token,
 )
@@ -51,7 +53,10 @@ def _get_identity_fields(collection: CollectionRecord) -> list[str]:
     """
     opts = collection.options or {}
     pa = opts.get("passwordAuth", {})
-    return pa.get("identityFields", ["email"])
+    fields = pa.get("identityFields", ["email"])
+    if not isinstance(fields, list):
+        return ["email"]
+    return list(dict.fromkeys(str(field) for field in fields if str(field).strip()))
 
 
 def _is_password_auth_enabled(collection: CollectionRecord) -> bool:
@@ -83,11 +88,28 @@ async def _get_raw_record_by_field(
 ) -> dict[str, Any] | None:
     """Fetch a raw row by an arbitrary column (e.g. email)."""
     table = _table_name(collection)
-    sql = f'SELECT * FROM "{table}" WHERE "{field}" = :val LIMIT 1'
+    case_insensitive = any(
+        isinstance(index, str)
+        and "unique" in index.lower()
+        and field.lower() in index.lower()
+        and "nocase" in index.lower()
+        for index in (collection.indexes or [])
+    )
+    predicate = (
+        f'LOWER("{field}") = LOWER(:val)'
+        if case_insensitive
+        else f'"{field}" = :val'
+    )
+    sql = f'SELECT * FROM "{table}" WHERE {predicate} LIMIT 1'
     async with engine.connect() as conn:
         result = await conn.execute(text(sql), {"val": value})
         row = result.mappings().first()
     return dict(row) if row else None
+
+
+_DUMMY_PASSWORD_HASH = (
+    "$2b$10$FrbgWgqTs2ugSWe493vQ/ehApVrt8VoFDyH6NlpWeRUpJ5MuNFPNK"
+)
 
 
 async def _update_record_columns(
@@ -162,8 +184,8 @@ async def auth_with_password(
 ) -> dict[str, Any] | None:
     """Authenticate a user by identity + password.
 
-    For _superusers collection, returns an admin token (type: "admin").
-    For other auth collections, returns a record token (type: "authRecord").
+    Returns the standard PocketBase auth token (type: ``"auth"``) for every
+    auth collection, including ``_superusers``.
 
     Returns ``{"token": ..., "record": ...}`` on success, or ``None`` on
     bad credentials.
@@ -174,39 +196,33 @@ async def auth_with_password(
         return None
 
     fields = _get_identity_fields(collection)
-    if not fields:
-        fields = ["email"]
-
     if identity_field and identity_field not in fields:
         return None
 
-    field = identity_field or fields[0]
-    if not field.replace("_", "").isalnum():
-        return None
+    if identity_field:
+        candidate_fields = [identity_field]
+    else:
+        candidate_fields = list(fields)
+        if len(candidate_fields) > 1 and _EMAIL_RE.match(identity):
+            candidate_fields.sort(key=lambda field: 0 if field == "email" else 1)
+    row: dict[str, Any] | None = None
+    for field in candidate_fields:
+        if not field or not field.replace("_", "").isalnum():
+            continue
+        candidate = await _get_raw_record_by_field(engine, collection, field, identity)
+        if candidate is not None:
+            row = candidate
+            break
 
-    row = await _get_raw_record_by_field(engine, collection, field, identity)
-    if row is None:
-        return None
-
-    pw_hash = row.get("password_hash", "")
+    pw_hash = row.get("password_hash", "") if row else ""
     if not pw_hash or not verify_password(password, pw_hash):
+        # Keep the password verification cost comparable for unknown identities.
+        if row is None:
+            verify_password(password, _DUMMY_PASSWORD_HASH)
         return None
 
     # _superusers collection uses admin tokens
-    if collection.name == "_superusers":
-        from ppbase.services.auth_service import create_admin_token
-        from ppbase.db.system_tables import SuperuserRecord
-
-        # Build a mock admin record object
-        class MockAdminRecord:
-            def __init__(self, row_dict):
-                self.id = row_dict.get("id", "")
-                self.token_key = row_dict.get("token_key", "")
-
-        mock_admin = MockAdminRecord(row)
-        token = create_admin_token(mock_admin, settings, superusers_collection=collection)
-    else:
-        token = create_record_auth_token(row, collection, settings)
+    token = create_record_auth_token(row, collection, settings)
 
     record = build_record_response(
         row,
@@ -409,8 +425,7 @@ async def auth_refresh(
 ) -> dict[str, Any] | None:
     """Refresh an auth token.
 
-    For _superusers collection, returns an admin token.
-    For other auth collections, returns a record token.
+    Returns a standard auth token for every auth collection.
 
     ``token_payload`` is the decoded JWT.  We re-fetch the record to verify
     it still exists and issue a fresh token.
@@ -421,7 +436,9 @@ async def auth_refresh(
 
     # Impersonation tokens are intentionally non-refreshable.
     if token_payload.get("refreshable") is False:
-        return None
+        token = str(token_payload.get("_raw_token", ""))
+    else:
+        token = ""
 
     record_id = token_payload.get("id")
     if not record_id:
@@ -431,19 +448,7 @@ async def auth_refresh(
     if row is None:
         return None
 
-    # _superusers collection uses admin tokens
-    if collection.name == "_superusers":
-        from ppbase.services.auth_service import create_admin_token
-        from ppbase.db.system_tables import SuperuserRecord
-
-        class MockAdminRecord:
-            def __init__(self, row_dict):
-                self.id = row_dict.get("id", "")
-                self.token_key = row_dict.get("token_key", "")
-
-        mock_admin = MockAdminRecord(row)
-        token = create_admin_token(mock_admin, settings, superusers_collection=collection)
-    else:
+    if not token:
         token = create_record_auth_token(row, collection, settings)
 
     record = build_record_response(
@@ -467,7 +472,8 @@ async def impersonate_auth_record(
 ) -> dict[str, Any] | None:
     """Generate a non-refreshable auth token for an existing auth record.
 
-    For _superusers collection, returns an admin token.
+    For _superusers collection, legacy ``admin`` tokens are accepted during
+    verification, but newly issued auth tokens use PocketBase's ``auth`` type.
     """
     from ppbase.models.record import build_record_response
 
@@ -475,41 +481,13 @@ async def impersonate_auth_record(
     if row is None:
         return None
 
-    # _superusers collection uses admin tokens
-    if collection.name == "_superusers":
-        from ppbase.services.auth_service import create_admin_token
-
-        class MockAdminRecord:
-            def __init__(self, row_dict):
-                self.id = row_dict.get("id", "")
-                self.token_key = row_dict.get("token_key", "")
-
-        mock_admin = MockAdminRecord(row)
-        token = create_admin_token(
-            mock_admin,
-            settings,
-            superusers_collection=collection,
-        )
-        # Admin tokens don't support refreshable flag in the same way
-        # but we can still make it non-refreshable by setting it in payload
-        import jwt as _jwt
-        unverified = _jwt.decode(token, options={"verify_signature": False})
-        unverified["refreshable"] = False
-        # Re-sign with same secret
-        secret = mock_admin.token_key
-        from ppbase.services.auth_service import get_collection_token_config
-        auth_secret, _ = get_collection_token_config(collection, 'authToken')
-        secret += auth_secret
-        from ppbase.services.auth_service import create_token
-        token = create_token(unverified, secret, duration if duration else 1209600)
-    else:
-        token = create_record_auth_token(
-            row,
-            collection,
-            settings,
-            refreshable=False,
-            duration_seconds=duration,
-        )
+    token = create_record_auth_token(
+        row,
+        collection,
+        settings,
+        refreshable=False,
+        duration_seconds=duration,
+    )
 
     record = build_record_response(
         row,
@@ -549,16 +527,16 @@ async def verify_record_auth_token(
 
     token_type = unverified.get("type")
 
-    # For _superusers, accept both admin and authRecord tokens
+    # For _superusers, accept legacy admin tokens and both current/legacy
+    # record-token claim names.
     if collection.name == "_superusers":
-        if token_type not in ("admin", "authRecord"):
+        if token_type not in ("admin", "auth", "authRecord"):
             return None
     else:
-        # For other collections, only accept authRecord tokens
-        if token_type != "authRecord":
+        if token_type not in ("auth", "authRecord"):
             return None
 
-    if unverified.get("collectionId") != collection.id:
+    if token_type != "admin" and unverified.get("collectionId") != collection.id:
         return None
 
     record_id = unverified.get("id")
@@ -722,11 +700,13 @@ async def confirm_password_reset(
             }
         }
 
-    if len(password) < 8:
+    try:
+        password = validate_password_value(collection, password)
+    except FieldValidationError as exc:
         return False, {
-            "password": {
-                "code": "validation_length_out_of_range",
-                "message": "The length must be between 8 and 72.",
+            exc.field_name: {
+                "code": exc.code,
+                "message": exc.message,
             }
         }
 
@@ -791,7 +771,7 @@ async def confirm_password_reset(
             }
         }
 
-    new_hash = hash_password(password)
+    new_hash = hash_password(password, cost=get_password_cost(collection))
     new_token_key = generate_token_key()
 
     await _update_record_columns(

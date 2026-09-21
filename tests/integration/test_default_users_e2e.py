@@ -108,7 +108,7 @@ class TestDefaultUsersE2E:
         token = login.json()["token"]
         decoded = pyjwt.decode(token, options={"verify_signature": False})
         assert decoded["collectionId"] == "_pb_users_auth_"
-        assert decoded["type"] == "authRecord"
+        assert decoded["type"] == "auth"
 
     async def test_password_reset_invalidates_old_tokens(
         self, app_client: AsyncClient, auth_collection: dict

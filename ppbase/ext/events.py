@@ -88,14 +88,14 @@ class HookEvent:
         return value or None
 
     def has_record_auth(self) -> bool:
-        return self.auth_type() == "authRecord"
+        return self.auth_type() in {"auth", "authRecord"}
 
     def has_superuser_auth(self) -> bool:
         """PocketBase-like superuser check for event auth context."""
         auth_type = self.auth_type()
         if auth_type == "admin":
             return True
-        if auth_type == "authRecord" and self.auth_collection_name() == "_superusers":
+        if auth_type in {"auth", "authRecord"} and self.auth_collection_name() == "_superusers":
             return True
         return False
 
@@ -204,7 +204,7 @@ class HookEvent:
     ) -> dict[str, Any] | None:
         """Fetch current auth record when auth token type is ``authRecord``."""
         auth = self.current_auth()
-        if not auth or auth.get("type") != "authRecord":
+        if not auth or auth.get("type") not in {"auth", "authRecord"}:
             return None
         collection_ref = str(
             auth.get("collectionName") or auth.get("collectionId") or ""
@@ -449,6 +449,8 @@ class RecordAuthRequestEvent(HookEvent):
     email: str | None = None
     otp_id: str | None = None
     otp: str | None = None
+    password_confirm: str | None = None
+    new_email: str | None = None
 
 
 @dataclass
