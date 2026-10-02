@@ -43,10 +43,12 @@ OPERATOR: "?!~" | "?!=" | "?>=" | "?<=" | "?>" | "?<" | "?~" | "?="
         | macro
         | field_path
 
-string: ESCAPED_STRING
+string: DOUBLE_STRING
       | SINGLE_STRING
 
-SINGLE_STRING: "'" /[^']*/ "'"
+// Quoted text ends at the first unescaped matching quote (PocketBase fexpr).
+DOUBLE_STRING: /"(?:[^"\\]|\\.)*"/s
+SINGLE_STRING: /'(?:[^'\\]|\\.)*'/s
 
 number: SIGNED_NUMBER
 
@@ -65,7 +67,6 @@ field_path: FIELD_IDENT ("." FIELD_IDENT)*
 
 FIELD_IDENT: /[a-zA-Z_][a-zA-Z0-9_:]*/
 
-%import common.ESCAPED_STRING
 %import common.SIGNED_NUMBER
 %import common.WS
 %ignore WS
@@ -238,6 +239,29 @@ _SAFE_IDENT_CHARS = frozenset(
 _MODIFIER_NAMES = {"isset", "changed", "length", "each", "lower"}
 
 
+_TEXT_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", '"': '"'}
+
+
+def _unescape_text(raw: str) -> str:
+    """Unescape quoted filter text like PocketBase's fexpr scanner.
+
+    ``\\n``, ``\\t``, ``\\r``, ``\\\\``, ``\\'`` and ``\\"`` are unescaped; any other
+    backslash is kept as is (``'C:\\dir'`` stays ``C:\\dir``). The JS SDK
+    ``pb.filter()`` relies on this to quote values containing apostrophes.
+    """
+    if "\\" not in raw:
+        return raw
+    out: list[str] = []
+    chars = iter(raw)
+    for ch in chars:
+        if ch != "\\":
+            out.append(ch)
+            continue
+        nxt = next(chars, "")
+        out.append(_TEXT_ESCAPES.get(nxt, "\\" + nxt))
+    return "".join(out)
+
+
 def _sanitize_ident(s: str) -> str:
     """Raise if *s* contains characters unsuitable for a SQL identifier."""
     for ch in s:
@@ -275,15 +299,8 @@ class _FilterTransformer(Transformer):
     # -- Leaf nodes ----------------------------------------------------------
 
     def string(self, items: list) -> tuple[str, str]:
-        raw = str(items[0])
-        # Strip surrounding quotes
-        if raw.startswith("'") and raw.endswith("'"):
-            val = raw[1:-1]
-        elif raw.startswith('"') and raw.endswith('"'):
-            val = raw[1:-1]
-        else:
-            val = raw
-        return ("literal", val)
+        # Strip the surrounding quotes, then unescape like PocketBase (fexpr).
+        return ("literal", _unescape_text(str(items[0])[1:-1]))
 
     def number(self, items: list) -> tuple[str, float | int]:
         raw = str(items[0])

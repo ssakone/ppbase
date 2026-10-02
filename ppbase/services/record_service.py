@@ -421,7 +421,7 @@ def _filter_needs_relation_index(filter_expression: str) -> bool:
             unquoted.append(" ")
             if escaped:
                 escaped = False
-            elif quote == '"' and char == "\\":
+            elif char == "\\":
                 escaped = True
             elif char == quote:
                 quote = None

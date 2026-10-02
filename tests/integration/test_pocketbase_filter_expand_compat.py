@@ -1,0 +1,87 @@
+"""PocketBase parity: escaped quotes in filter strings, merged expands, ``""`` vs NULL.
+
+- Escaped quotes: the JS SDK ``pb.filter("name ~ {:n}", {n: "N'Diaye"})`` produces
+  ``name ~ 'N\\'Diaye'``; PocketBase (fexpr) unescapes ``\\'``, ``\\"``, ``\\\\``, ``\\n``,
+  ``\\t``, ``\\r`` inside quoted text and keeps any other backslash as is.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from httpx import AsyncClient
+
+
+async def _collection(client: AsyncClient, token: str, name: str, schema: list[dict], **extra) -> dict:
+    payload = {
+        "name": name,
+        "type": "base",
+        "schema": schema,
+        "listRule": "",
+        "viewRule": "",
+        "createRule": "",
+        "updateRule": "",
+        "deleteRule": "",
+        **extra,
+    }
+    response = await client.post("/api/collections", headers={"Authorization": token}, json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _record(client: AsyncClient, token: str, collection: str, data: dict) -> dict:
+    response = await client.post(
+        f"/api/collections/{collection}/records", headers={"Authorization": token}, json=data
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _rel(name: str, collection_id: str) -> dict:
+    return {"name": name, "type": "relation", "options": {"collectionId": collection_id, "maxSelect": 1}}
+
+
+@pytest.mark.asyncio
+async def test_filter_strings_accept_escaped_quotes(app_client: AsyncClient, admin_token: str) -> None:
+    s = uuid.uuid4().hex[:8]
+    teams = await _collection(app_client, admin_token, f"teams_{s}", [{"name": "name", "type": "text"}])
+    people = f"people_{s}"
+    await _collection(
+        app_client, admin_token, people, [{"name": "username", "type": "text"}, _rel("team", teams["id"])]
+    )
+    blue = await _record(app_client, admin_token, teams["name"], {"name": "Blue"})
+    for username, team in (
+        ("N'Diaye", ""),
+        ('Say "hi"', ""),
+        ("back\\slash", ""),
+        ("line\nbreak", ""),
+        ("plain", blue["id"]),
+        ("other", ""),
+    ):
+        await _record(app_client, admin_token, people, {"username": username, "team": team})
+
+    async def usernames(filter_expr: str) -> list[str]:
+        response = await app_client.get(
+            f"/api/collections/{people}/records", params={"filter": filter_expr, "sort": "username"}
+        )
+        assert response.status_code == 200, (filter_expr, response.text)
+        return sorted(item["username"] for item in response.json()["items"])
+
+    # Form produced by the JS SDK: pb.filter("username ~ {:n}", {n: "N'Diaye"}).
+    assert await usernames(r"username ~ 'N\'Diaye'") == ["N'Diaye"]
+    assert await usernames(r"username = 'N\'Diaye'") == ["N'Diaye"]
+    assert await usernames(r'username = "Say \"hi\""') == ['Say "hi"']
+    assert await usernames(r"username ~ 'Say \"hi'") == ['Say "hi"']
+    assert await usernames("username = \"N'Diaye\"") == ["N'Diaye"]
+    # Unknown escapes keep their backslash; \\ and \n are unescaped (fexpr).
+    assert await usernames(r"username = 'back\slash'") == ["back\\slash"]
+    assert await usernames(r"username = 'back\\slash'") == ["back\\slash"]
+    assert await usernames(r"username = 'line\nbreak'") == ["line\nbreak"]
+    # An escaped quote does not hide a relation path that follows it.
+    assert await usernames(r"username = 'N\'Diaye' || team.name = 'Blue'") == ["N'Diaye", "plain"]
+    # Unterminated string stays a 400.
+    response = await app_client.get(
+        f"/api/collections/{people}/records", params={"filter": r"username = 'N\'"}
+    )
+    assert response.status_code == 400, response.text
