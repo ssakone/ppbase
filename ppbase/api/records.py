@@ -50,6 +50,7 @@ from ppbase.services.record_storage_coordinator import (
     ConnectionEngineAdapter as _ConnectionEngineAdapter,
     run_record_storage_transaction,
 )
+from ppbase.services.client_filter_guard import assert_client_query_allowed
 from ppbase.services.rule_engine import check_rule
 from ppbase.services.write_barrier import WriteBarrierTimeoutError
 
@@ -1271,6 +1272,17 @@ async def api_list_records(
                 403,
                 "Only superusers can perform this action.",
             )
+
+        try:
+            await assert_client_query_allowed(
+                e.engine or engine,
+                collection,
+                e.filter,
+                e.sort,
+                is_superuser=bool(auth_ctx and auth_ctx.get("is_admin")),
+            )
+        except ValueError as exc:
+            return _error_response(400, str(exc))
 
         effective_filter = e.filter
         if isinstance(rule_result, str):
