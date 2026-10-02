@@ -32,6 +32,7 @@ from ppbase.models.record import (
     build_record_response,
     format_datetime,
 )
+from ppbase.services.request_macros import resolve_request_macros
 from ppbase.services.filter_parser import parse_filter, parse_sort
 from ppbase.services.write_barrier import require_mutation_write_barrier
 
@@ -472,6 +473,7 @@ async def list_records(
             collection,
             filter_str,
         )
+        await resolve_request_macros(engine, filter_str, request_context, collection)
         where_sql, params = parse_filter(
             filter_str,
             request_context,
@@ -1491,6 +1493,7 @@ async def check_record_rule(
         collection,
         rule_filter,
     )
+    await resolve_request_macros(engine, rule_filter, request_context, collection)
     where_sql, params = parse_filter(
         rule_filter,
         request_context,

@@ -1498,6 +1498,11 @@ class _FilterTransformer(Transformer):
 
     def _resolve_macro(self, macro_name: str) -> str:
         name = macro_name.lstrip("@")
+        resolved = self._request_context.get("resolved_macros")
+        if isinstance(resolved, dict) and name in resolved:
+            # Pre-resolved by services.request_macros (auth record fields, relations).
+            pname = self._next_param(resolved[name])
+            return f":{pname}"
         if name == "now":
             return "(TIMEZONE('UTC', NOW()) AT TIME ZONE 'UTC')"
         if name == "second":
