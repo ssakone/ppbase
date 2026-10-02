@@ -124,6 +124,9 @@ async def resolve_request_macros(
             if segments[0] in _TOKEN_AUTH_FIELDS and len(segments) == 1:
                 continue
             if not auth.get("id") or not auth.get("collectionId"):
+                # Anonymous (or revoked token): every record field is NULL, never ''
+                # (a '' bound against a boolean column fails); collectionName stays ''.
+                resolved[key] = "" if path == "collectionName" else None
                 continue
             auth_collection = await loader.collection(str(auth["collectionId"]))
             if auth_collection is None:

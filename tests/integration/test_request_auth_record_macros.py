@@ -121,6 +121,11 @@ async def test_auth_record_fields_and_relations_in_rules(
     })
     assert await _titles(app_client, await _login(app_client, "users", email), docs) == set()
 
+    # Anonymous request: same rule, empty result, no 500.
+    anonymous = await app_client.get(f"/api/collections/{docs}/records")
+    assert anonymous.status_code == 200, anonymous.text
+    assert anonymous.json()["items"] == []
+
 
 @pytest.mark.asyncio
 async def test_body_relation_traversal_in_create_rule(
