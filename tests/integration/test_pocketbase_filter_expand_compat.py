@@ -3,6 +3,8 @@
 - Escaped quotes: the JS SDK ``pb.filter("name ~ {:n}", {n: "N'Diaye"})`` produces
   ``name ~ 'N\\'Diaye'``; PocketBase (fexpr) unescapes ``\\'``, ``\\"``, ``\\\\``, ``\\n``,
   ``\\t``, ``\\r`` inside quoted text and keeps any other backslash as is.
+- Expand: ``expand=a.b,a`` must keep ``expand.a.expand.b`` whatever the order (PocketBase merges
+  the expansions of the same field).
 """
 
 from __future__ import annotations
@@ -85,3 +87,43 @@ async def test_filter_strings_accept_escaped_quotes(app_client: AsyncClient, adm
         f"/api/collections/{people}/records", params={"filter": r"username = 'N\'"}
     )
     assert response.status_code == 400, response.text
+
+
+@pytest.mark.asyncio
+async def test_expand_merges_nested_and_plain_paths_of_same_field(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    s = uuid.uuid4().hex[:8]
+    networks = await _collection(app_client, admin_token, f"networks_{s}", [{"name": "name", "type": "text"}])
+    links = await _collection(
+        app_client,
+        admin_token,
+        f"agent_networks_{s}",
+        [{"name": "label", "type": "text"}, _rel("network", networks["id"]), _rel("backup", networks["id"])],
+    )
+    agents = f"agents_{s}"
+    await _collection(
+        app_client, admin_token, agents, [{"name": "name", "type": "text"}, _rel("agent_network", links["id"])]
+    )
+    main = await _record(app_client, admin_token, networks["name"], {"name": "main"})
+    spare = await _record(app_client, admin_token, networks["name"], {"name": "spare"})
+    link = await _record(
+        app_client, admin_token, links["name"], {"label": "L1", "network": main["id"], "backup": spare["id"]}
+    )
+    agent = await _record(app_client, admin_token, agents, {"name": "A", "agent_network": link["id"]})
+
+    async def expanded(expand: str) -> list[dict]:
+        listed = await app_client.get(f"/api/collections/{agents}/records", params={"expand": expand})
+        assert listed.status_code == 200, listed.text
+        viewed = await app_client.get(f"/api/collections/{agents}/records/{agent['id']}", params={"expand": expand})
+        assert viewed.status_code == 200, viewed.text
+        return [listed.json()["items"][0]["expand"]["agent_network"], viewed.json()["expand"]["agent_network"]]
+
+    for expand in ("agent_network.network,agent_network", "agent_network,agent_network.network"):
+        for link_expanded in await expanded(expand):
+            assert link_expanded["label"] == "L1", expand
+            assert link_expanded["expand"]["network"]["name"] == "main", expand
+
+    for link_expanded in await expanded("agent_network.network,agent_network.backup"):
+        assert link_expanded["expand"]["network"]["name"] == "main"
+        assert link_expanded["expand"]["backup"]["name"] == "spare"
