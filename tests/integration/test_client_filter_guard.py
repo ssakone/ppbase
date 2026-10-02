@@ -58,8 +58,9 @@ async def test_client_queries_cannot_reach_secrets_or_hidden_fields(
     assert await status({"filter": "secret = 's3cr3t'"}) == 400
     assert await status({"sort": "secret"}) == 400
     assert await status({"filter": "secret = 's3cr3t'"}, admin_token) == 200
-    # Unknown field: 400, not 500.
+    # Unknown field: 400, not 500 (superusers included).
     assert await status({"filter": "nope = 1"}) == 400
+    assert await status({"filter": "nope = 1"}, admin_token) == 400
     # Legitimate queries still work, through relations too.
     assert await status({"filter": "title = 't' && owner.email != ''", "sort": "-created,title"}) == 200
 

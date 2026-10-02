@@ -54,7 +54,7 @@ def _sort_paths(sort_str: str) -> list[list[str]]:
     return result
 
 
-async def _check_path(loader, collection: Any, segments: list[str]) -> None:
+async def _check_path(loader, collection: Any, segments: list[str], *, allow_hidden: bool = False) -> None:
     current = collection
     for index, segment in enumerate(segments):
         if segment in PROTECTED_FIELDS:
@@ -73,7 +73,7 @@ async def _check_path(loader, collection: Any, segments: list[str]) -> None:
         definition = fields.get(segment)
         if definition is None:
             raise ValueError(f"Invalid filter field: {segment}.")
-        if definition.get("hidden"):
+        if definition.get("hidden") and not allow_hidden:
             raise ValueError(f"Invalid filter field: {segment}.")
         if index == len(segments) - 1:
             return
@@ -111,12 +111,8 @@ async def assert_client_query_allowed(
     for collection_name, segments in references:
         if not segments:
             continue
-        if is_superuser:
-            # Superusers may use hidden fields, never stored auth secrets.
-            if any(s in PROTECTED_FIELDS for s in segments):
-                raise ValueError(f"Invalid filter field: {next(s for s in segments if s in PROTECTED_FIELDS)}.")
-            continue
         start = collection if collection_name is None else await loader.collection(collection_name)
         if start is None:
             raise ValueError(f"Invalid filter collection: {collection_name}.")
-        await _check_path(loader, start, segments)
+        # Superusers may use hidden fields, never stored auth secrets; unknown fields are 400 for all.
+        await _check_path(loader, start, segments, allow_hidden=is_superuser)
