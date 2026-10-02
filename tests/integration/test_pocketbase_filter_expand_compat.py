@@ -5,6 +5,9 @@
   ``\\t``, ``\\r`` inside quoted text and keeps any other backslash as is.
 - Expand: ``expand=a.b,a`` must keep ``expand.a.expand.b`` whatever the order (PocketBase merges
   the expansions of the same field).
+- Empty string: PocketBase compares ``x = ""`` as ``(x = '' OR x IS NULL)`` and ``x != ""`` as
+  ``(x IS NOT '' AND x IS NOT NULL)`` (``null`` behaves like ``""``), so NULL columns of views
+  built with ``LEFT JOIN`` match ``= ""``.
 """
 
 from __future__ import annotations
@@ -127,3 +130,106 @@ async def test_expand_merges_nested_and_plain_paths_of_same_field(
     for link_expanded in await expanded("agent_network.network,agent_network.backup"):
         assert link_expanded["expand"]["network"]["name"] == "main"
         assert link_expanded["expand"]["backup"]["name"] == "spare"
+
+
+@pytest.mark.asyncio
+async def test_empty_string_comparison_matches_null(app_client: AsyncClient, admin_token: str) -> None:
+    s = uuid.uuid4().hex[:8]
+    people = f"cpeople_{s}"
+    profiles = f"cprofiles_{s}"
+    people_coll = await _collection(
+        app_client,
+        admin_token,
+        people,
+        [
+            {"name": "name", "type": "text"},
+            {"name": "nick", "type": "text"},
+            {"name": "active", "type": "bool"},
+            {"name": "score", "type": "number"},
+            {"name": "born", "type": "date"},
+            {"name": "tags", "type": "select", "options": {"values": ["x", "y"], "maxSelect": 2}},
+        ],
+    )
+    await _collection(
+        app_client,
+        admin_token,
+        profiles,
+        [_rel("person", people_coll["id"]), {"name": "bio", "type": "text"}, {"name": "level", "type": "number"}],
+    )
+    rows = {
+        "full": {"nick": "f", "active": True, "score": 3, "born": "2020-01-02 00:00:00.000Z", "tags": ["x"]},
+        "blank": {"nick": "", "active": False, "score": 0, "born": "", "tags": []},
+        "orphan": {"nick": "", "active": False, "score": 0, "born": "", "tags": ["y"]},
+    }
+    ids = {}
+    for name, data in rows.items():
+        ids[name] = (await _record(app_client, admin_token, people, {"name": name, **data}))["id"]
+    await _record(app_client, admin_token, profiles, {"person": ids["full"], "bio": "hello", "level": 2})
+    await _record(app_client, admin_token, profiles, {"person": ids["blank"], "bio": "", "level": 0})
+    # "orphan" has no profile: bio and level are NULL in the LEFT JOIN view below.
+
+    view = f"cview_{s}"
+    response = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": view,
+            "type": "view",
+            "schema": [
+                {"name": "id", "type": "text"},
+                {"name": "name", "type": "text"},
+                {"name": "bio", "type": "text"},
+                {"name": "level", "type": "number"},
+            ],
+            "options": {
+                "query": (
+                    f'SELECT p.id, p.name, pr.bio, pr.level FROM "{people}" p '
+                    f'LEFT JOIN "{profiles}" pr ON pr.person = p.id'
+                ),
+            },
+            "listRule": "",
+            "viewRule": "",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    async def names(collection: str, filter_expr: str) -> list[str]:
+        response = await app_client.get(
+            f"/api/collections/{collection}/records", params={"filter": filter_expr, "perPage": 100}
+        )
+        assert response.status_code == 200, (filter_expr, response.text)
+        return sorted(item["name"] for item in response.json()["items"])
+
+    # View with LEFT JOIN: NULL counts as empty.
+    assert await names(view, 'bio = ""') == ["blank", "orphan"]
+    assert await names(view, "bio = ''") == ["blank", "orphan"]
+    assert await names(view, '"" = bio') == ["blank", "orphan"]
+    assert await names(view, "bio = null") == ["blank", "orphan"]
+    assert await names(view, 'bio != ""') == ["full"]
+    assert await names(view, "bio != null") == ["full"]
+    assert await names(view, 'bio = "hello"') == ["full"]
+    assert await names(view, 'level = ""') == ["orphan"]
+    assert await names(view, 'level != ""') == ["blank", "full"]
+    assert await names(view, "level = 0") == ["blank"]
+    assert await names(view, 'bio = "" && level = 0') == ["blank"]
+
+    # Base collection: empty text, booleans, numbers, dates and multi-values are not broken.
+    assert await names(people, 'nick = ""') == ["blank", "orphan"]
+    assert await names(people, 'nick != ""') == ["full"]
+    assert await names(people, "nick = null") == ["blank", "orphan"]
+    assert await names(people, "active = false") == ["blank", "orphan"]
+    assert await names(people, "active = true") == ["full"]
+    assert await names(people, "active != false") == ["full"]
+    assert await names(people, "score = 0") == ["blank", "orphan"]
+    assert await names(people, "score != 0") == ["full"]
+    assert await names(people, 'score = ""') == []
+    assert await names(people, 'born = ""') == ["blank", "orphan"]
+    assert await names(people, 'born != ""') == ["full"]
+    assert await names(people, "born = null") == ["blank", "orphan"]
+    assert await names(people, 'born > "2019-01-01 00:00:00.000Z"') == ["full"]
+    assert await names(people, 'tags ?= "x"') == ["full"]
+    assert await names(people, 'tags ?= "y"') == ["orphan"]
+    assert await names(people, 'tags ?!= "x"') == ["orphan"]
+    assert await names(people, 'name = "full" && nick != ""') == ["full"]
+    assert await names(people, '"" = ""') == ["blank", "full", "orphan"]
+    assert await names(people, '"" != null') == []

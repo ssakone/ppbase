@@ -262,6 +262,15 @@ def _unescape_text(raw: str) -> str:
     return "".join(out)
 
 
+def _is_empty_operand(node: Any) -> bool:
+    """``null``, ``''`` or ``""`` (PocketBase compares them all as "empty")."""
+    return (
+        isinstance(node, tuple)
+        and len(node) >= 2
+        and (node[0] == "null" or (node[0] == "literal" and node[1] == ""))
+    )
+
+
 def _sanitize_ident(s: str) -> str:
     """Raise if *s* contains characters unsuitable for a SQL identifier."""
     for ch in s:
@@ -491,6 +500,47 @@ class _FilterTransformer(Transformer):
         if kind == "sql_ref" and len(node) >= 4:
             return str(node[3] or "")
         return ""
+
+    def _is_json_operand(self, node: tuple[str, Any]) -> bool:
+        kind = node[0] if isinstance(node, tuple) and node else None
+        if kind == "sql_ref" and len(node) > 2 and node[2]:
+            return True
+        if kind == "relation_ref" and len(node) > 3 and node[3]:
+            return True
+        return self._operand_field_type(node) in {"json", "geoPoint"}
+
+    def _empty_equality_sql(
+        self,
+        sql_op: str,
+        left: tuple[str, Any],
+        left_sql: str,
+        right: tuple[str, Any],
+        right_sql: str,
+    ) -> str | None:
+        """PocketBase ``=``/``!=`` semantics against ``""`` or ``null``.
+
+        PocketBase treats ``""`` and ``null`` alike: ``a = ""`` is
+        ``(a = '' OR a IS NULL)`` and ``a != ""`` is ``(a IS NOT '' AND a IS NOT NULL)``
+        (search/filter.go ``resolveEqualExpr``). The text cast keeps the comparison valid for
+        boolean, numeric, date and array columns (never ``''``, so only NULL matches).
+        Returns ``None`` when the generic comparison applies: no empty operand, a non-empty
+        literal on the other side, or a JSON operand.
+        """
+        if sql_op not in {"=", "!="}:
+            return None
+        left_empty = _is_empty_operand(left)
+        right_empty = _is_empty_operand(right)
+        if not left_empty and not right_empty:
+            return None
+        if left_empty and right_empty:
+            return "TRUE" if sql_op == "=" else "FALSE"
+        other, other_sql = (right, right_sql) if left_empty else (left, left_sql)
+        if other[0] == "literal" or self._is_json_operand(other):
+            return None
+        text_sql = self._text_cast_sql(other_sql)
+        if sql_op == "=":
+            return f"({text_sql} = '' OR {text_sql} IS NULL)"
+        return f"({text_sql} <> '' AND {text_sql} IS NOT NULL)"
 
     def _coerce_comparison_literals(
         self,
@@ -760,6 +810,9 @@ class _FilterTransformer(Transformer):
         # Standard comparisons
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
+            empty_sql = self._empty_equality_sql(sql_op, left, left_sql, right, right_sql)
+            if empty_sql is not None:
+                return empty_sql
             # NULL special handling
             if right[0] == "null":
                 if sql_op == "=":
@@ -989,7 +1042,16 @@ class _FilterTransformer(Transformer):
 
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
+            empty_sql = self._empty_equality_sql(
+                sql_op,
+                ("sql_ref", ref_sql, ref.leaf_is_json, ref.leaf_type),
+                ref_sql,
+                other,
+                other_sql,
+            )
+            if empty_sql is not None:
+                condition = empty_sql
+            elif other[0] == "null":
                 if sql_op == "=":
                     condition = f"{ref_sql} IS NULL"
                 elif sql_op == "!=":
@@ -1182,7 +1244,11 @@ class _FilterTransformer(Transformer):
 
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
+            rel_node = left if rel_is_left else right
+            empty_sql = self._empty_equality_sql(sql_op, rel_node, rel_col, other, other_sql)
+            if empty_sql is not None:
+                where_cond = empty_sql
+            elif other[0] == "null":
                 if sql_op == "=":
                     where_cond = f"{rel_col} IS NULL"
                 elif sql_op == "!=":
@@ -1299,6 +1365,11 @@ class _FilterTransformer(Transformer):
 
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
+            empty_sql = self._empty_equality_sql(
+                sql_op, ("sql_ref", item_sql), item_sql, other, other_sql,
+            )
+            if empty_sql is not None:
+                return empty_sql
             if other[0] == "null":
                 if sql_op == "=":
                     return f"{item_sql} IS NULL"
