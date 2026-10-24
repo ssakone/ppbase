@@ -73,6 +73,7 @@ async def test_global_rate_limit_blocks_after_threshold(
         assert blocked.status_code == 429, blocked.text
         payload = blocked.json()
         assert payload == {
+            "code": 429,
             "status": 429,
             "message": "Too many requests.",
             "data": {},
