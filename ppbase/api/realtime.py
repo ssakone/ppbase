@@ -45,15 +45,22 @@ def _error_response(status: int, message: str, data: Any = None) -> JSONResponse
 def _build_realtime_auth_key(auth: dict[str, Any] | None) -> str | None:
     """Return the identity of the authenticated record, or ``None`` for guests.
 
-    PocketBase compares the authenticated model, never the token type:
-    v0.22.34 ``apis/realtime.go:187-191`` with ``extractAuthIdFromGetter``
-    (``:539-551``), v0.40.6 ``apis/realtime.go:218-222`` with ``isSameAuth``
-    (``:843-853``, record id and collection id).  A refreshed token therefore
-    keeps its identity even when the claim changes (PocketBase 0.22
-    ``authRecord`` refreshed by PPBase into ``auth``).  Admin tokens carry the
-    ``_superusers`` collection id set by ``get_optional_auth``, so a legacy
+    PocketBase compares the authenticated model, never the token type, so a
+    refreshed token keeps its identity even when the claim changes (PocketBase
+    0.22 ``authRecord`` refreshed by PPBase into ``auth``).  Admin tokens carry
+    the ``_superusers`` collection id set by ``get_optional_auth``, so a legacy
     ``admin`` token and a ``_superusers`` record token of the same superuser
     share one identity, as superusers are ``_superusers`` records in v0.40.6.
+
+    The identity is the collection id plus the record id, as v0.40.6
+    ``isSameAuth`` (``apis/realtime.go:218-222`` and ``:843-853``).  This is a
+    deliberate difference with v0.22.34, which compares the id alone
+    (``apis/realtime.go:187-191`` with ``extractAuthIdFromGetter``,
+    ``:539-551``): switching, on one SSE client, to an account of another auth
+    collection (or from an admin to a record) that has the same id is accepted
+    by 0.22.34 and refused (403) here.  Ids are random 15-character strings;
+    the BUMA backup has no id shared between its two auth collections and
+    ``_admins``.
     """
     if not auth:
         return None
