@@ -115,7 +115,10 @@ async def test_empty_list_total_pages_is_zero(
     coll = await _collection(
         app_client,
         admin_token,
-        {"name": f"rs_empty_{uuid.uuid4().hex[:8]}", "schema": [{"name": "name", "type": "text"}]},
+        {
+            "name": f"rs_empty_{uuid.uuid4().hex[:8]}",
+            "schema": [{"name": "name", "type": "text"}],
+        },
     )
     try:
         response = await app_client.get(

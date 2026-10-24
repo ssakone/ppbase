@@ -101,7 +101,9 @@ async def _collection(
     payload = {**PUBLIC, "type": "base", **body}
     response = await client.post("/api/collections", headers=admin, json=payload)
     if response.status_code != 200:
-        raise RuntimeError(f"collection {body.get('name')} failed: {response.text[:400]}")
+        raise RuntimeError(
+            f"collection {body.get('name')} failed: {response.text[:400]}"
+        )
     return response.json()
 
 
@@ -135,7 +137,11 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any
     stk = await _collection(
         client,
         admin,
-        {"name": "rs_stockage", "schema": [text_field("name")], "listRule": RULE_AUTH_ID},
+        {
+            "name": "rs_stockage",
+            "schema": [text_field("name")],
+            "listRule": RULE_AUTH_ID,
+        },
     )
     for i in range(3):
         await _create(client, "rs_stockage", {"name": f"s{i}"}, admin)
@@ -189,7 +195,10 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any
     # expand key: present with a linked record, omitted without one.
     expanded = await _list(client, "rs_posts", expand="rel", sort="name")
     out["expand_keys"] = {
-        item["name"]: ("expand" in item, (item.get("expand") or {}).get("rel", {}).get("name"))
+        item["name"]: (
+            "expand" in item,
+            (item.get("expand") or {}).get("rel", {}).get("name"),
+        )
         for item in expanded.get("items", [])
     }
     del stk, pdv, rels, posts
@@ -215,7 +224,9 @@ async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
             "--automigrate=false",
         ]
         await asyncio.to_thread(
-            subprocess.run, [str(binary), "migrate", "up", *flags], check=True,
+            subprocess.run,
+            [str(binary), "migrate", "up", *flags],
+            check=True,
             capture_output=True,
         )
         created = await asyncio.to_thread(
@@ -229,12 +240,20 @@ async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
             raise RuntimeError(f"PocketBase admin creation failed: {created.stderr}")
         port = _free_port()
         process = await asyncio.create_subprocess_exec(
-            str(binary), "serve", "--http", f"127.0.0.1:{port}",
-            "--publicDir", str(Path(root) / "pb_public"), *flags,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            str(binary),
+            "serve",
+            "--http",
+            f"127.0.0.1:{port}",
+            "--publicDir",
+            str(Path(root) / "pb_public"),
+            *flags,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         try:
-            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=30) as client:
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}", timeout=30
+            ) as client:
                 deadline = time.monotonic() + 30
                 while True:
                     try:
@@ -282,7 +301,9 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
     secret = "probe-secret-key-for-request-static-rules-0001"
     with tempfile.TemporaryDirectory(prefix="ppbase-reqstatic-data-") as data_dir:
         settings = Settings(
-            database_url=database_url, jwt_secret=secret, auto_migrate=False,
+            database_url=database_url,
+            jwt_secret=secret,
+            auto_migrate=False,
             data_dir=data_dir,
         )
         app = create_app(settings)
@@ -331,7 +352,9 @@ def _diff(left: Any, right: Any, path: str = "") -> list[dict[str, Any]]:
     if isinstance(left, dict) and isinstance(right, dict):
         rows: list[dict[str, Any]] = []
         for key in sorted(set(left) | set(right)):
-            rows.extend(_diff(left.get(key), right.get(key), f"{path}.{key}" if path else key))
+            rows.extend(
+                _diff(left.get(key), right.get(key), f"{path}.{key}" if path else key)
+            )
         return rows
     if left != right:
         return [{"path": path, "pocketbase": left, "ppbase": right}]
@@ -352,7 +375,9 @@ def main() -> int:
     ppbase = asyncio.run(run_ppbase(args.database_url))
     differences = _diff(pocketbase, ppbase)
     for name, payload in (("ppbase.json", ppbase), ("diff.json", differences)):
-        (args.out / name).write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n")
+        (args.out / name).write_text(
+            json.dumps(payload, indent=1, sort_keys=True) + "\n"
+        )
     print(json.dumps({"differences": len(differences)}, indent=1))
     for row in differences:
         print(json.dumps(row, sort_keys=True))

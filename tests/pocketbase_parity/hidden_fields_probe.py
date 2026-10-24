@@ -108,7 +108,9 @@ def number_field(name: str) -> dict[str, Any]:
     }
 
 
-def relation_field(name: str, collection_id: str, max_select: int = 1) -> dict[str, Any]:
+def relation_field(
+    name: str, collection_id: str, max_select: int = 1
+) -> dict[str, Any]:
     return {
         "system": False,
         "name": name,
@@ -144,7 +146,9 @@ async def _collection(
     payload = {**PUBLIC, "type": "base", **body}
     response = await client.post("/api/collections", headers=admin, json=payload)
     if response.status_code != 200:
-        raise RuntimeError(f"collection {body.get('name')} failed: {response.text[:400]}")
+        raise RuntimeError(
+            f"collection {body.get('name')} failed: {response.text[:400]}"
+        )
     return response.json()
 
 
@@ -183,7 +187,9 @@ async def _names(
 ) -> Any:
     query = {"perPage": 200, **params}
     query.setdefault("sort", "name")
-    response = await client.get(f"/api/collections/{name}/records", params=query, headers=headers)
+    response = await client.get(
+        f"/api/collections/{name}/records", params=query, headers=headers
+    )
     if response.status_code != 200:
         return _error(response)
     names = [item.get("name") for item in response.json()["items"]]
@@ -207,7 +213,10 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> dict[str,
         client,
         admin,
         users,
-        [relation_field("friend", users["id"]), relation_field("friends", users["id"], 5)],
+        [
+            relation_field("friend", users["id"]),
+            relation_field("friends", users["id"], 5),
+        ],
     )
     ids: dict[str, str] = {}
     for name, (visible, verified) in USERS.items():
@@ -243,7 +252,12 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> dict[str,
     secret = await _collection(
         client,
         admin,
-        {"name": "ph_secret", "schema": [text_field("name")], "listRule": None, "viewRule": None},
+        {
+            "name": "ph_secret",
+            "schema": [text_field("name")],
+            "listRule": None,
+            "viewRule": None,
+        },
     )
     guarded = await _collection(
         client,
@@ -271,8 +285,15 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> dict[str,
         },
     )
     for name, payload in (
-        ("p_vis", {"author": ids["vis"], "authors": [ids["vis"]], "secret": s1["id"],
-                   "guarded": g1["id"]}),
+        (
+            "p_vis",
+            {
+                "author": ids["vis"],
+                "authors": [ids["vis"]],
+                "secret": s1["id"],
+                "guarded": g1["id"],
+            },
+        ),
         ("p_hid", {"author": ids["hid"], "authors": [ids["hid"], ids["vis"]]}),
         ("p_none", {}),
     ):
@@ -388,9 +409,18 @@ async def list_scenarios(
     for caller in CALLERS:
         h = headers[caller]
         out[caller] = {
-            "users": {k: await _names(client, "ph_users", h, filter=v) for k, v in USER_FILTERS.items()},
-            "posts": {k: await _names(client, "ph_posts", h, filter=v) for k, v in POST_FILTERS.items()},
-            "sort": {k: await _names(client, "ph_users", h, sort=v) for k, v in USER_SORTS.items()},
+            "users": {
+                k: await _names(client, "ph_users", h, filter=v)
+                for k, v in USER_FILTERS.items()
+            },
+            "posts": {
+                k: await _names(client, "ph_posts", h, filter=v)
+                for k, v in POST_FILTERS.items()
+            },
+            "sort": {
+                k: await _names(client, "ph_users", h, sort=v)
+                for k, v in USER_SORTS.items()
+            },
             "members_list": await _names(client, "ph_members", h),
             "members_filter_email": await _names(
                 client, "ph_members", h, filter='email ~ "mhid"'
@@ -474,7 +504,9 @@ async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
             "--automigrate=false",
         ]
         await asyncio.to_thread(
-            subprocess.run, [str(binary), "migrate", "up", *flags], check=True,
+            subprocess.run,
+            [str(binary), "migrate", "up", *flags],
+            check=True,
             capture_output=True,
         )
         created = await asyncio.to_thread(
@@ -499,7 +531,9 @@ async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
             stderr=asyncio.subprocess.DEVNULL,
         )
         try:
-            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=30) as client:
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}", timeout=30
+            ) as client:
                 await _wait_health(client, "PocketBase")
                 yield client
         finally:
@@ -556,18 +590,30 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
         )
         task = asyncio.create_task(server.serve())
         try:
-            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=30) as client:
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}", timeout=30
+            ) as client:
                 await _wait_health(client, "PPBase")
                 factory = async_sessionmaker(
                     bind=get_engine(), class_=AsyncSession, expire_on_commit=False
                 )
                 async with factory() as session:
                     row = (
-                        await session.execute(
-                            select(ParamRecord).where(ParamRecord.key == "_setup_token")
+                        (
+                            await session.execute(
+                                select(ParamRecord).where(
+                                    ParamRecord.key == "_setup_token"
+                                )
+                            )
                         )
-                    ).scalars().first()
-                setup = row.value.get("token") if row and isinstance(row.value, dict) else None
+                        .scalars()
+                        .first()
+                    )
+                setup = (
+                    row.value.get("token")
+                    if row and isinstance(row.value, dict)
+                    else None
+                )
                 body = {
                     "email": ADMIN_EMAIL,
                     "password": ADMIN_PASSWORD,
@@ -577,7 +623,9 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
                     body["setupToken"] = setup
                 response = await client.post("/api/admins/init", json=body)
                 response.raise_for_status()
-                return await run_scenarios(client, {"Authorization": response.json()["token"]})
+                return await run_scenarios(
+                    client, {"Authorization": response.json()["token"]}
+                )
         finally:
             server.should_exit = True
             await asyncio.wait_for(task, timeout=30)
@@ -587,7 +635,9 @@ def _diff(left: Any, right: Any, path: str = "") -> list[dict[str, Any]]:
     if isinstance(left, dict) and isinstance(right, dict):
         rows: list[dict[str, Any]] = []
         for key in sorted(set(left) | set(right)):
-            rows.extend(_diff(left.get(key), right.get(key), f"{path}.{key}" if path else key))
+            rows.extend(
+                _diff(left.get(key), right.get(key), f"{path}.{key}" if path else key)
+            )
         return rows
     if left != right:
         return [{"path": path, "pocketbase": left, "ppbase": right}]
@@ -613,7 +663,9 @@ def main() -> int:
     for row in differences:
         row["known"] = KNOWN_DIVERGENCES.get(row["path"])
     for name, payload in (("ppbase.json", ppbase), ("diff.json", differences)):
-        (args.out / name).write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n")
+        (args.out / name).write_text(
+            json.dumps(payload, indent=1, sort_keys=True) + "\n"
+        )
     unexpected = [row for row in differences if not row["known"]]
     print(
         json.dumps(

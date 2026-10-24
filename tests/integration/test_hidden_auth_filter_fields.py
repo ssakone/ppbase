@@ -170,19 +170,25 @@ async def test_email_filter_is_restricted_to_visible_emails_for_non_admins(
         assert await _names(app_client, name, token, filter='email != ""') == ["vis"]
         assert (
             await _names(
-                app_client, name, token, filter=f'email = "hid_{suffix}@example.invalid"'
+                app_client,
+                name,
+                token,
+                filter=f'email = "hid_{suffix}@example.invalid"',
             )
             == []
         )
-        assert await _names(app_client, name, token, filter="emailVisibility = true") == [
-            "vis"
-        ]
+        assert await _names(
+            app_client, name, token, filter="emailVisibility = true"
+        ) == ["vis"]
     # Admin: no guard.
     assert sorted(
         await _names(app_client, name, hidden_env["admin"], filter='email != ""')
     ) == ["hid", "vis"]
     assert await _names(
-        app_client, name, hidden_env["admin"], filter=f'email = "hid_{suffix}@example.invalid"'
+        app_client,
+        name,
+        hidden_env["admin"],
+        filter=f'email = "hid_{suffix}@example.invalid"',
     ) == ["hid"]
 
 
@@ -192,7 +198,9 @@ async def test_email_sort_resolves_without_a_visibility_guard(
     # Sorting by email is allowed for everyone and returns every record (the
     # guard is a filter AfterBuild, not applied to ORDER BY).
     for token in ("", hidden_env["user"], hidden_env["admin"]):
-        assert sorted(await _names(app_client, hidden_env["name"], token, sort="email")) == [
+        assert sorted(
+            await _names(app_client, hidden_env["name"], token, sort="email")
+        ) == [
             "hid",
             "vis",
         ]

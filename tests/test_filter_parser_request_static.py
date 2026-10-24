@@ -68,7 +68,10 @@ def test_absent_request_auth_folds_to_constants_without_type_errors() -> None:
     sql, _ = _sql(RULE_PERM, {}, "buma_pdv")
     # The permission clause folds to FALSE; the agent clause matches empty/NULL
     # agents like PocketBase (COALESCE), but the && short-circuits to no rows.
-    assert sql == "((FALSE OR FALSE) AND (COALESCE(\"buma_pdv\".\"agent\"::text, '') = ''))"
+    assert (
+        sql
+        == "((FALSE OR FALSE) AND (COALESCE(\"buma_pdv\".\"agent\"::text, '') = ''))"
+    )
     assert "= TRUE" not in sql
 
 

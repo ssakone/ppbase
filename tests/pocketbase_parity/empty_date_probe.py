@@ -468,7 +468,9 @@ async def view_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> An
             "name": "pd_view_created",
             "type": "view",
             "schema": [text_field("title"), date_field("d")],
-            "options": {"query": "SELECT p.id, p.created, p.title, p.d FROM pd_dates p"},
+            "options": {
+                "query": "SELECT p.id, p.created, p.title, p.d FROM pd_dates p"
+            },
         },
     )
     out["schema"] = {
