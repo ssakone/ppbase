@@ -59,7 +59,9 @@ async def list_admins(
     """Return a paginated list of admin records."""
     count_q = select(func.count()).select_from(SuperuserRecord)
     total_items = (await session.execute(count_q)).scalar() or 0
-    total_pages = max(1, math.ceil(total_items / per_page))
+    # PocketBase: ceil(totalItems / perPage), 0 for an empty list
+    # (v0.22.34 tools/search/provider.go l.254).
+    total_pages = math.ceil(total_items / per_page) if per_page > 0 else 0
 
     q = (
         select(SuperuserRecord)

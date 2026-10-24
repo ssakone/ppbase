@@ -412,7 +412,9 @@ async def list_collections(
     if total_items < 0:
         total_pages = -1
     else:
-        total_pages = max(1, math.ceil(total_items / per_page)) if per_page > 0 else 0
+        # PocketBase: ceil(totalItems / perPage), 0 for an empty list
+        # (v0.22.34 tools/search/provider.go l.254).
+        total_pages = math.ceil(total_items / per_page) if per_page > 0 else 0
 
     # Query items
     stmt = select(CollectionRecord)

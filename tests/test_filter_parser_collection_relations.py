@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import re
+
 from ppbase.services.filter_parser import parse_filter
+
+
+def _aliases(sql: str, table: str) -> list[str]:
+    """Main-query aliases of ``table`` (PocketBase-like LEFT JOINs)."""
+    return re.findall(rf'LEFT JOIN "{table}" AS "(__pb\d+)"', sql)
+
+
+def _base(sql: str, table: str) -> str:
+    """Alias of the current table inside a join group (``id IN (SELECT ...)``)."""
+    (alias,) = set(re.findall(rf'FROM "{table}" AS "(__pbb\d+)"', sql))
+    return alias
 
 
 def test_collection_reference_simple_field_still_groups_by_alias() -> None:
@@ -13,8 +26,21 @@ def test_collection_reference_simple_field_still_groups_by_alias() -> None:
     )
 
     assert params == {"_fp1": "b"}
-    assert 'EXISTS (SELECT 1 FROM "refs" WHERE "refs"."linkKey" = "items"."itemKey")' in sql
-    assert 'EXISTS (SELECT 1 FROM "refs" WHERE "refs"."tag" = :_fp1)' in sql
+    # One LEFT JOIN per @collection alias, each in its own EXISTS (they do
+    # not share rows), plus PocketBase's multi-match subquery.
+    first, second = _aliases(sql, "refs")
+    base = _base(sql, "items")
+    assert f'LEFT JOIN "refs" AS "{first}" ON TRUE' in sql
+    assert (
+        f'COALESCE("{first}"."linkKey"::text, \'\') = '
+        f'COALESCE("{base}"."itemKey"::text, \'\')'
+    ) in sql
+    assert f'"{second}"."tag" = :_fp1' in sql
+    # The group reading the current record is an id IN (...) semi-join, the
+    # other one an uncorrelated EXISTS.
+    assert sql.count('"items"."id" IN (SELECT') == 1
+    assert sql.count("EXISTS (SELECT 1 FROM (SELECT 1)") == 1
+    assert sql.count("NOT EXISTS") == 2
 
 
 def test_relation_traversal_still_qualifies_current_table() -> None:
@@ -26,8 +52,12 @@ def test_relation_traversal_still_qualifies_current_table() -> None:
     )
 
     assert params == {"_fp1": "user_1"}
-    assert '"users"."id" = "business"."owner"' in sql
-    assert '"users"."id" = :_fp1' in sql
+    (users,) = _aliases(sql, "users")
+    base = _base(sql, "business")
+    assert sql.startswith(f'"business"."id" IN (SELECT "{base}"."id" FROM "business"')
+    assert f'LEFT JOIN "users" AS "{users}" ON "{users}"."id" = "{base}"."owner"' in sql
+    assert f'"{users}"."id" = :_fp1' in sql
+    assert "NOT EXISTS" not in sql  # a single relation has no multi-match
 
 
 def test_any_equals_is_scalar_safe_for_current_collection_fields() -> None:
@@ -39,7 +69,9 @@ def test_any_equals_is_scalar_safe_for_current_collection_fields() -> None:
     assert '"posts"."tags"' in sql
 
 
-def test_collection_relation_id_uses_stored_relation_column() -> None:
+def test_collection_relation_id_joins_the_target_like_pocketbase_0_22() -> None:
+    # PocketBase 0.22.34 joins the target for ``rel.id`` (a missing target is
+    # NULL); reading the stored column only exists since v0.23.0.
     sql, params = parse_filter(
         "@collection.business_access.business.id ?= id",
         collection_resolver={
@@ -58,10 +90,16 @@ def test_collection_relation_id_uses_stored_relation_column() -> None:
     )
 
     assert params == {}
-    assert '"business_access"."business"' in sql
-    assert '"business"."id"::text' in sql
-    assert 'FROM "business_access"' in sql
-    assert 'FROM "business" WHERE' not in sql
+    (access,) = _aliases(sql, "business_access")
+    (business,) = _aliases(sql, "business")
+    assert f'LEFT JOIN "business_access" AS "{access}" ON TRUE' in sql
+    assert (
+        f'LEFT JOIN "business" AS "{business}" '
+        f'ON "{business}"."id" = "{access}"."business"'
+    ) in sql
+    assert f'COALESCE("{business}"."id"::text, \'\')' in sql
+    assert f'COALESCE("{_base(sql, "business")}"."id"::text, \'\')' in sql
+    assert "NOT EXISTS" not in sql  # ?= is any-match
     assert "ANY(" not in sql
 
 
@@ -91,9 +129,13 @@ def test_collection_relation_field_generates_target_exists() -> None:
     )
 
     assert params == {"_fp1": "user_1"}
-    assert 'EXISTS (SELECT 1 FROM "business_access"' in sql
-    assert 'EXISTS (SELECT 1 FROM "business" WHERE "business"."id" = "business_access"."business"' in sql
-    assert '"business"."owner"' in sql
+    (access,) = _aliases(sql, "business_access")
+    (business,) = _aliases(sql, "business")
+    assert (
+        f'LEFT JOIN "business" AS "{business}" '
+        f'ON "{business}"."id" = "{access}"."business"'
+    ) in sql
+    assert f'"{business}"."owner" = :_fp1' in sql
     assert "ANY(" not in sql
 
 
@@ -119,9 +161,12 @@ def test_back_relation_generates_reverse_exists() -> None:
     )
 
     assert params == {"_fp1": "user_1"}
-    assert 'EXISTS (SELECT 1 FROM "business_access"' in sql
-    assert '"business_access"."business" = "business"."id"' in sql
-    assert '"business_access"."user"' in sql
+    (access,) = _aliases(sql, "business_access")
+    assert (
+        f'LEFT JOIN "business_access" AS "{access}" '
+        f'ON "{access}"."business" = "{_base(sql, "business")}"."id"'
+    ) in sql
+    assert f'"{access}"."user" = :_fp1' in sql
     assert "ANY(" not in sql
 
 
@@ -156,9 +201,15 @@ def test_back_relation_after_forward_relation_is_nested() -> None:
     )
 
     assert params == {"_fp1": "user_1"}
-    assert 'EXISTS (SELECT 1 FROM "business" WHERE "business"."id" = "sessions"."account"' in sql
-    assert 'EXISTS (SELECT 1 FROM "business_access" WHERE "business_access"."business" = "business"."id"' in sql
-    assert '"business_access"."user"' in sql
+    (business,) = _aliases(sql, "business")
+    (access,) = _aliases(sql, "business_access")
+    assert (
+        f'LEFT JOIN "business" AS "{business}" '
+        f'ON "{business}"."id" = "{_base(sql, "sessions")}"."account" '
+        f'LEFT JOIN "business_access" AS "{access}" '
+        f'ON "{access}"."business" = "{business}"."id"'
+    ) in sql
+    assert f'"{access}"."user" = :_fp1' in sql
 
 
 def test_back_relation_can_continue_through_relation_to_json_path() -> None:
@@ -198,8 +249,13 @@ def test_back_relation_can_continue_through_relation_to_json_path() -> None:
     )
 
     assert params == {"_fp1": "user_1"}
-    assert sql.count('EXISTS (SELECT 1 FROM "business_access"') == 1
-    assert '"business_access"."business" = "business"."id"' in sql
-    assert '"business_access"."user"' in sql
-    assert 'EXISTS (SELECT 1 FROM "business_roles" WHERE "business_roles"."id" = "business_access"."role"' in sql
-    assert 'jsonb_extract_path("business_roles"."permissions", \'wallet\', \'read\')' in sql
+    # Both operands share the back-relation row (one join, one EXISTS).
+    (access,) = _aliases(sql, "business_access")
+    (roles,) = _aliases(sql, "business_roles")
+    assert sql.count('"business"."id" IN (SELECT') == 1
+    assert f'"{access}"."business" = "{_base(sql, "business")}"."id"' in sql
+    assert f'"{access}"."user" = :_fp1' in sql
+    assert (
+        f'LEFT JOIN "business_roles" AS "{roles}" ON "{roles}"."id" = "{access}"."role"'
+    ) in sql
+    assert f'jsonb_extract_path("{roles}"."permissions", \'wallet\', \'read\')' in sql

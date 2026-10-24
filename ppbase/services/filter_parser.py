@@ -9,6 +9,7 @@ SQL strings -- to prevent SQL injection.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -125,26 +126,177 @@ _SYSTEM_FIELD_TYPES = {
 }
 
 
-# ---------------------------------------------------------------------------
-# @collection condition — grouped into EXISTS subqueries
-# ---------------------------------------------------------------------------
+class FilterFieldError(ValueError):
+    """A filter/sort references a field PocketBase does not resolve.
 
-
-class _CollectionCondition:
-    """A WHERE condition involving ``@collection.X.Y``.
-
-    Multiple conditions referencing the **same** collection inside the same
-    ``&&`` (AND) clause are grouped into a **single** ``EXISTS`` subquery so
-    that all conditions apply to the same row.  In ``||`` (OR) clauses each
-    condition gets its own ``EXISTS``.
+    PocketBase 0.22.34 resolves only base-model fields, the collection's
+    schema fields and, for auth collections, ``username``/``verified``/
+    ``emailVisibility``/``email`` (``resolvableSystemFieldNames``,
+    resolvers/record_field_resolve_runner.go l.718-732).  Any other name
+    (``password``, ``passwordHash``/``password_hash``, ``tokenKey``/
+    ``token_key``, ``email_visibility``, ``lastResetSentAt``...) is an
+    "unknown field" error for every caller, admin included.  The API maps
+    this to the same opaque 400 PocketBase returns.
     """
 
-    __slots__ = ("table_name", "group_key", "inner_sql")
 
-    def __init__(self, table_name: str, group_key: str, inner_sql: str) -> None:
-        self.table_name = table_name
-        self.group_key = group_key
-        self.inner_sql = inner_sql
+# Auth system fields PocketBase resolves by name in a filter/sort.
+_AUTH_RESOLVABLE_SYSTEM_FIELDS = frozenset(
+    {"username", "verified", "emailVisibility", "email"}
+)
+# PocketBase auth field name -> PPBase physical column.
+_AUTH_FIELD_COLUMNS = {"emailVisibility": "email_visibility"}
+_EMAIL_VISIBILITY_COLUMN = "email_visibility"
+# Auth system field names (every spelling PPBase may store in the schema or
+# keep as a physical column).  On an auth collection these are resolvable only
+# through ``_AUTH_RESOLVABLE_SYSTEM_FIELDS`` — never as a plain schema field,
+# even when PPBase persists them in the collection schema, since PocketBase
+# 0.22.34 keeps them out of ``collection.Schema`` entirely.
+_AUTH_SYSTEM_FIELD_NAMES = frozenset(
+    {
+        "email",
+        "emailVisibility",
+        "email_visibility",
+        "verified",
+        "username",
+        "password",
+        "passwordConfirm",
+        "oldPassword",
+        "passwordHash",
+        "password_hash",
+        "tokenKey",
+        "token_key",
+        "lastResetSentAt",
+        "last_reset_sent_at",
+        "lastVerificationSentAt",
+        "last_verification_sent_at",
+        "lastLoginAlertSentAt",
+        "last_login_alert_sent_at",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# PocketBase LEFT JOIN paths and multi-match
+# ---------------------------------------------------------------------------
+#
+# PocketBase resolves every relation, back-relation and ``@collection`` path
+# with LEFT JOINs on the main query (``SELECT DISTINCT``), so a missing target
+# is a NULL row, and adds a "multi-match" subquery to non-``?`` comparisons
+# whose path is multiple (v0.22.34 resolvers/record_field_resolve_runner.go
+# l.144-182, l.347-716; resolvers/record_field_resolver.go l.121-138;
+# resolvers/multi_match_subquery.go l.19-70; tools/search/filter.go l.183-215,
+# l.290-368, l.569-706).  PPBase registers the same joins (one alias per path
+# prefix, shared by every comparison of the filter) and renders them as
+# ``EXISTS (SELECT 1 FROM (SELECT 1) LEFT JOIN ... WHERE ...)`` correlated to
+# the current row, which keeps PocketBase's semantics: the EXISTS is pushed
+# into each ``||`` operand and groups the ``&&`` operands that share a join.
+
+
+# Qualifier of the current record's columns while parsing.  It becomes the
+# table name at the top level and the alias of the base table inside the
+# ``id IN (SELECT ...)`` subquery of a join group.
+_BASE_REF = '"__pb_base_ref__"'
+
+
+@dataclass(frozen=True)
+class _Join:
+    """One LEFT JOIN of the main query (``sql`` is the full clause)."""
+
+    alias: str
+    sql: str
+    parent: str | None
+
+
+@dataclass(frozen=True)
+class _MultiMatch:
+    """PocketBase multi-match subquery: ``value`` over ``from_sql`` rows.
+
+    ``record_id`` is set when the joins start from the current record: the
+    rows of every record are listed and matched on their id, like
+    PocketBase's ``WHERE __mm_base.id = base.id``.
+    """
+
+    from_sql: str
+    value: str
+    record_id: str | None = None
+    # Id of the leaf row for a nullable date leaf (see ``_PathOperand``).
+    row_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PathOperand:
+    """A resolved relation/``@collection`` operand.
+
+    ``sql`` reads the main-query join aliases listed in ``aliases`` (with
+    their parents); ``multi_match`` is set when PocketBase would attach a
+    multi-match subquery to a non-``?`` comparison.
+    """
+
+    sql: str
+    aliases: frozenset[str]
+    multi_match: _MultiMatch | None
+    field_type: str = ""
+    is_json: bool = False
+    # ``emailVisibility = TRUE`` on the leaf alias when the leaf is an auth
+    # ``email`` resolved without hidden-field access (PocketBase AfterBuild,
+    # applied to the main query only, never inside the multi-match subquery).
+    email_guard: str | None = None
+    # Id of the leaf row when the leaf is a nullable date: PPBase stores an
+    # empty date as NULL, so only a NULL id means a missing row (SQL NULL in
+    # PocketBase, where the empty date is '').
+    row_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _Side:
+    """One operand of a comparison: SQL, emptiness class and parse node.
+
+    ``kind`` follows ``tools/search/filter.go`` ``resolveEqualExpr``:
+    ``"empty"`` (NULL or a ``''`` value), ``"value"`` (a known non-empty
+    value) or ``"column"`` (anything evaluated per row).
+    """
+
+    sql: str
+    kind: str
+    node: tuple
+    is_json: bool = False
+
+
+class _Cond:
+    """A boolean condition tree and the join aliases it reads."""
+
+    __slots__ = ("aliases", "children", "kind", "sql")
+
+    def __init__(
+        self,
+        kind: str,
+        sql: str = "",
+        children: tuple[_Cond, ...] = (),
+        aliases: frozenset[str] = frozenset(),
+    ) -> None:
+        self.kind = kind
+        self.sql = sql
+        self.children = children
+        self.aliases = aliases
+
+    @classmethod
+    def atom(cls, sql: str, aliases: frozenset[str] = frozenset()) -> _Cond:
+        return cls("atom", sql=sql, aliases=aliases)
+
+    @classmethod
+    def of(cls, item: Any) -> _Cond:
+        return item if isinstance(item, _Cond) else cls.atom(str(item))
+
+    @classmethod
+    def combine(cls, kind: str, items: list[Any]) -> _Cond:
+        children = tuple(cls.of(item) for item in items)
+        if len(children) == 1:
+            return children[0]
+        aliases: frozenset[str] = frozenset()
+        for child in children:
+            aliases |= child.aliases
+        return cls(kind, children=children, aliases=aliases)
 
 
 @dataclass(frozen=True)
@@ -160,12 +312,27 @@ class _TraversalStep:
     # Explicit multiplicity from the relation index (``maxSelect: null`` is a
     # multiple relation); older metadata only carries ``max_select``.
     multiple: bool | None = None
+    # Back relation only: the back field has a single-column unique index.
+    unique: bool = False
 
     @property
     def is_multiple(self) -> bool:
         if self.multiple is not None:
             return self.multiple
         return self.max_select > 1
+
+    @property
+    def multi_match(self) -> bool:
+        """Whether PocketBase enables its multi-match for this hop.
+
+        A multiple relation always does; a back relation does unless its
+        field is single with a single-column unique index (v0.22.34
+        resolvers/record_field_resolve_runner.go l.561-565 and l.594-596,
+        v0.40.6 core/record_field_resolver_runner.go l.589-596).
+        """
+        if self.kind == "back":
+            return self.is_multiple or not self.unique
+        return self.is_multiple
 
 
 @dataclass(frozen=True)
@@ -178,6 +345,13 @@ class _ResolvedPath:
     field_type: str = ""
     # Whether the last segment is a multi-value field (shared rule).
     leaf_multiple: bool = False
+    # Column read on the last table (the JSON column for a JSON path).
+    leaf_field: str = ""
+    json_path: tuple[str, ...] = ()
+    # Table of the last segment and whether that leaf is an auth ``email``
+    # resolved without hidden-field access (needs the emailVisibility guard).
+    leaf_table: str = ""
+    email_guard: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,79 +366,6 @@ class _LeafOperand:
     field_type: str = ""
     multiple: bool = False
     modifier: str | None = None
-
-
-class _CollectionRef:
-    """Resolved ``@collection.X.path`` operand metadata."""
-
-    __slots__ = (
-        "table_name",
-        "group_key",
-        "column_sql",
-        "relation_steps",
-        "leaf_sql",
-        "leaf_is_json",
-        "leaf_type",
-        "leaf_multiple",
-        "modifier",
-    )
-
-    def __init__(
-        self,
-        table_name: str,
-        group_key: str,
-        *,
-        column_sql: str | None = None,
-        relation_steps: list[_TraversalStep] | None = None,
-        leaf_sql: str | None = None,
-        leaf_is_json: bool = False,
-        leaf_type: str = "",
-        leaf_multiple: bool = False,
-        modifier: str | None = None,
-    ) -> None:
-        self.table_name = table_name
-        self.group_key = group_key
-        self.column_sql = column_sql
-        self.relation_steps = relation_steps or []
-        self.leaf_sql = leaf_sql
-        self.leaf_is_json = leaf_is_json
-        self.leaf_type = leaf_type
-        self.leaf_multiple = leaf_multiple
-        self.modifier = modifier
-
-
-# ---------------------------------------------------------------------------
-# Relation field traversal — e.g. ``author.name = "John"``
-# ---------------------------------------------------------------------------
-
-
-class _RelationCondition:
-    """A WHERE condition involving a relation field traversal.
-
-    ``author.name = "John"`` where ``author`` is a relation field pointing
-    to the ``users`` collection generates::
-
-        EXISTS (SELECT 1 FROM "users"
-                WHERE "users"."id" = "author"          -- join_cond
-                  AND "users"."name" = :param)          -- where_cond
-
-    Multiple traversals on the **same** relation field inside an ``&&`` are
-    grouped into a single ``EXISTS`` (same as ``_CollectionCondition``).
-    """
-
-    __slots__ = ("relation_key", "target_table", "join_cond", "where_cond")
-
-    def __init__(
-        self,
-        relation_key: str,   # field name used for grouping (e.g. "author")
-        target_table: str,    # resolved table name (e.g. "users")
-        join_cond: str,       # e.g. '"users"."id" = "author"'
-        where_cond: str,      # e.g. '"users"."name" = :param'
-    ) -> None:
-        self.relation_key = relation_key
-        self.target_table = target_table
-        self.join_cond = join_cond
-        self.where_cond = where_cond
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +398,16 @@ class _FilterTransformer(Transformer):
         relation_resolver: dict[str, dict[str, Any]] | None = None,
         collection_resolver: dict[str, dict[str, Any]] | None = None,
         current_table: str | None = None,
+        allow_hidden: bool = True,
     ) -> None:
         super().__init__()
+        # Whether hidden auth fields are allowed without extra conditions
+        # (PocketBase ``allowHiddenFields``): true for admins and for
+        # server-evaluated rules, false for a non-admin list/realtime filter.
+        # Only affects the ``email`` emailVisibility guard; non-resolvable
+        # fields are rejected either way (0.22.34 has no hidden-field flag,
+        # resolvers/record_field_resolve_runner.go l.356-374).
+        self._allow_hidden = allow_hidden
         self._param_counter = 0
         self._params: dict[str, Any] = {}
         self._request_context = request_context or {}
@@ -310,6 +419,14 @@ class _FilterTransformer(Transformer):
         # SQL of direct multi-value fields rendered as their JSON text: they
         # are plain scalars for every operator, like in PocketBase.
         self._json_text_operands: set[str] = set()
+        # PocketBase-like LEFT JOINs of relation/@collection paths, keyed by
+        # path prefix so that every comparison shares the same rows.
+        self._joins: dict[str, _Join] = {}
+        self._join_keys: dict[tuple[Any, ...], str] = {}
+        self._alias_counter = 0
+        # Set while building a multi-match condition, which is negated: its
+        # date comparisons must be TRUE/FALSE/NULL exactly like PocketBase's.
+        self._exact_dates = False
 
     def _next_param(self, value: Any) -> str:
         self._param_counter += 1
@@ -455,6 +572,82 @@ class _FilterTransformer(Transformer):
         field_info = fields.get(safe_field) if isinstance(fields, dict) else None
         return field_info if isinstance(field_info, dict) else None
 
+    def _table_meta(self, table_name: str | None) -> dict[str, Any] | None:
+        """Flat metadata (``fields``/``type``) of a table, if the resolver has it."""
+        if not table_name:
+            return None
+        safe = _sanitize_ident(str(table_name))
+        for resolver in (self._relation_resolver, self._collection_resolver):
+            if self._is_flat_resolver(resolver):
+                meta = self._flat_collection(resolver, safe)
+                if meta:
+                    return meta
+        return None
+
+    def _resolve_leaf_column(
+        self,
+        table_name: str | None,
+        field_name: str,
+        *,
+        allow_guard: bool = True,
+        modifier: str | None = None,
+    ) -> tuple[str, bool]:
+        """Map a leaf field to its physical column, rejecting hidden fields.
+
+        Returns ``(physical_column, needs_email_guard)``.  Raises
+        :class:`FilterFieldError` for a field PocketBase 0.22.34 would not
+        resolve.  Enforced only when the resolver knows the table (system
+        and metadata-less tables stay permissive).
+
+        A system field (``id``/``created``/``updated`` and, on an auth
+        collection, ``username``/``verified``/``emailVisibility``/``email``)
+        never takes a modifier: PocketBase matches the whole ``prop`` (e.g.
+        ``email:lower``) against ``resolvableSystemFieldNames``, then looks the
+        bare name up in ``collection.Schema``, which never holds a system
+        field, and fails with "unknown field" (v0.22.34
+        resolvers/record_field_resolve_runner.go l.361-395;
+        ``splitModifier`` even rejects ``lower``, record_field_resolver.go
+        l.286-301).  Without this, ``email:lower``/``email:length``/
+        ``email:isset`` would read a masked email with no visibility guard.
+        """
+        field = _sanitize_ident(str(field_name))
+        meta = self._table_meta(table_name)
+        if meta is None:
+            return field, False
+        is_auth = meta.get("type") == "auth"
+        fields = meta.get("fields")
+        # An auth system field is never a plain schema field even when PPBase
+        # stores it in the schema: it resolves only via the auth branch below.
+        known = (
+            isinstance(fields, dict)
+            and field in fields
+            and field not in _SYSTEM_FIELD_TYPES
+            and not (is_auth and field in _AUTH_SYSTEM_FIELD_NAMES)
+        )
+        if known:
+            return field, False
+        if field in _SYSTEM_FIELD_TYPES or (
+            is_auth and field in _AUTH_RESOLVABLE_SYSTEM_FIELDS
+        ):
+            if modifier:
+                raise FilterFieldError(
+                    f"unknown filter field {field_name!r} (modifier {modifier!r})"
+                )
+            if field in _SYSTEM_FIELD_TYPES:
+                return field, False
+            if field == "username" and not (
+                isinstance(fields, dict) and "username" in fields
+            ):
+                # PocketBase always has the column; PPBase creates none for a
+                # generic auth collection (BUMA declares it as a schema field,
+                # docs/hidden-auth-fields.md): a 400, never SQL on a missing
+                # column (HTTP 500).
+                raise FilterFieldError(f"unknown filter field {field_name!r}")
+            column = _AUTH_FIELD_COLUMNS.get(field, field)
+            guard = allow_guard and field == "email" and not self._allow_hidden
+            return column, guard
+        raise FilterFieldError(f"unknown filter field {field_name!r}")
+
     def _is_multi_value_field(self, table_name: str | None, field_name: str) -> bool:
         """Return whether a current-collection field stores an array."""
         return self._info_is_multiple(self._field_info_for_table(table_name, field_name))
@@ -560,8 +753,8 @@ class _FilterTransformer(Transformer):
             if "." in str(node[1]):
                 return ""
             return self._field_type_for_table(self._current_table, str(node[1]))
-        if kind == "relation_ref" and len(node) >= 5:
-            return str(node[4] or "")
+        if kind == "relation_ref" and len(node) >= 2 and isinstance(node[1], _ResolvedPath):
+            return node[1].field_type
         if kind == "sql_ref" and len(node) >= 4:
             return str(node[3] or "")
         return ""
@@ -602,6 +795,7 @@ class _FilterTransformer(Transformer):
             source_field=source_field,
             back_field=back_field,
             multiple=multiple,
+            unique=bool(info.get("unique", False)),
         )
 
     def _json_extract_sql(self, column_sql: str, path_parts: list[str] | tuple[str, ...]) -> str:
@@ -618,14 +812,18 @@ class _FilterTransformer(Transformer):
         relations: dict[str, dict[str, Any]] | None,
         fields: dict[str, dict[str, Any]] | None = None,
         allow_unresolved: bool = True,
-        optimize_relation_id: bool = False,
         context: str = "field path",
+        email_guard_allowed: bool = True,
+        modifier: str | None = None,
     ) -> _ResolvedPath | None:
         """Resolve a PocketBase dotted path into SQL and traversal steps.
 
         This mirrors PocketBase's segment-by-segment resolver: each segment can
         be a direct relation, a synthetic back-relation, or a JSON field that
-        consumes the remaining segments as a JSON path.
+        consumes the remaining segments as a JSON path.  Like PocketBase
+        0.22.34, ``rel.id`` joins the target (a missing target is NULL); the
+        stored-column shortcut only exists since v0.23.0 (v0.40.6
+        core/record_field_resolver_runner.go l.651-657).
         """
         safe_parts = [_sanitize_ident(str(part)) for part in parts]
         if not safe_parts:
@@ -660,11 +858,20 @@ class _FilterTransformer(Transformer):
                     if isinstance(field_info, dict)
                     else _SYSTEM_FIELD_TYPES.get(part, "")
                 )
+                column, email_guard = self._resolve_leaf_column(
+                    current_table,
+                    part,
+                    allow_guard=email_guard_allowed,
+                    modifier=modifier,
+                )
                 return _ResolvedPath(
                     steps,
-                    self._column_expr_for_table(current_table, part),
+                    self._column_expr_for_table(current_table, column),
                     field_type=field_type,
                     leaf_multiple=self._info_is_multiple(field_info),
+                    leaf_field=column,
+                    leaf_table=current_table,
+                    email_guard=email_guard,
                 )
 
             field_info = current_fields.get(part) if isinstance(current_fields, dict) else None
@@ -678,6 +885,8 @@ class _FilterTransformer(Transformer):
                     ),
                     is_json=True,
                     field_type="",
+                    leaf_field=part,
+                    json_path=tuple(safe_parts[idx + 1:]),
                 )
 
             info = (
@@ -687,25 +896,6 @@ class _FilterTransformer(Transformer):
             )
             if isinstance(info, dict) and "table" in info:
                 step = self._step_from_info(part, info)
-
-                # PocketBase optimizes single relation `.id` lookups by using
-                # the stored relation id column instead of joining the target.
-                if (
-                    optimize_relation_id
-                    and step.kind == "forward"
-                    and not step.is_multiple
-                    and idx == len(safe_parts) - 2
-                    and safe_parts[idx + 1] == "id"
-                ):
-                    return _ResolvedPath(
-                        steps,
-                        self._column_expr_for_table(
-                            current_table,
-                            step.source_field or part,
-                        ),
-                        field_type="relation",
-                    )
-
                 steps.append(step)
                 current_table = step.target_table
                 if flat_resolver:
@@ -755,34 +945,51 @@ class _FilterTransformer(Transformer):
                 relations=self._relation_resolver,
                 fields=self._resolver_fields(self._relation_resolver),
                 allow_unresolved=True,
-                optimize_relation_id=False,
+                modifier=modifier,
             )
             if resolved is not None and resolved.steps:
                 return (
                     "relation_ref",
-                    resolved.steps,
-                    resolved.sql,
-                    resolved.is_json,
-                    resolved.field_type,
-                    _LeafOperand(
-                        resolved.sql,
-                        field_type=resolved.field_type,
-                        multiple=resolved.leaf_multiple,
-                        modifier=None if resolved.is_json else modifier,
-                    ),
+                    resolved,
+                    None if resolved.is_json else modifier,
                 )
             if resolved is not None and resolved.is_json:
-                return ("sql_ref", resolved.sql, resolved.is_json, resolved.field_type)
+                json_sql = self._json_extract_sql(
+                    self._field_expr(resolved.leaf_field),
+                    resolved.json_path,
+                )
+                return ("sql_ref", json_sql, resolved.is_json, resolved.field_type)
 
+        if len(parts) == 1:
+            # Single current-collection field: reject fields PocketBase does
+            # not resolve (password_hash, token_key, ...) and add the email
+            # visibility guard for a non-admin caller.
+            # A system field with a modifier (``email:lower``...) is an
+            # unknown field, so the guard can never be dropped here.
+            column, email_guard = self._resolve_leaf_column(
+                self._current_table, parts[0], modifier=modifier
+            )
+            if modifier:
+                return ("field_modifier", column, modifier)
+            field_type = self._field_type_for_table(self._current_table, column)
+            guard_sql = None
+            if email_guard:
+                guard_sql = f"{self._field_expr(_EMAIL_VISIBILITY_COLUMN)} = TRUE"
+            return ("field", column, field_type, guard_sql)
+
+        # A dotted path whose first segment is neither a relation, a back
+        # relation nor a JSON field does not resolve in PocketBase ("failed
+        # to resolve field" / "is not a valid relation", v0.22.34
+        # resolvers/record_field_resolve_runner.go l.517-523 and l.635-636):
+        # it is never emitted as raw SQL, otherwise
+        # ``users.password_hash`` would read the current table's hidden column
+        # and ``other.col`` would reference a table missing from FROM.  Only a
+        # parser without collection metadata keeps the legacy raw path.
+        if self._table_meta(self._current_table) is not None:
+            raise FilterFieldError(f"unknown filter field {'.'.join(parts)!r}")
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
-        field_name = ".".join(parts)
-        field_type = (
-            self._field_type_for_table(self._current_table, field_name)
-            if len(parts) == 1
-            else ""
-        )
-        return ("field", field_name, field_type)
+        return ("field", ".".join(parts), "")
 
     # -- Comparisons ---------------------------------------------------------
 
@@ -792,42 +999,14 @@ class _FilterTransformer(Transformer):
         left: tuple[str, Any],
         op_token: Any,
         right: tuple[str, Any],
-    ) -> str | _CollectionCondition | _RelationCondition:
+    ) -> str | _Cond:
         op = str(op_token).strip()
         if op in _STANDARD_OPS:
             left, right = self._coerce_comparison_literals(left, right)
 
-        # ── Relation field traversal → generate _RelationCondition ─────
-        left_is_rel = (
-            isinstance(left, tuple)
-            and len(left) >= 3
-            and left[0] == "relation_ref"
-        )
-        right_is_rel = (
-            isinstance(right, tuple)
-            and len(right) >= 3
-            and right[0] == "relation_ref"
-        )
-        if left_is_rel or right_is_rel:
-            return self._relation_comparison(
-                left, op, right, left_is_rel, right_is_rel,
-            )
-
-        # ── @collection references → generate _CollectionCondition ──────
-        left_is_coll = (
-            isinstance(left, tuple)
-            and len(left) >= 4
-            and left[0] == "collection_ref"
-        )
-        right_is_coll = (
-            isinstance(right, tuple)
-            and len(right) >= 4
-            and right[0] == "collection_ref"
-        )
-        if left_is_coll or right_is_coll:
-            return self._collection_comparison(
-                left, op, right, left_is_coll, right_is_coll,
-            )
+        # ── Relation, back-relation and @collection paths (LEFT JOINs) ──
+        if self._is_path_node(left) or self._is_path_node(right):
+            return self._path_comparison(left, op, right)
 
         # ── :each modifier comparisons (array "all items match") ──────
         left_each = self._extract_each_operand(left)
@@ -841,39 +1020,64 @@ class _FilterTransformer(Transformer):
         left_sql = self._operand_to_sql(left)
         right_sql = self._operand_to_sql(right)
 
+        def _guarded(sql: str) -> str:
+            # PocketBase wraps the whole comparison with the auth email
+            # visibility guard (AfterBuild); it attaches to the specific
+            # comparison, not the whole ``||`` filter.
+            for node in (left, right):
+                if isinstance(node, tuple) and node[0] == "field" and len(node) > 3 and node[3]:
+                    sql = f"({sql} AND {node[3]})"
+            return sql
+
+        date_sql = _empty_date_condition(self, left, left_sql, op, right, right_sql)
+        if date_sql is not None:
+            return _guarded(date_sql)
+
+        # A ``@request.*`` static value compared with = / != : resolve it with
+        # PocketBase's empty/NULL-aware, PostgreSQL-safe equality so an absent
+        # value (anonymous caller, or a role permission key the flattened
+        # context does not declare) never raises a type error and matches the
+        # same records as PocketBase.
+        if op in {"=", "!="} and (left[0] == "macro" or right[0] == "macro"):
+            return _guarded(self._static_equal_sql(left, right, equal=op == "="))
+        if op in {"<", "<=", ">", ">="} and (left[0] == "macro" or right[0] == "macro"):
+            folded = self._static_order_sql(left, op, right)
+            if folded is not None:
+                return _guarded(folded)
+
         # Standard comparisons
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
             # NULL special handling
             if right[0] == "null":
                 if sql_op == "=":
-                    return f"{left_sql} IS NULL"
+                    return _guarded(f"{left_sql} IS NULL")
                 elif sql_op == "!=":
-                    return f"{left_sql} IS NOT NULL"
+                    return _guarded(f"{left_sql} IS NOT NULL")
             if left[0] == "null":
                 if sql_op == "=":
-                    return f"{right_sql} IS NULL"
+                    return _guarded(f"{right_sql} IS NULL")
                 elif sql_op == "!=":
-                    return f"{right_sql} IS NOT NULL"
-            return f"{left_sql} {sql_op} {right_sql}"
+                    return _guarded(f"{right_sql} IS NOT NULL")
+            return _guarded(f"{left_sql} {sql_op} {right_sql}")
 
         # LIKE / NOT LIKE
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
-            return self._like_comparison_sql(left_sql, right, right_sql, sql_op)
+            return _guarded(self._like_comparison_sql(left_sql, right, right_sql, sql_op))
 
         # ANY standard operators (for array columns)
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
-            return self._scalar_or_array_any_sql(left_sql, right_sql, sql_op)
+            return _guarded(self._scalar_or_array_any_sql(left_sql, right_sql, sql_op))
 
         # ANY LIKE operators
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
             pattern_sql = self._like_pattern_sql(right, right_sql)
-            return self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op)
+            return _guarded(self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op))
 
-        return f"{left_sql} = {right_sql}"
+        return _guarded(f"{left_sql} = {right_sql}")
 
     # -- @collection comparison helpers --------------------------------------
 
@@ -981,26 +1185,41 @@ class _FilterTransformer(Transformer):
             "END)"
         )
 
-    def _resolve_collection_ref(self, node: tuple) -> _CollectionRef:
-        coll_name = _sanitize_ident(str(node[1]))
-        field_path = tuple(_sanitize_ident(str(part)) for part in node[2])
-        group_key = str(node[3])
-        modifier = node[4] if len(node) > 4 else None
+    # -- Relation, back-relation and @collection paths ----------------------
 
+    @staticmethod
+    def _is_path_node(node: Any) -> bool:
+        return isinstance(node, tuple) and bool(node) and node[0] in {
+            "relation_ref",
+            "collection_ref",
+        }
+
+    def _resolve_collection_path(
+        self,
+        coll_name: str,
+        field_path: tuple[str, ...],
+        modifier: str | None = None,
+    ) -> _ResolvedPath:
+        """Resolve the ``path`` of ``@collection.<coll_name>.<path>``."""
         if len(field_path) == 1:
-            field_type = self._field_type_for_collection_resolver(
-                coll_name,
-                field_path[0],
+            info = self._collection_resolver_field_info(coll_name, field_path[0])
+            # ``@collection`` paths set PocketBase's allowHiddenFields=true
+            # (prepare(), runner l.123-126): no email guard, but unknown
+            # fields (tokenKey...) and modified system fields are still
+            # rejected.
+            column, _ = self._resolve_leaf_column(
+                coll_name, field_path[0], allow_guard=False, modifier=modifier
             )
-            return _CollectionRef(
-                coll_name,
-                group_key,
-                column_sql=self._qualified_column(coll_name, field_path[0]),
-                leaf_type=field_type,
-                leaf_multiple=self._info_is_multiple(
-                    self._collection_resolver_field_info(coll_name, field_path[0])
+            return _ResolvedPath(
+                [],
+                self._qualified_column(coll_name, column),
+                field_type=self._field_type_for_collection_resolver(
+                    coll_name,
+                    field_path[0],
                 ),
-                modifier=modifier,
+                leaf_multiple=self._info_is_multiple(info),
+                leaf_field=column,
+                leaf_table=coll_name,
             )
 
         if self._is_flat_resolver(self._collection_resolver):
@@ -1016,92 +1235,559 @@ class _FilterTransformer(Transformer):
             relations=relations,
             fields=fields if isinstance(fields, dict) else {},
             allow_unresolved=False,
-            optimize_relation_id=True,
             context="@collection relation traversal",
+            email_guard_allowed=False,
+            modifier=modifier,
         )
         if resolved is None:
             raise ValueError(
                 f"Invalid @collection relation traversal: "
                 f"@collection.{coll_name}.{'.'.join(field_path)}."
             )
+        return resolved
 
-        leaf_modifier = None if resolved.is_json else modifier
-        if not resolved.steps:
-            return _CollectionRef(
-                coll_name,
-                group_key,
-                column_sql=resolved.sql,
-                leaf_type=resolved.field_type,
-                leaf_multiple=resolved.leaf_multiple,
-                modifier=leaf_modifier,
+    def _next_alias(self, prefix: str) -> str:
+        self._alias_counter += 1
+        return f"{prefix}{self._alias_counter}"
+
+    def _register_join(
+        self,
+        key: tuple[Any, ...],
+        parent: str | None,
+        template: str,
+    ) -> str:
+        """Register (once per path prefix) a main-query LEFT JOIN.
+
+        ``template`` is the JOIN clause with ``@ALIAS@`` for the new alias.
+        """
+        alias = self._join_keys.get(key)
+        if alias is None:
+            alias = self._next_alias("__pb")
+            self._joins[alias] = _Join(alias, template.replace("@ALIAS@", alias), parent)
+            self._join_keys[key] = alias
+        return alias
+
+    def _alias_closure(self, alias: str | None) -> frozenset[str]:
+        aliases: set[str] = set()
+        while alias is not None and alias in self._joins:
+            aliases.add(alias)
+            alias = self._joins[alias].parent
+        return frozenset(aliases)
+
+    def _column_of(self, alias: str | None, field_name: str) -> str:
+        if alias is None:
+            return self._column_expr_for_table(None, field_name)
+        return f'"{alias}"."{_sanitize_ident(field_name)}"'
+
+    def _join_path(
+        self,
+        root: str | None,
+        resolved: _ResolvedPath,
+        modifier: str | None,
+        make: Callable[[tuple[Any, ...], str | None, str], str],
+    ) -> tuple[str, str | None, bool]:
+        """Join the hops and the leaf of a path from ``root``.
+
+        Mirrors ``processActiveProps``: a single relation joins its target, a
+        multiple one ``json_each`` then the target, a back relation the
+        referencing records; every join is a LEFT JOIN.  Returns the leaf SQL,
+        the deepest alias and whether a hop or the leaf enables PocketBase's
+        multi-match (v0.22.34 resolvers/record_field_resolve_runner.go
+        l.347-477 and l.515-716).
+        """
+        parent = root
+        multi_match = False
+        for step in resolved.steps:
+            target = _sanitize_ident(step.target_table)
+            if step.kind == "back":
+                back_field = _sanitize_ident(step.back_field or "")
+                parent_id = self._column_of(parent, "id")
+                if step.is_multiple:
+                    on = f'{parent_id} = ANY("@ALIAS@"."{back_field}")'
+                else:
+                    on = f'"@ALIAS@"."{back_field}" = {parent_id}'
+                parent = make(
+                    ("back", parent, target, back_field),
+                    parent,
+                    f'LEFT JOIN "{target}" AS "@ALIAS@" ON {on}',
+                )
+            else:
+                source = self._column_of(parent, step.source_field or step.relation_key)
+                if step.is_multiple:
+                    each = make(
+                        ("each", parent, source),
+                        parent,
+                        f'LEFT JOIN LATERAL unnest({source}) AS "@ALIAS@"(value) ON TRUE',
+                    )
+                    parent = make(
+                        ("forward", parent, source),
+                        each,
+                        f'LEFT JOIN "{target}" AS "@ALIAS@" '
+                        f'ON "@ALIAS@"."id" = "{each}".value',
+                    )
+                else:
+                    parent = make(
+                        ("forward", parent, source),
+                        parent,
+                        f'LEFT JOIN "{target}" AS "@ALIAS@" ON "@ALIAS@"."id" = {source}',
+                    )
+            multi_match = multi_match or step.multi_match
+
+        if resolved.is_json:
+            return (
+                self._json_extract_sql(
+                    self._column_of(parent, resolved.leaf_field),
+                    resolved.json_path,
+                ),
+                parent,
+                multi_match,
             )
 
-        return _CollectionRef(
-            coll_name,
-            group_key,
-            relation_steps=resolved.steps,
-            leaf_sql=resolved.sql,
-            leaf_is_json=resolved.is_json,
-            leaf_type=resolved.field_type,
-            leaf_multiple=resolved.leaf_multiple,
-            modifier=leaf_modifier,
-        )
-
-    def _collection_relation_leaf_sql(self, ref: _CollectionRef) -> str:
-        if not ref.relation_steps or not ref.leaf_sql:
-            if ref.column_sql:
-                return ref.column_sql
-            raise ValueError("Invalid @collection relation reference.")
-        return ref.leaf_sql
-
-    def _join_condition_for_step(
-        self,
-        step: _TraversalStep,
-        parent_table: str | None,
-    ) -> str:
-        if step.kind == "back":
-            back_field = step.back_field or ""
-            target_expr = self._qualified_column(step.target_table, back_field)
-            parent_id = self._column_expr_for_table(parent_table, "id")
-            if step.is_multiple:
-                return self._scalar_or_array_any_sql(target_expr, parent_id, "=")
-            return f"{target_expr} = {parent_id}"
-
-        source_field = step.source_field or step.relation_key
-        source_expr = self._column_expr_for_table(parent_table, source_field)
-        target_id = self._qualified_column(step.target_table, "id")
-        if step.is_multiple:
-            return self._scalar_or_array_any_sql(source_expr, target_id, "=")
-        return f"{target_id} = {source_expr}"
-
-    def _wrap_collection_relation_exists(
-        self,
-        ref: _CollectionRef,
-        leaf_condition: str,
-    ) -> str:
-        wrapped = leaf_condition
-        for idx in range(len(ref.relation_steps) - 1, -1, -1):
-            step = ref.relation_steps[idx]
-            parent_table = ref.table_name if idx == 0 else ref.relation_steps[idx - 1].target_table
-            join_cond = self._join_condition_for_step(step, parent_table)
-            wrapped = (
-                f'EXISTS (SELECT 1 FROM "{step.target_table}" '
-                f'WHERE {join_cond} AND {wrapped})'
+        column = self._column_of(parent, resolved.leaf_field)
+        if modifier == "each" and resolved.field_type in _ARRAYABLE_FIELD_TYPES:
+            elements = self._each_elements_sql(column, multiple=resolved.leaf_multiple)
+            each = make(
+                ("leaf_each", parent, column),
+                parent,
+                f'LEFT JOIN LATERAL unnest({elements}) AS "@ALIAS@"(value) ON TRUE',
             )
-        return wrapped
+            return (
+                f'"{each}".value',
+                each,
+                multi_match or resolved.leaf_multiple,
+            )
+        leaf = _LeafOperand(
+            column,
+            field_type=resolved.field_type,
+            multiple=resolved.leaf_multiple,
+            modifier=modifier,
+        )
+        return self._leaf_value_sql(leaf), parent, multi_match
 
-    def _collection_ref_leaf(self, ref: _CollectionRef) -> _LeafOperand:
-        sql = (
-            ref.column_sql
-            if ref.column_sql is not None
-            else self._collection_relation_leaf_sql(ref)
+    def _path_operand(self, node: tuple) -> _PathOperand:
+        """Resolve a ``relation_ref``/``collection_ref`` node like PocketBase."""
+        if node[0] == "relation_ref":
+            resolved: _ResolvedPath = node[1]
+            modifier = node[2] if len(node) > 2 else None
+            collection: tuple[str, str] | None = None
+        else:
+            coll_name = _sanitize_ident(str(node[1]))
+            field_path = tuple(_sanitize_ident(str(part)) for part in node[2])
+            raw_modifier = node[4] if len(node) > 4 else None
+            resolved = self._resolve_collection_path(
+                coll_name, field_path, raw_modifier
+            )
+            modifier = None if resolved.is_json else raw_modifier
+            collection = (coll_name, str(node[3]))
+
+        # Main query: shared joins.
+        root = None
+        if collection is not None:
+            # A @collection join has no ON condition: every row of the
+            # collection, or one NULL row when it is empty (l.144-182).
+            root = self._register_join(
+                ("collection", collection[1]),
+                None,
+                f'LEFT JOIN "{collection[0]}" AS "@ALIAS@" ON TRUE',
+            )
+        leaf_sql, deepest, multi_match = self._join_path(
+            root,
+            resolved,
+            modifier,
+            self._register_join,
         )
-        return _LeafOperand(
-            sql,
-            field_type=ref.leaf_type,
-            multiple=ref.leaf_multiple,
-            modifier=ref.modifier,
+        multi_match = multi_match or collection is not None
+        date_leaf = (
+            not resolved.is_json
+            and modifier is None
+            and resolved.field_type in _NULLABLE_DATE_FIELD_TYPES
         )
+
+        # Multi-match subquery: the same joins with their own aliases.
+        mm: _MultiMatch | None = None
+        if multi_match:
+            clauses: list[str] = []
+
+            def make(
+                _key: tuple[Any, ...],
+                _parent: str | None,
+                template: str,
+            ) -> str:
+                alias = self._next_alias("__pbm")
+                clauses.append(template.replace("@ALIAS@", alias))
+                return alias
+
+            mm_root = None
+            if collection is not None:
+                mm_root = make(
+                    ("collection",),
+                    None,
+                    f'LEFT JOIN "{collection[0]}" AS "@ALIAS@" ON TRUE',
+                )
+            mm_leaf, mm_deepest, _multi = self._join_path(mm_root, resolved, modifier, make)
+            mm_row_id = self._column_of(mm_deepest, "id") if date_leaf else None
+            if collection is None and self._current_table:
+                # Joins from the current record: list every record's rows
+                # and match them on the id (decorrelated, PostgreSQL can
+                # anti-join instead of running one subquery per record).
+                base = f'"{self._next_alias("__pbmb")}"'
+                mm = _MultiMatch(
+                    from_sql=(
+                        f'"{self._current_table}" AS {base} ' + " ".join(clauses)
+                    ).replace(_BASE_REF, base),
+                    value=mm_leaf.replace(_BASE_REF, base),
+                    record_id=f"{base}.\"id\"",
+                    row_id=mm_row_id,
+                )
+            else:
+                mm = _MultiMatch(
+                    from_sql='(SELECT 1) AS "__pbm_row" ' + " ".join(clauses),
+                    value=mm_leaf,
+                    row_id=mm_row_id,
+                )
+
+        email_guard = None
+        if resolved.email_guard:
+            # AfterBuild guard on the main-query leaf alias only (never the
+            # multi-match subquery); a missing join row leaves it NULL/false.
+            email_guard = f"{self._column_of(deepest, _EMAIL_VISIBILITY_COLUMN)} = TRUE"
+        return _PathOperand(
+            leaf_sql,
+            self._alias_closure(deepest),
+            mm,
+            field_type=resolved.field_type,
+            is_json=resolved.is_json,
+            email_guard=email_guard,
+            row_id=self._column_of(deepest, "id") if date_leaf else None,
+        )
+
+    def _side(self, node: tuple, path: _PathOperand | None) -> _Side:
+        """Classify an operand like ``resolveEqualExpr`` (filter.go l.290-401)."""
+        if path is not None:
+            node = ("sql_ref", path.sql, path.is_json, path.field_type, path.row_id)
+            return _Side(path.sql, "column", node, is_json=path.is_json)
+        sql = self._operand_to_sql(node)
+        kind = node[0] if isinstance(node, tuple) and node else ""
+        if kind == "null" or sql == "NULL":
+            return _Side(sql, "empty", node)
+        if self._is_bound_param(sql):
+            value = self._params[sql[1:]]
+            return _Side(sql, "empty" if value in ("", None) else "value", node)
+        if kind in {"literal", "macro"}:
+            return _Side(sql, "value", node)
+        return _Side(sql, "column", node)
+
+    def _static_equal_sql(self, left: tuple, right: tuple, *, equal: bool) -> str:
+        """``=``/``!=`` when a ``@request.*`` static value is involved.
+
+        PocketBase binds an absent ``@request.*`` value as SQL ``NULL`` and a
+        present one as a typed param, then compares with ``resolveEqualExpr``
+        (resolvers/record_field_resolver.go l.186-223, tools/search/filter.go
+        l.290-368).  Over SQLite's loose typing ``'' = TRUE`` or ``'' = 1`` is
+        just ``false`` and ``col IS NOT NULL`` works; PostgreSQL rejects an
+        untyped ``$n IS NOT NULL`` and ``'' = TRUE``.  This builds the same
+        result with PG-safe SQL: an empty operand never equals a known
+        non-empty value, and an empty operand compared with a column matches
+        its empty/NULL rows (``COALESCE(col,'') = ''``).
+        """
+        left_side = self._side(left, None)
+        right_side = self._side(right, None)
+        left_empty = left_side.kind == "empty"
+        right_empty = right_side.kind == "empty"
+        if left_empty and right_empty:
+            return "TRUE" if equal else "FALSE"
+        if left_empty or right_empty:
+            other = right_side if left_empty else left_side
+            if other.kind != "column":
+                # Empty can never equal a known non-empty value.
+                return "FALSE" if equal else "TRUE"
+            col = self._text_cast_sql(other.sql)
+            return (
+                f"(COALESCE({col}, '') = '')"
+                if equal
+                else f"(COALESCE({col}, '') <> '')"
+            )
+        left_known, left_value = self._static_value(left_side)
+        right_known, right_value = self._static_value(right_side)
+        if left_known and right_known:
+            # Two values known while parsing (a present ``@request.*`` value
+            # and a literal, ``true``/``false`` or another request value):
+            # PocketBase compares them in SQLite without any column affinity
+            # (``true`` is the integer ``1``, filter.go l.249-262), so a
+            # number/boolean never equals a text and ``1 = true``.  Folding
+            # the result never binds a non-boolean to a boolean parameter
+            # (asyncpg DataError, HTTP 500).
+            same = _sqlite_compare(left_value, right_value) == 0
+            return "TRUE" if same == equal else "FALSE"
+        if left_side.kind == "column" and right_side.kind == "column":
+            left_col = self._text_cast_sql(left_side.sql)
+            right_col = self._text_cast_sql(right_side.sql)
+            if equal:
+                return f"COALESCE({left_col}, '') = COALESCE({right_col}, '')"
+            return (
+                f"COALESCE({left_col}, '') IS DISTINCT FROM COALESCE({right_col}, '')"
+            )
+        if equal:
+            return f"{left_side.sql} = {right_side.sql}"
+        return f"({left_side.sql} IS DISTINCT FROM {right_side.sql})"
+
+    def _static_value(self, side: _Side) -> tuple[bool, Any]:
+        """``(True, value)`` for an operand whose value is known while parsing.
+
+        Literals and bound ``@request.*`` values are known; a column, a JSON
+        path or a SQL macro (``@now``...) is not.
+        """
+        node = side.node
+        if isinstance(node, tuple) and node and node[0] == "literal":
+            return True, node[1]
+        if self._is_bound_param(side.sql):
+            return True, self._params[side.sql[1:]]
+        if side.sql in {"TRUE", "FALSE"}:
+            return True, side.sql == "TRUE"
+        return False, None
+
+    def _static_order_sql(self, left: tuple, op: str, right: tuple) -> str | None:
+        """``<``/``<=``/``>``/``>=`` between two values known while parsing.
+
+        Only used when a ``@request.*`` macro is involved.  SQLite compares
+        them by storage class (NULL yields NULL, numbers sort before text);
+        PostgreSQL would instead infer one parameter type from the other and
+        reject a mismatching value (HTTP 500).
+        """
+        left_side = self._side(left, None)
+        right_side = self._side(right, None)
+        left_known, left_value = self._static_value(left_side)
+        right_known, right_value = self._static_value(right_side)
+        if not (left_known and right_known):
+            return None
+        if left_value is None or right_value is None:
+            return "NULL"
+        order = _sqlite_compare(left_value, right_value)
+        result = {
+            "<": order < 0,
+            "<=": order <= 0,
+            ">": order > 0,
+            ">=": order >= 0,
+        }[op]
+        return "TRUE" if result else "FALSE"
+
+    def _pb_equal_sql(self, left: _Side, right: _Side, *, equal: bool) -> str:
+        """``=``/``!=`` like PocketBase ``resolveEqualExpr``.
+
+        ``!=`` is NULL-safe (``IS NOT``); an empty operand also matches NULL;
+        otherwise both sides are compared with ``COALESCE(x, '')``
+        (v0.22.34 tools/search/filter.go l.290-368).
+        """
+        compare = "=" if equal else "IS DISTINCT FROM"
+        concat = "OR" if equal else "AND"
+        null_check = "IS NULL" if equal else "IS NOT NULL"
+        left_empty = left.kind == "empty"
+        right_empty = right.kind == "empty"
+        if left_empty and right_empty:
+            return "TRUE" if equal else "FALSE"
+        if left.kind == "value" or right.kind == "value":
+            left_sql = "''" if left_empty else left.sql
+            right_sql = "''" if right_empty else right.sql
+            return f"{left_sql} {compare} {right_sql}"
+        if left_empty:
+            return (
+                f"({self._text_cast_sql(right.sql)} {compare} '' "
+                f"{concat} {right.sql} {null_check})"
+            )
+        if right_empty:
+            return (
+                f"({self._text_cast_sql(left.sql)} {compare} '' "
+                f"{concat} {left.sql} {null_check})"
+            )
+        return (
+            f"COALESCE({self._text_cast_sql(left.sql)}, '') {compare} "
+            f"COALESCE({self._text_cast_sql(right.sql)}, '')"
+        )
+
+    def _compare_sides(self, left: _Side, op: str, right: _Side) -> str:
+        """One comparison of a path leaf (``?`` only disables multi-match)."""
+        if left.is_json or right.is_json:
+            # JSON leaves keep PPBase's JSON comparison.
+            ref, other, ref_is_left = (left, right, True) if left.is_json else (
+                right,
+                left,
+                False,
+            )
+            return self._operator_condition_sql(
+                ref.sql,
+                op,
+                other.node,
+                other.sql,
+                ref_is_left=ref_is_left,
+            )
+        base_op = op.removeprefix("?")
+        if self._exact_dates or base_op not in {"=", "!="}:
+            date_sql = _empty_date_condition(
+                self,
+                left.node,
+                left.sql,
+                base_op,
+                right.node,
+                right.sql,
+                exact=self._exact_dates,
+            )
+            if date_sql is not None:
+                return date_sql
+        if base_op in {"=", "!="}:
+            return self._pb_equal_sql(left, right, equal=base_op == "=")
+        if base_op in _LIKE_OPS:
+            return self._like_comparison_sql(
+                left.sql,
+                right.node,
+                right.sql,
+                _LIKE_OPS[base_op],
+            )
+        sql_op = _STANDARD_OPS.get(base_op, "=")
+        return f"{left.sql} {sql_op} {right.sql}"
+
+    @staticmethod
+    def _multi_match_failure(condition: str, op: str, values: list[str]) -> str:
+        """Rows that fail a multi-match (v0.22.34 filter.go l.680-706).
+
+        ``NOT (condition)``; except for ``=``, a NULL value (missing target,
+        empty list or empty collection) also fails.  PocketBase v0.24.0
+        dropped this NULL clause (v0.40.6 filter.go l.708-711).
+        """
+        failing = f"NOT ({condition})"
+        if op == "=":
+            return failing
+        return "(" + " OR ".join([failing, *(f"{v} IS NULL" for v in values)]) + ")"
+
+    @staticmethod
+    def _multi_match_value(alias: str, mm: _MultiMatch, side: _Side) -> tuple[_Side, str]:
+        """The subquery value of a multi-match and the SQL that is NULL when
+        the joined row is missing (the value itself, or the leaf row id of a
+        nullable date leaf, whose NULL value is an empty date)."""
+        value = f'"{alias}"."v"'
+        if mm.row_id is None:
+            return _Side(value, "column", ("sql_ref", value), is_json=side.is_json), value
+        row_id = f'"{alias}"."r"'
+        node = ("sql_ref", value, False, side.node[3], row_id)
+        return _Side(value, "column", node), row_id
+
+    def _many_vs_one_sql(
+        self,
+        mm: _MultiMatch,
+        path_side: _Side,
+        op: str,
+        other: _Side,
+        *,
+        path_is_left: bool,
+    ) -> str:
+        alias = self._next_alias("__pbsm")
+        value_side, missing = self._multi_match_value(alias, mm, path_side)
+        self._exact_dates = True
+        try:
+            condition = (
+                self._compare_sides(value_side, op, other)
+                if path_is_left
+                else self._compare_sides(other, op, value_side)
+            )
+        finally:
+            self._exact_dates = False
+        failure = self._multi_match_failure(condition, op, [missing])
+        if mm.record_id is not None:
+            failure = f'"{alias}"."__pbm_id" = {_BASE_REF}."id" AND {failure}'
+        return (
+            f"NOT EXISTS (SELECT 1 FROM ({self._multi_match_select(mm)}) "
+            f'AS "{alias}" WHERE {failure})'
+        )
+
+    @staticmethod
+    def _multi_match_select(mm: _MultiMatch) -> str:
+        record_id = f', {mm.record_id} AS "__pbm_id"' if mm.record_id else ""
+        row_id = f', {mm.row_id} AS "r"' if mm.row_id else ""
+        return f'SELECT {mm.value} AS "v"{record_id}{row_id} FROM {mm.from_sql}'
+
+    def _many_vs_many_sql(
+        self,
+        left_mm: _MultiMatch,
+        left: _Side,
+        op: str,
+        right_mm: _MultiMatch,
+        right: _Side,
+    ) -> str:
+        left_alias = self._next_alias("__pbml")
+        right_alias = self._next_alias("__pbmr")
+        left_side, left_missing = self._multi_match_value(left_alias, left_mm, left)
+        right_side, right_missing = self._multi_match_value(right_alias, right_mm, right)
+        self._exact_dates = True
+        try:
+            condition = self._compare_sides(left_side, op, right_side)
+        finally:
+            self._exact_dates = False
+        failure = self._multi_match_failure(condition, op, [left_missing, right_missing])
+        right_on = "TRUE"
+        if right_mm.record_id is not None:
+            right_on = f'"{right_alias}"."__pbm_id" = {_BASE_REF}."id"'
+        if left_mm.record_id is not None:
+            failure = f'"{left_alias}"."__pbm_id" = {_BASE_REF}."id" AND {failure}'
+        return (
+            f"NOT EXISTS (SELECT 1 FROM ({self._multi_match_select(left_mm)}) "
+            f'AS "{left_alias}" LEFT JOIN ({self._multi_match_select(right_mm)}) '
+            f'AS "{right_alias}" ON {right_on} WHERE {failure})'
+        )
+
+    def _path_comparison(self, left: tuple, op: str, right: tuple) -> _Cond:
+        """Compare relation/``@collection`` paths like PocketBase.
+
+        The leaf is read through the shared LEFT JOINs (``?`` operators are
+        any-match); other operators also need every row of PocketBase's
+        multi-match subquery to match (v0.22.34 tools/search/filter.go
+        l.183-215, l.569-706).
+        """
+        left_path = self._path_operand(left) if self._is_path_node(left) else None
+        right_path = self._path_operand(right) if self._is_path_node(right) else None
+        if (
+            left_path is not None
+            and right_path is None
+            and left_path.field_type in _DATETIME_FIELD_TYPES
+        ):
+            right = self._literal_for_field_type(right, left_path.field_type)
+        if (
+            right_path is not None
+            and left_path is None
+            and right_path.field_type in _DATETIME_FIELD_TYPES
+        ):
+            left = self._literal_for_field_type(left, right_path.field_type)
+
+        left_side = self._side(left, left_path)
+        right_side = self._side(right, right_path)
+        sql = self._compare_sides(left_side, op, right_side)
+
+        left_mm = left_path.multi_match if left_path is not None else None
+        right_mm = right_path.multi_match if right_path is not None else None
+        if not op.startswith("?"):
+            if left_mm is not None and right_mm is not None:
+                sql = (
+                    f"({sql} AND "
+                    f"{self._many_vs_many_sql(left_mm, left_side, op, right_mm, right_side)})"
+                )
+            elif left_mm is not None:
+                mm_sql = self._many_vs_one_sql(
+                    left_mm, left_side, op, right_side, path_is_left=True
+                )
+                sql = f"({sql} AND {mm_sql})"
+            elif right_mm is not None:
+                mm_sql = self._many_vs_one_sql(
+                    right_mm, right_side, op, left_side, path_is_left=False
+                )
+                sql = f"({sql} AND {mm_sql})"
+
+        for path in (left_path, right_path):
+            if path is not None and path.email_guard:
+                sql = f"({sql} AND {path.email_guard})"
+
+        aliases: frozenset[str] = frozenset()
+        for path in (left_path, right_path):
+            if path is not None:
+                aliases |= path.aliases
+        return _Cond.atom(sql, aliases)
 
     def _operator_condition_sql(
         self,
@@ -1149,214 +1835,6 @@ class _FilterTransformer(Transformer):
         if ref_is_left:
             return f"{ref_sql} = {other_sql}"
         return f"{other_sql} = {ref_sql}"
-
-    def _leaf_condition_sql(
-        self,
-        leaf: _LeafOperand,
-        op: str,
-        other: tuple,
-        *,
-        leaf_is_left: bool,
-    ) -> str:
-        """Compare the last segment of a relation/``@collection`` path."""
-        if leaf.modifier == "each" and leaf.field_type in _ARRAYABLE_FIELD_TYPES:
-            return self._each_condition_sql(
-                self._each_elements_sql(leaf.sql, multiple=leaf.multiple),
-                op,
-                other,
-                each_is_left=leaf_is_left,
-                multiple=leaf.multiple,
-            )
-        leaf_sql = self._leaf_value_sql(leaf)
-        other_sql = self._operand_to_sql(other)
-        return self._operator_condition_sql(
-            leaf_sql,
-            op,
-            other,
-            other_sql,
-            ref_is_left=leaf_is_left,
-        )
-
-    def _collection_ref_condition(
-        self,
-        ref: _CollectionRef,
-        op: str,
-        other: tuple,
-        *,
-        ref_is_left: bool,
-    ) -> str:
-        if ref.leaf_type in _DATETIME_FIELD_TYPES:
-            other = self._literal_for_field_type(other, ref.leaf_type)
-        condition = self._leaf_condition_sql(
-            self._collection_ref_leaf(ref),
-            op,
-            other,
-            leaf_is_left=ref_is_left,
-        )
-        if ref.column_sql is not None:
-            return condition
-        return self._wrap_collection_relation_exists(ref, condition)
-
-    def _collection_comparison(
-        self,
-        left: tuple,
-        op: str,
-        right: tuple,
-        left_is_coll: bool,
-        right_is_coll: bool,
-    ) -> _CollectionCondition | str:
-        """Handle comparisons where at least one side is ``@collection.X.Y``."""
-
-        # Both sides reference @collection -----------------------------------
-        if left_is_coll and right_is_coll:
-            l_ref = self._resolve_collection_ref(left)
-            r_ref = self._resolve_collection_ref(right)
-            if "each" in (l_ref.modifier, r_ref.modifier):
-                raise ValueError(
-                    "Comparisons between two @collection references cannot use :each."
-                )
-            l_col = self._leaf_value_sql(self._collection_ref_leaf(l_ref))
-            r_col = self._leaf_value_sql(self._collection_ref_leaf(r_ref))
-            sql_op = _STANDARD_OPS.get(op, "=")
-            inner = f"{l_col} {sql_op} {r_col}"
-            if l_ref.column_sql is None:
-                inner = self._wrap_collection_relation_exists(l_ref, inner)
-            if r_ref.column_sql is None:
-                inner = self._wrap_collection_relation_exists(r_ref, inner)
-            if l_ref.group_key == r_ref.group_key:
-                return _CollectionCondition(l_ref.table_name, l_ref.group_key, inner)
-            # Cross-collection → inline EXISTS with two tables
-            return (
-                f'EXISTS (SELECT 1 FROM "{l_ref.table_name}", "{r_ref.table_name}" '
-                f"WHERE {inner})"
-            )
-
-        # One side is @collection -------------------------------------------
-        if left_is_coll:
-            ref = self._resolve_collection_ref(left)
-            other = right
-            coll_is_left = True
-        else:
-            ref = self._resolve_collection_ref(right)
-            other = left
-            coll_is_left = False
-
-        condition = self._collection_ref_condition(
-            ref,
-            op,
-            other,
-            ref_is_left=coll_is_left,
-        )
-        return _CollectionCondition(ref.table_name, ref.group_key, condition)
-
-    # -- Relation traversal comparison helpers --------------------------------
-
-    def _relation_comparison(
-        self,
-        left: tuple,
-        op: str,
-        right: tuple,
-        left_is_rel: bool,
-        right_is_rel: bool,
-    ) -> _RelationCondition | str:
-        """Handle comparisons where at least one side is a relation traversal."""
-
-        def _wrap_nested_relation_exists(
-            steps: list[_TraversalStep],
-            leaf_condition: str,
-            root_parent_table: str | None = None,
-        ) -> str:
-            wrapped = leaf_condition
-            for idx in range(len(steps) - 1, -1, -1):
-                step = steps[idx]
-                parent_table = (
-                    root_parent_table
-                    if idx == 0
-                    else steps[idx - 1].target_table
-                )
-                join_cond = self._join_condition_for_step(step, parent_table)
-                wrapped = (
-                    f'EXISTS (SELECT 1 FROM "{step.target_table}" '
-                    f'WHERE {join_cond} AND {wrapped})'
-                )
-            return wrapped
-
-        def _relation_condition_for_steps(
-            steps: list[_TraversalStep],
-            leaf_condition: str,
-        ) -> _RelationCondition:
-            first = steps[0]
-            first_join = self._join_condition_for_step(first, None)
-            where_cond = (
-                leaf_condition
-                if len(steps) == 1
-                else _wrap_nested_relation_exists(
-                    steps[1:],
-                    leaf_condition,
-                    first.target_table,
-                )
-            )
-            return _RelationCondition(
-                first.relation_key,
-                first.target_table,
-                first_join,
-                where_cond,
-            )
-
-        def _leaf_of(node: tuple) -> _LeafOperand:
-            if len(node) >= 6 and isinstance(node[5], _LeafOperand):
-                return node[5]
-            return _LeafOperand(
-                str(node[2]),
-                field_type=str(node[4]) if len(node) >= 5 else "",
-            )
-
-        # Both sides are relation refs (rare) --------------------------------
-        if left_is_rel and right_is_rel:
-            l_steps, r_steps = left[1], right[1]
-            if len(l_steps) > 1 or len(r_steps) > 1:
-                raise ValueError(
-                    "Comparisons between two nested relation traversals are not supported."
-                )
-            l_leaf, r_leaf = _leaf_of(left), _leaf_of(right)
-            if "each" in (l_leaf.modifier, r_leaf.modifier):
-                raise ValueError(
-                    "Comparisons between two relation traversals cannot use :each."
-                )
-            l_col = self._leaf_value_sql(l_leaf)
-            r_col = self._leaf_value_sql(r_leaf)
-
-            l_step = l_steps[0]
-            r_step = r_steps[0]
-            l_join = self._join_condition_for_step(l_step, None)
-            r_join = self._join_condition_for_step(r_step, None)
-            sql_op = _STANDARD_OPS.get(op, "=")
-            return (
-                f'EXISTS (SELECT 1 FROM "{l_step.target_table}", "{r_step.target_table}" '
-                f"WHERE {l_join} AND {r_join} AND {l_col} {sql_op} {r_col})"
-            )
-
-        # One side is a relation ref -----------------------------------------
-        if left_is_rel:
-            rel_steps, leaf = left[1], _leaf_of(left)
-            other = right
-            rel_is_left = True
-        else:
-            rel_steps, leaf = right[1], _leaf_of(right)
-            other = left
-            rel_is_left = False
-
-        # PocketBase resolves the last segment like a direct field: a
-        # multi-value leaf is its JSON text, ``:length``/``:each`` iterate it
-        # (v0.22.34 resolvers/record_field_resolve_runner.go l.356-477,
-        # v0.40.6 core/record_field_resolver_runner.go l.758-852).
-        where_cond = self._leaf_condition_sql(
-            leaf,
-            op,
-            other,
-            leaf_is_left=rel_is_left,
-        )
-        return _relation_condition_for_steps(rel_steps, where_cond)
 
     # -- :each modifier helpers ---------------------------------------------
 
@@ -1598,63 +2076,89 @@ class _FilterTransformer(Transformer):
 
     # -- Logical operators ---------------------------------------------------
 
-    def or_expr(self, items: list) -> str:
-        """OR: each @collection / relation condition becomes its own EXISTS."""
+    def or_expr(self, items: list) -> _Cond:
+        return _Cond.combine("or", items)
+
+    def and_expr(self, items: list) -> _Cond:
+        return _Cond.combine("and", items)
+
+    # -- Rendering -------------------------------------------------------------
+
+    def render(self, node: Any, bound: frozenset[str] = frozenset()) -> str:
+        """Render a condition tree; join aliases become correlated EXISTS.
+
+        PocketBase evaluates the whole filter on each LEFT JOIN row of the
+        main query.  An EXISTS over those joins distributes over ``||``; an
+        ``&&`` keeps the operands that share a join in one EXISTS so that
+        they read the same row, exactly like PocketBase's shared aliases.
+        """
+        node = _Cond.of(node)
+        if node.kind == "atom":
+            free = node.aliases - bound
+            return self._exists_sql(free, node.sql) if free else node.sql
+        if node.kind == "or":
+            parts = [self.render(child, bound) for child in node.children]
+            return "(" + " OR ".join(parts) + ")"
+
         parts: list[str] = []
-        for item in items:
-            if isinstance(item, _CollectionCondition):
-                parts.append(
-                    f'EXISTS (SELECT 1 FROM "{item.table_name}" WHERE {item.inner_sql})'
-                )
-            elif isinstance(item, _RelationCondition):
-                conds = " AND ".join([item.join_cond, item.where_cond])
-                parts.append(
-                    f'EXISTS (SELECT 1 FROM "{item.target_table}" WHERE {conds})'
-                )
-            else:
-                parts.append(str(item))
-        if len(parts) == 1:
-            return parts[0]
-        return "(" + " OR ".join(parts) + ")"
-
-    def and_expr(self, items: list) -> str:
-        """AND: @collection / relation conditions for the **same** target are
-        merged into a single EXISTS so all conditions match the same row."""
-        coll_groups: dict[str, list[str]] = {}
-        coll_tables: dict[str, str] = {}
-        rel_groups: dict[str, list[_RelationCondition]] = {}
-        regular_parts: list[str] = []
-
-        for item in items:
-            if isinstance(item, _CollectionCondition):
-                coll_groups.setdefault(item.group_key, []).append(item.inner_sql)
-                coll_tables.setdefault(item.group_key, item.table_name)
-            elif isinstance(item, _RelationCondition):
-                rel_groups.setdefault(item.relation_key, []).append(item)
-            else:
-                regular_parts.append(str(item))
-
-        # @collection groups
-        for group_key, conditions in coll_groups.items():
-            table_name = coll_tables[group_key]
-            inner = " AND ".join(conditions)
-            regular_parts.append(
-                f'EXISTS (SELECT 1 FROM "{table_name}" WHERE {inner})'
+        groups: list[tuple[set[str], list[int]]] = []
+        for index, child in enumerate(node.children):
+            free = set(child.aliases - bound)
+            if not free:
+                continue
+            members = [index]
+            kept: list[tuple[set[str], list[int]]] = []
+            for aliases, indexes in groups:
+                if aliases & free:
+                    free |= aliases
+                    members.extend(indexes)
+                else:
+                    kept.append((aliases, indexes))
+            groups = [*kept, (free, sorted(members))]
+        grouped = {index for _aliases, indexes in groups for index in indexes}
+        for index, child in enumerate(node.children):
+            if index not in grouped:
+                parts.append(self.render(child, bound))
+        for aliases, indexes in sorted(groups, key=lambda group: group[1][0]):
+            inner_bound = bound | frozenset(aliases)
+            inner = " AND ".join(
+                self.render(node.children[index], inner_bound) for index in indexes
             )
+            parts.append(self._exists_sql(frozenset(aliases), inner))
+        return parts[0] if len(parts) == 1 else "(" + " AND ".join(parts) + ")"
 
-        # Relation traversal groups — join_cond is the same for all items
-        # in the same group so we include it once.
-        for _rel_key, conditions in rel_groups.items():
-            table = conditions[0].target_table
-            join = conditions[0].join_cond
-            all_conds = [join] + [c.where_cond for c in conditions]
-            regular_parts.append(
-                f'EXISTS (SELECT 1 FROM "{table}" WHERE {" AND ".join(all_conds)})'
+    def _exists_sql(self, aliases: frozenset[str] | set[str], condition: str) -> str:
+        """``∃`` joined row of the current record matching ``condition``.
+
+        Rendered as ``id IN (SELECT base.id FROM <table> AS base LEFT JOIN
+        ... WHERE ...)``: the shape of PocketBase's ``SELECT DISTINCT ...
+        LEFT JOIN``, which PostgreSQL runs as a semi-join (a correlated
+        EXISTS with outer references in the joins would run per record).
+        Join groups only exist at the top level of the condition, so every
+        ``_BASE_REF`` inside is the current record.
+        """
+        joins = " ".join(
+            join.sql for alias, join in self._joins.items() if alias in aliases
+        )
+        if not self._current_table or _BASE_REF not in f"{joins} {condition}":
+            # Without the current record (e.g. only @collection joins) the
+            # EXISTS is uncorrelated: PostgreSQL evaluates it once.
+            return (
+                f'EXISTS (SELECT 1 FROM (SELECT 1) AS "__pb_row" {joins} '
+                f"WHERE {condition})"
             )
+        base = f'"{self._next_alias("__pbb")}"'
+        body = (
+            f'SELECT {base}."id" FROM "{self._current_table}" AS {base} {joins} '
+            f"WHERE {condition}"
+        ).replace(_BASE_REF, base)
+        return f'{_BASE_REF}."id" IN ({body})'
 
-        if len(regular_parts) == 1:
-            return regular_parts[0]
-        return "(" + " AND ".join(regular_parts) + ")"
+    def finish(self, sql: str) -> str:
+        """Qualify the remaining current-record columns with the table."""
+        if not self._current_table:
+            return sql
+        return sql.replace(_BASE_REF, f'"{self._current_table}"')
 
     # -- Helpers -------------------------------------------------------------
 
@@ -1710,7 +2214,7 @@ class _FilterTransformer(Transformer):
         if "." in safe:
             return safe
         if self._current_table:
-            return self._qualified_column(self._current_table, safe)
+            return f'{_BASE_REF}."{safe}"'
         return f'"{safe}"'
 
     @staticmethod
@@ -1846,32 +2350,33 @@ class _FilterTransformer(Transformer):
             method = self._request_context.get("method", "")
             pname = self._next_param(method)
             return f":{pname}"
+        # An absent ``@request.*`` value is SQL NULL, like PocketBase
+        # (``extractNestedMapVal`` fails, ``case nil`` -> ``NULL``, v0.22.34
+        # resolvers/record_field_resolver.go l.162-192): it equals only an
+        # empty operand and never satisfies ``<``/``>``/``~``, whereas a
+        # present '' is an empty string.
         if name.startswith("request.headers."):
             field = name[len("request.headers."):]
             headers = self._request_context.get("headers", {})
-            val = ""
+            val = None
             if isinstance(headers, dict):
                 normalized = field.lower().replace("-", "_")
                 # Header macros can use either header-name or header_name style.
-                val = (
-                    headers.get(normalized)
-                    or headers.get(field.lower())
-                    or headers.get(field)
-                    or ""
-                )
+                for key in (normalized, field.lower(), field):
+                    if headers.get(key):
+                        val = headers[key]
+                        break
+                else:
+                    for key in (normalized, field.lower(), field):
+                        if key in headers:
+                            val = headers[key]
+                            break
             pname = self._next_param(val)
             return f":{pname}"
         if name.startswith("request.auth."):
             field = name[len("request.auth."):]
             auth = self._request_context.get("auth", {})
-            if field == "id":
-                val = auth.get("id", "")
-            elif field == "collectionId":
-                val = auth.get("collectionId", "")
-            elif field == "collectionName":
-                val = auth.get("collectionName", "")
-            else:
-                val = auth.get(field, "")
+            val = auth.get(field) if isinstance(auth, dict) else None
             pname = self._next_param(self._request_value(val))
             return f":{pname}"
         if name.startswith("request.data.") or name.startswith("request.body."):
@@ -1900,8 +2405,7 @@ class _FilterTransformer(Transformer):
             if modifier == "changed":
                 if not has_field:
                     return "FALSE"
-                safe_field = _sanitize_ident(field)
-                field_sql = f'"{safe_field}"'
+                field_sql = self._field_expr(_sanitize_ident(field))
                 pname = self._next_param(val)
                 return (
                     f"(COALESCE({field_sql}::text, '') "
@@ -1918,13 +2422,17 @@ class _FilterTransformer(Transformer):
                 pname = self._next_param(lowered)
                 return f":{pname}"
 
-            pname = self._next_param(self._request_value(val) if has_field else "")
+            pname = self._next_param(self._request_value(val) if has_field else None)
             return f":{pname}"
         if name.startswith("request.query."):
             field = name[len("request.query."):]
             query = self._request_context.get("query", {})
-            val = query.get(field, "")
-            pname = self._next_param(val)
+            val = query.get(field) if isinstance(query, dict) else None
+            pname = self._next_param(self._request_value(val))
+            return f":{pname}"
+        if name.startswith("request."):
+            # Any other ``@request.*`` key is absent: NULL.
+            pname = self._next_param(None)
             return f":{pname}"
         # Fallback: treat unknown macros as empty string
         pname = self._next_param("")
@@ -1942,6 +2450,7 @@ def parse_filter(
     relation_resolver: dict[str, dict[str, Any]] | None = None,
     collection_resolver: dict[str, dict[str, Any]] | None = None,
     current_table: str | None = None,
+    allow_hidden: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Parse a PocketBase filter expression into a SQL WHERE clause.
 
@@ -1980,16 +2489,17 @@ def parse_filter(
         relation_resolver,
         collection_resolver,
         current_table,
+        allow_hidden=allow_hidden,
     )
     try:
-        where_sql = transformer.transform(tree)
+        where_sql = transformer.finish(transformer.render(transformer.transform(tree)))
     except VisitError as exc:
         # Invalid identifiers, modifiers or paths are client errors (400),
         # not server errors.
         if isinstance(exc.orig_exc, ValueError):
             raise exc.orig_exc from exc
         raise
-    return (str(where_sql), transformer._params)
+    return (where_sql, transformer._params)
 
 
 def parse_sort(sort_str: str) -> list[tuple[str, str]]:
@@ -2037,3 +2547,257 @@ def parse_sort(sort_str: str) -> list[tuple[str, str]]:
             result.append((f'"{part}"', direction))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Empty dates
+# ---------------------------------------------------------------------------
+#
+# PocketBase stores an empty date as '' (``TEXT DEFAULT '' NOT NULL``,
+# v0.22.34 models/schema/schema_field.go l.163, v0.40.6 core/field_date.go
+# l.109-110) and compares dates as SQLite text: ``=``/``!=`` treat '' and
+# NULL alike (``resolveEqualExpr``, v0.22.34 tools/search/filter.go
+# l.290-368, v0.40.6 l.340-422), while ``<``, ``<=``, ``>``, ``>=``, ``~``
+# and ``!~`` compare the stored text directly (v0.22.34 l.155-176), so ''
+# sorts before every date.  PPBase stores the empty date as NULL in a
+# ``TIMESTAMPTZ NULL`` column; the SQL below gives that NULL the semantics
+# of ''.  The ``null`` identifier stays SQL NULL for ``<``-like operators,
+# as in PocketBase.
+
+# Only ``date`` columns are nullable; ``autodate`` columns are NOT NULL.
+_NULLABLE_DATE_FIELD_TYPES = {"date"}
+_FLIPPED_STANDARD_OPS = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+
+def _date_operand_kind(parser: _FilterTransformer, node: Any, sql: str) -> str:
+    """Classify a comparison operand for the empty-date semantics.
+
+    ``"date"`` is a nullable date column (NULL stands for ''), ``"empty"`` an
+    empty string value, ``"null"`` the ``null`` identifier or a missing
+    request value, ``"value"`` anything else (date literal, macro, column).
+    """
+    kind = node[0] if isinstance(node, tuple) and node else ""
+    # A ``sql_ref`` whose third item is True is a JSON path, never a column.
+    is_column = kind == "field" or (kind == "sql_ref" and node[2:3] != (True,))
+    if is_column and parser._operand_field_type(node) in _NULLABLE_DATE_FIELD_TYPES:
+        return "date"
+    if kind == "null":
+        return "null"
+    if parser._is_bound_param(sql):
+        value = parser._params[sql[1:]]
+        if value is None:
+            return "null"
+        if value == "":
+            return "empty"
+    return "value"
+
+
+def _date_row_sql(node: Any) -> str | None:
+    """Leaf row id of a relation-path date operand (``_PathOperand.row_id``)."""
+    if isinstance(node, tuple) and len(node) >= 5 and node[0] == "sql_ref":
+        return node[4]
+    return None
+
+
+def _and_sql(*terms: str | None) -> str:
+    """``AND`` of the given terms; ``None`` terms are TRUE."""
+    kept = [term for term in terms if term]
+    if not kept:
+        return "TRUE"
+    return kept[0] if len(kept) == 1 else "(" + " AND ".join(kept) + ")"
+
+
+def _pb_date_text_sql(sql: str, row_sql: str | None = None) -> str:
+    """The text PocketBase stores for a date: '' or ``YYYY-MM-DD HH:MM:SS.mmmZ``.
+
+    With ``row_sql`` (relation path leaf), a missing row stays SQL NULL.
+    """
+    text = (
+        f"COALESCE(to_char({sql} AT TIME ZONE 'UTC', "
+        "'YYYY-MM-DD HH24:MI:SS.MS\"Z\"'), '')"
+    )
+    if row_sql is None:
+        return text
+    return f"(CASE WHEN {row_sql} IS NOT NULL THEN {text} END)"
+
+
+def _empty_date_sql(
+    date_sql: str,
+    sql_op: str,
+    other_sql: str,
+    other_kind: str,
+    date_row: str | None = None,
+    other_row: str | None = None,
+) -> str:
+    """Compare a nullable date column like the SQLite text PocketBase stores.
+
+    ``date_row``/``other_row`` are the leaf row ids of relation paths: a
+    missing row is SQL NULL in PocketBase too, only the NULL of an existing
+    row is an empty date.  ``None`` means that the row always exists.
+    """
+    d, o = date_sql, other_sql
+    d_row = None if date_row is None else f"{date_row} IS NOT NULL"
+    d_empty = _and_sql(f"{d} IS NULL", d_row)
+    if other_kind == "date":
+        o_row = None if other_row is None else f"{other_row} IS NOT NULL"
+        o_empty = _and_sql(f"{o} IS NULL", o_row)
+        return {
+            "=": f"({d} IS NOT DISTINCT FROM {o})",
+            "!=": f"({d} IS DISTINCT FROM {o})",
+            "<": f"({d} < {o} OR {_and_sql(d_empty, f'{o} IS NOT NULL')})",
+            "<=": f"({d} <= {o} OR {_and_sql(d_empty, o_row)})",
+            ">": f"({d} > {o} OR {_and_sql(f'{d} IS NOT NULL', o_empty)})",
+            ">=": f"({d} >= {o} OR {_and_sql(o_empty, d_row)})",
+        }[sql_op]
+    if other_kind == "empty":
+        return {
+            "=": f"{d} IS NULL",
+            "!=": f"{d} IS NOT NULL",
+            "<": "FALSE",
+            "<=": d_empty,
+            ">": f"{d} IS NOT NULL",
+            ">=": _and_sql(d_row),
+        }[sql_op]
+    if other_kind == "null":
+        if sql_op in {"=", "!="}:
+            return f"{d} IS {'' if sql_op == '=' else 'NOT '}NULL"
+        return f"{d} {sql_op} NULL"
+    return {
+        "=": f"{d} = {o}",
+        "!=": f"({d} <> {o} OR {d} IS NULL)",
+        "<": f"({d} < {o} OR {d_empty})",
+        "<=": f"({d} <= {o} OR {d_empty})",
+        ">": f"{d} > {o}",
+        ">=": f"{d} >= {o}",
+    }[sql_op]
+
+
+# SQLite text order of PocketBase dates: '' (empty) before any date.
+_EMPTY_VS_EMPTY = {"<": False, "<=": True, ">": False, ">=": True, "=": True, "!=": False}
+_EMPTY_VS_DATE = {"<": True, "<=": True, ">": False, ">=": False, "=": False, "!=": True}
+_DATE_VS_EMPTY = {"<": False, "<=": False, ">": True, ">=": True, "=": False, "!=": True}
+
+
+def _sqlite_storage(value: Any) -> tuple[int, Any]:
+    """SQLite storage class rank and comparable value of a bound Go value.
+
+    The Go driver binds a bool as the integer 1/0 and a number as INTEGER or
+    REAL; a string is TEXT and bytes a BLOB.  SQLite orders NULL < numbers <
+    TEXT < BLOB and compares TEXT with the BINARY collation (byte order of
+    UTF-8, i.e. code point order).
+    """
+    if isinstance(value, bool):
+        return 1, int(value)
+    if isinstance(value, (int, float)):
+        return 1, value
+    if isinstance(value, (bytes, bytearray)):
+        return 3, bytes(value)
+    return 2, value if isinstance(value, str) else str(value)
+
+
+def _sqlite_compare(left: Any, right: Any) -> int:
+    """-1/0/1 comparison of two non-NULL values without column affinity."""
+    left_rank, left_value = _sqlite_storage(left)
+    right_rank, right_value = _sqlite_storage(right)
+    if left_rank != right_rank:
+        return -1 if left_rank < right_rank else 1
+    return (left_value > right_value) - (left_value < right_value)
+
+
+def _bool_sql(value: bool | None) -> str:
+    return "NULL" if value is None else ("TRUE" if value else "FALSE")
+
+
+def _exact_date_sql(
+    d: str,
+    sql_op: str,
+    o: str,
+    other_kind: str,
+    date_row: str | None,
+    other_row: str | None,
+) -> str:
+    """``d op o`` with PocketBase's exact three-valued result.
+
+    PocketBase compares the stored text: '' for an empty date (before any
+    date), SQL NULL only for a missing row; ``=``/``!=`` follow
+    ``resolveEqualExpr`` (v0.22.34 tools/search/filter.go l.290-368).  A
+    multi-match negates the condition (``NOT (...)``, l.680-706), so an empty
+    date must give TRUE or FALSE there, never the NULL of PPBase's column.
+    """
+    equal_op = sql_op in {"=", "!="}
+    whens: list[str] = []
+    if other_kind == "date":
+        if equal_op:
+            # COALESCE(a, '') = COALESCE(b, ''): a missing row is ''.
+            distinct = "IS NOT DISTINCT FROM" if sql_op == "=" else "IS DISTINCT FROM"
+            return f"({d} {distinct} {o})"
+        rows = [f"{row} IS NULL" for row in (date_row, other_row) if row]
+        if rows:
+            whens.append(f"WHEN {' OR '.join(rows)} THEN NULL")
+        whens.append(
+            f"WHEN {d} IS NULL AND {o} IS NULL THEN {_bool_sql(_EMPTY_VS_EMPTY[sql_op])}"
+        )
+        whens.append(f"WHEN {d} IS NULL THEN {_bool_sql(_EMPTY_VS_DATE[sql_op])}")
+        whens.append(f"WHEN {o} IS NULL THEN {_bool_sql(_DATE_VS_EMPTY[sql_op])}")
+        return f"(CASE {' '.join(whens)} ELSE {d} {sql_op} {o} END)"
+    if other_kind == "null" and not equal_op:
+        return "NULL"  # v < NULL
+    missing: bool | None
+    if other_kind in {"empty", "null"}:
+        # ``null`` is an empty identifier for ``=``/``!=`` (filter.go l.395):
+        # (v = '' OR v IS NULL) / (v IS NOT '' AND v IS NOT NULL).
+        missing = {"=": True, "!=": False}.get(sql_op)
+        empty: bool | None = _EMPTY_VS_EMPTY[sql_op]
+        value: bool | None = _DATE_VS_EMPTY[sql_op]
+    else:
+        # A known value: v = 'x' / v IS NOT 'x' / v < 'x'...
+        missing = True if sql_op == "!=" else None
+        empty = _EMPTY_VS_DATE[sql_op]
+        value = None
+    if date_row is not None:
+        whens.append(f"WHEN {date_row} IS NULL THEN {_bool_sql(missing)}")
+    whens.append(f"WHEN {d} IS NULL THEN {_bool_sql(empty)}")
+    if value is None:
+        compare = "<>" if sql_op == "!=" else sql_op
+        return f"(CASE {' '.join(whens)} ELSE {d} {compare} {o} END)"
+    return f"(CASE {' '.join(whens)} ELSE {_bool_sql(value)} END)"
+
+
+def _empty_date_condition(
+    parser: _FilterTransformer,
+    left: Any,
+    left_sql: str,
+    op: str,
+    right: Any,
+    right_sql: str,
+    *,
+    exact: bool = False,
+) -> str | None:
+    """SQL of ``left op right`` when one operand is a nullable date column.
+
+    Returns ``None`` for any other comparison, which keeps its usual SQL.
+    ``exact`` gives PocketBase's exact three-valued result (multi-match).
+    """
+    left_kind = _date_operand_kind(parser, left, left_sql)
+    right_kind = _date_operand_kind(parser, right, right_sql)
+    if "date" not in (left_kind, right_kind):
+        return None
+    left_row, right_row = _date_row_sql(left), _date_row_sql(right)
+    if op in _LIKE_OPS:
+        if left_kind == "date":
+            left_sql = _pb_date_text_sql(left_sql, left_row)
+        if right_kind == "date":
+            right_sql = _pb_date_text_sql(right_sql, right_row)
+            right = ("sql_ref", right_sql)
+        return parser._like_comparison_sql(left_sql, right, right_sql, _LIKE_OPS[op])
+    if op not in _STANDARD_OPS:
+        return None
+    sql_op = _STANDARD_OPS[op]
+    if left_kind != "date":
+        # ``value op date`` is ``date flipped(op) value``.
+        left_sql, right_sql, right_kind = right_sql, left_sql, left_kind
+        left_row, right_row = right_row, left_row
+        sql_op = _FLIPPED_STANDARD_OPS[sql_op]
+    if exact:
+        return _exact_date_sql(left_sql, sql_op, right_sql, right_kind, left_row, right_row)
+    return _empty_date_sql(left_sql, sql_op, right_sql, right_kind, left_row, right_row)

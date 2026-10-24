@@ -129,6 +129,44 @@ def _prepare_rule_context(
     return auth_ctx, request_context
 
 
+# PocketBase 0.22.34 ``checkForAdminOnlyRuleFields`` (apis/record_helpers.go
+# l.319-345): only admins may use these in the ``filter``/``sort`` of a list
+# request; the list handler checks it first (apis/record_crud.go l.50-53).
+_ADMIN_ONLY_RULE_FIELDS = ("@collection.", "@request.")
+
+# Opaque 400 message PocketBase returns for any filter/sort parse error,
+# including an unresolved field (``NewBadRequestError("", err)``).
+_FILTER_FIELD_ERROR_MESSAGE = "Something went wrong while processing your request."
+
+
+def _admin_only_rule_fields_error(
+    auth: dict[str, Any] | None,
+    *,
+    filter_value: str | None,
+    sort_value: str | None,
+) -> JSONResponse | None:
+    """403 when a guest or a record uses an admin-only filter/sort field."""
+    if _is_superuser_payload(auth):
+        return None
+    for value in (filter_value, sort_value):
+        if not value:
+            continue
+        for field in _ADMIN_ONLY_RULE_FIELDS:
+            if field in value:
+                return _error_response(403, f"Only admins can filter by {field}")
+    return None
+
+
+def _is_superuser_payload(token_payload: dict[str, Any] | None) -> bool:
+    """The superuser test of ``_prepare_rule_context``."""
+    if not token_payload:
+        return False
+    return token_payload.get("type") == "admin" or (
+        token_payload.get("type") in {"auth", "authRecord"}
+        and token_payload.get("collectionName") == "_superusers"
+    )
+
+
 # Auth collection managed fields during create that require manageRule
 # (or superuser).
 _AUTH_MANAGED_CREATE_FIELDS = frozenset(
@@ -1367,6 +1405,12 @@ async def api_list_records(
     if collection is None:
         return _error_response(404, "Missing collection context.")
 
+    forbidden = _admin_only_rule_fields_error(
+        auth, filter_value=filter, sort_value=sort
+    )
+    if forbidden is not None:
+        return forbidden
+
     event = RecordRequestEvent(
         app=request.app,
         request=request,
@@ -1411,9 +1455,16 @@ async def api_list_records(
                 fields=e.fields,
                 skip_total=bool(e.skip_total),
                 request_context=request_context,
+                # Hidden auth fields (email emailVisibility guard, hidden
+                # columns) are searchable only by admins
+                # (apis/record_crud.go l.59-66).
+                allow_hidden=_is_superuser_payload(e.auth),
             )
-        except ValueError as exc:
-            return _error_response(400, str(exc))
+        except ValueError:
+            # PocketBase wraps every filter/sort error (syntax, unknown or
+            # hidden field, bad modifier...) in an opaque 400
+            # (NewBadRequestError("", err), apis/record_crud.go l.83-86).
+            return _error_response(400, _FILTER_FIELD_ERROR_MESSAGE)
 
         if e.expand and result["items"]:
             all_colls = await get_all_collections(e.engine or engine)

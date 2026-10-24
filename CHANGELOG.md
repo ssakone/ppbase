@@ -2,6 +2,96 @@
 
 ## Unreleased
 
+### Security follow-up: qualified paths, modifiers, realtime payload, expand
+
+See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
+`docs/error-envelope.md`.
+
+- A dotted filter path must start with a relation, a back relation or a JSON
+  field: `users.password_hash~"$2b$"` (table-qualified self reference) used to
+  read the hidden column, and `other.col` produced a 500; both are now an
+  opaque 400 like in PocketBase 0.22.34.
+- A system field never takes a modifier: `email:lower`, `email:length`,
+  `email:isset`, `email:each`, `id:length`... are a 400 (they used to drop the
+  email visibility guard, a masked-email oracle).
+- Every list filter/sort error answers PocketBase's opaque message.
+- Realtime payloads no longer send a hidden email to every subscriber: only
+  the owner whose `manageRule` check passes receives it, like PocketBase
+  0.22.34 (admins do not).
+- Expand applies the related collection's `viewRule` (nil: admins only).
+- `emailVisibility`/`verified` are parsed like Go's `cast.ToBool` on create
+  and update: the multipart/JSON string `"false"` is false.
+- `username` resolves in a filter/sort only when the auth collection has a
+  `username` column (400 instead of a 500 otherwise).
+- A present `@request.*` value compared with a literal, `true`/`false` or
+  another request value is folded with SQLite's comparison (`1 = true`,
+  `"true" != true`) instead of being bound against a boolean (500); an absent
+  value is SQL NULL, so `<`, `>`, `~` never match it.
+- `totalPages` is `ceil(totalItems / perPage)` (0 when empty) for the
+  collections, admins and logs lists too.
+- JSON error bodies carry PocketBase 0.22's `code` next to `status`.
+
+### Absent @request.* values no longer 500; totalPages and expand key
+
+See `docs/request-static-fields.md`.
+
+- An absent `@request.*` value (anonymous caller, or a role-permission key the
+  flattened BUMA context does not declare) is resolved with PostgreSQL-safe,
+  PocketBase-equivalent equality instead of `$n IS NOT NULL`/`'' = TRUE`,
+  which asyncpg/PostgreSQL rejected. Anonymous lists of `buma_article_stockage`,
+  `buma_pdv` and the other role-permission collections return 200 with the
+  authorized rows.
+- `totalPages` of an empty result set is `0` (was `1`), matching
+  `ceil(totalItems / perPage)`.
+- A record with no expanded relation no longer carries an empty `expand: {}`;
+  the key is omitted, as in PocketBase.
+
+### Security: hidden auth fields are not filterable/sortable
+
+See `docs/hidden-auth-fields.md`.
+
+- A filter, sort or rule may no longer reference `password`,
+  `passwordHash`/`password_hash`, `tokenKey`/`token_key`, `email_visibility`
+  or `lastResetSentAt`; PocketBase 0.22.34 returns the same opaque 400 for
+  every caller. This closes an anonymous oracle on the bcrypt hash, token key
+  and masked emails (`users.listRule` is `""`).
+- A non-admin list request and a realtime client filter restrict an `email`
+  comparison to `emailVisibility = TRUE`; admins and server-evaluated access
+  rules carry no guard. `emailVisibility`/`verified`/`username` resolve to
+  their columns.
+- Realtime subscriptions enforce the `@collection.`/`@request.` admin-only
+  check on both the `filter` and `sort` options and evaluate the client
+  filter without hidden-field access.
+- Auth record create now accepts PocketBase's `emailVisibility` wire name (it
+  previously ignored it, leaving visibility always off).
+
+### Empty dates served, filtered and sorted like PocketBase
+
+See `docs/empty-dates.md`.
+
+- An empty date is served `""` (never `null`); view records omit empty
+  `created`/`updated`.
+- Filters and sorts give the stored `NULL` the semantics of PocketBase's
+  `''` (before every date), including relation and `@collection` leaves,
+  where a missing target stays SQL `NULL`, and multi-match subqueries.
+
+### Relation paths: PocketBase LEFT JOIN and multi-match
+
+See `docs/filter-paths-multi-match.md`.
+
+- Relation, back-relation and `@collection` paths in filters and API rules
+  are LEFT JOINs shared by the whole expression, like PocketBase 0.22.34: a
+  missing target is a NULL leaf (`rel.f = ""` and `rel.id = ""` match a record
+  without or with an orphan relation) and `rel.id` joins the target.
+- Comparisons without `?` through `@collection`, a multiple relation or a
+  back relation (without single-column unique index) need every row to match
+  (PocketBase multi-match; a NULL row fails every operator but `=`).
+  `@collection.users.id = @request.auth.id` is now false with two accounts or
+  more: in the BUMA `users` create/update rules, an ordinary user can no
+  longer create accounts or edit other accounts.
+- Guests and auth records get 403 "Only admins can filter by @collection."
+  (or `@request.`) for those fields in a list `filter`/`sort`.
+
 ### Relation multiplicity (PocketBase 0.22 `maxSelect: null`)
 
 See `docs/relation-multiplicity.md` for the rule, the PocketBase references

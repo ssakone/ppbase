@@ -103,7 +103,9 @@ async def list_logs(
     total = (await session.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
     rows = (await session.execute(q.offset((page - 1) * perPage).limit(perPage))).scalars().all()
 
-    total_pages = max(1, (total + perPage - 1) // perPage)
+    # PocketBase: ceil(totalItems / perPage), 0 for an empty list
+    # (v0.22.34 tools/search/provider.go l.254).
+    total_pages = (total + perPage - 1) // perPage
 
     return {
         "page": page,

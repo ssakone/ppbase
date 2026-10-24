@@ -378,14 +378,6 @@ async def test_filters_match_pocketbase_on_direct_and_nested_paths(
     assert [item["name"] for item in response.json()["items"]] == ["alpha"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known PPBase divergence (not introduced by D-0019): a traversal "
-        "through a multiple relation with a non-? operator is any-match "
-        "(EXISTS), while PocketBase adds its match-all multi-match subquery."
-    ),
-)
 @pytest.mark.parametrize(
     ("expression", "titles"),
     [

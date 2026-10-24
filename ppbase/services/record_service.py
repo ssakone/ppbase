@@ -40,7 +40,14 @@ from ppbase.models.record import (
     build_record_response,
     format_datetime,
 )
-from ppbase.services.filter_parser import parse_filter, parse_sort
+from ppbase.services.filter_parser import (
+    _AUTH_FIELD_COLUMNS,
+    _AUTH_RESOLVABLE_SYSTEM_FIELDS,
+    _AUTH_SYSTEM_FIELD_NAMES,
+    FilterFieldError,
+    parse_filter,
+    parse_sort,
+)
 from ppbase.services.write_barrier import require_mutation_write_barrier
 
 logger = logging.getLogger(__name__)
@@ -214,6 +221,21 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
     if not fields_param:
         return None
     return [f.strip() for f in fields_param.split(",") if f.strip()]
+
+
+def _sort_term(column: str, direction: str, date_fields: set[str]) -> str:
+    """Render one ``ORDER BY`` term like PocketBase sorts it.
+
+    PocketBase sorts a date column as SQLite text, where the empty date ''
+    comes before any date (``ORDER BY [[col]] ASC|DESC``, v0.22.34
+    tools/search/sort.go l.23-37).  PPBase stores that empty date as NULL,
+    which PostgreSQL sorts last in ascending order, hence the explicit
+    ``NULLS FIRST``/``NULLS LAST``.
+    """
+    if column.strip('"') not in date_fields:
+        return f"{column} {direction}"
+    nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
+    return f"{column} {direction} {nulls}"
 
 
 def _table_name(collection: CollectionRecord) -> str:
@@ -527,6 +549,67 @@ def _relation_index_signature(
     )
 
 
+# PocketBase ``dbutils.ParseIndex`` (v0.22.34 tools/dbutils/index.go l.11-12,
+# l.127-207; v0.40.6 tools/dbutils/index.go l.203-214).
+_PB_INDEX_RE = re.compile(
+    r"create\s+(unique\s+)?\s*index\s*(if\s+not\s+exists\s+)?(\S*)\s+on\s+(\S*)"
+    r"\s*\(([\s\S]*)\)(?:\s*where\s+([\s\S]*))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PB_INDEX_COLUMN_RE = re.compile(
+    r"^([\s\S]+?)(?:\s+collate\s+([\w]+))?(?:\s+(asc|desc))?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PB_INDEX_TRIM = "`\"'[]\r\n\t\f\v "
+
+
+def _split_index_columns(raw: str) -> list[str]:
+    """Split on top-level commas, like PocketBase's tokenizer."""
+    columns: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote = ""
+    previous = ""
+    for char in raw:
+        if previous != "\\":
+            if char == "(" and not quote:
+                depth += 1
+            elif char == ")" and depth > 0 and not quote:
+                depth -= 1
+            elif char in "'\"`":
+                if quote == char:
+                    quote = ""
+                elif not quote:
+                    quote = char
+        if char == "," and depth == 0 and not quote:
+            columns.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(char)
+        previous = char
+    columns.append("".join(buf).strip())
+    return columns
+
+
+def _has_single_column_unique_index(column: str, indexes: Any) -> bool:
+    """PocketBase ``HasSingleColumnUniqueIndex``: WHERE clauses are ignored."""
+    for raw_index in indexes if isinstance(indexes, list) else []:
+        match = _PB_INDEX_RE.search(str(raw_index))
+        if match is None or not (match.group(1) or "").strip():
+            continue
+        names = []
+        for raw_column in _split_index_columns(match.group(5)):
+            column_match = _PB_INDEX_COLUMN_RE.match(raw_column)
+            if column_match is None:
+                continue
+            name = column_match.group(1).strip(_PB_INDEX_TRIM)
+            if name:
+                names.append(name)
+        if len(names) == 1 and names[0].lower() == column.lower():
+            return True
+    return False
+
+
 def _build_relation_index_from_collections(
     collections: list[CollectionRecord],
 ) -> RelationIndex:
@@ -554,6 +637,10 @@ def _build_relation_index_from_collections(
         collections_meta[table] = {
             "id": str(coll.id),
             "table": table,
+            # Collection type lets the filter parser resolve the auth system
+            # fields (email/username/verified/emailVisibility) and reject the
+            # hidden ones (password_hash, token_key, ...).
+            "type": _collection_type(coll),
             "fields": fields,
             "relations": relations,
         }
@@ -579,6 +666,11 @@ def _build_relation_index_from_collections(
                 "back_field": field_name,
                 "max_select": max_select,
                 "multiple": multiple,
+                # A single back field with a single-column unique index has
+                # no PocketBase multi-match.
+                "unique": _has_single_column_unique_index(
+                    field_name, getattr(coll, "indexes", None)
+                ),
             }
 
     return result
@@ -669,6 +761,30 @@ def _filter_needs_relation_index(filter_expression: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# strconv.ParseBool true spellings (Go standard library).
+_GO_TRUE_STRINGS = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+
+
+def _go_to_bool(value: Any) -> bool:
+    """``cast.ToBool`` of PocketBase's record upsert form.
+
+    PocketBase 0.22.34 loads ``emailVisibility``/``verified`` with
+    ``cast.ToBool`` (forms/record_upsert.go l.380-384; spf13/cast v1.7.1):
+    a string goes through ``strconv.ParseBool`` and anything unparsable is
+    false, so the multipart/JSON strings ``"false"``/``"0"`` are false, not
+    Python-truthy.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value in _GO_TRUE_STRINGS
+    return False
+
+
 async def list_records(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -680,8 +796,14 @@ async def list_records(
     fields: str | None = None,
     skip_total: bool = False,
     request_context: dict[str, Any] | None = None,
+    allow_hidden: bool = True,
 ) -> dict[str, Any]:
     """List records with filtering, sorting, and pagination.
+
+    ``allow_hidden`` follows PocketBase's resolver flag: admins (and
+    server-evaluated callers) see hidden auth fields, a non-admin list request
+    does not, so an ``email`` filter is restricted to ``emailVisibility = TRUE``
+    (apis/record_crud.go l.59-66).
 
     Returns a paginated response dict.
     """
@@ -705,6 +827,7 @@ async def list_records(
             relation_resolver,
             collection_resolver,
             table,
+            allow_hidden=allow_hidden,
         )
 
     # Build ORDER BY clause
@@ -722,23 +845,39 @@ async def list_records(
     if sort:
         sort_parts = parse_sort(sort)
         if sort_parts:
-            # Validate sort fields exist in the collection schema or are system fields
+            # Validate sort fields exist in the collection schema or are system
+            # fields.  Like a filter, PocketBase resolves only base-model
+            # fields, schema fields and (auth) username/verified/
+            # emailVisibility/email; any other name (password_hash, tokenKey,
+            # ...) is a 400 for every caller.  Sort has no email visibility
+            # guard (resolvers/record_field_resolve_runner.go l.356-374).
             system_fields = {"id", "created", "updated"}
             schema_field_names = {f.name for f in schema_fields}
             valid_fields = system_fields | schema_field_names
-            for col_expr, _dir in sort_parts:
+            if col_type == "auth":
+                # Same resolution as the filter parser: an auth system name is
+                # never a plain schema field, and ``username`` needs the
+                # physical column PPBase only has when the schema declares it.
+                valid_fields -= _AUTH_SYSTEM_FIELD_NAMES
+                valid_fields |= _AUTH_RESOLVABLE_SYSTEM_FIELDS - {"username"}
+                if "username" in schema_field_names:
+                    valid_fields.add("username")
+            resolved_parts: list[tuple[str, str]] = []
+            for col_expr, direction in sort_parts:
                 # col_expr is quoted like '"fieldname"' or a function like 'RANDOM()'
                 col_name = col_expr.strip('"')
-                if (
-                    col_name not in valid_fields
-                    and not col_expr.endswith("()")
-                    and col_name != "ctid"
-                ):
-                    raise ValueError(
-                        f"Invalid sort field: {col_name}. "
-                        f"Available fields: {', '.join(sorted(valid_fields))}."
-                    )
-            order_sql = ", ".join(f"{col} {direction}" for col, direction in sort_parts)
+                if col_expr.endswith("()") or col_name == "ctid":
+                    resolved_parts.append((col_expr, direction))
+                    continue
+                if col_name not in valid_fields:
+                    raise FilterFieldError(f"unknown sort field {col_name!r}")
+                column = _AUTH_FIELD_COLUMNS.get(col_name, col_name)
+                resolved_parts.append((f'"{column}"', direction))
+            date_fields = {f.name for f in schema_fields if f.type == FieldType.DATE}
+            order_sql = ", ".join(
+                _sort_term(col, direction, date_fields)
+                for col, direction in resolved_parts
+            )
 
     # Clamp pagination (PocketBase normalizes invalid values instead of rejecting)
     if per_page <= 0:
@@ -1009,16 +1148,20 @@ async def create_record(
             data.pop("emailVisibility", None)
             data.pop("verified", None)
         else:
-            if "email_visibility" not in data:
-                columns["email_visibility"] = False
-            else:
-                columns["email_visibility"] = bool(
-                    data.pop("email_visibility", False)
+            # Accept PocketBase's wire name ``emailVisibility`` as well as the
+            # snake_case alias; otherwise a client can never turn visibility on.
+            if "email_visibility" in data or "emailVisibility" in data:
+                raw_visibility = data.pop(
+                    "email_visibility", data.pop("emailVisibility", False)
                 )
+                data.pop("emailVisibility", None)
+                columns["email_visibility"] = _go_to_bool(raw_visibility)
+            else:
+                columns["email_visibility"] = False
             if "verified" not in data:
                 columns["verified"] = False
             else:
-                columns["verified"] = bool(data.pop("verified", False))
+                columns["verified"] = _go_to_bool(data.pop("verified", False))
 
     # Build field map for file handling
     field_map = {f.name: f for f in schema_fields}
@@ -1285,11 +1428,11 @@ async def update_record(
             data.pop("verified", None)
         else:
             if "email_visibility" in data:
-                updates["email_visibility"] = bool(data.pop("email_visibility"))
+                updates["email_visibility"] = _go_to_bool(data.pop("email_visibility"))
             elif "emailVisibility" in data:
-                updates["email_visibility"] = bool(data.pop("emailVisibility"))
+                updates["email_visibility"] = _go_to_bool(data.pop("emailVisibility"))
             if "verified" in data:
-                updates["verified"] = bool(data.pop("verified"))
+                updates["verified"] = _go_to_bool(data.pop("verified"))
 
     field_map = {f.name: f for f in schema_fields}
 
@@ -1862,12 +2005,15 @@ async def check_record_rule(
     record_id: str,
     rule_filter: str,
     request_context: dict[str, Any] | None = None,
+    allow_hidden: bool = True,
 ) -> bool:
     """Check if a record matches a rule filter expression.
 
     Used for view/update/delete rule enforcement.  Parses the rule as a
     PocketBase filter expression and runs it as a WHERE clause against the
-    record's row.
+    record's row.  ``allow_hidden`` follows PocketBase's resolver flag: a
+    server-evaluated access rule allows hidden auth fields (no emailVisibility
+    guard), a client-supplied realtime filter does not.
 
     Returns True if the record matches the rule, False otherwise.
     """
@@ -1883,6 +2029,7 @@ async def check_record_rule(
         relation_resolver,
         collection_resolver,
         table,
+        allow_hidden=allow_hidden,
     )
     sql = (
         f'SELECT 1 FROM "{table}" WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'
