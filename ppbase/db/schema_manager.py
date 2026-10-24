@@ -1527,9 +1527,10 @@ class MultiValueShapeMismatchError(ValueError):
         super().__init__(
             "Some select/file/relation columns do not match their field "
             f"multiplicity: {listing}. Convert them with "
-            "ppbase.db.schema_manager.reconcile_multi_value_columns(), for "
-            "example from an application migration, before serving or "
-            "updating these collections (see docs/relation-multiplicity.md)."
+            "ppbase.db.schema_manager.reconcile_multi_value_columns() before "
+            "serving or updating these collections, for example from an "
+            "application migration: await app.reconcile_multi_value_columns("
+            "'<collection>', ['<field>']) (see docs/relation-multiplicity.md)."
         )
 
 

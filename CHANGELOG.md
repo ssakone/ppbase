@@ -34,4 +34,4 @@ and the known differences.
   shape contradicts its field (for example a `maxSelect: null` relation
   created as `VARCHAR(15)` by an earlier version) until
   `reconcile_multi_value_columns()` has converted it, typically from an
-  application migration.
+  application migration with `app.reconcile_multi_value_columns(...)`.

@@ -103,10 +103,12 @@ field_names=None)` converts only the columns whose live shape contradicts the
 rule (`''` → `{}`, `'x'` → `{x}`, a stored JSON array of plain strings → that
 array; an array column for a single field keeps its last element), recreates
 their managed indexes, returns the converted field names and is a no-op on a
-second run. Run it from an application migration (it joins the migration
-transaction and rolls back with it): the migration runs at startup before the
-check, or with `python -m ppbase migrate up`. BUMA does this in its migration
-`1789236850` for its three relations.
+second run. Run it from an application migration, where
+`await app.reconcile_multi_value_columns("<collection>", ["<field>"])` calls
+it inside the migration transaction (a failing migration rolls the conversion
+back): pending migrations run at startup before the check, or with
+`python -m ppbase migrate up`. BUMA's migration `1789236850` does this for its
+three relations.
 
 ## Writes
 

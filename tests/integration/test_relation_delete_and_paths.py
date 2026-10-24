@@ -899,8 +899,51 @@ async def test_unreconciled_scalar_column_fails_explicitly_until_reconciled(
         async with isolated_database.begin() as conn:
             await update_collection_table(conn, owners, owners)
 
-    async with isolated_database.begin() as conn:
-        assert await reconcile_multi_value_columns(conn, owners) == ["pdv"]
+    # The repair runs from an application migration, inside its transaction:
+    # a failing migration rolls the conversion back and PPBase still refuses.
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    failing = migrations / "1700000001_reconcile_shape_owners.py"
+    failing.write_text(
+        textwrap.dedent(
+            """
+            async def up(app):
+                converted = await app.reconcile_multi_value_columns(
+                    "shape_owners", ["pdv"]
+                )
+                assert converted == ["pdv"], converted
+                raise RuntimeError("abort after the conversion")
+
+
+            async def down(app):
+                pass
+            """
+        )
+    )
+    code, output = await _start_ppbase(database_url, tmp_path)
+    assert code != 0 and "abort after the conversion" in output, output
+    assert [
+        m.field for m in await find_multi_value_shape_mismatches(isolated_database)
+    ] == ["pdv"]
+
+    failing.write_text(
+        textwrap.dedent(
+            """
+            async def up(app):
+                converted = await app.reconcile_multi_value_columns(
+                    "shape_owners", ["pdv"]
+                )
+                assert converted in (["pdv"], []), converted
+
+
+            async def down(app):
+                pass
+            """
+        )
+    )
+    code, output = await _start_ppbase(database_url, tmp_path)
+    assert code == 0, output
+    assert "STARTED" in output
     assert await find_multi_value_shape_mismatches(isolated_database) == []
     async with isolated_database.connect() as conn:
         rows = (
@@ -908,12 +951,22 @@ async def test_unreconciled_scalar_column_fails_explicitly_until_reconciled(
                 text("SELECT title, pdv FROM shape_owners ORDER BY title")
             )
         ).all()
+        index = (
+            await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE indexname = 'idx_shape_owners_pdv'"
+                )
+            )
+        ).scalar_one()
     assert [tuple(row) for row in rows] == [("empty", []), ("one", ["shapetarget0001"])]
+    assert "USING gin" in index
     async with isolated_database.begin() as conn:
         await update_collection_table(conn, owners, owners)  # no error any more
-    code, output = await _start_ppbase(database_url, tmp_path)
+        # A second run converts nothing.
+        assert await reconcile_multi_value_columns(conn, owners) == []
+    code, output = await _start_ppbase(database_url, tmp_path)  # already applied
     assert code == 0, output
-    assert "STARTED" in output
 
 
 class SimpleCollection:
