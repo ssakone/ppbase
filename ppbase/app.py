@@ -536,6 +536,7 @@ def create_app(
     from ppbase.middleware.error_compat import (
         ERROR_KIND_HEADER,
         error_kind_headers,
+        error_kinds,
     )
 
     @app.exception_handler(HTTPException)
@@ -546,7 +547,9 @@ def create_app(
         # Only the 0.22 error-kind tag of a guard is forwarded (and only
         # while that mode is on): other exception headers stay dropped.
         kind = (getattr(exc, "headers", None) or {}).get(ERROR_KIND_HEADER)
-        headers = error_kind_headers(request.app, kind) if kind else None
+        headers = (
+            error_kind_headers(request.app, kind) if kind in error_kinds() else None
+        )
         if isinstance(detail, dict) and "status" in detail:
             # Already a PocketBase-format error dict
             return JSONResponse(

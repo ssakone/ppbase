@@ -190,3 +190,34 @@ async def test_guards_answer_the_pocketbase_022_messages(
         assert got_status == status, key
         assert list(body) == ["code", "message", "data"], key
         assert body == {"code": status, "message": legacy, "data": {}}, key
+
+
+async def test_an_unknown_kind_header_is_ignored() -> None:
+    from fastapi import HTTPException
+
+    app_pb = PPBase()
+    app_pb.set_error_compat("0.22")
+
+    @app_pb.get("/ext/guard/bogus")
+    async def bogus():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": 403,
+                "message": "Only superusers can perform this action.",
+                "data": {},
+            },
+            headers={ERROR_KIND_HEADER: "bogus"},
+        )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app_pb.get_app()), base_url="http://testserver"
+    ) as client:
+        response = await client.get("/ext/guard/bogus")
+    assert ERROR_KIND_HEADER not in response.headers
+    assert response.status_code == 403
+    assert response.json() == {
+        "code": 403,
+        "message": "Only admins can perform this action.",
+        "data": {},
+    }
