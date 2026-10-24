@@ -36,15 +36,53 @@ A token whose `collectionId` names a base or view collection is ignored
 ## Admin password reset (0.22 routes)
 
 `POST /api/admins/request-password-reset` and
-`POST /api/admins/confirm-password-reset` follow `v0.22.34 apis/admin.go:21-22`:
-validation codes and messages of the 0.22.34 binary (for the request: blank,
-then more than 255 bytes, then e-mail format, first error only;
-`forms/admin_password_reset_request.go:47-55`), `204` for any valid e-mail
-(known or not), a 120 second resend throttle on `last_reset_sent_at`, a link
-`{appURL}/_/#/confirm-password-reset/{token}`, a new token key after the
-reset. The e-mail is sent only through the `PPBASE_SMTP_*` settings and the
-link or token is never logged. The PPBase dashboard has no page for this link
-(nor for the record confirmation links): the token can be posted to the API.
+`POST /api/admins/confirm-password-reset` follow `v0.22.34 apis/admin.go:21-22`
+and answer the statuses, codes and messages of the 0.22.34 binary, compared
+request by request (synthetic data):
+
+- Request: blank, then more than 255 bytes, then e-mail format, first error
+  only (`forms/admin_password_reset_request.go:47-55`). The format is
+  govalidator `IsEmail`, the rule of ozzo `is.EmailFormat` in 0.22.34: it
+  refuses `someone@[127.0.0.1]`, `us..er@example.com` or `.user@example.com`
+  and accepts a few odd quoted local parts such as `"j"@example.com`.
+- Confirmation: token, password and confirmation are checked together. The
+  password has 10 to 72 bytes, not characters (`Length(10, 72)`,
+  `forms/admin_password_reset_confirm.go:45`): five two-byte characters pass,
+  37 are refused, with a valid token or not.
+- Body: JSON, `application/x-www-form-urlencoded` and `multipart/form-data`,
+  read like the 0.22.34 binder (`tools/rest/multi_binder.go:29-146`): case
+  folded keys, first form value, query string merged with form bodies,
+  `@jsonPayload`, a lone surrogate escape read as U+FFFD. Another or no
+  `Content-Type` answers `400 An error occurred while loading the submitted
+  data.` The details and the measured cases are in `ppbase/api/legacy_forms.py`.
+- `204` for any valid e-mail (known or not), a 120 second resend throttle on
+  `last_reset_sent_at`, a link `{appURL}/_/#/confirm-password-reset/{token}`,
+  `updated` set with `last_reset_sent_at` when the e-mail is sent (`SaveAdmin`),
+  a new token key after the reset.
+
+The e-mail is sent only through the `PPBASE_SMTP_*` settings and the link or
+token is never logged. The PPBase dashboard has no page for this link (nor for
+the record confirmation links): the token can be posted to the API.
+
+## Passwords and bcrypt's 72 bytes
+
+bcrypt cannot hash more than 72 bytes, which a password of 71 characters or
+less can reach with multi-byte characters; no route answers `500` for that:
+
+- `POST /api/admins` and `PATCH /api/admins/{id}` apply the 0.22.34 admin
+  rule, 10 to 72 bytes (`forms/admin_upsert.go:75-79`), with the 0.22.34
+  answer `400 Something went wrong while processing your request.`; an
+  unknown admin is a `404` first.
+- `POST /api/admins/init` and `POST /api/admins/{id}/change-password`, PPBase
+  routes, keep their rule and answer over 72 bytes the `validation_invalid_value`
+  error of a v0.40.6 superuser (`core/field_password.go:170-172`).
+- A record `confirm-password-reset` over 72 bytes answers `400` with empty data,
+  as 0.22.34 does from 73 to 100 bytes (`forms/record_password_reset_confirm.go:48`,
+  `:92-93`).
+
+Passwords are hashed and checked as the Go strings PocketBase would hash: a
+lone surrogate escape in JSON is U+FFFD, so a password set through PocketBase
+0.22 with such escapes still signs in.
 
 ## E-mailed links
 
@@ -104,6 +142,13 @@ strings, so this needs two accounts sharing an id.
   depth (a section such as `{"smtp": null}` or a value), keeps the stored
   value, as measured on 0.22.34. The dashboard removes masked values before
   saving, like the 0.22.34 dashboard.
+- Request logs: the request logger stores bodies redacted key by key. A
+  urlencoded body (such as an admin reset confirmation with `token` and
+  `password`) is redacted like JSON, keys folded like PocketBase reads them
+  (`paſſword`, with long s, is a password); a JSON body that cannot be parsed is
+  stored as `[REDACTED MALFORMED BODY]`, never as is, and a body beyond Python's
+  integer or nesting limits no longer turns the handled request into a `500`.
+  `text/*` bodies are still stored as sent and multipart bodies never.
 - SQL errors: every engine sets `hide_parameters=True`, so SQLAlchemy never
   appends the bound values (password hashes, token keys, secrets) to
   `DBAPIError` messages or echo logs. This does not cover values quoted by the
@@ -145,6 +190,20 @@ strings, so this needs two accounts sharing an id.
   email-change link whose `email` claim no longer matches the record.
 - Realtime identity: collection and id (v0.40.6) instead of the id alone
   (0.22.34), see above.
+- `PATCH /api/admins/{id}` (and `POST /api/admins`) keep `passwordConfirm`
+  optional, where 0.22.34 requires it with a password
+  (`forms/admin_upsert.go:80-84`); the rest of the 0.22 admin form (id,
+  avatar bounds, e-mail rules) is not reproduced either.
+- Body binding of the admin reset routes, beyond the measured cases: LF-only
+  multipart line endings and blanks after a multipart boundary are refused
+  (accepted by Go), invalid UTF-8 in a form value counts three bytes (Go: one),
+  and Python's JSON decoder stops a few levels before Go's 10000-level limit.
+- A protected file refused to a token is a `404` (current PocketBase,
+  `v0.40.6 apis/file.go:132-133`) where 0.22.34 answers `403 Insufficient
+  permissions to access the file resource.` (`v0.22.34 apis/file.go:136-138`).
+- A record reset refusal keeps PPBase's message (`Failed to confirm password
+  reset.`, 0.22.34: `Something went wrong while processing your request.`) and
+  PPBase's 71-character password rule.
 - The record verification and password reset requests have no resend
   throttle (0.22.34: 120 seconds, `forms/record_verification_request.go:37`,
   `forms/record_password_reset_request.go:38`), and the record e-mails have
