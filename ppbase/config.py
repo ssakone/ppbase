@@ -83,7 +83,8 @@ class Settings(BaseSettings):
     oauth2_facebook_client_id: str = ""
     oauth2_facebook_client_secret: str = ""
 
-    # ---- SMTP (optional — if not configured, tokens are logged) ----
+    # ---- SMTP (optional — if not configured, nothing is sent; messages, links
+    # and tokens are logged in dev mode only, see services/mail_service.py) ----
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""

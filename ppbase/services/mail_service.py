@@ -1,7 +1,12 @@
 """Email service for verification and password reset emails.
 
-When SMTP is not configured (``settings.smtp_host`` is empty), the token
-URL is logged to stdout so developers can still complete flows locally.
+Messages go through the SMTP server of ``PPBASE_SMTP_*`` (``settings.smtp_host``).
+When it is not configured nothing is sent.  The message (link and token
+included) is then logged only in the explicit development mode
+(``PPBASE_DEV``); otherwise a warning without recipient, link or token is
+logged, because these links grant access to the account (password reset,
+e-mail change) and logs are kept and shared far more widely than mailboxes.
+PocketBase never logs a message body.
 """
 
 from __future__ import annotations
@@ -15,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 def _smtp_configured(settings: Any) -> bool:
     return bool(getattr(settings, "smtp_host", ""))
+
+
+def _dev_mode(settings: Any) -> bool:
+    return getattr(settings, "dev", False) is True
 
 
 def _smtp_send(to: str, subject: str, body_text: str, settings: Any) -> None:
@@ -43,8 +52,13 @@ async def _send_email(
     body_text: str,
     settings: Any,
 ) -> None:
-    """Send an email via SMTP if configured, else log it."""
+    """Send an email via SMTP if configured; else log it in dev mode only."""
     if not _smtp_configured(settings):
+        if not _dev_mode(settings):
+            logger.warning(
+                "SMTP not configured (PPBASE_SMTP_HOST): %r email not sent.", subject
+            )
+            return
         logger.info("SMTP not configured — email not sent.")
         logger.info("  To:      %s", to)
         logger.info("  Subject: %s", subject)
@@ -75,7 +89,7 @@ async def send_verification_email(
         f"If you did not request this email you can safely ignore it."
     )
 
-    if not _smtp_configured(settings):
+    if not _smtp_configured(settings) and _dev_mode(settings):
         logger.info("[DEV] Verification token for %s: %s", to, token)
 
     await _send_email(to, subject, body, settings)
@@ -98,7 +112,7 @@ async def send_password_reset_email(
         f"If you did not request this email you can safely ignore it."
     )
 
-    if not _smtp_configured(settings):
+    if not _smtp_configured(settings) and _dev_mode(settings):
         logger.info("[DEV] Password-reset token for %s: %s", to, token)
 
     await _send_email(to, subject, body, settings)
@@ -121,7 +135,7 @@ async def send_confirm_email_change_email(
         f"If you did not request this email you can safely ignore it."
     )
 
-    if not _smtp_configured(settings):
+    if not _smtp_configured(settings) and _dev_mode(settings):
         logger.info("[DEV] Email-change token for %s: %s", to, token)
 
     await _send_email(to, subject, body, settings)
@@ -142,7 +156,7 @@ async def send_otp_email(
         f"If you did not request this email you can safely ignore it."
     )
 
-    if not _smtp_configured(settings):
+    if not _smtp_configured(settings) and _dev_mode(settings):
         logger.info("[DEV] OTP for %s (otpId=%s): %s", to, otp_id, otp_code)
 
     await _send_email(to, subject, body, settings)
