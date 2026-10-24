@@ -190,3 +190,95 @@ async def test_expand_key_is_omitted_without_a_related_record(
                 f"/api/collections/{coll['id']}",
                 headers={"Authorization": admin_token},
             )
+
+
+@pytest.mark.parametrize(
+    ("permission", "allowed"),
+    [
+        # BUMA flattens the role JSON into dotted @request.auth keys
+        # (app/auth/context.py).  PocketBase compares the json_extract value
+        # with ``true`` (1) in SQLite: 1 and true match, "true"/0 do not, a
+        # missing key is NULL.  Paired with the 0.22.34 binary by
+        # tests/pocketbase_parity/request_static_rules_probe.py.
+        ({"role.permission.pdv.read": True}, True),
+        ({"role.permission.pdv.read": 1}, True),
+        ({"role.permission.pdv.read": 1.0}, True),
+        ({"role.permission.pdv.read": 0}, False),
+        ({"role.permission.pdv.read": "true"}, False),
+        ({"role.permission.pdv.read": "1"}, False),
+        ({"role.permission.pdv.read": None}, False),
+        ({"role.permission.pdv.read": [True]}, False),
+        ({}, False),
+        ({"role.permission.isAdmin": "true"}, False),
+        ({"role.permission.isAdmin": 1}, True),
+    ],
+)
+async def test_present_non_boolean_permission_values_never_500(
+    app_client: AsyncClient, admin_token: str, permission: dict, allowed: bool
+) -> None:
+    from ppbase.db.engine import get_engine
+    from ppbase.services.record_service import list_records, resolve_collection
+
+    suffix = uuid.uuid4().hex[:8]
+    pdv = await _collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"rs_pdvv_{suffix}",
+            "schema": [
+                {"name": "name", "type": "text"},
+                {"name": "agent", "type": "text"},
+            ],
+            "listRule": RULE_PERM,
+        },
+    )
+    try:
+        for name, agent in (("p_empty", ""), ("p_a1", "A1"), ("p_a2", "A2")):
+            resp = await app_client.post(
+                f"/api/collections/{pdv['name']}/records",
+                headers={"Authorization": admin_token},
+                json={"name": name, "agent": agent},
+            )
+            assert resp.status_code == 200, resp.text
+        engine = get_engine()
+        collection = await resolve_collection(engine, pdv["name"])
+        auth = {"id": "u1", "type": "authRecord", "agent": "A1", **permission}
+
+        def is_true(key: str) -> bool:
+            # SQLite: ``value = 1`` holds for true, 1 and 1.0 only.
+            value = permission.get(key)
+            return value is True or (type(value) in (int, float) and value == 1)
+
+        # ``(isAdmin != true || read != true)``: true unless both are true.
+        negated_allowed = not (
+            is_true("role.permission.isAdmin") and is_true("role.permission.pdv.read")
+        )
+        for rule, expected in (
+            (RULE_PERM, ["p_a1"] if allowed else []),
+            (
+                RULE_PERM.replace("= true", "!= true"),
+                ["p_a1"] if negated_allowed else [],
+            ),
+        ):
+            result = await list_records(
+                engine,
+                collection,
+                filter_str=rule,
+                sort="name",
+                request_context={"auth": auth, "query": {}, "data": {}},
+                allow_hidden=False,
+            )
+            assert [item["name"] for item in result["items"]] == expected, rule
+        # Absent request values are NULL for ordering/like comparisons.
+        for value in ("name < @request.query.nope", "name ~ @request.query.nope"):
+            result = await list_records(
+                engine,
+                collection,
+                filter_str=value,
+                request_context={"auth": auth, "query": {}, "data": {}},
+            )
+            assert result["items"] == [], value
+    finally:
+        await app_client.delete(
+            f"/api/collections/{pdv['id']}", headers={"Authorization": admin_token}
+        )
