@@ -87,6 +87,17 @@ def _error(response) -> tuple[str, dict[str, Any]]:
 
 
 async def test_request_validation_matches_pocketbase(app_client: AsyncClient, sent_mails) -> None:
+    """Required, then Length(1, 255) in bytes, then EmailFormat, first error only.
+
+    forms/admin_password_reset_request.go:47-55; measured on 0.22.34: 255
+    bytes pass, 256 bytes and 139 two-byte runes (269 bytes) fail on length,
+    a 300-byte non-address fails on length, not on format.
+    """
+    length = {
+        "code": "validation_length_out_of_range",
+        "message": "The length must be between 1 and 255.",
+    }
+    labels = ".".join(["b" * 60] * 3)
     for body, field_error in (
         ({}, BLANK),
         ({"email": ""}, BLANK),
@@ -94,10 +105,19 @@ async def test_request_validation_matches_pocketbase(app_client: AsyncClient, se
             {"email": "not-an-email"},
             {"code": "validation_is_email", "message": "Must be a valid email address."},
         ),
+        ({"email": "a" * 64 + "@" + labels + "." + "c" * 8}, length),
+        ({"email": "x" * 300}, length),
+        ({"email": "é" * 130 + "@c11.test"}, length),
     ):
         resp = await app_client.post("/api/admins/request-password-reset", json=body)
         assert resp.status_code == 400, resp.text
         assert _error(resp) == (VALIDATE_FORM, {"email": field_error})
+    assert sent_mails == []
+
+    # 255 bytes (and 109 two-byte runes, 209 bytes) are valid: 204, nothing sent.
+    for email in ("a" * 64 + "@" + labels + "." + "c" * 7, "é" * 100 + "@c11.test"):
+        resp = await app_client.post("/api/admins/request-password-reset", json={"email": email})
+        assert resp.status_code == 204, resp.text
     assert sent_mails == []
 
 

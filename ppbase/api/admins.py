@@ -39,6 +39,8 @@ router = APIRouter()
 
 # PocketBase 0.22.34 validation wording, measured on the official binary.
 _BLANK = {"code": "validation_required", "message": "Cannot be blank."}
+_VALIDATE_FORM = "An error occurred while validating the form."
+_EMAIL_MAX_BYTES = 255  # forms/admin_password_reset_request.go:52
 _ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX = 10, 72  # forms/admin_password_reset_confirm.go:45
 
 
@@ -276,11 +278,25 @@ async def request_password_reset(
     """
     body = await _json_object_or_error(request)
     email = _string_fields(body, "email")["email"]
+    # Same rules, in the same order, as forms/admin_password_reset_request.go:47-55
+    # (ozzo stops at the first failing rule): Required, Length(1, 255) counted
+    # in bytes like Go's len(), then EmailFormat.  Measured on 0.22.34: 255 bytes
+    # pass, 256 bytes and 139 two-byte runes (269 bytes) give the length error.
     if not email:
-        raise _bad_request("An error occurred while validating the form.", {"email": _BLANK})
-    if len(email) > 255 or not _EMAIL_RE.match(email):
+        raise _bad_request(_VALIDATE_FORM, {"email": _BLANK})
+    if len(email.encode("utf-8")) > _EMAIL_MAX_BYTES:
         raise _bad_request(
-            "An error occurred while validating the form.",
+            _VALIDATE_FORM,
+            {
+                "email": {
+                    "code": "validation_length_out_of_range",
+                    "message": f"The length must be between 1 and {_EMAIL_MAX_BYTES}.",
+                }
+            },
+        )
+    if not _EMAIL_RE.match(email):
+        raise _bad_request(
+            _VALIDATE_FORM,
             {"email": {"code": "validation_is_email", "message": "Must be a valid email address."}},
         )
 
