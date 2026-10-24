@@ -204,6 +204,7 @@ await pb.apis.enrich_record(
     record,           # dict | None
     collection=...,   # CollectionRecord | str | None (resolved automatically from record if omitted)
     default_expand=None,  # fallback expand string if ?expand= is not in the request
+    auth_record=None,     # evaluate the expand rules as this auth record instead
 )
 
 await pb.apis.enrich_records(
@@ -211,8 +212,14 @@ await pb.apis.enrich_records(
     records,          # list[dict]
     collection=...,
     default_expand=None,
+    auth_record=None,
 )
 ```
+
+Like PocketBase's `apis.EnrichRecords`, every expanded record must satisfy
+the `viewRule` of its collection for the current request (admins excepted),
+with the same `@request.*` context as the records API; `record_auth_response`
+expands as the authenticated record. See `docs/expand-view-rules.md`.
 
 ### `pb.apis.record_auth_response`
 

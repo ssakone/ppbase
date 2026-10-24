@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Security: expand applies the related viewRule
+
+See `docs/expand-view-rules.md`.
+
+- Every expanded record must satisfy the `viewRule` of its collection for the
+  current request (PocketBase 0.22.34 `expandFetch`): admins see everything,
+  a `null` rule fails the path, any other rule is evaluated by the list
+  filter parser with the same `@request.*` context. An anonymous caller or a
+  role without the permission no longer reads protected records through a
+  public relation (BUMA: `buma_sale.customer`, `users.employee`,
+  `buma_payment.caisse_transaction`, ...).
+- Paths are normalized like PocketBase, a failing path is skipped, a failing
+  nested level drops the whole path, refused or missing targets are skipped
+  in field order; `<collection>_via_<field>` back relations are supported.
+- Expanded auth records show their email only to an admin, the owner or a
+  `manageRule` match.
+- Create/update, auth responses (as the authenticated record), realtime and
+  `pb.apis.enrich_records`/`record_auth_response` use the same rules; one
+  query per path and level, in a savepoint inside write transactions.
+
+### PocketBase 0.22 error compatibility (opt-in)
+
+See `docs/error-compat.md`.
+
+- `pb.set_error_compat("0.22")` or `PPBASE_ERROR_COMPAT=0.22` makes every
+  PPBase JSON error answer `{code, message, data}` with the PocketBase
+  0.22.34 messages ("Only admins can perform this action.", ...). Disabled by
+  default; status codes and non-PPBase bodies are never changed.
+
 ### Absent @request.* values no longer 500; totalPages and expand key
 
 See `docs/request-static-fields.md`.
