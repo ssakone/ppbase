@@ -162,6 +162,9 @@ _CONFIRM_FORM_ROUTE = re.compile(
     r"^/api/collections/[^/]+/(?:confirm-password-reset|confirm-verification)/?$"
 )
 _REALTIME_ROUTE = re.compile(r"^/api/realtime/?$")
+_COLLECTION_ADMIN_ROUTE = re.compile(r"^/api/collections/[^/]+(?:/truncate)?/?$")
+_LOGS_ROUTE = re.compile(r"^/api/logs/")
+_SETTINGS_ROUTE = re.compile(r"^/api/settings/?$")
 _BODY_ERRORS = ("Invalid JSON body.", "Request body must be a JSON object.")
 
 #: PocketBase 0.22.34 wording of the PPBase messages that differ
@@ -268,6 +271,29 @@ _MESSAGE_RULES: tuple[_MessageRule, ...] = (
         methods=frozenset({"GET"}),
         source="apis/record_crud.go l.82-86: a filter/sort parse error is "
         "NewBadRequestError('', err), without the parser text",
+    ),
+    _MessageRule(
+        404,
+        pattern=re.compile(r"^Collection '.*' not found\.$"),
+        replacement="The requested resource wasn't found.",
+        path=_COLLECTION_ADMIN_ROUTE,
+        source="apis/collection.go l.62 (view), l.117 (update), l.156 (delete): "
+        "NewNotFoundError('', err)",
+    ),
+    _MessageRule(
+        404,
+        messages=("Log not found.",),
+        replacement="The requested resource wasn't found.",
+        path=_LOGS_ROUTE,
+        source="apis/logs.go l.72, l.77: NewNotFoundError('', ...)",
+    ),
+    _MessageRule(
+        400,
+        messages=("Invalid settings payload.",),
+        replacement="An error occurred while loading the submitted data.",
+        path=_SETTINGS_ROUTE,
+        methods=frozenset({"PATCH"}),
+        source="apis/settings.go l.53 (c.Bind failure)",
     ),
     _MessageRule(
         400,

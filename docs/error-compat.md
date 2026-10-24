@@ -77,6 +77,9 @@ Status codes are never changed.
 | 400 | Failed to create/update record. Validation failed for: … | Failed to create record. / Failed to update record. | record create/update | `apis/record_crud.go` l.286, l.378 |
 | 400 | any filter/sort parse error text | Something went wrong while processing your request. | GET record list | `apis/record_crud.go` l.82-86 |
 | 400 | Failed to authenticate. (data `identity` `validation_invalid_credentials`) | Failed to authenticate. (data `{}`) | record and admin auth-with-password | `apis/record_auth.go` l.316-317, `apis/admin.go` l.97-98 |
+| 404 | Collection '<name>' not found. | The requested resource wasn't found. | `/api/collections/{c}` (admin) | `apis/collection.go` l.62, l.117, l.156 |
+| 404 | Log not found. | The requested resource wasn't found. | `/api/logs/…` | `apis/logs.go` l.72, l.77 |
+| 400 | Invalid settings payload. | An error occurred while loading the submitted data. | PATCH `/api/settings` | `apis/settings.go` l.53 |
 | 404 | Not Found (Starlette `detail`) | Not Found. | unknown route | `apis/base.go` l.72-74 (echo `HTTPError` through `NewApiError`) |
 
 Messages already identical (e.g. "The requested resource wasn't found.",
@@ -89,8 +92,8 @@ Messages already identical (e.g. "The requested resource wasn't found.",
   translation table, untouched bodies) and
   `tests/integration/test_error_compat.py` (both modes on 400, 401, 403,
   404 and a 500 JSON route, host bodies untouched).
-- `tests/pocketbase_parity/expand_rules_probe.py` (`errors` group, 35
-  requests) against the 0.22.34 binary: 31 identical; the 4 known differences
+- `tests/pocketbase_parity/expand_rules_probe.py` (`errors` group, 38
+  requests) against the 0.22.34 binary: 33 identical; the 5 known differences
   are listed below.
 
 ## Known differences (not rewritten)
@@ -112,6 +115,10 @@ Validation details inside `data` keep PPBase's codes (for example an
 unparsable verification token: 0.22.34 `validation_invalid_token_claims`,
 PPBase `validation_invalid_token`). PPBase-only routes (backups, hooks,
 migrations, batch, OTP, impersonate) keep their messages and only change
-envelope. A Python exception that escapes every handler is still Starlette's
+envelope. Admin collection create/update validation errors keep PPBase's
+message and data (0.22.34: "Something went wrong while processing your
+request." or "Failed to create/update the collection." with form errors,
+`apis/collection.go` l.85-99, l.124-138). A Python exception that escapes
+every handler is still Starlette's
 plain-text 500; PocketBase 0.22.34 turns a recovered panic into a 400 JSON
 (`apis/base.go` l.52, l.75-80).

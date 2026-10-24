@@ -828,6 +828,17 @@ async def error_scenarios(
         "unknown_route": ("GET", "/api/wsa6-nothing", {}),
         "method_not_allowed": ("DELETE", "/api/health", {}),
         "file_token_guest": ("POST", "/api/files/token", {}),
+        "admin_unknown_collection": (
+            "GET",
+            "/api/collections/wsa6_nope",
+            {"headers": "admin"},
+        ),
+        "admin_unknown_log": ("GET", "/api/logs/zzzzzzzzzzzzzzz", {"headers": "admin"}),
+        "admin_settings_array_body": (
+            "PATCH",
+            "/api/settings",
+            {"headers": "admin", "json": [1]},
+        ),
         "admin_password_bad": (
             "POST",
             "/api/admins/auth-with-password",

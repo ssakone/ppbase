@@ -126,6 +126,27 @@ def test_sentenize_matches_pocketbase_inflector() -> None:
             "/api/collections/x/records",
             "Failed to create record.",
         ),
+        (
+            404,
+            "Collection 'posts' not found.",
+            "GET",
+            "/api/collections/posts",
+            "The requested resource wasn't found.",
+        ),
+        (
+            404,
+            "Log not found.",
+            "GET",
+            "/api/logs/abc",
+            "The requested resource wasn't found.",
+        ),
+        (
+            400,
+            "Invalid settings payload.",
+            "PATCH",
+            "/api/settings",
+            "An error occurred while loading the submitted data.",
+        ),
         # Same text, other route: unchanged.
         (
             400,
