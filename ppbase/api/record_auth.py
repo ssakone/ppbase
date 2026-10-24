@@ -389,6 +389,32 @@ def _build_rule_request_context(
     }
 
 
+def _auth_response_expand_context(
+    request: Request,
+    collection: Any,
+    record: dict[str, Any],
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rule context of the ``expand`` of an auth response.
+
+    PocketBase 0.22.34 ``RecordAuthResponse`` (apis/record_helpers.go
+    l.105-116) expands with a copy of the request info whose ``Admin`` is nil
+    and whose ``AuthRecord`` is the authenticated record, so every expanded
+    record must satisfy its ``viewRule`` for that record (v0.40.6
+    ``recordAuthResponse`` l.94-113: ``requestInfo.Auth = e.Record``).
+    """
+    auth_payload = {key: value for key, value in record.items() if key != "expand"}
+    auth_payload.setdefault("collectionId", getattr(collection, "id", ""))
+    auth_payload.setdefault("collectionName", getattr(collection, "name", ""))
+    auth_payload["type"] = "authRecord"
+    return _build_rule_request_context(
+        request,
+        context="default",
+        data=data if isinstance(data, dict) else None,
+        auth_payload=auth_payload,
+    )
+
+
 async def _passes_auth_rule(
     engine: Any,
     collection: Any,
@@ -665,7 +691,14 @@ async def api_auth_with_password(
         if expand_str and result.get("record"):
             all_colls = await get_all_collections(engine)
             records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+                engine,
+                collection,
+                [result["record"]],
+                expand_str,
+                all_colls,
+                request_context=_auth_response_expand_context(
+                    request, collection, result["record"], payload
+                ),
             )
             result["record"] = records[0] if records else result["record"]
 
@@ -890,7 +923,14 @@ async def api_auth_with_otp(
         if expand_str and result.get("record"):
             all_colls = await get_all_collections(engine)
             records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+                engine,
+                collection,
+                [result["record"]],
+                expand_str,
+                all_colls,
+                request_context=_auth_response_expand_context(
+                    request, collection, result["record"], payload
+                ),
             )
             result["record"] = records[0] if records else result["record"]
 
@@ -1059,7 +1099,14 @@ async def api_auth_with_oauth2(
             if expand_str and response_data.get("record"):
                 all_colls = await get_all_collections(engine)
                 records = await expand_records(
-                    engine, collection, [response_data["record"]], expand_str, all_colls,
+                    engine,
+                    collection,
+                    [response_data["record"]],
+                    expand_str,
+                    all_colls,
+                    request_context=_auth_response_expand_context(
+                        request, collection, response_data["record"], payload
+                    ),
                 )
                 response_data["record"] = records[0] if records else response_data["record"]
 
@@ -1182,7 +1229,14 @@ async def api_auth_refresh(
         if expand_str and result.get("record"):
             all_colls = await get_all_collections(engine)
             records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+                engine,
+                collection,
+                [result["record"]],
+                expand_str,
+                all_colls,
+                request_context=_auth_response_expand_context(
+                    request, collection, result["record"], None
+                ),
             )
             result["record"] = records[0] if records else result["record"]
 
@@ -1298,7 +1352,14 @@ async def api_impersonate_record(
     if expand_str and result.get("record"):
         all_colls = await get_all_collections(engine)
         records = await expand_records(
-            engine, collection, [result["record"]], expand_str, all_colls,
+            engine,
+            collection,
+            [result["record"]],
+            expand_str,
+            all_colls,
+            request_context=_auth_response_expand_context(
+                request, collection, result["record"], data
+            ),
         )
         result["record"] = records[0] if records else result["record"]
 
