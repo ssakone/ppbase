@@ -25,6 +25,14 @@ def format_datetime(dt: datetime | str | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+# Field types whose value is a PocketBase ``types.DateTime``.  PPBase stores
+# an empty date as NULL (``TIMESTAMPTZ NULL``) where PocketBase stores ''
+# (``TEXT DEFAULT '' NOT NULL``, v0.22.34 models/schema/schema_field.go
+# l.163, v0.40.6 core/field_date.go l.109-110); the zero DateTime always
+# marshals as "" (v0.22.34 tools/types/datetime.go l.47-58, v0.40.6
+# l.100-111), so NULL is served "" and never null.
+_DATETIME_FIELD_TYPES = frozenset({"date", "autodate"})
+
 # Auth collection columns that must NEVER appear in API responses
 _AUTH_HIDDEN_COLUMNS = frozenset({
     "password_hash", "token_key",
@@ -76,6 +84,13 @@ def build_record_response(
         "created": format_datetime(row.get("created")),
         "updated": format_datetime(row.get("updated")),
     }
+    if is_view_collection:
+        # A view record exports created/updated only when they are not zero
+        # (v0.22.34 models/record.go l.545-550): a view that does not select
+        # them, or selects an empty value, has no such key.
+        for key in ("created", "updated"):
+            if not result[key]:
+                del result[key]
 
     def _can_view_auth_email() -> bool:
         if not apply_email_visibility:
@@ -129,7 +144,9 @@ def build_record_response(
                 continue
 
             val = row.get(fname)
-            if isinstance(val, datetime):
+            if isinstance(val, datetime) or (
+                val is None and field_def.get("type") in _DATETIME_FIELD_TYPES
+            ):
                 val = format_datetime(val)
             # Return integers for whole-number floats (PocketBase compat)
             if isinstance(val, float) and val == int(val):

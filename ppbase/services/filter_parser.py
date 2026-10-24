@@ -840,6 +840,9 @@ class _FilterTransformer(Transformer):
         # ── Regular comparisons ────────────────────────────────────────
         left_sql = self._operand_to_sql(left)
         right_sql = self._operand_to_sql(right)
+        date_sql = _empty_date_condition(self, left, left_sql, op, right, right_sql)
+        if date_sql is not None:
+            return date_sql
 
         # Standard comparisons
         if op in _STANDARD_OPS:
@@ -1169,6 +1172,15 @@ class _FilterTransformer(Transformer):
             )
         leaf_sql = self._leaf_value_sql(leaf)
         other_sql = self._operand_to_sql(other)
+        if leaf.modifier is None and not leaf.multiple:
+            ref = ("sql_ref", leaf_sql, False, leaf.field_type)
+            operands = (ref, leaf_sql, other, other_sql)
+            if not leaf_is_left:
+                operands = (other, other_sql, ref, leaf_sql)
+            left, left_sql, right, right_sql = operands
+            date_sql = _empty_date_condition(self, left, left_sql, op, right, right_sql)
+            if date_sql is not None:
+                return date_sql
         return self._operator_condition_sql(
             leaf_sql,
             op,
@@ -2037,3 +2049,122 @@ def parse_sort(sort_str: str) -> list[tuple[str, str]]:
             result.append((f'"{part}"', direction))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Empty dates
+# ---------------------------------------------------------------------------
+#
+# PocketBase stores an empty date as '' (``TEXT DEFAULT '' NOT NULL``,
+# v0.22.34 models/schema/schema_field.go l.163, v0.40.6 core/field_date.go
+# l.109-110) and compares dates as SQLite text: ``=``/``!=`` treat '' and
+# NULL alike (``resolveEqualExpr``, v0.22.34 tools/search/filter.go
+# l.290-368, v0.40.6 l.340-422), while ``<``, ``<=``, ``>``, ``>=``, ``~``
+# and ``!~`` compare the stored text directly (v0.22.34 l.155-176), so ''
+# sorts before every date.  PPBase stores the empty date as NULL in a
+# ``TIMESTAMPTZ NULL`` column; the SQL below gives that NULL the semantics
+# of ''.  The ``null`` identifier stays SQL NULL for ``<``-like operators,
+# as in PocketBase.
+
+# Only ``date`` columns are nullable; ``autodate`` columns are NOT NULL.
+_NULLABLE_DATE_FIELD_TYPES = {"date"}
+_FLIPPED_STANDARD_OPS = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+
+def _date_operand_kind(parser: _FilterTransformer, node: Any, sql: str) -> str:
+    """Classify a comparison operand for the empty-date semantics.
+
+    ``"date"`` is a nullable date column (NULL stands for ''), ``"empty"`` an
+    empty string value, ``"null"`` the ``null`` identifier or a missing
+    request value, ``"value"`` anything else (date literal, macro, column).
+    """
+    kind = node[0] if isinstance(node, tuple) and node else ""
+    # A ``sql_ref`` whose third item is True is a JSON path, never a column.
+    is_column = kind == "field" or (kind == "sql_ref" and node[2:3] != (True,))
+    if is_column and parser._operand_field_type(node) in _NULLABLE_DATE_FIELD_TYPES:
+        return "date"
+    if kind == "null":
+        return "null"
+    if parser._is_bound_param(sql):
+        value = parser._params[sql[1:]]
+        if value is None:
+            return "null"
+        if value == "":
+            return "empty"
+    return "value"
+
+
+def _pb_date_text_sql(sql: str) -> str:
+    """The text PocketBase stores for a date: '' or ``YYYY-MM-DD HH:MM:SS.mmmZ``."""
+    return (
+        f"COALESCE(to_char({sql} AT TIME ZONE 'UTC', "
+        "'YYYY-MM-DD HH24:MI:SS.MS\"Z\"'), '')"
+    )
+
+
+def _empty_date_sql(date_sql: str, sql_op: str, other_sql: str, other_kind: str) -> str:
+    """Compare a nullable date column like the SQLite text PocketBase stores."""
+    d, o = date_sql, other_sql
+    if other_kind == "date":
+        return {
+            "=": f"({d} IS NOT DISTINCT FROM {o})",
+            "!=": f"({d} IS DISTINCT FROM {o})",
+            "<": f"({d} < {o} OR ({d} IS NULL AND {o} IS NOT NULL))",
+            "<=": f"({d} <= {o} OR {d} IS NULL)",
+            ">": f"({d} > {o} OR ({d} IS NOT NULL AND {o} IS NULL))",
+            ">=": f"({d} >= {o} OR {o} IS NULL)",
+        }[sql_op]
+    if other_kind == "empty":
+        return {
+            "=": f"{d} IS NULL",
+            "!=": f"{d} IS NOT NULL",
+            "<": "FALSE",
+            "<=": f"{d} IS NULL",
+            ">": f"{d} IS NOT NULL",
+            ">=": "TRUE",
+        }[sql_op]
+    if other_kind == "null":
+        if sql_op in {"=", "!="}:
+            return f"{d} IS {'' if sql_op == '=' else 'NOT '}NULL"
+        return f"{d} {sql_op} NULL"
+    return {
+        "=": f"{d} = {o}",
+        "!=": f"({d} <> {o} OR {d} IS NULL)",
+        "<": f"({d} < {o} OR {d} IS NULL)",
+        "<=": f"({d} <= {o} OR {d} IS NULL)",
+        ">": f"{d} > {o}",
+        ">=": f"{d} >= {o}",
+    }[sql_op]
+
+
+def _empty_date_condition(
+    parser: _FilterTransformer,
+    left: Any,
+    left_sql: str,
+    op: str,
+    right: Any,
+    right_sql: str,
+) -> str | None:
+    """SQL of ``left op right`` when one operand is a nullable date column.
+
+    Returns ``None`` for any other comparison, which keeps its usual SQL.
+    """
+    left_kind = _date_operand_kind(parser, left, left_sql)
+    right_kind = _date_operand_kind(parser, right, right_sql)
+    if "date" not in (left_kind, right_kind):
+        return None
+    if op in _LIKE_OPS:
+        if left_kind == "date":
+            left_sql = _pb_date_text_sql(left_sql)
+        if right_kind == "date":
+            right_sql = _pb_date_text_sql(right_sql)
+            right = ("sql_ref", right_sql)
+        return parser._like_comparison_sql(left_sql, right, right_sql, _LIKE_OPS[op])
+    if op not in _STANDARD_OPS:
+        return None
+    sql_op = _STANDARD_OPS[op]
+    if left_kind != "date":
+        # ``value op date`` is ``date flipped(op) value``.
+        left_sql, right_sql, right_kind = right_sql, left_sql, left_kind
+        sql_op = _FLIPPED_STANDARD_OPS[sql_op]
+    return _empty_date_sql(left_sql, sql_op, right_sql, right_kind)

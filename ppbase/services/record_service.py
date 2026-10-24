@@ -216,6 +216,21 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
     return [f.strip() for f in fields_param.split(",") if f.strip()]
 
 
+def _sort_term(column: str, direction: str, date_fields: set[str]) -> str:
+    """Render one ``ORDER BY`` term like PocketBase sorts it.
+
+    PocketBase sorts a date column as SQLite text, where the empty date ''
+    comes before any date (``ORDER BY [[col]] ASC|DESC``, v0.22.34
+    tools/search/sort.go l.23-37).  PPBase stores that empty date as NULL,
+    which PostgreSQL sorts last in ascending order, hence the explicit
+    ``NULLS FIRST``/``NULLS LAST``.
+    """
+    if column.strip('"') not in date_fields:
+        return f"{column} {direction}"
+    nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
+    return f"{column} {direction} {nulls}"
+
+
 def _table_name(collection: CollectionRecord) -> str:
     # _superusers is now a real table (no longer mapped to _admins)
     return collection.name
@@ -738,7 +753,10 @@ async def list_records(
                         f"Invalid sort field: {col_name}. "
                         f"Available fields: {', '.join(sorted(valid_fields))}."
                     )
-            order_sql = ", ".join(f"{col} {direction}" for col, direction in sort_parts)
+            date_fields = {f.name for f in schema_fields if f.type == FieldType.DATE}
+            order_sql = ", ".join(
+                _sort_term(col, direction, date_fields) for col, direction in sort_parts
+            )
 
     # Clamp pagination (PocketBase normalizes invalid values instead of rejecting)
     if per_page <= 0:
