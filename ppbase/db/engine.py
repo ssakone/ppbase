@@ -43,7 +43,9 @@ async def init_engine(
         pool_pre_ping=True,
         echo=echo,
         # Bound values include password hashes, token keys, token secrets and
-        # SMTP/S3 credentials: never copy them into error messages or logs.
+        # SMTP/S3 credentials: SQLAlchemy must not append them to error
+        # messages or echo logs.  Values quoted by asyncpg or PostgreSQL
+        # themselves are not covered (docs/pocketbase-022-compatibility.md).
         hide_parameters=True,
         connect_args={"ssl": "disable"},
     )

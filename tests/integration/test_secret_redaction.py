@@ -375,15 +375,60 @@ class TestSettingsSecrets:
 
 
 class TestBoundParametersAreHidden:
-    async def test_sql_errors_do_not_contain_bound_values(self, app_client: AsyncClient) -> None:
+    """What ``hide_parameters=True`` hides, and what it cannot hide.
+
+    SQLAlchemy no longer appends ``[parameters: ...]`` to ``DBAPIError``
+    messages.  Values quoted by the driver or the server are another matter:
+    asyncpg copies up to 40 characters of the ``repr`` of a value it cannot
+    encode, PostgreSQL quotes the input of a failed cast, and the ``DETAIL`` of
+    a unique violation (``Key (k)=(value) already exists.``) is part of the
+    chained asyncpg exception shown in full tracebacks.  The values are short
+    on purpose, so that no truncation can hide them.
+    """
+
+    VALUE = "s3cr3t-v4lue"
+
+    @staticmethod
+    async def _message(engine, sql: str, value: str) -> str:
+        with pytest.raises(DBAPIError) as exc_info:
+            async with engine.connect() as conn:
+                await conn.execute(text(sql), {"value": value})
+        return str(exc_info.value)
+
+    async def test_sqlalchemy_never_appends_bound_values(self, app_client: AsyncClient) -> None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
         from ppbase.db.engine import get_engine
 
         engine = get_engine()
         assert engine.sync_engine.hide_parameters is True
-        secret = "bound-secret-" + uuid.uuid4().hex
-        with pytest.raises(DBAPIError) as exc_info:
-            async with engine.connect() as conn:
-                await conn.execute(text("SELECT CAST(:value AS integer)"), {"value": secret})
-        message = str(exc_info.value)
-        assert secret not in message
-        assert "hide_parameters" in message
+        # The server text of this error never quotes the value: only the
+        # SQLAlchemy appendix could carry it.
+        sql = "SELECT CAST(:value AS text), 1/0"
+        message = await self._message(engine, sql, self.VALUE)
+        assert "[SQL parameters hidden due to hide_parameters=True]" in message
+        assert "[parameters:" not in message
+        assert self.VALUE not in message
+
+        # Control: the very same error carries the value without the setting.
+        control = create_async_engine(engine.url, connect_args={"ssl": "disable"})
+        try:
+            assert self.VALUE in await self._message(control, sql, self.VALUE)
+        finally:
+            await control.dispose()
+
+    async def test_values_quoted_by_the_driver_or_the_server_are_not_hidden(
+        self, app_client: AsyncClient
+    ) -> None:
+        """Documented limit: these messages still quote the value."""
+        from ppbase.db.engine import get_engine
+
+        engine = get_engine()
+        # asyncpg client-side encoding error (repr of the value, cut at 40).
+        assert self.VALUE in await self._message(
+            engine, "SELECT CAST(:value AS integer)", self.VALUE
+        )
+        # PostgreSQL cast error: invalid input syntax for type integer: "...".
+        assert self.VALUE in await self._message(
+            engine, "SELECT CAST(CAST(:value AS text) AS integer)", self.VALUE
+        )
