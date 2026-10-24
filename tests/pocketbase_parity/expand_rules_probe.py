@@ -92,6 +92,7 @@ R = {  # record ids
     "b1": "wsa6bcustomer01",
     "s1": "wsa6sale0000001",
     "s2": "wsa6sale0000002",
+    "s3": "wsa6sale0000003",
     "n1": "wsa6note0000001",
 }
 USERS = ("manager", "reader", "visible", "plain", "rolereader", "rolenone")
@@ -176,6 +177,14 @@ KNOWN_DIVERGENCES: dict[str, str] = {
     ),
     "errors.confirm_verification_bad_token.body.data.token.message": (
         "same case as the data code"
+    ),
+    # Main (not expanded) auth records: PPBase applies emailVisibility, the
+    # owner and admins, but not the manageRule of
+    # autoIgnoreAuthRecordsEmailVisibility (apis/record_helpers.go
+    # l.245-276) that EnrichRecords also applies to the listed records.
+    "expand.main_auth_list.*": (
+        "Open: the manageRule email visibility of listed/viewed auth records "
+        "(not expanded ones) is not implemented by the records API."
     ),
 }
 
@@ -484,6 +493,13 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> None:
         "s2",
         {"label": "s2", "customer": R["c1"], "user": R["visible"]},
     )
+    await _create(
+        client,
+        admin,
+        "sale",
+        "s3",
+        {"label": "s3", "customer": R["c3"], "user": R["reader"]},
+    )
     await _create(client, admin, "note", "n1", {"label": "n1", "customer": R["c1"]})
 
 
@@ -553,8 +569,17 @@ async def expand_scenarios(
         ),
         "auth_email": (f"{sale}/{R['s1']}", {"expand": "user"}),
         "auth_email_visible": (f"{sale}/{R['s2']}", {"expand": "user"}),
+        # reader has no managers: "managers.id ?= @request.auth.id" is true
+        # for a guest too (NULL and '' compare equal), so 0.22.34 shows it.
+        "auth_email_unmanaged": (f"{sale}/{R['s3']}", {"expand": "user"}),
         "request_query": (f"{sale}/{R['s1']}", {"expand": "tag", "reveal": "1"}),
         "buma_role_rule": (f"{sale}/{R['s1']}", {"expand": "bcustomer"}),
+        # Not an expand: the email of the *listed* auth records, for the
+        # manageRule comparison with the expanded ones.
+        "main_auth_list": (
+            f"/api/collections/{N['users']}/records",
+            {"sort": "email", "fields": "id,email,emailVisibility"},
+        ),
     }
     result: dict[str, Any] = {}
     for name, (url, params) in views.items():
