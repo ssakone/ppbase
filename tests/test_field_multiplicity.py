@@ -402,8 +402,8 @@ def test_filter_traversal_joins_null_max_select_relation_as_array() -> None:
     )
     assert params == {"_fp1": "alpha"}
     # PocketBase json_each: one row per item, then the target.
-    each, target = re.findall(r'AS "(__pb\d+)"', sql)
-    assert f'LEFT JOIN LATERAL unnest("owners"."rels") AS "{each}"(value) ON TRUE' in sql
+    base, each, target = re.findall(r'AS "(__pbb?\d+)"', sql)
+    assert f'LEFT JOIN LATERAL unnest("{base}"."rels") AS "{each}"(value) ON TRUE' in sql
     assert f'LEFT JOIN "targets" AS "{target}" ON "{target}"."id" = "{each}".value' in sql
     assert "NOT EXISTS" not in sql  # ?= is any-match
 

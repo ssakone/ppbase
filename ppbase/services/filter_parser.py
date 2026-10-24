@@ -143,6 +143,12 @@ _SYSTEM_FIELD_TYPES = {
 # into each ``||`` operand and groups the ``&&`` operands that share a join.
 
 
+# Qualifier of the current record's columns while parsing.  It becomes the
+# table name at the top level and the alias of the base table inside the
+# ``id IN (SELECT ...)`` subquery of a join group.
+_BASE_REF = '"__pb_base_ref__"'
+
+
 @dataclass(frozen=True)
 class _Join:
     """One LEFT JOIN of the main query (``sql`` is the full clause)."""
@@ -154,10 +160,16 @@ class _Join:
 
 @dataclass(frozen=True)
 class _MultiMatch:
-    """PocketBase multi-match subquery: ``value`` over ``from_sql`` rows."""
+    """PocketBase multi-match subquery: ``value`` over ``from_sql`` rows.
+
+    ``record_id`` is set when the joins start from the current record: the
+    rows of every record are listed and matched on their id, like
+    PocketBase's ``WHERE __mm_base.id = base.id``.
+    """
 
     from_sql: str
     value: str
+    record_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -780,7 +792,11 @@ class _FilterTransformer(Transformer):
                     None if resolved.is_json else modifier,
                 )
             if resolved is not None and resolved.is_json:
-                return ("sql_ref", resolved.sql, resolved.is_json, resolved.field_type)
+                json_sql = self._json_extract_sql(
+                    self._field_expr(resolved.leaf_field),
+                    resolved.json_path,
+                )
+                return ("sql_ref", json_sql, resolved.is_json, resolved.field_type)
 
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
@@ -1182,10 +1198,23 @@ class _FilterTransformer(Transformer):
                     f'LEFT JOIN "{collection[0]}" AS "@ALIAS@" ON TRUE',
                 )
             mm_leaf, _deepest, _multi = self._join_path(mm_root, resolved, modifier, make)
-            mm = _MultiMatch(
-                from_sql='(SELECT 1) AS "__pbm_row" ' + " ".join(clauses),
-                value=mm_leaf,
-            )
+            if collection is None and self._current_table:
+                # Joins from the current record: list every record's rows
+                # and match them on the id (decorrelated, PostgreSQL can
+                # anti-join instead of running one subquery per record).
+                base = f'"{self._next_alias("__pbmb")}"'
+                mm = _MultiMatch(
+                    from_sql=(
+                        f'"{self._current_table}" AS {base} ' + " ".join(clauses)
+                    ).replace(_BASE_REF, base),
+                    value=mm_leaf.replace(_BASE_REF, base),
+                    record_id=f"{base}.\"id\"",
+                )
+            else:
+                mm = _MultiMatch(
+                    from_sql='(SELECT 1) AS "__pbm_row" ' + " ".join(clauses),
+                    value=mm_leaf,
+                )
 
         return _PathOperand(
             leaf_sql,
@@ -1302,10 +1331,18 @@ class _FilterTransformer(Transformer):
             if path_is_left
             else self._compare_sides(other, op, value_side)
         )
+        failure = self._multi_match_failure(condition, op, [value])
+        if mm.record_id is not None:
+            failure = f'"{alias}"."__pbm_id" = {_BASE_REF}."id" AND {failure}'
         return (
-            f'NOT EXISTS (SELECT 1 FROM (SELECT {mm.value} AS "v" FROM {mm.from_sql}) '
-            f'AS "{alias}" WHERE {self._multi_match_failure(condition, op, [value])})'
+            f"NOT EXISTS (SELECT 1 FROM ({self._multi_match_select(mm)}) "
+            f'AS "{alias}" WHERE {failure})'
         )
+
+    @staticmethod
+    def _multi_match_select(mm: _MultiMatch) -> str:
+        record_id = f', {mm.record_id} AS "__pbm_id"' if mm.record_id else ""
+        return f'SELECT {mm.value} AS "v"{record_id} FROM {mm.from_sql}'
 
     def _many_vs_many_sql(
         self,
@@ -1325,11 +1362,15 @@ class _FilterTransformer(Transformer):
             _Side(right_value, "column", ("sql_ref", right_value), is_json=right.is_json),
         )
         failure = self._multi_match_failure(condition, op, [left_value, right_value])
+        right_on = "TRUE"
+        if right_mm.record_id is not None:
+            right_on = f'"{right_alias}"."__pbm_id" = {_BASE_REF}."id"'
+        if left_mm.record_id is not None:
+            failure = f'"{left_alias}"."__pbm_id" = {_BASE_REF}."id" AND {failure}'
         return (
-            f'NOT EXISTS (SELECT 1 FROM (SELECT {left_mm.value} AS "v" '
-            f'FROM {left_mm.from_sql}) AS "{left_alias}" '
-            f'LEFT JOIN (SELECT {right_mm.value} AS "v" FROM {right_mm.from_sql}) '
-            f'AS "{right_alias}" ON TRUE WHERE {failure})'
+            f"NOT EXISTS (SELECT 1 FROM ({self._multi_match_select(left_mm)}) "
+            f'AS "{left_alias}" LEFT JOIN ({self._multi_match_select(right_mm)}) '
+            f'AS "{right_alias}" ON {right_on} WHERE {failure})'
         )
 
     def _path_comparison(self, left: tuple, op: str, right: tuple) -> _Cond:
@@ -1723,13 +1764,37 @@ class _FilterTransformer(Transformer):
         return parts[0] if len(parts) == 1 else "(" + " AND ".join(parts) + ")"
 
     def _exists_sql(self, aliases: frozenset[str] | set[str], condition: str) -> str:
+        """``∃`` joined row of the current record matching ``condition``.
+
+        Rendered as ``id IN (SELECT base.id FROM <table> AS base LEFT JOIN
+        ... WHERE ...)``: the shape of PocketBase's ``SELECT DISTINCT ...
+        LEFT JOIN``, which PostgreSQL runs as a semi-join (a correlated
+        EXISTS with outer references in the joins would run per record).
+        Join groups only exist at the top level of the condition, so every
+        ``_BASE_REF`` inside is the current record.
+        """
         joins = " ".join(
             join.sql for alias, join in self._joins.items() if alias in aliases
         )
-        return (
-            f'EXISTS (SELECT 1 FROM (SELECT 1) AS "__pb_row" {joins} '
-            f"WHERE {condition})"
-        )
+        if not self._current_table or _BASE_REF not in f"{joins} {condition}":
+            # Without the current record (e.g. only @collection joins) the
+            # EXISTS is uncorrelated: PostgreSQL evaluates it once.
+            return (
+                f'EXISTS (SELECT 1 FROM (SELECT 1) AS "__pb_row" {joins} '
+                f"WHERE {condition})"
+            )
+        base = f'"{self._next_alias("__pbb")}"'
+        body = (
+            f'SELECT {base}."id" FROM "{self._current_table}" AS {base} {joins} '
+            f"WHERE {condition}"
+        ).replace(_BASE_REF, base)
+        return f'{_BASE_REF}."id" IN ({body})'
+
+    def finish(self, sql: str) -> str:
+        """Qualify the remaining current-record columns with the table."""
+        if not self._current_table:
+            return sql
+        return sql.replace(_BASE_REF, f'"{self._current_table}"')
 
     # -- Helpers -------------------------------------------------------------
 
@@ -1785,7 +1850,7 @@ class _FilterTransformer(Transformer):
         if "." in safe:
             return safe
         if self._current_table:
-            return self._qualified_column(self._current_table, safe)
+            return f'{_BASE_REF}."{safe}"'
         return f'"{safe}"'
 
     @staticmethod
@@ -1975,8 +2040,7 @@ class _FilterTransformer(Transformer):
             if modifier == "changed":
                 if not has_field:
                     return "FALSE"
-                safe_field = _sanitize_ident(field)
-                field_sql = f'"{safe_field}"'
+                field_sql = self._field_expr(_sanitize_ident(field))
                 pname = self._next_param(val)
                 return (
                     f"(COALESCE({field_sql}::text, '') "
@@ -2057,7 +2121,7 @@ def parse_filter(
         current_table,
     )
     try:
-        where_sql = transformer.render(transformer.transform(tree))
+        where_sql = transformer.finish(transformer.render(transformer.transform(tree)))
     except VisitError as exc:
         # Invalid identifiers, modifiers or paths are client errors (400),
         # not server errors.

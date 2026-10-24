@@ -37,6 +37,12 @@ def _aliases(sql: str, table: str) -> list[str]:
     return re.findall(rf'LEFT JOIN "{table}" AS "(__pb\d+)"', sql)
 
 
+def _base(sql: str, table: str) -> str:
+    """Alias of the current table inside a join group (``id IN (SELECT ...)``)."""
+    (alias,) = set(re.findall(rf'FROM "{table}" AS "(__pbb\d+)"', sql))
+    return alias
+
+
 def _rel(name: str, collection_id: str, *, max_select: int = 1) -> dict:
     return {
         "name": name,
@@ -121,7 +127,7 @@ def test_flat_relation_index_handles_cycles_path_based() -> None:
     assert params == {"_fp1": "match"}
     first_b, last_b = _aliases(sql, "cycle_b")
     (middle_a,) = _aliases(sql, "cycle_a")
-    assert f'"{first_b}"."id" = "cycle_a"."to_b"' in sql
+    assert f'"{first_b}"."id" = "{_base(sql, "cycle_a")}"."to_b"' in sql
     assert f'"{middle_a}"."id" = "{first_b}"."to_a"' in sql
     assert f'"{last_b}"."id" = "{middle_a}"."to_b"' in sql
     assert f'"{last_b}"."name" = :_fp1' in sql
@@ -156,8 +162,8 @@ def test_flat_relation_index_groups_back_relation_json_path_on_same_record() -> 
     assert params == {"_fp1": "user_1"}
     (access,) = _aliases(sql, "business_access")
     (roles,) = _aliases(sql, "business_roles")
-    assert sql.count("EXISTS (SELECT 1 FROM (SELECT 1)") == 1
-    assert f'"{access}"."business" = "business"."id"' in sql
+    assert sql.count('"business"."id" IN (SELECT') == 1
+    assert f'"{access}"."business" = "{_base(sql, "business")}"."id"' in sql
     assert f'"{access}"."user" = :_fp1' in sql
     assert (
         f'LEFT JOIN "business_roles" AS "{roles}" ON "{roles}"."id" = "{access}"."role"'
@@ -190,7 +196,7 @@ def test_flat_relation_index_resolves_boutique_wallet_caisse_sale_paths() -> Non
     (wallet,) = _aliases(sql, "boutique_wallet")
     (caisse_alias,) = _aliases(sql, "caisse")
     (sale_alias,) = _aliases(sql, "sale")
-    assert f'"{wallet}"."business" = "business"."id"' in sql
+    assert f'"{wallet}"."business" = "{_base(sql, "business")}"."id"' in sql
     assert f'"{caisse_alias}"."id" = "{wallet}"."caisse"' in sql
     assert f'"{sale_alias}"."id" = "{caisse_alias}"."sale"' in sql
     assert f'"{sale_alias}"."name" = :_fp1' in sql
