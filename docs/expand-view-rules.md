@@ -114,8 +114,10 @@ hidden fields (`autoResolveRecordsFlags`).
   `collectionId`, `collectionName`) and returns extra `@request.auth` keys
   (flattened dotted keys allowed); `password_hash`, `token_key` and
   `_raw_token` are never merged. It is called only when the auth response
-  has an `expand`. `ppbase.api.record_auth.set_auth_record_rule_context(app,
-  loader)` does the same on an app; a host route that authenticates by
+  has an `expand`; if it raises, the error is logged, nothing is merged (a
+  role-gated expand is refused) and the authentication still succeeds.
+  `ppbase.api.record_auth.set_auth_record_rule_context(app, loader)` does
+  the same on an app; a host route that authenticates by
   itself builds the same context with `await
   ppbase.api.record_auth.auth_response_rule_context(request, collection,
   record, body)`.
@@ -130,8 +132,9 @@ l.437-508 keeps it). PPBase now does the same
 false) is shown to an admin (admin token or `_superusers` record), to the
 record's owner and to the records the collection `manageRule` matches with
 the request context (hidden fields allowed), one query per list page.
-Create and update responses (and their `/api/batch` counterparts) follow it
-as well: before, they always showed the email, so any caller allowed to update an auth record read its hidden
+Create and update responses (and their `/api/batch` counterparts) and
+`pb.apis.enrich_records` (`records.hide_unmanaged_auth_emails`, one query
+for all the records) follow it as well: before, they always showed the email, so any caller allowed to update an auth record read its hidden
 email (BUMA: `users.updateRule` lets every logged-in user update users, and
 `users.manageRule` grants the role admins the emails). A guest signup
 response therefore hides the new record's email unless `emailVisibility`

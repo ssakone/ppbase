@@ -431,6 +431,50 @@ def _update_validation_error(
     )
 
 
+async def hide_unmanaged_auth_emails(
+    engine: Any,
+    collection: Any,
+    records: list[dict[str, Any]],
+    auth: dict[str, Any] | None,
+    request_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Main auth record responses with PocketBase's email visibility.
+
+    ``EnrichRecords`` (v0.22.34 apis/record_helpers.go l.153-158 ->
+    autoIgnoreAuthRecordsEmailVisibility, l.216-279; used for the create and
+    update responses, apis/record_crud.go l.289, l.381): a hidden email is
+    shown only to an admin, the record's owner or a ``manageRule`` match,
+    one query for all the records.  ``auth`` is the token payload of the
+    requester.
+    """
+    if (getattr(collection, "type", "base") or "base") != "auth":
+        return records
+    if _is_superuser_payload(auth):
+        return records
+    hidden = [
+        record
+        for record in records
+        if "email" in record
+        and not bool(record.get("emailVisibility", False))
+        and not _is_self_auth_target(auth, collection, str(record.get("id", "")))
+    ]
+    if not hidden:
+        return records
+    visible = await auth_email_visible_ids(
+        engine,
+        collection,
+        [{"id": record.get("id"), "email_visibility": False} for record in hidden],
+        request_context,
+    )
+    refused = {id(record) for record in hidden if record.get("id") not in visible}
+    return [
+        {key: value for key, value in record.items() if key != "email"}
+        if id(record) in refused
+        else record
+        for record in records
+    ]
+
+
 async def _main_auth_record_email(
     engine: Any,
     collection: Any,
@@ -438,30 +482,11 @@ async def _main_auth_record_email(
     auth: dict[str, Any] | None,
     request_context: dict[str, Any],
 ) -> dict[str, Any]:
-    """The email visibility of a created/updated auth record response.
-
-    PocketBase enriches the create and update responses like a view
-    (v0.22.34 apis/record_crud.go l.289, l.381 -> EnrichRecord ->
-    autoIgnoreAuthRecordsEmailVisibility, apis/record_helpers.go
-    l.216-279): a hidden email is shown only to an admin, the record's
-    owner or a ``manageRule`` match.
-    """
-    if (getattr(collection, "type", "base") or "base") != "auth":
-        return record
-    record_id = str(record.get("id", "") or "")
-    if "email" not in record or bool(record.get("emailVisibility", False)):
-        return record
-    if _is_superuser_payload(auth) or _is_self_auth_target(auth, collection, record_id):
-        return record
-    visible = await auth_email_visible_ids(
-        engine,
-        collection,
-        [{"id": record_id, "email_visibility": False}],
-        request_context,
+    """The email visibility of a created/updated auth record response."""
+    (result,) = await hide_unmanaged_auth_emails(
+        engine, collection, [record], auth, request_context
     )
-    if record_id in visible:
-        return record
-    return {key: value for key, value in record.items() if key != "email"}
+    return result
 
 
 async def _relation_errors_before_hooks(

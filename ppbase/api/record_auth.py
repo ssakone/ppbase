@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -417,6 +418,8 @@ def _auth_response_expand_context(
     )
 
 
+_logger = logging.getLogger(__name__)
+
 #: ``loader(engine, auth) -> dict`` (sync or async): extra ``@request.auth.*``
 #: values of an authenticated record, see :func:`set_auth_record_rule_context`.
 AuthRecordRuleContextLoader = Callable[[Any, dict[str, Any]], Any]
@@ -455,16 +458,22 @@ async def auth_response_rule_context(
     :func:`_auth_response_expand_context` (the authenticated record as
     ``@request.auth``, no admin) merged with the keys returned by the loader
     of :func:`set_auth_record_rule_context`.  Public for host routes that
-    authenticate themselves (BUMA's username login).
+    authenticate themselves (BUMA's username login).  A failing loader adds
+    nothing (a role-gated expand is then refused) and never fails the
+    authentication, like any expand failure in PocketBase.
     """
     context = _auth_response_expand_context(request, collection, record, data)
     state = getattr(getattr(request, "app", None), "state", None)
     loader = getattr(state, "auth_record_rule_context", None)
     if loader is None:
         return context
-    extra = loader(get_engine(), dict(context["auth"]))
-    if inspect.isawaitable(extra):
-        extra = await extra
+    try:
+        extra = loader(get_engine(), dict(context["auth"]))
+        if inspect.isawaitable(extra):
+            extra = await extra
+    except Exception:  # logged; the expand stays restrictive
+        _logger.warning("auth record rule context loader failed", exc_info=True)
+        return context
     if isinstance(extra, dict):
         context["auth"].update(
             {key: value for key, value in extra.items() if key not in _SECRET_AUTH_KEYS}

@@ -941,6 +941,14 @@ async def test_auth_response_context_loader_extends_the_authenticated_record(
         )
         assert response.status_code == 200, response.text
         assert response.json()["record"]["expand"]["b"]["id"] == env["ids"]["b1"]
+
+        # A failing loader never fails the authentication; the expand is
+        # refused (fails closed).
+        def broken(engine: Any, auth: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("loader down")
+
+        set_auth_record_rule_context(app, broken)
+        assert "expand" not in (await login("granted"))["record"]
     finally:
         set_auth_record_rule_context(app, None)
         await app_client.delete(
@@ -969,6 +977,13 @@ async def test_pb_enrich_combines_default_and_query_expands_with_body_data(
             request, record, collection=sales, default_expand="customers,tag"
         )
 
+    @app_pb.get("/ext/wsa6/user-plain")
+    async def enriched_user(request: Request):
+        engine = get_engine()
+        users = await resolve_collection(engine, names["u"])
+        record = await get_record(engine, users, ids["plain"])
+        return await app_pb.apis.enrich_record(request, record, collection=users)
+
     transport = ASGITransport(app=app_pb.get_app())
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         hidden = (
@@ -979,6 +994,22 @@ async def test_pb_enrich_combines_default_and_query_expands_with_body_data(
                 "/ext/wsa6/sale-defaults?expand=user", json={"reveal": True}
             )
         ).json()
+        # EnrichRecords also applies the email visibility to the main record.
+        user_emails = {
+            caller: "email"
+            in (
+                await client.get("/ext/wsa6/user-plain", headers=_headers(env, caller))
+            ).json()
+            for caller in ("guest", "reader", "manager", "plain", "admin")
+        }
+
+    assert user_emails == {
+        "guest": False,
+        "reader": False,
+        "manager": True,
+        "plain": True,
+        "admin": True,
+    }
 
     assert _names(hidden["expand"]["customers"]) == ["c3", "c1"]
     assert hidden["expand"]["user"]["id"] == ids["plain"]

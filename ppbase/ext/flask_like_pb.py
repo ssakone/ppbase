@@ -449,7 +449,9 @@ class _BuiltinRouteMiddlewares:
     ) -> list[dict[str, Any]]:
         """``apis.EnrichRecords``: ``?expand`` (and ``?fields``) of the request.
 
-        The ``?expand`` paths are appended to ``default_expand`` (v0.22.34
+        The hidden email of an auth record is removed unless the requester
+        is an admin, its owner or a ``manageRule`` match (l.153-158). The
+        ``?expand`` paths are appended to ``default_expand`` (v0.22.34
         apis/record_helpers.go l.160-163). Every expanded record must satisfy
         its collection ``viewRule`` for this request (admins excepted), with
         the same rule context as the records API and a JSON request body as
@@ -468,6 +470,8 @@ class _BuiltinRouteMiddlewares:
         engine = get_engine()
         collection_ref = await self._resolve_collection_ref(engine, collection, records[0])
 
+        from ppbase.api import records as records_api
+
         result_records = [dict(item) for item in records]
         body_data = await self._request_body_data(request)
         if auth_record is not None:
@@ -476,15 +480,18 @@ class _BuiltinRouteMiddlewares:
             request_context = await auth_response_rule_context(
                 request, collection_ref, auth_record, body_data
             )
+            auth_payload = request_context.get("auth")
         else:
             # Looked up at call time: host applications may extend the rule
             # context of the records API (BUMA flattens role permissions).
-            from ppbase.api import records as records_api
-
             auth_payload = await self._resolve_request_auth(request)
             _auth_ctx, request_context = records_api._prepare_rule_context(
                 request, auth_payload, data=body_data
             )
+        # The main auth records' email visibility (EnrichRecords l.156).
+        result_records = await records_api.hide_unmanaged_auth_emails(
+            engine, collection_ref, result_records, auth_payload, request_context
+        )
 
         expand_value = ",".join(
             part
