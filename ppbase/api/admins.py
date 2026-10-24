@@ -31,8 +31,8 @@ from ppbase.api.deps import (
     require_admin,
 )
 from ppbase.db.engine import get_async_session
-from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services import admin_service
+from ppbase.services.legacy_validation import byte_length, is_email_format, length_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,8 +40,18 @@ router = APIRouter()
 # PocketBase 0.22.34 validation wording, measured on the official binary.
 _BLANK = {"code": "validation_required", "message": "Cannot be blank."}
 _VALIDATE_FORM = "An error occurred while validating the form."
+_GENERIC = "Something went wrong while processing your request."
 _EMAIL_MAX_BYTES = 255  # forms/admin_password_reset_request.go:52
-_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX = 10, 72  # forms/admin_password_reset_confirm.go:45
+# forms/admin_password_reset_confirm.go:45 and forms/admin_upsert.go:78:
+# validation.Length(10, 72), counted in bytes like every ozzo Length rule.
+_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX = 10, 72
+
+
+def _admin_password_error(password: str) -> dict[str, str] | None:
+    """0.22.34 admin password rule; an empty password is left to ``Required``."""
+    if password and not _ADMIN_PASSWORD_MIN <= byte_length(password) <= _ADMIN_PASSWORD_MAX:
+        return length_error(_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -280,21 +290,14 @@ async def request_password_reset(
     email = _string_fields(body, "email")["email"]
     # Same rules, in the same order, as forms/admin_password_reset_request.go:47-55
     # (ozzo stops at the first failing rule): Required, Length(1, 255) counted
-    # in bytes like Go's len(), then EmailFormat.  Measured on 0.22.34: 255 bytes
-    # pass, 256 bytes and 139 two-byte runes (269 bytes) give the length error.
+    # in bytes like Go's len(), then EmailFormat (govalidator IsEmail, see
+    # services/legacy_validation.py).  Measured on 0.22.34: 255 bytes pass,
+    # 256 bytes and 139 two-byte runes (269 bytes) give the length error.
     if not email:
         raise _bad_request(_VALIDATE_FORM, {"email": _BLANK})
-    if len(email.encode("utf-8")) > _EMAIL_MAX_BYTES:
-        raise _bad_request(
-            _VALIDATE_FORM,
-            {
-                "email": {
-                    "code": "validation_length_out_of_range",
-                    "message": f"The length must be between 1 and {_EMAIL_MAX_BYTES}.",
-                }
-            },
-        )
-    if not _EMAIL_RE.match(email):
+    if byte_length(email) > _EMAIL_MAX_BYTES:
+        raise _bad_request(_VALIDATE_FORM, {"email": length_error(1, _EMAIL_MAX_BYTES)})
+    if not is_email_format(email):
         raise _bad_request(
             _VALIDATE_FORM,
             {"email": {"code": "validation_is_email", "message": "Must be a valid email address."}},
@@ -330,15 +333,14 @@ async def confirm_password_reset(
                 "code": "validation_invalid_token",
                 "message": "Invalid or expired token.",
             }
+    # Length(10, 72) counts bytes: measured on 0.22.34, five two-byte
+    # characters (10 bytes) pass and 37 (74 bytes) fail, with a valid token or
+    # not; bcrypt could not hash more than 72 bytes anyway.
+    password_error = _admin_password_error(password)
     if not password:
         errors["password"] = _BLANK
-    elif not _ADMIN_PASSWORD_MIN <= len(password) <= _ADMIN_PASSWORD_MAX:
-        errors["password"] = {
-            "code": "validation_length_out_of_range",
-            "message": (
-                f"The length must be between {_ADMIN_PASSWORD_MIN} and {_ADMIN_PASSWORD_MAX}."
-            ),
-        }
+    elif password_error:
+        errors["password"] = password_error
     if not confirm:
         errors["passwordConfirm"] = _BLANK
     elif confirm != password:
@@ -347,7 +349,7 @@ async def confirm_password_reset(
             "message": "Values don't match.",
         }
     if errors:
-        raise _bad_request("Something went wrong while processing your request.", errors)
+        raise _bad_request(_GENERIC, errors)
 
     await admin_service.set_admin_password(session, admin, password)
     admin.updated = datetime.now(timezone.utc)
@@ -378,24 +380,19 @@ async def create_admin(
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new admin (admin auth required)."""
-    from ppbase.models.field_types import FieldValidationError
-    from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
-    from ppbase.services.auth_service import validate_password_value
+    from ppbase.services.admin_service import _admin_to_dict
 
-    try:
-        validate_password_value(
-            await _get_superusers_collection(session),
-            body.password,
-        )
-    except FieldValidationError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "status": 400,
-                "message": "An error occurred while validating the submitted data.",
-                "data": {"password": {"code": exc.code, "message": exc.message}},
-            },
-        )
+    # The 0.22.34 admin form: Required, then Length(10, 72) in bytes
+    # (forms/admin_upsert.go:75-79).  Measured: 9 bytes and 74 bytes (37
+    # two-byte characters) answer 400, 10 bytes (five two-byte characters)
+    # pass.  The former rule counted 8 to 71 characters: it refused five
+    # two-byte characters, accepted nine ASCII ones and let bcrypt fail with a
+    # 500 on 37 two-byte ones.
+    if not body.password:
+        raise _bad_request(_GENERIC, {"password": _BLANK})
+    password_error = _admin_password_error(body.password)
+    if password_error:
+        raise _bad_request(_GENERIC, {"password": password_error})
 
     admin = await admin_service.create_admin(
         session, body.email, body.password, body.avatar
@@ -437,6 +434,13 @@ async def update_admin(
     from ppbase.services.admin_service import _admin_to_dict
 
     data = body.model_dump(exclude_none=True)
+    # forms/admin_upsert.go:75-79: a new password has 10 to 72 bytes; an
+    # unknown admin is a 404 first (apis/admin.go:285-288).  Measured on
+    # 0.22.34.  ``passwordConfirm`` stays optional here, a PPBase contract
+    # (0.22.34 requires it with a password, forms/admin_upsert.go:80-84).
+    password_error = _admin_password_error(body.password or "")
+    if password_error and await admin_service.get_admin(session, admin_id) is not None:
+        raise _bad_request(_GENERIC, {"password": password_error})
     admin = await admin_service.update_admin(session, admin_id, data)
     if admin is None:
         raise HTTPException(

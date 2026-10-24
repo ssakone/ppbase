@@ -309,3 +309,142 @@ async def test_password_change_by_patch_also_clears_the_throttle(
     )
     assert patched.status_code == 200, patched.text
     assert (await _row(admin["id"]))["last_reset_sent_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# Measured on 0.22.34: byte lengths, e-mail format and request bodies
+# ---------------------------------------------------------------------------
+
+LENGTH_10_72 = {
+    "code": "validation_length_out_of_range",
+    "message": "The length must be between 10 and 72.",
+}
+IS_EMAIL = {"code": "validation_is_email", "message": "Must be a valid email address."}
+
+
+async def _legacy_reset_token(admin: dict[str, Any]) -> str:
+    """A reset link of PocketBase 0.22.34 (tokens/admin.go:19-26) for the current token key."""
+    row = await _row(admin["id"])
+    claims = {
+        "exp": int(time.time()) + 600,
+        "id": admin["id"],
+        "type": "admin",
+        "email": admin["email"],
+    }
+    return pyjwt.encode(claims, row["token_key"] + await _reset_secret(), algorithm="HS256")
+
+
+async def test_confirm_password_length_counts_bytes_like_pocketbase(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """forms/admin_password_reset_confirm.go:45 Length(10, 72) counts bytes.
+
+    Measured on 0.22.34 with a valid 0.22 token and with an invalid one:
+    five two-byte characters (10 bytes) pass, 37 (74 bytes) fail; the former
+    PPBase rule counted characters, refused the first and answered 500 (bcrypt
+    limit) for the second.
+    """
+    admin = await _create_admin(app_client, admin_token)
+    cases = [
+        ("é" * 4 + "a", False),  # 9 bytes
+        ("é" * 5, True),  # 10 bytes
+        ("é" * 9, True),
+        ("é" * 36, True),  # 72 bytes
+        ("é" * 37, False),  # 74 bytes
+        ("é" * 40, False),
+        ("a" * 9, False),
+        ("a" * 10, True),
+        ("a" * 72, True),
+        ("a" * 73, False),
+        ("\U0001f600" * 18, True),  # 72 bytes
+        ("\U0001f600" * 19, False),  # 76 bytes
+    ]
+    for password, valid in cases:
+        garbage = await app_client.post(
+            "/api/admins/confirm-password-reset",
+            json={"token": "garbage", "password": password, "passwordConfirm": password},
+        )
+        expected = (
+            {"token": INVALID_TOKEN}
+            if valid
+            else {"password": LENGTH_10_72, "token": INVALID_TOKEN}
+        )
+        assert garbage.status_code == 400, garbage.text
+        assert _error(garbage) == (GENERIC, expected)
+
+        resp = await app_client.post(
+            "/api/admins/confirm-password-reset",
+            json={
+                "token": await _legacy_reset_token(admin),
+                "password": password,
+                "passwordConfirm": password,
+            },
+        )
+        if valid:
+            assert resp.status_code == 204, resp.text
+            login = await app_client.post(
+                "/api/admins/auth-with-password",
+                json={"identity": admin["email"], "password": password},
+            )
+            assert login.status_code == 200, login.text
+        else:
+            assert resp.status_code == 400, resp.text
+            assert _error(resp) == (GENERIC, {"password": LENGTH_10_72})
+
+
+async def test_confirm_reads_lone_surrogates_like_go(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """Go's JSON decoder reads each lone surrogate escape as U+FFFD (3 bytes).
+
+    Measured on 0.22.34: ten of them (30 bytes) are a valid password and the
+    same JSON then signs in; three plus "a" (10 bytes) pass the length rule.
+    """
+    admin = await _create_admin(app_client, admin_token)
+    lone = b'"' + b"\\ud800" * 10 + b'"'
+    token = (await _legacy_reset_token(admin)).encode()
+    body = (
+        b'{"token": "' + token + b'", "password": ' + lone + b', "passwordConfirm": ' + lone + b"}"
+    )
+    resp = await app_client.post(
+        "/api/admins/confirm-password-reset",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 204, resp.text
+    login = await app_client.post(
+        "/api/admins/auth-with-password",
+        content=b'{"identity": "' + admin["email"].encode() + b'", "password": ' + lone + b"}",
+        headers={"Content-Type": "application/json"},
+    )
+    assert login.status_code == 200, login.text
+
+    short = b'"' + b"\\ud800" * 3 + b'a"'
+    garbage = b'{"token": "garbage", "password": ' + short + b', "passwordConfirm": ' + short + b"}"
+    resp = await app_client.post(
+        "/api/admins/confirm-password-reset",
+        content=garbage,
+        headers={"Content-Type": "application/json"},
+    )
+    assert _error(resp) == (GENERIC, {"token": INVALID_TOKEN})
+
+
+async def test_request_email_format_is_govalidator(app_client: AsyncClient, sent_mails) -> None:
+    """is.EmailFormat (forms/admin_password_reset_request.go:53), measured on 0.22.34.
+
+    The three addresses of the review were accepted by the former PPBase
+    pattern; govalidator also accepts a few odd quoted local parts.
+    """
+    for email in (
+        "someone@[127.0.0.1]",
+        "us..er@example.com",
+        ".user@example.com",
+        '"john"@c11.test',
+    ):
+        resp = await app_client.post("/api/admins/request-password-reset", json={"email": email})
+        assert resp.status_code == 400, (email, resp.text)
+        assert _error(resp) == (VALIDATE_FORM, {"email": IS_EMAIL})
+    for email in ('"j"@c11.test', "user@c11.test.", "١@c11.test", "a" * 65 + "@c11.test"):
+        resp = await app_client.post("/api/admins/request-password-reset", json={"email": email})
+        assert resp.status_code == 204, (email, resp.text)
+    assert sent_mails == []
