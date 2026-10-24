@@ -146,8 +146,9 @@ strings, so this needs two accounts sharing an id.
   (0.22.34), see above.
 - The record verification and password reset requests have no resend
   throttle (0.22.34: 120 seconds, `forms/record_verification_request.go:37`,
-  `forms/record_password_reset_request.go:38`), and the record e-mails do not
-  use the 0.22 templates of the settings (`meta.verificationTemplate`,
-  `meta.resetPasswordTemplate`, `meta.confirmEmailChangeTemplate`,
-  `models/settings/settings.go:81-83`); the admin password reset has the
-  0.22.34 throttle.
+  `forms/record_password_reset_request.go:38`), and the record e-mails have
+  PPBase's fixed text: neither the 0.22 templates of the settings
+  (`meta.verificationTemplate`, `meta.resetPasswordTemplate`,
+  `meta.confirmEmailChangeTemplate`, `models/settings/settings.go:81-83`) nor
+  the templates of the auth collection options are used. The admin password
+  reset has the 0.22.34 throttle.
