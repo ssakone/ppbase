@@ -71,16 +71,26 @@ on three points:
   `LEFT JOIN "target" AS "__pbN" ON ...`; a multiple relation uses
   `LEFT JOIN LATERAL unnest(col) AS "__pbN"(value) ON TRUE` (one row per item,
   one NULL row for an empty list, like `json_each`).
-- The condition tree is rendered as `EXISTS (SELECT 1 FROM (SELECT 1) AS
-  "__pb_row" LEFT JOIN ... WHERE ...)` correlated to the current row. An
-  EXISTS distributes over `||`; for `&&`, the operands that share a join stay
-  in one EXISTS (same joined row), the others get their own. This is the
-  `SELECT DISTINCT ... LEFT JOIN` of PocketBase.
+- The condition tree keeps PocketBase's "one joined row" semantics: a join
+  group distributes over `||`, and the `&&` operands that share a join stay
+  in one group (same joined row), the others get their own. A group reading
+  the current record is rendered `id IN (SELECT base.id FROM <table> AS base
+  LEFT JOIN ... WHERE ...)`, the shape of PocketBase's `SELECT DISTINCT ...
+  LEFT JOIN`, which PostgreSQL runs as a semi-join; a group without the
+  current record (only `@collection` joins) is an uncorrelated `EXISTS`
+  evaluated once.
 - A list rule and the request filter are parsed as `(rule) && (filter)`, so
   they share their joins like PocketBase's single resolver.
 - The multi-match is a `NOT EXISTS` over the same joins with their own
   aliases (`_many_vs_one_sql`, `_many_vs_many_sql`), with the 0.22.34 NULL
-  clause (`_multi_match_failure`).
+  clause (`_multi_match_failure`). When the path starts at the current
+  record, it lists every record's rows and matches them on the record id,
+  like PocketBase's `WHERE __mm_base.id = base.id`, so PostgreSQL can use an
+  anti-join.
+- Performance on synthetic tables (200,000 records, 1,000 targets, local
+  PostgreSQL 16): `rel.name = ...` 7 ms before, 22 ms now; `rels.name ?=`
+  7.9 s before, 0.2 s now; `rels.name =` 0.46 s (any-match before);
+  single-record rule checks about 1 ms.
 - `=`/`!=` on a path leaf follow `resolveEqualExpr` (`_pb_equal_sql`), with a
   text cast where PostgreSQL types would refuse `''`. JSON leaves keep
   PPBase's existing JSON comparison.
