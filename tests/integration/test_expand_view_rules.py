@@ -837,3 +837,131 @@ async def test_create_and_update_responses_hide_unmanaged_emails(
             f"/api/collections/{collection['id']}",
             headers={"Authorization": admin_token},
         )
+
+
+# ---------------------------------------------------------------------------
+# Auth responses: host extension of the authenticated record's context
+# ---------------------------------------------------------------------------
+
+
+async def test_auth_response_context_loader_extends_the_authenticated_record(
+    app_client: AsyncClient, admin_token: str, env: dict[str, Any]
+) -> None:
+    """``set_auth_record_rule_context``: the BUMA role rule on auth responses.
+
+    PocketBase 0.22.34 resolves ``@request.auth.role.permission.*`` from the
+    authenticated record (apis/record_helpers.go l.105-116); PPBase asks the
+    host's loader for that record (probe group ``auth``, rolereader/rolenone).
+    """
+    from ppbase.api.record_auth import set_auth_record_rule_context
+
+    app = app_client._transport.app  # type: ignore[attr-defined]
+    sfx = uuid.uuid4().hex[:8]
+    name = f"xl_{sfx}"
+    bcustomer = await resolve_collection(get_engine(), env["names"]["b"])
+    collection = await _collection(
+        app_client,
+        admin_token,
+        {
+            "name": name,
+            "type": "auth",
+            "schema": [_relation("b", bcustomer.id, 1)],
+            "options": AUTH_OPTIONS,
+        },
+    )
+    calls: list[dict[str, Any]] = []
+    try:
+        ids = {}
+        for key in ("granted", "denied"):
+            ids[key] = await _create(
+                app_client,
+                admin_token,
+                name,
+                {
+                    "email": f"{key}-{sfx}@example.invalid",
+                    "password": PASSWORD,
+                    "passwordConfirm": PASSWORD,
+                    "b": env["ids"]["b1"],
+                },
+            )
+
+        async def loader(engine: Any, auth: dict[str, Any]) -> dict[str, Any]:
+            calls.append(dict(auth))
+            return {
+                "role.permission.isAdmin": False,
+                "role.permission.customer.read": auth.get("id") == ids["granted"],
+                "token_key": "never-merged",
+            }
+
+        async def login(key: str) -> dict[str, Any]:
+            response = await app_client.post(
+                f"/api/collections/{name}/auth-with-password",
+                params={"expand": "b"},
+                json={"identity": f"{key}-{sfx}@example.invalid", "password": PASSWORD},
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        # Without the host loader the role keys are absent: refused.
+        assert "expand" not in (await login("granted"))["record"]
+        assert not calls
+
+        set_auth_record_rule_context(app, loader)
+        granted = await login("granted")
+        assert granted["record"]["expand"]["b"]["id"] == env["ids"]["b1"]
+        assert "expand" not in (await login("denied"))["record"]
+        assert calls and calls[0]["id"] == ids["granted"]
+        assert calls[0]["collectionName"] == name
+        assert calls[0]["type"] == "authRecord"
+
+        response = await app_client.post(
+            f"/api/collections/{name}/auth-refresh",
+            headers={"Authorization": granted["token"]},
+            params={"expand": "b"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["record"]["expand"]["b"]["id"] == env["ids"]["b1"]
+    finally:
+        set_auth_record_rule_context(app, None)
+        await app_client.delete(
+            f"/api/collections/{collection['id']}",
+            headers={"Authorization": admin_token},
+        )
+
+
+async def test_pb_enrich_combines_default_and_query_expands_with_body_data(
+    app_client: AsyncClient, env: dict[str, Any]
+) -> None:
+    """EnrichRecords appends ``?expand`` to the defaults and sees the body."""
+    from httpx import ASGITransport
+
+    from ppbase import PPBase
+
+    names, ids = env["names"], env["ids"]
+    app_pb = PPBase()
+
+    @app_pb.post("/ext/wsa6/sale-defaults")
+    async def enriched_sale(request: Request):
+        engine = get_engine()
+        sales = await resolve_collection(engine, names["s"])
+        record = await get_record(engine, sales, ids["s1"])
+        return await app_pb.apis.enrich_record(
+            request, record, collection=sales, default_expand="customers,tag"
+        )
+
+    transport = ASGITransport(app=app_pb.get_app())
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        hidden = (
+            await client.post("/ext/wsa6/sale-defaults?expand=user", json={})
+        ).json()
+        revealed = (
+            await client.post(
+                "/ext/wsa6/sale-defaults?expand=user", json={"reveal": True}
+            )
+        ).json()
+
+    assert _names(hidden["expand"]["customers"]) == ["c3", "c1"]
+    assert hidden["expand"]["user"]["id"] == ids["plain"]
+    assert "tag" not in hidden["expand"]
+    # The tag viewRule reads @request.data.reveal.
+    assert _names(revealed["expand"]["tag"]) == "t1"

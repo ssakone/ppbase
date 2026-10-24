@@ -18,7 +18,9 @@ Provides authentication endpoints for collections of type ``auth``:
 
 from __future__ import annotations
 
+import inspect
 import json
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -415,6 +417,61 @@ def _auth_response_expand_context(
     )
 
 
+#: ``loader(engine, auth) -> dict`` (sync or async): extra ``@request.auth.*``
+#: values of an authenticated record, see :func:`set_auth_record_rule_context`.
+AuthRecordRuleContextLoader = Callable[[Any, dict[str, Any]], Any]
+
+_SECRET_AUTH_KEYS = frozenset({"password_hash", "token_key", "_raw_token"})
+
+
+def set_auth_record_rule_context(
+    app: Any, loader: AuthRecordRuleContextLoader | None
+) -> None:
+    """Install (or remove, with ``None``) the host's auth-record rule context.
+
+    PocketBase resolves ``@request.auth.<relation>.<field>`` from the auth
+    record itself; PPBase reads the flat ``@request.auth`` keys of the rule
+    context, which a host application may extend (BUMA flattens
+    ``role.permission.*``).  For the HTTP request's own identity the host
+    extends the records API context; an auth response (auth-with-password,
+    OTP, OAuth2, auth-refresh, impersonate, ``pb.apis.record_auth_response``)
+    expands as the *authenticated* record instead (v0.22.34
+    apis/record_helpers.go l.105-116), so it calls this loader with that
+    record's ``@request.auth`` payload and merges the returned keys.
+    """
+    if loader is not None and not callable(loader):
+        raise TypeError("The auth record rule context loader must be callable.")
+    app.state.auth_record_rule_context = loader
+
+
+async def auth_response_rule_context(
+    request: Request,
+    collection: Any,
+    record: dict[str, Any],
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The rule context of an auth response ``expand``, host extension included.
+
+    :func:`_auth_response_expand_context` (the authenticated record as
+    ``@request.auth``, no admin) merged with the keys returned by the loader
+    of :func:`set_auth_record_rule_context`.  Public for host routes that
+    authenticate themselves (BUMA's username login).
+    """
+    context = _auth_response_expand_context(request, collection, record, data)
+    state = getattr(getattr(request, "app", None), "state", None)
+    loader = getattr(state, "auth_record_rule_context", None)
+    if loader is None:
+        return context
+    extra = loader(get_engine(), dict(context["auth"]))
+    if inspect.isawaitable(extra):
+        extra = await extra
+    if isinstance(extra, dict):
+        context["auth"].update(
+            {key: value for key, value in extra.items() if key not in _SECRET_AUTH_KEYS}
+        )
+    return context
+
+
 async def _passes_auth_rule(
     engine: Any,
     collection: Any,
@@ -696,7 +753,7 @@ async def api_auth_with_password(
                 [result["record"]],
                 expand_str,
                 all_colls,
-                request_context=_auth_response_expand_context(
+                request_context=await auth_response_rule_context(
                     request, collection, result["record"], payload
                 ),
             )
@@ -928,7 +985,7 @@ async def api_auth_with_otp(
                 [result["record"]],
                 expand_str,
                 all_colls,
-                request_context=_auth_response_expand_context(
+                request_context=await auth_response_rule_context(
                     request, collection, result["record"], payload
                 ),
             )
@@ -1104,7 +1161,7 @@ async def api_auth_with_oauth2(
                     [response_data["record"]],
                     expand_str,
                     all_colls,
-                    request_context=_auth_response_expand_context(
+                    request_context=await auth_response_rule_context(
                         request, collection, response_data["record"], payload
                     ),
                 )
@@ -1234,7 +1291,7 @@ async def api_auth_refresh(
                 [result["record"]],
                 expand_str,
                 all_colls,
-                request_context=_auth_response_expand_context(
+                request_context=await auth_response_rule_context(
                     request, collection, result["record"], None
                 ),
             )
@@ -1357,7 +1414,7 @@ async def api_impersonate_record(
             [result["record"]],
             expand_str,
             all_colls,
-            request_context=_auth_response_expand_context(
+            request_context=await auth_response_rule_context(
                 request, collection, result["record"], data
             ),
         )

@@ -449,11 +449,14 @@ class _BuiltinRouteMiddlewares:
     ) -> list[dict[str, Any]]:
         """``apis.EnrichRecords``: ``?expand`` (and ``?fields``) of the request.
 
-        Every expanded record must satisfy its collection ``viewRule`` for
-        this request (admins excepted), with the same rule context as the
-        records API. ``auth_record`` evaluates the rules as that auth record
-        instead of the request auth, like PocketBase's ``RecordAuthResponse``
-        (apis/record_helpers.go l.105-116).
+        The ``?expand`` paths are appended to ``default_expand`` (v0.22.34
+        apis/record_helpers.go l.160-163). Every expanded record must satisfy
+        its collection ``viewRule`` for this request (admins excepted), with
+        the same rule context as the records API and a JSON request body as
+        ``@request.data`` (``RequestInfo``). ``auth_record`` evaluates the
+        rules as that auth record instead of the request auth, like
+        PocketBase's ``RecordAuthResponse`` (l.105-116), host extension of
+        ``set_auth_record_rule_context`` included.
         """
         if not records:
             return []
@@ -466,11 +469,12 @@ class _BuiltinRouteMiddlewares:
         collection_ref = await self._resolve_collection_ref(engine, collection, records[0])
 
         result_records = [dict(item) for item in records]
+        body_data = await self._request_body_data(request)
         if auth_record is not None:
-            from ppbase.api.record_auth import _auth_response_expand_context
+            from ppbase.api.record_auth import auth_response_rule_context
 
-            request_context = _auth_response_expand_context(
-                request, collection_ref, auth_record
+            request_context = await auth_response_rule_context(
+                request, collection_ref, auth_record, body_data
             )
         else:
             # Looked up at call time: host applications may extend the rule
@@ -479,12 +483,17 @@ class _BuiltinRouteMiddlewares:
 
             auth_payload = await self._resolve_request_auth(request)
             _auth_ctx, request_context = records_api._prepare_rule_context(
-                request, auth_payload
+                request, auth_payload, data=body_data
             )
 
-        expand_value = str(request.query_params.get("expand", "") or "").strip()
-        if not expand_value:
-            expand_value = str(default_expand or "").strip()
+        expand_value = ",".join(
+            part
+            for part in (
+                str(default_expand or "").strip(),
+                str(request.query_params.get("expand", "") or "").strip(),
+            )
+            if part
+        )
         if expand_value:
             all_collections = await get_all_collections(engine)
             await expand_records(
@@ -504,6 +513,22 @@ class _BuiltinRouteMiddlewares:
             ]
 
         return result_records
+
+    @staticmethod
+    async def _request_body_data(request: Request) -> dict[str, Any]:
+        """``RequestInfo.Data`` of a JSON request body (``{}`` otherwise).
+
+        Multipart and urlencoded bodies are not read here (``{}``).
+        """
+        if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+            return {}
+        if "application/json" not in request.headers.get("content-type", "").lower():
+            return {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - an unreadable body is no data
+            return {}
+        return body if isinstance(body, dict) else {}
 
     async def enrich_record(
         self,
@@ -627,6 +652,7 @@ class FlaskLikePB:
         self._extensions = ExtensionRegistry()
         self._pending_hook_targets: list[str] = []
         self._extensions_loaded = False
+        self._auth_record_rule_context: Any | None = None
         self.apis = _BuiltinRouteMiddlewares(self)
 
     def configure(self, **settings_overrides: object) -> FlaskLikePB:
@@ -657,6 +683,26 @@ class FlaskLikePB:
         self.settings.error_compat = normalized
         if self._app is not None:
             set_error_compat(self._app, normalized)
+        return self
+
+    def set_auth_record_rule_context(self, loader: Any | None) -> FlaskLikePB:
+        """Extend the rule context of auth-response expands.
+
+        ``loader(engine, auth)`` (sync or async) receives the
+        ``@request.auth`` payload of the authenticated record of an auth
+        response and returns extra ``@request.auth.*`` keys (flattened dotted
+        keys allowed), merged before the expanded records are filtered by
+        their ``viewRule`` (``ppbase.api.record_auth.set_auth_record_rule_context``).
+        ``None`` removes it. Callable before the app is built and from a
+        hooks ``register(pb)`` function at startup.
+        """
+        from ppbase.api.record_auth import set_auth_record_rule_context
+
+        if loader is not None and not callable(loader):
+            raise TypeError("The auth record rule context loader must be callable.")
+        self._auth_record_rule_context = loader
+        if self._app is not None:
+            set_auth_record_rule_context(self._app, loader)
         return self
 
     @property
@@ -698,6 +744,10 @@ class FlaskLikePB:
                 # marker-without-journal case that cannot be detected locally.
                 deferred_extension_loader=load_pending_extensions,
             )
+            if self._auth_record_rule_context is not None:
+                from ppbase.api.record_auth import set_auth_record_rule_context
+
+                set_auth_record_rule_context(self._app, self._auth_record_rule_context)
         return self._app
 
     def start(self, host: str | None = None, port: int | None = None) -> None:
@@ -1291,6 +1341,7 @@ class FlaskLikePB:
     def _reset_for_tests(self) -> None:
         """Reset singleton state between tests."""
         self._app = None
+        self._auth_record_rule_context = None
         self._settings_kwargs = {}
         self.settings = Settings()
         self._extensions = ExtensionRegistry()
