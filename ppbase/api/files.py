@@ -3,18 +3,25 @@
 Endpoints:
     POST /api/files/token
     GET  /api/files/{collectionIdOrName}/{recordId}/{filename}
+    HEAD /api/files/{collectionIdOrName}/{recordId}/{filename}
+
+Downloads follow PocketBase's ``apis/file.go`` ``download`` and
+``tools/filesystem`` ``Serve``: content type from the ``.attrs`` side-car,
+``Content-Disposition``, thumbnails, security and cache headers.  The rules
+live in :mod:`ppbase.storage.serving` and :mod:`ppbase.storage.thumbs`; see
+``docs/file-serving.md``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import mimetypes
+import os
 import re
-from io import BytesIO
+import weakref
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
-from urllib.parse import quote
+from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -41,7 +48,6 @@ from ppbase.services.file_storage import (
     StorageFileStream,
     open_file_stream,
     pin_storage_config,
-    read_local_storage_variant_bytes,
     write_local_storage_variant_bytes,
 )
 from ppbase.services.record_service import check_record_rule
@@ -50,10 +56,32 @@ from ppbase.services.write_barrier import (
     WriteBarrierLease,
     mutation_write_barrier_on_connection,
 )
+from ppbase.storage.local_variants import (
+    OversizedFileAttributes,
+    open_local_stream,
+    read_local_attrs,
+)
+from ppbase.storage.serving import (
+    ATTRS_SUFFIX,
+    CACHE_CONTROL,
+    CONTENT_SECURITY_POLICY,
+    FILE_SECURITY_HEADERS,
+    FORCE_ATTACHMENT_PARAM,
+    THUMB_IMAGE_CONTENT_TYPES,
+    InvalidFileAttributes,
+    content_disposition,
+    disposition_type,
+    encode_attrs,
+    force_attachment,
+    latin1_header_value,
+    parse_attrs,
+    response_content_type,
+    thumb_names,
+    thumb_size_allowed,
+)
+from ppbase.storage.thumbs import create_thumb_bytes
 
 router = APIRouter()
-_THUMB_OPTION_PATTERN = re.compile(r"^(\d+)x(\d+)([tbf]?)$")
-_SUPPORTED_THUMB_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 _QUERY_SOURCE_RE = re.compile(
     r'\b(?:FROM|JOIN)\s+("(?P<qtable>[^"]+)"|(?P<table>[A-Za-z_][A-Za-z0-9_]*))'
     r'(?:\s+(?:AS\s+)?("(?P<qalias>[^"]+)"|(?P<alias>[A-Za-z_][A-Za-z0-9_]*)))?',
@@ -76,9 +104,28 @@ _SQL_KEYWORDS = {
     "where",
 }
 
+#: Concurrent thumbnail generations and their maximum wait, like
+#: ``bindFileApi`` (v0.22.34 ``apis/file.go`` l.33-35: ``NumCPU() + 2`` and
+#: 60 seconds; v0.40.6 l.27-41 keeps these defaults, overridable there by
+#: ``PB_THUMBS_MAX_WORKERS``/``PB_THUMBS_MAX_WAIT``).
+_THUMB_GENERATION_MAX_WAIT_SECONDS = 60.0
+_thumb_generation_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+#: Returned by :func:`_resolve_thumbnail` on a lock-free cache miss.
+_THUMBNAIL_CACHE_MISS = object()
+
 
 class _ThumbnailGenerationRequiresBarrier(Exception):
     """Restart a cache-miss request after acquiring the shared barrier."""
+
+
+@dataclass
+class _ServedThumbnail:
+    stream: StorageFileStream
+    served_name: str
+    content_type: str
 
 
 def _not_found_error() -> HTTPException:
@@ -103,39 +150,15 @@ def _file_token_error() -> HTTPException:
     )
 
 
-def _parse_download_option(request: Request) -> tuple[bool, str | None]:
-    """Parse ``download`` query parameter.
-
-    Returns:
-        ``(force_download, custom_filename)``
-    """
-    raw = request.query_params.get("download")
-    if raw is None:
-        return False, None
-
-    value = str(raw).strip()
-    if value.lower() in {"0", "f", "false", "no", "off"}:
-        return False, None
-    if value == "" or value.lower() in {"1", "t", "true", "yes", "on"}:
-        return True, None
-
-    # Accept a custom filename as non-empty value.
-    custom_filename = os.path.basename(value)
-    if not custom_filename:
-        return True, None
-    return True, custom_filename
-
-
-def _parse_thumb_option(request: Request) -> str | None:
-    """Parse and normalize the optional ``thumb`` query parameter."""
-    raw = request.query_params.get("thumb")
-    if raw is None:
-        return None
-
-    value = str(raw).strip().lower()
-    if not value:
-        return None
-    return value
+def _first_query_value(request: Request, name: str) -> str | None:
+    """Go's ``url.Values.Get``: the first value of a repeated parameter."""
+    params = request.query_params
+    getlist = getattr(params, "getlist", None)
+    if callable(getlist):
+        values = getlist(name)
+        return str(values[0]) if values else None
+    value = params.get(name)
+    return None if value is None else str(value)
 
 
 def _guess_media_type(filename: str) -> str:
@@ -145,186 +168,238 @@ def _guess_media_type(filename: str) -> str:
     return "application/octet-stream"
 
 
-def _attachment_content_disposition(filename: str) -> str:
-    """Build an injection-safe RFC 5987 attachment header value."""
-    cleaned = "".join(
-        "_" if ord(char) < 32 or ord(char) == 127 else char
-        for char in os.path.basename(filename)
-    ).strip()
-    if not cleaned:
-        cleaned = "download"
-    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii") or "download"
-    ascii_name = ascii_name.replace("\\", "_").replace('"', "'")
-    encoded_name = quote(cleaned, safe="")
-    return (
-        f'attachment; filename="{ascii_name}"; '
-        f"filename*=UTF-8''{encoded_name}"
-    )
+def _fallback_content_type(filename: str) -> str:
+    """PPBase's extension-based type for a file without ``.attrs``.
 
-
-def _normalize_thumb_options(options: dict[str, Any]) -> set[str]:
-    """Return normalized configured thumb size presets for a file field."""
-    raw = options.get("thumbs")
-    if isinstance(raw, str):
-        candidate = raw.strip().lower()
-        return {candidate} if candidate else set()
-    if isinstance(raw, list):
-        values: set[str] = set()
-        for item in raw:
-            candidate = str(item or "").strip().lower()
-            if candidate:
-                values.add(candidate)
-        return values
-    return set()
-
-
-def _is_supported_thumb_image(filename: str) -> bool:
-    return Path(filename).suffix.lower() in _SUPPORTED_THUMB_IMAGE_EXTENSIONS
-
-
-def _image_resample_filter(image_module: Any) -> Any:
-    resampling = getattr(image_module, "Resampling", None)
-    if resampling is not None:
-        return resampling.LANCZOS
-    return image_module.LANCZOS
-
-
-def _try_generate_thumb_bytes(
-    source_bytes: bytes,
-    thumb_option: str,
-) -> bytes | None:
-    """Try to generate thumbnail bytes without path-based file access.
-
-    Returns ``None`` if generation is unavailable or fails for any reason.
+    Unchanged from earlier releases: the guessed type, with Starlette's
+    ``; charset=utf-8`` for ``text/*`` that responses used to add.
     """
-    match = _THUMB_OPTION_PATTERN.match(thumb_option)
-    if match is None:
-        return None
-
-    width = int(match.group(1))
-    height = int(match.group(2))
-    mode = match.group(3)
-    if width <= 0 and height <= 0:
-        return None
-
-    try:
-        from PIL import Image, ImageOps, UnidentifiedImageError
-    except Exception:
-        return None
-
-    resample_filter = _image_resample_filter(Image)
-
-    try:
-        with Image.open(BytesIO(source_bytes)) as src:
-            src.load()
-            fmt = src.format
-            if not fmt:
-                return None
-            result = src
-
-            if width == 0 and height > 0:
-                new_width = max(1, int(round(src.width * (height / max(src.height, 1)))))
-                result = src.resize((new_width, height), resample_filter)
-            elif height == 0 and width > 0:
-                new_height = max(1, int(round(src.height * (width / max(src.width, 1)))))
-                result = src.resize((width, new_height), resample_filter)
-            elif width > 0 and height > 0 and mode == "f":
-                result = ImageOps.contain(src, (width, height), method=resample_filter)
-            elif width > 0 and height > 0:
-                centering = (0.5, 0.5)
-                if mode == "t":
-                    centering = (0.5, 0.0)
-                elif mode == "b":
-                    centering = (0.5, 1.0)
-                result = ImageOps.fit(
-                    src,
-                    (width, height),
-                    method=resample_filter,
-                    centering=centering,
-                )
-
-            save_kwargs: dict[str, Any] = {}
-            if (fmt or "").upper() == "JPEG" and result.mode not in {"RGB", "L"}:
-                result = result.convert("RGB")
-                save_kwargs["quality"] = 85
-
-            output = BytesIO()
-            try:
-                result.save(output, format=fmt, **save_kwargs)
-                return output.getvalue()
-            finally:
-                if result is not src:
-                    result.close()
-    except (OSError, ValueError, UnidentifiedImageError):
-        return None
+    media_type = _guess_media_type(filename)
+    if media_type.startswith("text/") and "charset=" not in media_type.lower():
+        media_type += "; charset=utf-8"
+    return media_type
 
 
-async def _resolve_thumb_bytes(
+def _original_content_type(
+    opened: StorageFileStream,
     collection_id: str,
     record_id: str,
     filename: str,
-    field_def: dict[str, Any],
-    thumb_option: str | None,
-    source_loader: Callable[[], bytes | None],
+) -> str:
+    """The real content type of a stored file (``Serve``'s ``ContentType``).
+
+    Raises :class:`InvalidFileAttributes` for an undecodable side-car, which
+    PocketBase answers with a 404.
+    """
+    if opened.backend != "local" or opened.config is None:
+        return _fallback_content_type(filename)
+    try:
+        raw = read_local_attrs(opened.config, collection_id, record_id, filename)
+    except OversizedFileAttributes as exc:
+        raise InvalidFileAttributes(str(exc)) from exc
+    if raw is None:
+        return _fallback_content_type(filename)
+    return parse_attrs(raw).content_type
+
+
+def _thumb_generation_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphore = _thumb_generation_semaphores.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore((os.cpu_count() or 1) + 2)
+        _thumb_generation_semaphores[loop] = semaphore
+    return semaphore
+
+
+def _open_existing_thumbnail(
+    storage_config: Any,
+    collection_id: str,
+    record_id: str,
+    thumb_dir: str,
+    thumb_name: str,
+    original_content_type: str,
+) -> _ServedThumbnail | None:
+    """Open a stored thumbnail and its side-car, ``None`` when missing.
+
+    A thumbnail whose side-car cannot be decoded does not exist for
+    ``fileblob``'s ``Exists``: PocketBase generates it again.
+    """
+    stream = open_local_stream(
+        storage_config,
+        collection_id,
+        record_id,
+        thumb_name,
+        directory_name=thumb_dir,
+    )
+    if stream is None:
+        return None
+    try:
+        raw = read_local_attrs(
+            storage_config,
+            collection_id,
+            record_id,
+            thumb_name,
+            directory_name=thumb_dir,
+        )
+        attrs = parse_attrs(raw) if raw is not None else None
+    except (InvalidFileAttributes, OversizedFileAttributes):
+        stream.close()
+        return None
+    except BaseException:
+        stream.close()
+        raise
+    # A thumbnail without side-car (one generated by an earlier PPBase) has
+    # the type of its original, which is what PocketBase records for it.
+    content_type = attrs.content_type if attrs is not None else original_content_type
+    return _ServedThumbnail(stream, thumb_name, content_type)
+
+
+def _read_original_bytes(
+    storage_config: Any,
+    collection_id: str,
+    record_id: str,
+    filename: str,
+) -> bytes | None:
+    opened = open_local_stream(storage_config, collection_id, record_id, filename)
+    if opened is None:
+        return None
+    try:
+        return bytes(opened.stream.read())
+    finally:
+        opened.close()
+
+
+async def _create_thumbnail(
+    collection_id: str,
+    record_id: str,
+    filename: str,
+    thumb_dir: str,
+    thumb_name: str,
+    thumb_size: str,
+    original_content_type: str,
+    storage_config: Any,
+    lease: WriteBarrierLease,
+) -> bool:
+    """Generate and publish one thumbnail like ``CreateThumb``.
+
+    The side-car is written first, like ``fileblob``'s writer, with the
+    original's content type (v0.22.34 ``filesystem.go`` l.501-503).  Any
+    failure, including a write failure or the 60 s wait, means "serve the
+    original" (v0.22.34 ``apis/file.go`` l.179-190).
+    """
+    semaphore = _thumb_generation_semaphore()
+    try:
+        await asyncio.wait_for(
+            semaphore.acquire(), timeout=_THUMB_GENERATION_MAX_WAIT_SECONDS
+        )
+    except TimeoutError:
+        return False
+    try:
+        try:
+            source = await asyncio.to_thread(
+                _read_original_bytes,
+                storage_config,
+                collection_id,
+                record_id,
+                filename,
+            )
+        except (OSError, StorageSafetyError):
+            return False
+        if source is None:
+            return False
+        generated = await asyncio.to_thread(create_thumb_bytes, source, thumb_size)
+        if generated is None:
+            return False
+        try:
+            write_local_storage_variant_bytes(
+                collection_id,
+                record_id,
+                thumb_dir,
+                f"{thumb_name}{ATTRS_SUFFIX}",
+                encode_attrs(generated, original_content_type),
+                lease=lease,
+                config=storage_config,
+            )
+            write_local_storage_variant_bytes(
+                collection_id,
+                record_id,
+                thumb_dir,
+                thumb_name,
+                generated,
+                lease=lease,
+                config=storage_config,
+            )
+        except (OSError, StorageSafetyError):
+            return False
+        return True
+    finally:
+        semaphore.release()
+
+
+async def _resolve_thumbnail(
+    collection_id: str,
+    record_id: str,
+    filename: str,
+    thumb_size: str,
+    original_content_type: str,
     storage_config: Any,
     lease: WriteBarrierLease | None,
-) -> tuple[bytes, str, str] | None:
-    """Return secure cached/generated thumbnail bytes and variant names."""
-    if not thumb_option:
-        return None
-    if _THUMB_OPTION_PATTERN.match(thumb_option) is None:
-        return None
-    if not _is_supported_thumb_image(filename):
-        return None
+) -> _ServedThumbnail | object | None:
+    """Return the thumbnail to serve, ``None`` to serve the original.
 
-    options = _normalize_file_options(field_def)
-    allowed_thumbs = _normalize_thumb_options(options)
-    if thumb_option not in allowed_thumbs:
-        return None
-
-    thumb_dir_name = f"thumbs_{filename}"
-    thumb_filename = f"{thumb_option}_{filename}"
+    Without a write lease a missing thumbnail is reported as
+    :data:`_THUMBNAIL_CACHE_MISS` so that the request restarts under the
+    shared barrier before generating it.
+    """
+    thumb_dir, thumb_name = thumb_names(thumb_size, filename)
     try:
-        cached = await asyncio.to_thread(
-            read_local_storage_variant_bytes,
+        existing = await asyncio.to_thread(
+            _open_existing_thumbnail,
+            storage_config,
             collection_id,
             record_id,
-            thumb_dir_name,
-            thumb_filename,
-            config=storage_config,
+            thumb_dir,
+            thumb_name,
+            original_content_type,
         )
     except (OSError, StorageSafetyError):
+        # An unsafe variant path (a symlink...) is never followed nor
+        # replaced: the original is served.
         return None
-    if cached is not None:
-        return cached, thumb_dir_name, thumb_filename
+    if existing is not None:
+        return existing
     if lease is None:
-        return None
-
-    source_bytes = await asyncio.to_thread(source_loader)
-    if source_bytes is None:
-        return None
-    generated = await asyncio.to_thread(
-        _try_generate_thumb_bytes,
-        source_bytes,
-        thumb_option,
+        return _THUMBNAIL_CACHE_MISS
+    created = await _create_thumbnail(
+        collection_id,
+        record_id,
+        filename,
+        thumb_dir,
+        thumb_name,
+        thumb_size,
+        original_content_type,
+        storage_config,
+        lease,
     )
-    if generated is None:
+    if not created:
         return None
     try:
-        write_local_storage_variant_bytes(
+        reopened = await asyncio.to_thread(
+            _open_existing_thumbnail,
+            storage_config,
             collection_id,
             record_id,
-            thumb_dir_name,
-            thumb_filename,
-            generated,
-            lease=lease,
-            config=storage_config,
+            thumb_dir,
+            thumb_name,
+            original_content_type,
         )
-    except (OSError, StorageSafetyError):
-        # The generated bytes are still safe to serve even when caching loses
-        # a race or an unsafe pre-existing variant path is rejected.
-        pass
-    return generated, thumb_dir_name, thumb_filename
+    except (OSError, StorageSafetyError) as exc:
+        raise _not_found_error() from exc
+    if reopened is None:
+        # PocketBase serves the thumbnail it has just written; when that
+        # read fails ``Serve`` returns an error and the request is a 404.
+        raise _not_found_error()
+    return reopened
 
 
 async def _stream_storage_file(
@@ -829,7 +904,10 @@ async def generate_file_token(
     return await _trigger_file_token_request_hooks(request, event, _default_file_token)
 
 
-@router.get("/{collection_id_or_name}/{record_id}/{filename}")
+@router.api_route(
+    "/{collection_id_or_name}/{record_id}/{filename}",
+    methods=["GET", "HEAD"],
+)
 async def serve_file(
     collection_id_or_name: str,
     record_id: str,
@@ -838,7 +916,12 @@ async def serve_file(
     session: AsyncSession = Depends(get_session),
     settings: Any = Depends(get_settings),
 ):
-    """Serve a file from local or S3-compatible storage."""
+    """Serve a file from local or S3-compatible storage.
+
+    ``HEAD`` is served like ``GET`` without a body, as by PocketBase
+    (v0.22.34 ``apis/file.go`` l.40-41; v0.40.6 l.45, where Go's router
+    matches ``HEAD`` with a ``GET`` pattern).
+    """
     try:
         # Cached thumbnails and ordinary reads stay lock-free.  This first pass
         # is strictly read-only: a cache miss restarts only after leaving the
@@ -914,7 +997,6 @@ async def _serve_file(
         if not has_view_access:
             raise _not_found_error()
 
-    thumb_option = _parse_thumb_option(request)
     storage_collection_id = collection.id
     storage_record_id = record_id
 
@@ -943,62 +1025,63 @@ async def _serve_file(
     storage_backend = opened_stream.backend
     storage_config = opened_stream.config
     source_path = opened_stream.storage_path
-    served_file_path: Path | None = None
     if storage_backend == "local" and (storage_config is None or source_path is None):
         opened_stream.close()
         raise _not_found_error()
 
-    source_bytes: bytes | None = None
-    if source_path is not None:
-        served_file_path = source_path
-        try:
-            thumb_result = None
-            if thumb_option:
-                thumb_result = await _resolve_thumb_bytes(
-                    storage_collection_id,
-                    storage_record_id,
-                    filename,
-                    field_def,
-                    thumb_option,
-                    lambda: bytes(opened_stream.stream.read()),
-                    storage_config,
-                    thumbnail_write_lease,
-                )
-                if thumb_result is None and thumbnail_write_lease is None:
-                    raise _ThumbnailGenerationRequiresBarrier
-        except BaseException as exc:
+    served_stream: StorageFileStream = opened_stream
+    served_name = filename
+    served_file_path: Path | None = source_path
+    try:
+        original_content_type = await asyncio.to_thread(
+            _original_content_type,
+            opened_stream,
+            storage_collection_id,
+            storage_record_id,
+            filename,
+        )
+        served_content_type = original_content_type
+
+        # v0.22.34 apis/file.go l.162-193 == v0.40.6 l.164-196.  Thumbnails
+        # are only produced on the local backend (S3 serves the original).
+        thumb_size = _first_query_value(request, "thumb") or ""
+        if (
+            thumb_size
+            and storage_backend == "local"
+            and thumb_size_allowed(
+                thumb_size, _normalize_file_options(field_def).get("thumbs")
+            )
+            and original_content_type in THUMB_IMAGE_CONTENT_TYPES
+        ):
+            thumbnail = await _resolve_thumbnail(
+                storage_collection_id,
+                storage_record_id,
+                filename,
+                thumb_size,
+                original_content_type,
+                storage_config,
+                thumbnail_write_lease,
+            )
+            if thumbnail is _THUMBNAIL_CACHE_MISS:
+                raise _ThumbnailGenerationRequiresBarrier
+            if isinstance(thumbnail, _ServedThumbnail):
+                opened_stream.close()
+                served_stream = thumbnail.stream
+                served_name = thumbnail.served_name
+                served_content_type = thumbnail.content_type
+                served_file_path = thumbnail.stream.storage_path
+    except BaseException as exc:
+        served_stream.close()
+        if served_stream is not opened_stream:
             opened_stream.close()
-            if isinstance(exc, StorageSafetyError):
-                raise _not_found_error() from exc
-            raise
-        if thumb_result is not None:
-            source_bytes, thumb_dir_name, thumb_filename = thumb_result
-            served_file_path = source_path.parent / thumb_dir_name / thumb_filename
-            opened_stream.close()
-            opened_stream = None
-        elif thumb_option:
-            # Thumbnail generation may have consumed the source stream before
-            # falling back to the original. Reopen it from the anchored path.
-            opened_stream.close()
-            try:
-                opened_stream = await asyncio.to_thread(
-                    open_file_stream,
-                    storage_collection_id,
-                    storage_record_id,
-                    filename,
-                    config=storage_config,
-                )
-            except StorageSafetyError as exc:
-                raise _not_found_error() from exc
-            if opened_stream is None:
-                raise _not_found_error()
+        if isinstance(exc, (StorageSafetyError, InvalidFileAttributes)):
+            raise _not_found_error() from exc
+        raise
 
     try:
         default_served_path = (
             str(served_file_path) if served_file_path is not None else ""
         )
-        force_download, download_filename = _parse_download_option(request)
-        served_name = (download_filename or filename) if force_download else filename
         event = FileDownloadRequestEvent(
             app=request.app,
             request=request,
@@ -1007,12 +1090,13 @@ async def _serve_file(
             file_field=field_def,
             filename=filename,
             served_path=default_served_path,
-            served_name=str(served_name),
-            force_download=bool(force_download),
+            served_name=served_name,
+            force_download=force_attachment(
+                _first_query_value(request, FORCE_ATTACHMENT_PARAM)
+            ),
         )
     except BaseException:
-        if opened_stream is not None:
-            opened_stream.close()
+        served_stream.close()
         raise
 
     async def _default_file_download(_: FileDownloadRequestEvent) -> None:
@@ -1023,20 +1107,17 @@ async def _serve_file(
             request, event, _default_file_download
         )
     except BaseException:
-        if opened_stream is not None:
-            opened_stream.close()
+        served_stream.close()
         raise
     if isinstance(hook_result, Response):
-        if opened_stream is not None:
-            opened_stream.close()
+        served_stream.close()
         return hook_result
 
     resolved_served_path_raw = str(event.served_path or "").strip()
     if resolved_served_path_raw and resolved_served_path_raw != default_served_path:
         # A server-side hook explicitly selected a custom path. Hook code is a
         # trusted extension boundary; default storage reads never use this path.
-        if opened_stream is not None:
-            opened_stream.close()
+        served_stream.close()
         resolved_served_path = Path(resolved_served_path_raw).expanduser()
         if not resolved_served_path.is_file():
             raise _not_found_error()
@@ -1051,95 +1132,90 @@ async def _serve_file(
 
         return FileResponse(str(resolved_served_path), content_disposition_type="inline")
 
-    effective_filename = str(event.filename or filename).strip() or filename
-    if source_bytes is None:
-        if opened_stream is None:  # pragma: no cover - internal invariant
-            raise _not_found_error()
-        headers: dict[str, str] = {"Accept-Ranges": "bytes"}
-        if opened_stream.etag:
-            headers["ETag"] = opened_stream.etag
-        if opened_stream.last_modified:
-            headers["Last-Modified"] = opened_stream.last_modified
-        status_code = 200
-        range_start = 0
-        stream_start = 0
-        range_length = opened_stream.content_length
-        raw_range = str(request.headers.get("range", "") or "").strip()
-        raw_if_range = str(request.headers.get("if-range", "") or "").strip()
-        if raw_range and raw_if_range and raw_if_range not in {
-            opened_stream.etag,
-            opened_stream.last_modified,
-        }:
-            raw_range = ""
-        if raw_range and opened_stream.content_length is not None:
+    # Serve (v0.22.34 tools/filesystem/filesystem.go l.393-430 == v0.40.6
+    # l.562-599 for everything below but the quoting of non-token names).
+    disposition_name = str(event.served_name or "") or served_name
+    disposition = disposition_type(
+        served_content_type, forced=bool(event.force_download)
+    )
+    headers: dict[str, str] = {
+        "Content-Disposition": latin1_header_value(
+            content_disposition(disposition, disposition_name)
+        ),
+        "Content-Type": latin1_header_value(
+            response_content_type(served_content_type, disposition_name)
+        ),
+        "Content-Security-Policy": CONTENT_SECURITY_POLICY,
+        "Cache-Control": CACHE_CONTROL,
+        **FILE_SECURITY_HEADERS,
+        "Accept-Ranges": "bytes",
+    }
+    if served_stream.etag:
+        headers["ETag"] = served_stream.etag
+    if served_stream.last_modified:
+        headers["Last-Modified"] = served_stream.last_modified
+    status_code = 200
+    range_start = 0
+    stream_start = 0
+    range_length = served_stream.content_length
+    raw_range = str(request.headers.get("range", "") or "").strip()
+    raw_if_range = str(request.headers.get("if-range", "") or "").strip()
+    if raw_range and raw_if_range and raw_if_range not in {
+        served_stream.etag,
+        served_stream.last_modified,
+    }:
+        raw_range = ""
+    if raw_range and served_stream.content_length is not None:
+        try:
+            range_start, range_end = _parse_single_byte_range(
+                raw_range,
+                served_stream.content_length,
+            )
+        except ValueError:
+            served_stream.close()
+            return Response(
+                status_code=416,
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": (f"bytes */{served_stream.content_length}"),
+                },
+            )
+        status_code = 206
+        range_length = range_end - range_start + 1
+        stream_start = range_start
+        headers["Content-Range"] = (
+            f"bytes {range_start}-{range_end}/{served_stream.content_length}"
+        )
+        if served_stream.backend == "s3" and served_stream.etag:
+            # Only an original is ever served from S3.
+            range_etag = served_stream.etag
+            served_stream.close()
             try:
-                range_start, range_end = _parse_single_byte_range(
-                    raw_range,
-                    opened_stream.content_length,
+                served_stream = await asyncio.to_thread(
+                    open_file_stream,
+                    storage_collection_id,
+                    storage_record_id,
+                    filename,
+                    byte_range=(range_start, range_end),
+                    config=storage_config,
+                    if_match=range_etag,
                 )
-            except ValueError:
-                opened_stream.close()
-                return Response(
-                    status_code=416,
-                    headers={
-                        "Accept-Ranges": "bytes",
-                        "Content-Range": (
-                            f"bytes */{opened_stream.content_length}"
-                        ),
-                    },
-                )
-            status_code = 206
-            range_length = range_end - range_start + 1
-            stream_start = range_start
-            headers["Content-Range"] = (
-                f"bytes {range_start}-{range_end}/{opened_stream.content_length}"
-            )
-            if opened_stream.backend == "s3" and opened_stream.etag:
-                range_etag = opened_stream.etag
-                opened_stream.close()
-                try:
-                    opened_stream = await asyncio.to_thread(
-                        open_file_stream,
-                        storage_collection_id,
-                        storage_record_id,
-                        filename,
-                        byte_range=(range_start, range_end),
-                        config=storage_config,
-                        if_match=range_etag,
-                    )
-                except StorageSafetyError as exc:
-                    raise _not_found_error() from exc
-                if opened_stream is None:
-                    raise _not_found_error()
-                stream_start = 0
-        if range_length is not None:
-            headers["Content-Length"] = str(range_length)
-        if event.force_download:
-            safe_name = os.path.basename(
-                str(event.served_name or effective_filename).strip()
-            ) or effective_filename
-            headers["Content-Disposition"] = _attachment_content_disposition(
-                safe_name
-            )
-        return StreamingResponse(
-            _stream_storage_file(
-                opened_stream,
-                start=stream_start,
-                length=range_length,
-            ),
-            status_code=status_code,
-            media_type=_guess_media_type(effective_filename),
-            headers=headers,
-        )
-
-    if event.force_download:
-        safe_name = os.path.basename(str(event.served_name or effective_filename).strip()) or effective_filename
-        return Response(
-            content=source_bytes,
-            media_type=_guess_media_type(effective_filename),
-            headers={
-                "Content-Disposition": _attachment_content_disposition(safe_name),
-            },
-        )
-
-    return Response(content=source_bytes, media_type=_guess_media_type(effective_filename))
+            except StorageSafetyError as exc:
+                raise _not_found_error() from exc
+            if served_stream is None:
+                raise _not_found_error()
+            stream_start = 0
+    if range_length is not None:
+        headers["Content-Length"] = str(range_length)
+    if str(getattr(request, "method", "GET") or "GET").upper() == "HEAD":
+        served_stream.close()
+        return Response(status_code=status_code, headers=headers)
+    return StreamingResponse(
+        _stream_storage_file(
+            served_stream,
+            start=stream_start,
+            length=range_length,
+        ),
+        status_code=status_code,
+        headers=headers,
+    )
