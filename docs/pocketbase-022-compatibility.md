@@ -51,7 +51,8 @@ link or token is never logged. The PPBase dashboard has no page for this link
 Every e-mailed link (admin password reset, record verification, password
 reset and e-mail change) starts with the stored `meta.appURL`, like
 PocketBase (`v0.22.34 mails/admin.go:22-26`, `mails/record.go:175-184`;
-`v0.40.6 mails/record.go:265-266`). Without a settings row, or with an empty or
+`v0.40.6 mails/record.go:265-266`), used as stored apart from a trailing slash
+(no `0.0.0.0` rewrite). Without a settings row, or with an empty or
 non-absolute `appURL`, the default `http://localhost:8090` is used, as in
 PocketBase (`v0.22.34 models/settings/settings.go:77`). The `Host` and
 `X-Forwarded-*` request headers are never used: they are chosen by the
