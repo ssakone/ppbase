@@ -4,17 +4,19 @@ PocketBase 0.22.34 validates its forms with ozzo-validation v4.3.0 on Go
 strings (``v0.22.34 go.mod``).  Three details change the answers; each was
 measured on the official 0.22.34 binary with synthetic data:
 
-- ``validation.Length(min, max)`` counts UTF-8 bytes, not characters
-  (ozzo ``LengthRule.Validate`` uses ``LengthOfValue``, a ``reflect`` ``Len()``;
-  only ``RuneLength`` counts runes).  ``forms/admin_password_reset_confirm.go:45``
-  (``Length(10, 72)``) accepts five two-byte characters and refuses 37.
+- ``validation.Length(min, max)`` counts UTF-8 bytes, not characters: ozzo
+  v4.3.0 ``length.go:63-65`` counts runes for ``RuneLength`` only and
+  otherwise calls ``LengthOfValue``, a ``reflect`` ``Len()`` (``util.go:50-54``).
+  ``forms/admin_password_reset_confirm.go:45`` (``Length(10, 72)``) accepts
+  five two-byte characters and refuses 37.
 - Go's JSON decoder turns every lone UTF-16 surrogate escape into U+FFFD
   (three bytes), where Python's ``json`` keeps the surrogate, which cannot
   even be encoded to UTF-8.
-- ``is.EmailFormat`` is govalidator ``IsEmail`` (ozzo-validation v4.3.0
-  ``is/rules.go``): the ``rxEmail`` pattern of govalidator ``a9d515a09cc2``
-  ``patterns.go``, as compiled into the 0.22.34 binary.  It is implemented
-  below without a regular expression: the pattern has nested, overlapping
+- ``is.EmailFormat`` is govalidator ``IsEmail`` (ozzo v4.3.0
+  ``is/rules.go:131``), the ``rxEmail`` match of govalidator ``a9d515a09cc2``
+  (``validator.go:67-70``, ``patterns.go:7`` and ``:72``); the pattern is the
+  very string compiled into the 0.22.34 binary.  It is implemented below
+  without a regular expression: the pattern has nested, overlapping
   repetitions on which Python's backtracking engine can take exponential
   time, where Go's RE2 engine is linear.
 """

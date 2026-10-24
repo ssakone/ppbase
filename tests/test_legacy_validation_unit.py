@@ -4,8 +4,9 @@ The expected answers were measured on the official PocketBase 0.22.34 binary
 (``POST /api/admins/request-password-reset``, synthetic addresses only): ``True``
 is a 204, ``False`` a ``validation_is_email`` error.  The regular expression
 below is govalidator's ``rxEmail``, copied from the 0.22.34 binary (the only
-string of the executable holding ``\\x{00A0}-\\x{D7FF}``); it serves as the
-oracle of the hand-written matcher on short inputs.
+string of the executable holding ``\\x{00A0}-\\x{D7FF}``) and identical to the
+``Email`` pattern of govalidator ``a9d515a09cc2`` ``patterns.go:7``; it serves
+as the oracle of the hand-written matcher on short inputs.
 """
 
 from __future__ import annotations

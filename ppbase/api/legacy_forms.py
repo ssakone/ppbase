@@ -1,11 +1,16 @@
 """Request binding of the PocketBase 0.22 forms (admin password reset routes).
 
 PocketBase 0.22.34 reads these forms with ``c.Bind`` and ``rest.MultiBinder``
-(``v0.22.34 tools/rest/multi_binder.go:29-146``), after the
+(``v0.22.34 tools/rest/multi_binder.go:29-146``), falling back to echo v5
+``ec5b858dab61`` (``bind.go:55-90`` ``BindBody``, ``:123-212`` ``bindData``:
+exact key, else ``strings.EqualFold`` at ``:182``, first value at ``:195`` and
+``:212``; ``context.go:477-488`` ``FormValues``), after the
 ``eagerRequestInfoCache`` middleware of every ``/api`` route has parsed the
 body once and ignored its errors (``apis/middlewares.go:405-421``,
-``apis/record_helpers.go:64-65``, ``apis/base.go:120``).  The resulting rules,
-each measured on the official 0.22.34 binary with synthetic data:
+``apis/record_helpers.go:64-65``, ``apis/base.go:120``).  That eager parse
+decodes an XML body into a map, which ``encoding/xml`` refuses, and consumes
+it: the form decode then always fails.  The resulting rules, each measured on
+the official 0.22.34 binary with synthetic data:
 
 - ``Content-Length: 0`` (or no body) binds nothing, even with a query string;
   a chunked body is read even when it is empty.
