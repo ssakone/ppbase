@@ -243,22 +243,10 @@ imports; each one aligns PPBase with PocketBase (0.22.34 and v0.40.6 agree):
 
 ## Known differences with PocketBase
 
-They predate this rule; the first three are pinned by strict `xfail` tests
-(`tests/integration/test_relation_maxselect_null.py`,
-`tests/integration/test_relation_delete_and_paths.py`):
+They predate this rule. The multi-match and the NULL leaf of a missing
+relation in a path, formerly listed here, now follow PocketBase 0.22.34: see
+`docs/filter-paths-multi-match.md`.
 
-- **Multi-match.** PocketBase adds a "no row may fail" subquery to non-`?`
-  comparisons that traverse a multiple relation or a back relation, or use
-  `@collection`. PPBase uses any-match `EXISTS`: `rels.name = "a"`,
-  `rels.id = "x"`, `rels.name != "a"` and `@collection.X.f = v` match when one
-  related row matches. The BUMA `users` create/update rules start with
-  `@collection.users.id = @request.auth.id`, which PocketBase 0.22.34 only
-  satisfies when every `users` row is the caller (probe: no match with two
-  users) and PPBase satisfies for any `users` caller.
-- **Missing relation in a path.** PocketBase LEFT JOINs the relation, so a
-  record without a target compares a NULL leaf (`customer.pdv = ""` and
-  `customer.pdv:length = 0` match a sale without customer); PPBase's `EXISTS`
-  does not match.
 - **Envelope and messages.** PPBase answers validation errors with
   `{"status", "message", "data"}` and the message "Failed to create record.
   Validation failed for: rels, title."; PocketBase 0.22.34 uses the `code`

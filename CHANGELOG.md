@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Relation paths: PocketBase LEFT JOIN and multi-match
+
+See `docs/filter-paths-multi-match.md`.
+
+- Relation, back-relation and `@collection` paths in filters and API rules
+  are LEFT JOINs shared by the whole expression, like PocketBase 0.22.34: a
+  missing target is a NULL leaf (`rel.f = ""` and `rel.id = ""` match a record
+  without or with an orphan relation) and `rel.id` joins the target.
+- Comparisons without `?` through `@collection`, a multiple relation or a
+  back relation (without single-column unique index) need every row to match
+  (PocketBase multi-match; a NULL row fails every operator but `=`).
+  `@collection.users.id = @request.auth.id` is now false with two accounts or
+  more: in the BUMA `users` create/update rules, an ordinary user can no
+  longer create accounts or edit other accounts.
+- Guests and auth records get 403 "Only admins can filter by @collection."
+  (or `@request.`) for those fields in a list `filter`/`sort`.
+
 ### Relation multiplicity (PocketBase 0.22 `maxSelect: null`)
 
 See `docs/relation-multiplicity.md` for the rule, the PocketBase references
