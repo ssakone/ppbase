@@ -92,9 +92,54 @@ hidden fields (`autoResolveRecordsFlags`).
   PostgreSQL's order. PocketBase uses SQLite's scan (rowid) order; an
   updated PostgreSQL row moves in `ctid` order. No BUMA client uses `_via_`.
 - Auth responses (auth-with-password/otp/oauth2, auth-refresh, impersonate)
-  expand as the authenticated record (`_auth_response_expand_context`);
-  `pb.apis.enrich_records` uses the records API context and
-  `pb.apis.record_auth_response` the authenticated record.
+  expand as the authenticated record (`auth_response_rule_context`: that
+  record as `@request.auth`, no admin). `pb.apis.enrich_records` uses the
+  records API context, a JSON request body as `@request.data` and appends
+  `?expand` to `default_expand` (l.160-163); `pb.apis.record_auth_response`
+  expands as the authenticated record.
+- **Host context of the authenticated record.** A host that extends
+  `@request.auth` for the requester (BUMA patches the records API context
+  with the live `role.permission.*` of the token's record) must also extend
+  it for the authenticated record of an auth response, which is not the
+  requester (a guest, for auth-with-password). It registers a loader, once,
+  at startup:
+
+  ```python
+  def register(pb):
+      pb.set_auth_record_rule_context(load_auth_record_context)
+  ```
+
+  `loader(engine, auth)` (sync or async) receives the `@request.auth`
+  payload of the authenticated record (its fields, `type` "authRecord",
+  `collectionId`, `collectionName`) and returns extra `@request.auth` keys
+  (flattened dotted keys allowed); `password_hash`, `token_key` and
+  `_raw_token` are never merged. It is called only when the auth response
+  has an `expand`. `ppbase.api.record_auth.set_auth_record_rule_context(app,
+  loader)` does the same on an app; a host route that authenticates by
+  itself builds the same context with `await
+  ppbase.api.record_auth.auth_response_rule_context(request, collection,
+  record, body)`.
+
+## Emails of the main auth records
+
+`EnrichRecords` applies `autoIgnoreAuthRecordsEmailVisibility` to the main
+records too (l.153-158, l.216-279; list `apis/record_crud.go` l.99, view
+l.186, create l.289, update l.381; v0.40.6 `autoResolveRecordsFlags`
+l.437-508 keeps it). PPBase now does the same
+(`record_service.auth_email_visible_ids`): a hidden email (`emailVisibility`
+false) is shown to an admin (admin token or `_superusers` record), to the
+record's owner and to the records the collection `manageRule` matches with
+the request context (hidden fields allowed), one query per list page.
+Create and update responses (and their `/api/batch` counterparts) follow it
+as well: before, they always showed the email, so any caller allowed to update an auth record read its hidden
+email (BUMA: `users.updateRule` lets every logged-in user update users, and
+`users.manageRule` grants the role admins the emails). A guest signup
+response therefore hides the new record's email unless `emailVisibility`
+(0.22.34 and v0.40.6 alike). A `manageRule` that fails to evaluate shows no
+extra email; PocketBase 0.22.34 then also skips the expand of the main
+records, which PPBase does not reproduce. The realtime messages of auth
+records keep their previous behavior (0.22.34 `apis/realtime.go` l.439-448
+uses another test, not compared).
 
 ## Evidence
 
@@ -105,19 +150,29 @@ hidden fields (`autoResolveRecordsFlags`).
   on create, `@request.query`, a BUMA-like flattened role context, update,
   auth-with-password/auth-refresh, realtime and the one-query-per-level
   count.
+  Also: the email of listed, created and updated auth records per caller
+  (`test_listed_and_viewed_auth_emails_follow_the_manage_rule`,
+  `test_create_and_update_responses_hide_unmanaged_emails`), the host loader
+  on auth-with-password/auth-refresh
+  (`test_auth_response_context_loader_extends_the_authenticated_record`)
+  and `enrich_records` defaults plus body data.
 - `tests/pocketbase_parity/expand_rules_probe.py` against the 0.22.34
-  binary: 105 expand checks (list/view for seven callers), 9 create/update/
-  delete, 4 auth responses and 4 realtime events identical; the only known
-  difference of the expand groups is the open item below.
+  binary: 105 expand checks (list/view for seven callers, including the
+  emails of the listed auth records), 18 writes (create/update/delete,
+  signups, the update response email per caller), 8 auth responses (among
+  them the BUMA role rule through the host loader) and 4 realtime events
+  identical. The only known difference of these groups is outside expand: a
+  guest signup that sets `emailVisibility` is refused by PPBase (manage
+  access required) and accepted by 0.22.34 (`forms/record_upsert.go`
+  l.380-381; only `verified` is guarded, l.514-522) — pre-existing, open.
 
 ## Open
 
-- The **listed or viewed** auth records themselves (not the expanded ones)
-  do not get the `manageRule` email visibility of
-  `autoIgnoreAuthRecordsEmailVisibility` (`EnrichRecords` applies it to the
-  main records too, l.156): a caller matching `manageRule` sees PocketBase
-  0.22.34 emails that PPBase hides (probe group `expand.main_auth_list`).
 - `@request.auth.<field>` resolves from the token claims and the host
   context only (`api/deps.py` loads no auth record), in expand as in every
   rule; PocketBase reads the auth record and its relations. BUMA provides the
-  values it needs through its live auth context.
+  values it needs through its live auth context (and, for auth responses,
+  `set_auth_record_rule_context`).
+- `fields=id,expand` drops `expand` in PPBase; 0.22.34 returns the whole
+  expand object (pre-existing records API `fields` filter, no BUMA client
+  uses `fields` with `expand`).
