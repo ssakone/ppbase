@@ -38,6 +38,15 @@ async def get_session():
 # Auth helpers
 # ---------------------------------------------------------------------------
 
+# PocketBase 0.22.34 wording (apis/middlewares.go:99 and :119), seen by the
+# clients through the error ``message``.
+RECORD_AUTH_REQUIRED_MESSAGE = (
+    "The request requires valid record authorization token to be set."
+)
+ADMIN_AUTH_REQUIRED_MESSAGE = (
+    "The request requires valid admin authorization token to be set."
+)
+
 
 async def get_optional_auth(
     request: Request,
@@ -113,8 +122,10 @@ async def get_optional_auth(
             CollectionRecord.id == collection_id
         )
         coll = (await session.execute(stmt)).scalars().first()
-        if coll is None:
-            # PocketBase ignores invalid tokens in its optional-auth middleware.
+        if coll is None or (coll.type or "base") != "auth":
+            # PocketBase ignores invalid tokens in its optional-auth middleware,
+            # including a collectionId of a non-auth collection (v0.22.34
+            # daos/record.go:432-434, v0.40.6 core/record_query.go:511-513).
             # Protected routes will still reject the resulting anonymous request.
             return None
 
@@ -167,7 +178,7 @@ async def require_admin(
             status_code=401,
             detail={
                 "status": 401,
-                "message": "The request requires admin authorization token to be set.",
+                "message": ADMIN_AUTH_REQUIRED_MESSAGE,
                 "data": {},
             },
         )
@@ -188,7 +199,7 @@ async def require_admin(
         status_code=401,
         detail={
             "status": 401,
-            "message": "The request requires admin authorization token to be set.",
+            "message": ADMIN_AUTH_REQUIRED_MESSAGE,
             "data": {},
         },
     )

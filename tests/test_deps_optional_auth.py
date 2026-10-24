@@ -67,6 +67,7 @@ async def test_authrecord_lookup_reuses_the_dependency_session(monkeypatch):
     collection = SimpleNamespace(
         id="users_collection",
         name="users",
+        type="auth",
         options={
             "authToken": {
                 "secret": "collection-secret-long-enough",

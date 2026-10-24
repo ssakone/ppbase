@@ -91,6 +91,7 @@ async def test_auth_record_file_token_round_trip_uses_collection_file_secret() -
     collection = SimpleNamespace(
         id="users000000001",
         name="users",
+        type="auth",
         options={
             "fileToken": {
                 "secret": "users-file-secret",

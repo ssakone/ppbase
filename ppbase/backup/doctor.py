@@ -220,6 +220,7 @@ async def backup_doctor(
     runtime_engine = create_async_engine(
         str(settings.database_url),
         poolclass=NullPool,
+        hide_parameters=True,
     )
     try:
         async with runtime_engine.connect() as connection:

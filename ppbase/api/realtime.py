@@ -43,13 +43,32 @@ def _error_response(status: int, message: str, data: Any = None) -> JSONResponse
 
 
 def _build_realtime_auth_key(auth: dict[str, Any] | None) -> str | None:
-    """Build a stable auth identity key for realtime subscription consistency."""
+    """Return the identity of the authenticated record, or ``None`` for guests.
+
+    PocketBase compares the authenticated model, never the token type, so a
+    refreshed token keeps its identity even when the claim changes (PocketBase
+    0.22 ``authRecord`` refreshed by PPBase into ``auth``).  Admin tokens carry
+    the ``_superusers`` collection id set by ``get_optional_auth``, so a legacy
+    ``admin`` token and a ``_superusers`` record token of the same superuser
+    share one identity, as superusers are ``_superusers`` records in v0.40.6.
+
+    The identity is the collection id plus the record id, as v0.40.6
+    ``isSameAuth`` (``apis/realtime.go:218-222`` and ``:843-853``).  This is a
+    deliberate difference with v0.22.34, which compares the id alone
+    (``apis/realtime.go:187-191`` with ``extractAuthIdFromGetter``,
+    ``:539-551``): switching, on one SSE client, to an account of another auth
+    collection (or from an admin to a record) that has the same id is accepted
+    by 0.22.34 and refused (403) here.  Ids are random 15-character strings;
+    the BUMA backup has no id shared between its two auth collections and
+    ``_admins``.
+    """
     if not auth:
         return None
-    token_type = auth.get("type", "")
     auth_id = auth.get("id", "")
+    if not auth_id:
+        return None
     collection_id = auth.get("collectionId", "")
-    return f"{token_type}:{collection_id}:{auth_id}"
+    return f"{collection_id}:{auth_id}"
 
 
 async def _trigger_realtime_hook(
@@ -164,15 +183,14 @@ async def realtime_subscribe(
     if not session:
         return _error_response(404, "Missing or invalid client id.")
 
+    # Only guest -> auth upgrades are allowed; any other identity change is
+    # refused (v0.22.34 apis/realtime.go:187-191, v0.40.6 :218-222).
     current_auth_key = _build_realtime_auth_key(auth)
-    if session.auth_key_set and session.auth_key != current_auth_key:
+    if session.auth_key is not None and session.auth_key != current_auth_key:
         return _error_response(
             403,
             "The current and the previous request authorization don't match.",
         )
-    if not session.auth_key_set:
-        session.auth_key = current_auth_key
-        session.auth_key_set = True
 
     engine = get_engine()
 
@@ -232,6 +250,12 @@ async def realtime_subscribe(
             )
 
         e.parsed_subscriptions = parsed_subscriptions
+        # Every accepted subscription request stores the current auth state
+        # (v0.22.34 apis/realtime.go:201-203, v0.40.6 :230-231): a guest that
+        # authenticates is upgraded, a refreshed token keeps its identity.
+        target_session = subscription_manager.get_session(e.client_id)
+        if target_session is not None:
+            target_session.auth_key = current_auth_key
         await subscription_manager.replace_subscriptions(
             e.client_id,
             parsed_subscriptions,

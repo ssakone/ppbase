@@ -35,6 +35,7 @@ from ppbase.db.schema_manager import (
 )
 from ppbase.db.system_tables import CollectionRecord, MigrationRecord
 from ppbase.services.auth_service import normalize_auth_password_schema
+from ppbase.services.secret_redaction import merge_auth_options
 
 logger = logging.getLogger(__name__)
 
@@ -131,17 +132,6 @@ async def acquire_migration_transaction_lock(
         await asyncio.sleep(_MIGRATION_LOCK_POLL_SECONDS)
 
 
-def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge ``override`` into ``base`` without mutating either."""
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def _merge_auth_options(
     defaults: dict[str, Any],
     existing: dict[str, Any],
@@ -152,48 +142,11 @@ def _merge_auth_options(
     Token settings are nested mappings and are covered by the regular deep
     merge. OAuth providers are a list, so sanitized snapshot entries must be
     matched by provider name to retain an existing ``clientId`` and
-    ``clientSecret`` that were intentionally not written to disk.
+    ``clientSecret`` that were intentionally not written to disk.  The rules
+    are shared with the collections API
+    (:func:`ppbase.services.secret_redaction.merge_auth_options`).
     """
-    merged = _deep_merge_dicts(defaults, existing)
-    incoming_copy = dict(incoming)
-    incoming_oauth = incoming_copy.get("oauth2")
-
-    if isinstance(incoming_oauth, dict) and isinstance(
-        incoming_oauth.get("providers"), list
-    ):
-        current_oauth = merged.get("oauth2")
-        current_providers = (
-            current_oauth.get("providers", [])
-            if isinstance(current_oauth, dict)
-            else []
-        )
-        current_by_name = {
-            provider.get("name"): provider
-            for provider in current_providers
-            if isinstance(provider, dict) and provider.get("name")
-        }
-        providers: list[Any] = []
-        for provider in incoming_oauth["providers"]:
-            if not isinstance(provider, dict):
-                providers.append(provider)
-                continue
-            provider_name = provider.get("name")
-            current = current_by_name.get(provider_name, {})
-            providers.append(_deep_merge_dicts(current, provider))
-
-        oauth_without_providers = dict(incoming_oauth)
-        oauth_without_providers.pop("providers", None)
-        incoming_copy["oauth2"] = oauth_without_providers
-        merged = _deep_merge_dicts(merged, incoming_copy)
-        merged_oauth = merged.get("oauth2")
-        if not isinstance(merged_oauth, dict):
-            merged_oauth = {}
-        merged_oauth = dict(merged_oauth)
-        merged_oauth["providers"] = providers
-        merged["oauth2"] = merged_oauth
-        return merged
-
-    return _deep_merge_dicts(merged, incoming_copy)
+    return merge_auth_options(defaults, existing, incoming)
 
 
 # ---------------------------------------------------------------------------

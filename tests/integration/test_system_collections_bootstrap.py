@@ -150,7 +150,8 @@ class TestDefaultUsersCollection:
         data = resp.json()
         opts = data.get("options", {})
         assert "authToken" in opts
-        assert "secret" in opts["authToken"]
+        # The signing secret is never served (v0.40.6 core/collection_model.go:564-584).
+        assert "secret" not in opts["authToken"]
         assert "duration" in opts["authToken"]
         assert opts["authToken"]["duration"] == 604800  # 7 days for non-superusers
 

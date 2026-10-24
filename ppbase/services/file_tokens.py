@@ -22,6 +22,23 @@ async def get_superusers_collection(
     return (await session.execute(statement)).scalars().first()
 
 
+# PocketBase 0.22.34 file tokens carry no ``for`` claim: ``type`` is ``admin``
+# or ``authRecord`` and only the file secret tells them from session tokens
+# (tokens/admin.go:28-35, tokens/record.go:81-95, apis/file.go:221-251).  The
+# signature below is still checked with the token key plus the file secret.
+_POCKETBASE_022_FILE_TOKEN_TYPES = frozenset({"admin", "authRecord"})
+
+
+def _is_auth_collection(collection: CollectionRecord | None) -> bool:
+    """Only auth collections have a ``token_key`` column.
+
+    A token whose ``collectionId`` names a base or view collection is not
+    associated with an auth record (v0.22.34 daos/record.go:432-434, v0.40.6
+    core/record_query.go:511-513) and must not reach the ``token_key`` query.
+    """
+    return collection is not None and (collection.type or "base") == "auth"
+
+
 async def _get_auth_record_token_key(
     session: AsyncSession,
     collection: CollectionRecord,
@@ -79,7 +96,7 @@ async def create_file_token_for_auth(
             raise ValueError("Missing collectionId.")
 
         auth_collection = await session.get(CollectionRecord, collection_id)
-        if auth_collection is None:
+        if not _is_auth_collection(auth_collection):
             raise ValueError("Missing auth collection.")
 
         token_key = await _get_auth_record_token_key(
@@ -119,10 +136,13 @@ async def verify_file_token(
     except jwt.InvalidTokenError:
         return None
 
-    if unverified.get("for") != "file":
+    token_type = str(unverified.get("type", "") or "")
+    purpose = unverified.get("for")
+    if purpose != "file" and not (
+        purpose is None and token_type in _POCKETBASE_022_FILE_TOKEN_TYPES
+    ):
         return None
 
-    token_type = str(unverified.get("type", "") or "")
     token_id = str(unverified.get("id", "") or "")
     if not token_type or not token_id:
         return None
@@ -160,7 +180,7 @@ async def verify_file_token(
             return None
 
         auth_collection = await session.get(CollectionRecord, collection_id)
-        if auth_collection is None:
+        if not _is_auth_collection(auth_collection):
             return None
 
         token_key = await _get_auth_record_token_key(

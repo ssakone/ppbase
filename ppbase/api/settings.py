@@ -24,7 +24,12 @@ from ppbase.core.id_generator import generate_id
 from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import ParamRecord
 from ppbase.models.field_types import _EMAIL_RE
+from ppbase.services.app_url import DEFAULT_APP_URL
 from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
+from ppbase.services.secret_redaction import (
+    redact_settings,
+    without_unchanged_settings_values,
+)
 from ppbase.services.write_barrier import (
     WriteBarrierLease,
     assert_write_barrier_held,
@@ -37,7 +42,7 @@ router = APIRouter()
 _DEFAULT_SETTINGS: dict[str, Any] = {
     "meta": {
         "appName": "PPBase",
-        "appURL": "http://localhost:8090",
+        "appURL": DEFAULT_APP_URL,
         "senderName": "Support",
         "senderAddress": "support@example.com",
         "hideControls": False,
@@ -366,10 +371,14 @@ async def get_settings(
     _admin: dict = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ):
-    """Return the current application settings."""
+    """Return the current application settings, secrets masked.
+
+    PocketBase 0.22.34 answers ``RedactClone``: every non-empty secret is
+    ``******`` (apis/settings.go:29-30, models/settings/settings.go:279-334).
+    """
     row = await _get_or_create_settings(session)
     await session.commit()
-    return row.value or _DEFAULT_SETTINGS
+    return redact_settings(row.value or _DEFAULT_SETTINGS)
 
 
 @router.patch("")
@@ -392,6 +401,12 @@ async def update_settings(
                 "data": {},
             },
         )
+    # ``null`` keeps the stored value at any depth, as Go binds JSON on top of
+    # the stored settings (measured on 0.22.34), and a client saving the masked
+    # document it was served sends the mask back: the stored secret is kept.
+    # The 0.22.34 dashboard strips the mask itself
+    # (ui/src/utils/CommonHelper.js:332-349).
+    body = without_unchanged_settings_values(body)
 
     backups_update = body.get("backups")
     if isinstance(backups_update, dict):
@@ -460,7 +475,8 @@ async def update_settings(
             await _reconcile_storage_runtime_uncancellable(request, engine)
         raise
 
-    return merged
+    # Same masked shape as GET (v0.22.34 apis/settings.go:75-80).
+    return redact_settings(merged)
 
 
 @router.post("/test/email", status_code=204)

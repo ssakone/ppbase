@@ -4,6 +4,8 @@ Endpoints:
     POST   /api/admins/init               (public, first-run only)
     POST   /api/admins/auth-with-password
     POST   /api/admins/auth-refresh
+    POST   /api/admins/request-password-reset   (PocketBase 0.22)
+    POST   /api/admins/confirm-password-reset   (PocketBase 0.22)
     GET    /api/admins
     POST   /api/admins
     GET    /api/admins/{id}
@@ -13,16 +15,58 @@ Endpoints:
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ppbase.api.deps import get_session, get_settings, require_admin
+from ppbase.api.deps import (
+    ADMIN_AUTH_REQUIRED_MESSAGE,
+    get_session,
+    get_settings,
+    require_admin,
+)
+from ppbase.api.legacy_forms import LOAD_ERROR_MESSAGE, FormLoadError, bind_legacy_form
+from ppbase.db.engine import get_async_session
 from ppbase.services import admin_service
+from ppbase.services.legacy_validation import byte_length, is_email_format, length_error
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# PocketBase 0.22.34 validation wording, measured on the official binary.
+_BLANK = {"code": "validation_required", "message": "Cannot be blank."}
+_VALIDATE_FORM = "An error occurred while validating the form."
+_GENERIC = "Something went wrong while processing your request."
+_EMAIL_MAX_BYTES = 255  # forms/admin_password_reset_request.go:52
+# forms/admin_password_reset_confirm.go:45 and forms/admin_upsert.go:78:
+# validation.Length(10, 72), counted in bytes like every ozzo Length rule.
+_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX = 10, 72
+_BCRYPT_MAX_BYTES = 72
+
+
+def _admin_password_error(password: str) -> dict[str, str] | None:
+    """0.22.34 admin password rule; an empty password is left to ``Required``."""
+    if password and not _ADMIN_PASSWORD_MIN <= byte_length(password) <= _ADMIN_PASSWORD_MAX:
+        return length_error(_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX)
+    return None
+
+
+def _bcrypt_limit_error(password: str) -> dict[str, Any] | None:
+    """Over 72 bytes bcrypt refuses to hash; answer like a v0.40.6 superuser.
+
+    Only for the PPBase routes without a PocketBase 0.22 counterpart (``init``,
+    ``change-password``): their own rule counts characters, so a password of
+    at most 71 characters can still exceed bcrypt's 72 bytes.  v0.40.6 reports
+    the bcrypt error of a superuser password (``core/field_password.go:170-172``)
+    as ``validation_invalid_value`` (``tools/router/error.go:206-217``).
+    """
+    if byte_length(password) > _BCRYPT_MAX_BYTES:
+        return {"password": {"code": "validation_invalid_value", "message": "Invalid value."}}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +167,9 @@ async def init_admin(
                 },
             },
         )
+    bcrypt_error = _bcrypt_limit_error(body.password)
+    if bcrypt_error:
+        raise _bad_request("An error occurred while validating the submitted data.", bcrypt_error)
 
     from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
     from ppbase.services.auth_service import create_admin_token
@@ -193,11 +240,121 @@ async def auth_refresh(
             status_code=401,
             detail={
                 "status": 401,
-                "message": "The request requires admin authorization token to be set.",
+                "message": ADMIN_AUTH_REQUIRED_MESSAGE,
                 "data": {},
             },
         )
     return result
+
+
+def _bad_request(message: str, data: dict[str, Any] | None = None) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={"status": 400, "message": message, "data": data or {}},
+    )
+
+
+async def _bind(request: Request, *names: str) -> dict[str, str]:
+    """``c.Bind(form)`` of PocketBase 0.22.34 (apis/admin.go:113-115, :158-160).
+
+    JSON, urlencoded and multipart bodies are read like the 0.22.34 binder
+    (``ppbase/api/legacy_forms.py``); anything else is a loading error.
+    """
+    try:
+        return await bind_legacy_form(request, names)
+    except FormLoadError:
+        raise _bad_request(LOAD_ERROR_MESSAGE) from None
+
+
+async def _send_admin_password_reset(email: str, settings: Any) -> None:
+    """Background part of the reset request: errors are never shown to the client."""
+    try:
+        async for session in get_async_session():
+            await admin_service.request_password_reset(session, email, settings)
+    except Exception as exc:  # pragma: no cover - logged, like PocketBase's FireAndForget
+        logger.error("Failed to send admin password reset request: %s", type(exc).__name__)
+
+
+@router.post("/request-password-reset", status_code=204)
+async def request_password_reset(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    settings: Any = Depends(get_settings),
+):
+    """PocketBase 0.22 admin password reset request (apis/admin.go:21, :111-154).
+
+    Answers 204 for any valid e-mail, known or not, before anything is sent
+    (protection against admin enumeration); the link is sent in the background,
+    built on the stored application URL only (services/app_url.py), never on
+    the request headers.
+    """
+    email = (await _bind(request, "email"))["email"]
+    # Same rules, in the same order, as forms/admin_password_reset_request.go:47-55
+    # (ozzo stops at the first failing rule): Required, Length(1, 255) counted
+    # in bytes like Go's len(), then EmailFormat (govalidator IsEmail, see
+    # services/legacy_validation.py).  Measured on 0.22.34: 255 bytes pass,
+    # 256 bytes and 139 two-byte runes (269 bytes) give the length error.
+    if not email:
+        raise _bad_request(_VALIDATE_FORM, {"email": _BLANK})
+    if byte_length(email) > _EMAIL_MAX_BYTES:
+        raise _bad_request(_VALIDATE_FORM, {"email": length_error(1, _EMAIL_MAX_BYTES)})
+    if not is_email_format(email):
+        raise _bad_request(
+            _VALIDATE_FORM,
+            {"email": {"code": "validation_is_email", "message": "Must be a valid email address."}},
+        )
+
+    background_tasks.add_task(_send_admin_password_reset, email, settings)
+    return Response(status_code=204)
+
+
+@router.post("/confirm-password-reset", status_code=204)
+async def confirm_password_reset(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """PocketBase 0.22 admin password reset confirmation (apis/admin.go:22, :156-186).
+
+    The token is checked like ``forms/admin_password_reset_confirm.go:41-62``:
+    signature with the admin token key plus the reset secret, never the type.
+    On success the token key is renewed, revoking every session and link.
+    """
+    values = await _bind(request, "token", "password", "passwordConfirm")
+    token, password, confirm = values["token"], values["password"], values["passwordConfirm"]
+
+    errors: dict[str, Any] = {}
+    admin = None
+    if not token:
+        errors["token"] = _BLANK
+    else:
+        admin = await admin_service.find_admin_by_password_reset_token(session, token)
+        if admin is None:
+            errors["token"] = {
+                "code": "validation_invalid_token",
+                "message": "Invalid or expired token.",
+            }
+    # Length(10, 72) counts bytes: measured on 0.22.34, five two-byte
+    # characters (10 bytes) pass and 37 (74 bytes) fail, with a valid token or
+    # not; bcrypt could not hash more than 72 bytes anyway.
+    password_error = _admin_password_error(password)
+    if not password:
+        errors["password"] = _BLANK
+    elif password_error:
+        errors["password"] = password_error
+    if not confirm:
+        errors["passwordConfirm"] = _BLANK
+    elif confirm != password:
+        errors["passwordConfirm"] = {
+            "code": "validation_values_mismatch",
+            "message": "Values don't match.",
+        }
+    if errors:
+        raise _bad_request(_GENERIC, errors)
+
+    await admin_service.set_admin_password(session, admin, password)
+    admin.updated = datetime.now(timezone.utc)
+    await session.commit()
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -223,24 +380,19 @@ async def create_admin(
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new admin (admin auth required)."""
-    from ppbase.models.field_types import FieldValidationError
-    from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
-    from ppbase.services.auth_service import validate_password_value
+    from ppbase.services.admin_service import _admin_to_dict
 
-    try:
-        validate_password_value(
-            await _get_superusers_collection(session),
-            body.password,
-        )
-    except FieldValidationError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "status": 400,
-                "message": "An error occurred while validating the submitted data.",
-                "data": {"password": {"code": exc.code, "message": exc.message}},
-            },
-        )
+    # The 0.22.34 admin form: Required, then Length(10, 72) in bytes
+    # (forms/admin_upsert.go:75-79).  Measured: 9 bytes and 74 bytes (37
+    # two-byte characters) answer 400, 10 bytes (five two-byte characters)
+    # pass.  The former rule counted 8 to 71 characters: it refused five
+    # two-byte characters, accepted nine ASCII ones and let bcrypt fail with a
+    # 500 on 37 two-byte ones.
+    if not body.password:
+        raise _bad_request(_GENERIC, {"password": _BLANK})
+    password_error = _admin_password_error(body.password)
+    if password_error:
+        raise _bad_request(_GENERIC, {"password": password_error})
 
     admin = await admin_service.create_admin(
         session, body.email, body.password, body.avatar
@@ -282,6 +434,13 @@ async def update_admin(
     from ppbase.services.admin_service import _admin_to_dict
 
     data = body.model_dump(exclude_none=True)
+    # forms/admin_upsert.go:75-79: a new password has 10 to 72 bytes; an
+    # unknown admin is a 404 first (apis/admin.go:285-288).  Measured on
+    # 0.22.34.  ``passwordConfirm`` stays optional here, a PPBase contract
+    # (0.22.34 requires it with a password, forms/admin_upsert.go:80-84).
+    password_error = _admin_password_error(body.password or "")
+    if password_error and await admin_service.get_admin(session, admin_id) is not None:
+        raise _bad_request(_GENERIC, {"password": password_error})
     admin = await admin_service.update_admin(session, admin_id, data)
     if admin is None:
         raise HTTPException(
@@ -299,10 +458,12 @@ async def update_admin(
 @router.delete("/{admin_id}", status_code=204)
 async def delete_admin(
     admin_id: str,
+    request: Request,
     _admin: dict = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ):
     """Delete an admin (cannot delete the last one)."""
+    superusers_collection = await admin_service._get_superusers_collection(session)
     deleted = await admin_service.delete_admin(session, admin_id)
     if not deleted:
         # Either not found or last admin
@@ -325,6 +486,12 @@ async def delete_admin(
             },
         )
     await session.commit()
+
+    # Realtime clients of the deleted admin become guests, as in PocketBase
+    # (v0.22.34 apis/realtime.go:269-280, unregisterClientsByAuthModel).
+    manager = getattr(request.app.state, "subscription_manager", None)
+    if manager is not None and superusers_collection is not None:
+        manager.unset_auth_record(str(superusers_collection.id), admin_id)
 
 
 @router.post("/{admin_id}/change-password")
@@ -376,6 +543,9 @@ async def change_password(
                 },
             },
         )
+    bcrypt_error = _bcrypt_limit_error(body.password)
+    if bcrypt_error:
+        raise _bad_request("An error occurred while validating the submitted data.", bcrypt_error)
 
     admin = await admin_service.update_admin(
         session, admin_id, {"password": body.password}

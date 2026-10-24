@@ -422,7 +422,7 @@ class TestAuthRefresh:
         admin_token: str,
         auth_collection: dict,
     ):
-        """Token from collection A, refresh on collection B → 401."""
+        """Token from collection A, refresh on collection B → 403 (as PocketBase)."""
         import uuid
         members_name = f"members_{uuid.uuid4().hex[:8]}"
         # Create a second auth collection
@@ -461,12 +461,17 @@ class TestAuthRefresh:
         assert resp.status_code == 200, resp.text
         members_token = resp.json()["token"]
 
-        # Try to refresh members token on users collection
+        # Try to refresh members token on users collection: 403 naming the
+        # token's collection (v0.22.34 apis/middlewares.go:102-105, v0.40.6
+        # apis/middlewares.go:164-167; measured on the 0.22.34 binary).
         resp2 = await app_client.post(
             "/api/collections/users/auth-refresh",
             headers={"Authorization": members_token},
         )
-        assert resp2.status_code == 401, resp2.text
+        assert resp2.status_code == 403, resp2.text
+        assert resp2.json()["message"] == (
+            f"The request requires auth record from {members_name} collection."
+        )
 
 
 # =========================================================================

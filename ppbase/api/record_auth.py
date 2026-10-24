@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from ppbase.api.deps import get_optional_auth
+from ppbase.api.deps import RECORD_AUTH_REQUIRED_MESSAGE, get_optional_auth
 from ppbase.db.engine import get_engine
 from ppbase.ext.events import RecordAuthRequestEvent
 from ppbase.ext.registry import (
@@ -44,6 +44,7 @@ from ppbase.ext.registry import (
     get_extension_registry,
 )
 from ppbase.models.field_types import _EMAIL_RE
+from ppbase.services.app_url import resolve_app_url
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
     check_record_rule,
@@ -134,73 +135,6 @@ def _normalize_oauth_provider_auth_url(auth_url: str) -> str:
     items.append(("redirect_uri", ""))
     normalized_query = urlencode(items, doseq=True)
     return f"{base}?{normalized_query}"
-
-
-def _extract_first_header_value(value: str | None) -> str:
-    """Return first comma-separated header value."""
-    if not value:
-        return ""
-    return value.split(",")[0].strip()
-
-
-async def _resolve_public_base_url(request: Request, engine: Any) -> str:
-    """Resolve externally accessible app base URL.
-
-    Resolution order:
-    1) ``settings.meta.appURL`` from persisted settings
-    2) reverse-proxy headers (``X-Forwarded-*``)
-    3) request base URL fallback
-    """
-    configured_url = ""
-    try:
-        from sqlalchemy import select
-        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-        from ppbase.db.system_tables import ParamRecord
-
-        factory = async_sessionmaker(
-            bind=engine,
-            class_=AsyncSession,
-            expire_on_commit=False,
-        )
-        async with factory() as session:
-            stmt = select(ParamRecord.value).where(ParamRecord.key == "settings")
-            raw_settings = (await session.execute(stmt)).scalar_one_or_none()
-
-        if isinstance(raw_settings, dict):
-            meta = raw_settings.get("meta")
-            if isinstance(meta, dict):
-                configured_url = str(meta.get("appURL", "") or "").strip().rstrip("/")
-    except Exception:
-        configured_url = ""
-
-    if configured_url:
-        parsed = urlsplit(configured_url)
-        if parsed.scheme and parsed.netloc:
-            normalized = urlunsplit(
-                (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
-            )
-            return _normalize_oauth_base_url(normalized.rstrip("/"))
-
-    scheme = _extract_first_header_value(request.headers.get("x-forwarded-proto"))
-    host = _extract_first_header_value(request.headers.get("x-forwarded-host"))
-    forwarded_port = _extract_first_header_value(request.headers.get("x-forwarded-port"))
-
-    if not scheme:
-        scheme = request.url.scheme
-    if not host:
-        host = request.headers.get("host", "").strip()
-
-    if host and forwarded_port and ":" not in host:
-        is_default_http = scheme == "http" and forwarded_port == "80"
-        is_default_https = scheme == "https" and forwarded_port == "443"
-        if not is_default_http and not is_default_https:
-            host = f"{host}:{forwarded_port}"
-
-    if host:
-        return _normalize_oauth_base_url(f"{scheme}://{host}".rstrip("/"))
-
-    return _normalize_oauth_base_url(str(request.base_url).rstrip("/"))
 
 
 async def _extract_oauth2_redirect_payload(request: Request) -> dict[str, str]:
@@ -1115,15 +1049,17 @@ async def api_auth_refresh(
     if auth is not None:
         auth_type = auth.get("type")
         if auth_type in {"auth", "authRecord"} and auth.get("collectionId") != collection.id:
+            # The message names the collection of the token's record
+            # (v0.22.34 apis/middlewares.go:102-105, v0.40.6 apis/middlewares.go
+            # RequireSameCollectionContextAuth).
+            token_collection = auth.get("collectionName") or collection.name
             return _error_response(
                 403,
-                f"The request requires auth record from {collection.name} collection.",
+                f"The request requires auth record from {token_collection} collection.",
             )
         if auth_type == "admin" and collection.name != "_superusers":
-            return _error_response(
-                403,
-                f"The request requires auth record from {collection.name} collection.",
-            )
+            # An admin token loads no auth record (v0.22.34 apis/middlewares.go:97-100).
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
     event = RecordAuthRequestEvent(
         app=request.app,
@@ -1144,7 +1080,7 @@ async def api_auth_refresh(
         token_str = token_str.strip()
 
         if not token_str:
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
         settings = request.app.state.settings
         from ppbase.services.record_auth_service import (
@@ -1154,13 +1090,13 @@ async def api_auth_refresh(
 
         payload = await verify_record_auth_token(engine, collection, token_str, settings)
         if payload is None:
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
         payload["_raw_token"] = token_str
         e.payload = payload
         result = await auth_refresh(engine, collection, payload, settings)
         if result is None:
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
         rule_request_context = _build_rule_request_context(
             request,
@@ -1356,7 +1292,9 @@ async def api_request_verification(
             )
 
         settings = request.app.state.settings
-        base_url = await _resolve_public_base_url(request, engine)
+        # Links are built on the stored application URL only, never on the
+        # client-chosen Host or X-Forwarded-* headers (services/app_url.py).
+        base_url = await resolve_app_url(engine)
         from ppbase.services.record_auth_service import request_verification as _req_verif
 
         await _req_verif(engine, collection, email, settings, base_url=base_url)
@@ -1481,7 +1419,9 @@ async def api_request_password_reset(
             )
 
         settings = request.app.state.settings
-        base_url = await _resolve_public_base_url(request, engine)
+        # Links are built on the stored application URL only, never on the
+        # client-chosen Host or X-Forwarded-* headers (services/app_url.py).
+        base_url = await resolve_app_url(engine)
         from ppbase.services.record_auth_service import request_password_reset as _req_reset
 
         await _req_reset(engine, collection, email, settings, base_url=base_url)
@@ -1594,11 +1534,14 @@ async def api_request_email_change(
         )
 
     # A record token from another auth collection is valid, but cannot be used
-    # to change emails in this collection.
+    # to change emails in this collection; the message names the token's
+    # collection (v0.22.34 apis/record_auth.go:53 RequireSameContextRecordAuth,
+    # apis/middlewares.go:102-105).
     if auth.get("collectionId") != collection.id:
+        token_collection = auth.get("collectionName") or collection.name
         return _error_response(
             403,
-            "The authorized record model is not allowed to perform this action.",
+            f"The request requires auth record from {token_collection} collection.",
         )
 
     token_str = _extract_auth_token(request)
@@ -1656,7 +1599,9 @@ async def api_request_email_change(
     )
 
     async def _default_request_email_change(e: RecordAuthRequestEvent) -> Response:
-        base_url = await _resolve_public_base_url(request, engine)
+        # Links are built on the stored application URL only, never on the
+        # client-chosen Host or X-Forwarded-* headers (services/app_url.py).
+        base_url = await resolve_app_url(engine)
         ok, errors = await _request_email_change(
             engine,
             collection,

@@ -12,6 +12,7 @@ import bcrypt
 import jwt
 
 from ppbase.models.field_types import FieldDefinition, FieldType, validate_field_value
+from ppbase.services.legacy_validation import go_string
 
 # Alphabet for token key generation
 _TOKEN_KEY_ALPHABET = string.ascii_letters + string.digits
@@ -280,16 +281,22 @@ def get_password_cost(collection: Any | None) -> int:
 
 
 def hash_password(password: str, *, cost: int | None = None) -> str:
-    """Hash a plaintext password using bcrypt."""
-    pwd_bytes = password.encode("utf-8")
+    """Hash a plaintext password using bcrypt.
+
+    The password is hashed as the Go string PocketBase would hash: a lone
+    surrogate escape decoded by Python's ``json`` becomes U+FFFD, as with Go's
+    JSON decoder (it could not be encoded to UTF-8 otherwise).  bcrypt refuses
+    more than 72 bytes (``ValueError``): callers validate the length first.
+    """
+    pwd_bytes = go_string(password).encode("utf-8")
     salt = bcrypt.gensalt(rounds=cost or DEFAULT_BCRYPT_COST)
     return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash."""
+    """Verify a plaintext password against a bcrypt hash (Go string, as above)."""
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        return bcrypt.checkpw(go_string(plain).encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
 
@@ -511,12 +518,35 @@ def create_verification_token(
     return create_token(payload, secret, duration)
 
 
+# PocketBase 0.22 signs every record purpose token (verification, password
+# reset, email change, file) with ``type=authRecord``: only the purpose secret
+# tells them apart (v0.22.34 tokens/record.go:30-95, tokens/tokens.go:4-7), and
+# its confirmations check the signature, never the type
+# (forms/record_verification_confirm.go:58-60,
+# forms/record_password_reset_confirm.go:59-62,
+# forms/record_email_change_confirm.go:103-106).  PPBase issues explicit
+# purpose types like PocketBase >= 0.23 and also accepts the 0.22 type, so the
+# links e-mailed by PocketBase 0.22 before a migration keep working.
+LEGACY_RECORD_TOKEN_TYPE = "authRecord"
+
+
+def is_purpose_token_type(token_type: Any, expected_type: str) -> bool:
+    """Return whether ``token_type`` is the purpose type or the 0.22 type."""
+    return token_type in (expected_type, LEGACY_RECORD_TOKEN_TYPE)
+
+
 def verify_purpose_token(
     token_str: str,
     secret: str,
     expected_type: str,
+    *,
+    accept_legacy_record_type: bool = False,
 ) -> dict[str, Any] | None:
     """Decode a purpose-specific JWT and check its ``type`` claim.
+
+    ``secret`` must be the record ``token_key`` plus the purpose secret.  With
+    ``accept_legacy_record_type`` a PocketBase 0.22 ``authRecord`` token signed
+    with that same key is accepted too.
 
     Returns the decoded payload dict on success, or ``None`` on failure.
     """
@@ -524,7 +554,11 @@ def verify_purpose_token(
         payload = verify_token(token_str, secret)
     except jwt.InvalidTokenError:
         return None
-    if payload.get("type") != expected_type:
+    token_type = payload.get("type")
+    if accept_legacy_record_type:
+        if not is_purpose_token_type(token_type, expected_type):
+            return None
+    elif token_type != expected_type:
         return None
     return payload
 

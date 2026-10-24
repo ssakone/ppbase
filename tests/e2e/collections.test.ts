@@ -64,8 +64,9 @@ describe('Collections API', () => {
     try {
       expect(collection.options.manageRule).toBe('@request.auth.id != ""');
       expect(collection.options.authToken.duration).toBe(1234);
-      expect(typeof collection.options.authToken.secret).toBe('string');
-      expect(collection.options.authToken.secret.length).toBe(50);
+      // Token secrets are generated but never served
+      // (PocketBase v0.40.6 core/collection_model.go:564-584).
+      expect(collection.options.authToken.secret).toBeUndefined();
       expect(collection.options.passwordResetToken).toBeTruthy();
       expect(collection.options.verificationToken).toBeTruthy();
       expect(collection.options.fileToken).toBeTruthy();

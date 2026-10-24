@@ -770,7 +770,8 @@ describe('Auth Collection Flows', () => {
 
       await expect(
         pb.collection(second.collection.name).requestEmailChange(newEmail)
-      ).rejects.toThrow(/403|not allowed|authorization/i);
+        // PocketBase wording: "The request requires auth record from <collection> collection."
+      ).rejects.toThrow(/403|not allowed|authorization|auth record from/i);
     } finally {
       await second.cleanup();
     }
