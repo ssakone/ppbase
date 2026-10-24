@@ -3,8 +3,15 @@
 Runs the same HTTP scenarios against an official PocketBase 0.22 binary and
 against PPBase, then writes ``pocketbase.json``, ``ppbase.json`` and
 ``diff.json`` in ``--out``.  It backs the expected values of
-``tests/integration/test_relation_maxselect_null.py`` and
-``tests/integration/test_relation_delete_and_paths.py``.
+``tests/integration/test_relation_maxselect_null.py``,
+``tests/integration/test_relation_delete_and_paths.py`` and
+``tests/integration/test_multi_match_rules.py`` (groups ``multimatch`` and
+``buma_rules``: PocketBase multi-match and LEFT JOIN paths, the BUMA users
+and buma_pdv rules).  ``--groups`` selects scenario groups.
+
+PPBase does not join ``@request.auth.<relation>.<field>``: like BUMA's
+``app/auth/context.py``, the probe serves ``role.permission.*`` of the
+caller's role through ``_prepare_rule_context`` (a missing key is NULL).
 
 Only synthetic records are created.  PocketBase runs in a temporary data
 directory on a random loopback port and is always stopped; PPBase runs
