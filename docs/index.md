@@ -17,6 +17,7 @@ PPBase is a Python reimplementation of [PocketBase](https://pocketbase.io/) back
 | [Realtime / SSE](./realtime.md) | Subscribe hooks, message events |
 | [Storage & Assets](./storage.md) | Local vs S3/R2 storage, public dir, file URLs |
 | [Native Backup & Restore](./native-backup-restore.md) | PocketBase-style ZIP storage, destructive in-place restore, restart and cron |
+| [PocketBase 0.22 compatibility](./pocketbase-022-compatibility.md) | Imported 0.22 sessions and links, realtime identity, secrets never served |
 | [Multi-file Projects](./multi-file.md) | Organising hooks across files |
 
 ## Architecture at a glance
