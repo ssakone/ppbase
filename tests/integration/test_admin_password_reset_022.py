@@ -320,6 +320,7 @@ LENGTH_10_72 = {
     "message": "The length must be between 10 and 72.",
 }
 IS_EMAIL = {"code": "validation_is_email", "message": "Must be a valid email address."}
+LOADING = "An error occurred while loading the submitted data."
 
 
 async def _legacy_reset_token(admin: dict[str, Any]) -> str:
@@ -448,3 +449,51 @@ async def test_request_email_format_is_govalidator(app_client: AsyncClient, sent
         resp = await app_client.post("/api/admins/request-password-reset", json={"email": email})
         assert resp.status_code == 204, (email, resp.text)
     assert sent_mails == []
+
+
+async def test_bodies_are_bound_like_pocketbase(
+    app_client: AsyncClient, admin_token: str, sent_mails
+) -> None:
+    """c.Bind of 0.22.34 reads JSON, urlencoded and multipart bodies (measured)."""
+    admin = await _create_admin(app_client, admin_token)
+    path = "/api/admins/request-password-reset"
+    form = {"Content-Type": "application/x-www-form-urlencoded"}
+    for kwargs, status in (
+        ({"content": b"email=nobody%40c11.test", "headers": form}, 204),
+        ({"files": {"email": (None, "nobody@c11.test")}}, 204),
+        ({"content": b"EMAIL=nobody%40c11.test", "headers": form}, 204),
+        ({"json": {"EMAIL": "nobody@c11.test"}}, 204),
+        (
+            {"content": b'{"email": "nobody@c11.test"}', "headers": {"Content-Type": "text/plain"}},
+            400,
+        ),
+        ({"content": b"x=1", "headers": form, "params": {"email": "nobody@c11.test"}}, 204),
+        ({"json": {}, "params": {"email": "nobody@c11.test"}}, 400),
+    ):
+        resp = await app_client.post(path, **kwargs)
+        assert resp.status_code == status, (kwargs, resp.text)
+    text_plain = await app_client.post(
+        path, content=b'{"email": "a@b.co"}', headers={"Content-Type": "text/plain"}
+    )
+    assert _error(text_plain) == (LOADING, {})
+    assert sent_mails == []
+
+    # A urlencoded and a multipart confirmation both reset the password.
+    token = await _legacy_reset_token(admin)
+    body = f"token={token}&password=form-password-1&passwordConfirm=form-password-1".encode()
+    resp = await app_client.post("/api/admins/confirm-password-reset", content=body, headers=form)
+    assert resp.status_code == 204, resp.text
+    resp = await app_client.post(
+        "/api/admins/confirm-password-reset",
+        files={
+            "token": (None, await _legacy_reset_token(admin)),
+            "password": (None, "multipart-pass-1"),
+            "passwordConfirm": (None, "multipart-pass-1"),
+        },
+    )
+    assert resp.status_code == 204, resp.text
+    login = await app_client.post(
+        "/api/admins/auth-with-password",
+        json={"identity": admin["email"], "password": "multipart-pass-1"},
+    )
+    assert login.status_code == 200, login.text

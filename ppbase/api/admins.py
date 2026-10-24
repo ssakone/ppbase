@@ -15,7 +15,6 @@ Endpoints:
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +29,7 @@ from ppbase.api.deps import (
     get_settings,
     require_admin,
 )
+from ppbase.api.legacy_forms import LOAD_ERROR_MESSAGE, FormLoadError, bind_legacy_form
 from ppbase.db.engine import get_async_session
 from ppbase.services import admin_service
 from ppbase.services.legacy_validation import byte_length, is_email_format, length_error
@@ -229,20 +229,6 @@ async def auth_refresh(
     return result
 
 
-async def _json_object_or_error(request: Request) -> dict[str, Any]:
-    """Body of a PocketBase 0.22 form: a JSON object, empty meaning ``{}``."""
-    raw = await request.body()
-    if not raw.strip():
-        return {}
-    try:
-        body = json.loads(raw)
-    except ValueError:
-        body = None
-    if not isinstance(body, dict):
-        raise _bad_request("An error occurred while loading the submitted data.")
-    return body
-
-
 def _bad_request(message: str, data: dict[str, Any] | None = None) -> HTTPException:
     return HTTPException(
         status_code=400,
@@ -250,18 +236,16 @@ def _bad_request(message: str, data: dict[str, Any] | None = None) -> HTTPExcept
     )
 
 
-def _string_fields(body: dict[str, Any], *names: str) -> dict[str, str]:
-    """Go binds JSON strings only: any other value is a loading error."""
-    values: dict[str, str] = {}
-    for name in names:
-        value = body.get(name)
-        if value is None:
-            values[name] = ""
-        elif isinstance(value, str):
-            values[name] = value
-        else:
-            raise _bad_request("An error occurred while loading the submitted data.")
-    return values
+async def _bind(request: Request, *names: str) -> dict[str, str]:
+    """``c.Bind(form)`` of PocketBase 0.22.34 (apis/admin.go:113-115, :158-160).
+
+    JSON, urlencoded and multipart bodies are read like the 0.22.34 binder
+    (``ppbase/api/legacy_forms.py``); anything else is a loading error.
+    """
+    try:
+        return await bind_legacy_form(request, names)
+    except FormLoadError:
+        raise _bad_request(LOAD_ERROR_MESSAGE) from None
 
 
 async def _send_admin_password_reset(email: str, settings: Any) -> None:
@@ -286,8 +270,7 @@ async def request_password_reset(
     built on the stored application URL only (services/app_url.py), never on
     the request headers.
     """
-    body = await _json_object_or_error(request)
-    email = _string_fields(body, "email")["email"]
+    email = (await _bind(request, "email"))["email"]
     # Same rules, in the same order, as forms/admin_password_reset_request.go:47-55
     # (ozzo stops at the first failing rule): Required, Length(1, 255) counted
     # in bytes like Go's len(), then EmailFormat (govalidator IsEmail, see
@@ -318,8 +301,7 @@ async def confirm_password_reset(
     signature with the admin token key plus the reset secret, never the type.
     On success the token key is renewed, revoking every session and link.
     """
-    body = await _json_object_or_error(request)
-    values = _string_fields(body, "token", "password", "passwordConfirm")
+    values = await _bind(request, "token", "password", "passwordConfirm")
     token, password, confirm = values["token"], values["password"], values["passwordConfirm"]
 
     errors: dict[str, Any] = {}
