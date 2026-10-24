@@ -28,7 +28,7 @@ from ppbase.services.app_url import DEFAULT_APP_URL
 from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
 from ppbase.services.secret_redaction import (
     redact_settings,
-    without_unchanged_settings_secrets,
+    without_unchanged_settings_values,
 )
 from ppbase.services.write_barrier import (
     WriteBarrierLease,
@@ -401,10 +401,12 @@ async def update_settings(
                 "data": {},
             },
         )
-    # A client saving the masked document it was served sends the mask (or
-    # null) back: the stored secret is kept.  The 0.22.34 dashboard strips the
-    # mask itself (ui/src/utils/CommonHelper.js:332-349).
-    body = without_unchanged_settings_secrets(body)
+    # ``null`` keeps the stored value at any depth, as Go binds JSON on top of
+    # the stored settings (measured on 0.22.34), and a client saving the masked
+    # document it was served sends the mask back: the stored secret is kept.
+    # The 0.22.34 dashboard strips the mask itself
+    # (ui/src/utils/CommonHelper.js:332-349).
+    body = without_unchanged_settings_values(body)
 
     backups_update = body.get("backups")
     if isinstance(backups_update, dict):

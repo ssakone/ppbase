@@ -208,6 +208,47 @@ class TestCollectionSecrets:
         assert _secrets(stored) == before
         assert stored["authToken"]["duration"] == 4321
 
+    async def test_null_token_configs_and_oauth2_keep_the_stored_ones(
+        self, app_client: AsyncClient, admin_token: str
+    ) -> None:
+        """A JSON null bound to a Go struct leaves it unchanged (v0.40.6
+        ``TokenConfig``/``OAuth2Config``, core/collection_model_auth_options.go:
+        292-297 and :407-448); it used to store ``None`` and lose the secrets."""
+        name = await _auth_collection_with_provider(app_client, admin_token)
+        before = await _stored_options(name)
+        headers = {"Authorization": admin_token}
+        resp = await app_client.patch(
+            f"/api/collections/{name}",
+            headers=headers,
+            json={"options": {**{option: None for option in TOKEN_OPTIONS}, "oauth2": None}},
+        )
+        assert resp.status_code == 200, resp.text
+        stored = await _stored_options(name)
+        assert _secrets(stored) == _secrets(before)
+        assert {option: stored[option] for option in TOKEN_OPTIONS} == {
+            option: before[option] for option in TOKEN_OPTIONS
+        }
+        assert stored["oauth2"] == before["oauth2"]
+
+        # The collection still signs and accepts tokens.
+        email = f"null_{uuid.uuid4().hex[:8]}@example.com"
+        created = await app_client.post(
+            f"/api/collections/{name}/records",
+            headers=headers,
+            json={"email": email, "password": "securepass123", "passwordConfirm": "securepass123"},
+        )
+        assert created.status_code == 200, created.text
+        login = await app_client.post(
+            f"/api/collections/{name}/auth-with-password",
+            json={"identity": email, "password": "securepass123"},
+        )
+        assert login.status_code == 200, login.text
+        refresh = await app_client.post(
+            f"/api/collections/{name}/auth-refresh",
+            headers={"Authorization": login.json()["token"]},
+        )
+        assert refresh.status_code == 200, refresh.text
+
     async def test_new_secret_is_stored_but_not_echoed(
         self, app_client: AsyncClient, admin_token: str
     ) -> None:
@@ -305,6 +346,22 @@ class TestSettingsSecrets:
             stored = await _stored_settings()
             assert stored["smtp"]["password"] == "smtp-password-value"
             assert stored["smtp"]["host"] == "h2"
+
+            # null sections, sub-sections and values keep the stored ones
+            # (measured on 0.22.34: 200 and nothing changed).
+            kept = await _stored_settings()
+            for patch in (
+                {"smtp": None},
+                {"meta": None},
+                {"s3": None},
+                {"backups": None},
+                {"backups": {"s3": None, "cron": None, "cronMaxKeep": None}},
+                {"recordAuthToken": None},
+                {"smtp": {"host": None, "password": None}},
+            ):
+                resp = await app_client.patch("/api/settings", headers=headers, json=patch)
+                assert resp.status_code == 200, (patch, resp.text)
+                assert await _stored_settings() == kept, patch
 
             # An empty string clears the secret, as in PocketBase 0.22.34.
             cleared = await app_client.patch(

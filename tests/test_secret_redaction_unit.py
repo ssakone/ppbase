@@ -11,7 +11,7 @@ from ppbase.services.secret_redaction import (
     merge_auth_options,
     redact_collection_options,
     redact_settings,
-    without_unchanged_settings_secrets,
+    without_unchanged_settings_values,
 )
 
 OPTIONS = {
@@ -114,6 +114,26 @@ def test_merge_auth_options_keeps_secrets_that_were_not_shown() -> None:
     assert created["authToken"]["secret"] == "generated"
 
 
+def test_merge_auth_options_ignores_null_sections_like_go() -> None:
+    """A JSON null bound to a Go struct leaves it unchanged.
+
+    v0.40.6 ``TokenConfig`` and ``OAuth2Config`` are struct fields of the
+    collection (core/collection_model_auth_options.go:292-297, :407-448); a
+    null used to replace them with ``None`` and lose every stored secret.
+    """
+    defaults = {"authToken": {"secret": "generated", "duration": 1}}
+    stored = copy.deepcopy(OPTIONS)
+    stored["manageRule"] = "id != ''"
+    for name in ("authToken", "fileToken", "oauth2", "passwordAuth"):
+        merged = merge_auth_options(defaults, stored, {name: None})
+        assert merged[name] == stored[name], name
+    # Null scalars of a token configuration are ignored too (int64/string fields).
+    merged = merge_auth_options(defaults, stored, {"authToken": {"secret": None, "duration": None}})
+    assert merged["authToken"] == stored["authToken"]
+    # Pointer-like values keep their meaning: a null rule is "superusers only".
+    assert merge_auth_options(defaults, stored, {"manageRule": None})["manageRule"] is None
+
+
 def test_settings_are_masked_like_pocketbase_redact_clone() -> None:
     stored = {
         "meta": {"appName": "BUMA"},
@@ -139,7 +159,7 @@ def test_settings_are_masked_like_pocketbase_redact_clone() -> None:
     assert redact_settings({}) == {}
 
 
-def test_settings_patch_drops_masked_and_null_secrets_only() -> None:
+def test_settings_patch_drops_masked_secrets_and_nulls() -> None:
     body = {
         "smtp": {"host": "h", "password": SECRET_MASK},
         "s3": {"secret": None, "bucket": "b"},
@@ -147,7 +167,7 @@ def test_settings_patch_drops_masked_and_null_secrets_only() -> None:
         "recordAuthToken": {"secret": SECRET_MASK, "duration": 10},
         "meta": {"appName": SECRET_MASK},
     }
-    cleaned = without_unchanged_settings_secrets(body)
+    cleaned = without_unchanged_settings_values(body)
     assert cleaned == {
         "smtp": {"host": "h"},
         "s3": {"bucket": "b"},
@@ -157,3 +177,19 @@ def test_settings_patch_drops_masked_and_null_secrets_only() -> None:
         "meta": {"appName": SECRET_MASK},
     }
     assert body["smtp"]["password"] == SECRET_MASK
+
+
+def test_settings_patch_null_keeps_sections_and_values() -> None:
+    """Measured on 0.22.34: null sections, sub-sections and leaves keep the stored value."""
+    body = {
+        "smtp": None,
+        "meta": {"appName": None, "appURL": "https://app.example"},
+        "backups": {"s3": None, "cron": None},
+        "rateLimits": {"rules": [{"label": "*", "audience": None}]},
+    }
+    assert without_unchanged_settings_values(body) == {
+        "meta": {"appURL": "https://app.example"},
+        "backups": {},
+        # Lists are replaced as a whole, as sent.
+        "rateLimits": {"rules": [{"label": "*", "audience": None}]},
+    }

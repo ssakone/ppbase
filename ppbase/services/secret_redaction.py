@@ -118,24 +118,46 @@ def redact_collection_options(options: Mapping[str, Any] | None) -> dict[str, An
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge like Go binds JSON on top of a stored struct.
+
+    A JSON ``null`` for a stored mapping (a struct in PocketBase, such as
+    ``authToken``, ``oauth2`` or ``passwordAuth``) leaves it unchanged: Go's
+    ``encoding/json`` ignores a null bound to a struct, and v0.40.6
+    ``OAuth2Config.UnmarshalJSON`` keeps the stored providers when none are
+    submitted (``core/collection_model_auth_options.go:422-448``).  Other
+    values, ``null`` included (``authRule``, ``manageRule``), replace the
+    stored one.
+    """
     merged = dict(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
+        elif value is None and isinstance(merged.get(key), dict):
+            continue
         else:
             merged[key] = value
     return merged
 
 
 def _without_kept_token_secrets(incoming: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop the token configuration values that keep the stored ones.
+
+    The secret is kept when absent, ``None``, empty or masked (see
+    :func:`_keeps_stored_secret`); a ``None`` duration is ignored like a JSON
+    null bound to the ``int64`` field of v0.40.6 ``TokenConfig``
+    (``core/collection_model_auth_options.go:292-297``).
+    """
     result = dict(incoming)
     for key in AUTH_TOKEN_OPTION_KEYS:
         token_config = result.get(key)
-        if isinstance(token_config, dict) and "secret" in token_config:
-            if _keeps_stored_secret(token_config["secret"]):
-                token_config = dict(token_config)
-                token_config.pop("secret")
-                result[key] = token_config
+        if not isinstance(token_config, dict):
+            continue
+        kept = dict(token_config)
+        if "secret" in kept and _keeps_stored_secret(kept["secret"]):
+            kept.pop("secret")
+        if "duration" in kept and kept["duration"] is None:
+            kept.pop("duration")
+        result[key] = kept
     return result
 
 
@@ -214,14 +236,30 @@ def redact_settings(settings_value: Mapping[str, Any] | None) -> dict[str, Any]:
     return redacted
 
 
-def without_unchanged_settings_secrets(body: Mapping[str, Any]) -> dict[str, Any]:
-    """Drop the secrets a settings ``PATCH`` sends back unchanged.
+def _without_null_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _without_null_values(item) for key, item in value.items() if item is not None}
+    return value
 
-    The mask and ``null`` keep the stored value (Go ignores a JSON ``null``
-    bound to a string field); an empty string still clears the secret, as in
-    PocketBase 0.22.34.
+
+def without_unchanged_settings_values(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop what a settings ``PATCH`` sends without changing it.
+
+    * ``null``, at any depth of a mapping, keeps the stored value: Go ignores
+      a JSON ``null`` bound to a struct, string, number or boolean field, which
+      are the 0.22.34 settings sections and values (models/settings/settings.go:
+      24-70) apart from the unused ``pkce`` pointer and ``emailAuth`` domain
+      lists (:639, :695-696).  Measured on 0.22.34: ``{"smtp": null}``,
+      ``{"meta": null}``, ``{"backups": {"s3": null}}`` and ``{"smtp": {"host":
+      null, "password": null}}`` all answer 200 and keep the stored values.
+      Lists are replaced as a whole and kept as sent.
+    * The mask on a secret keeps the stored secret.  This differs from
+      0.22.34, which stores the mask as the new secret (its dashboard strips
+      it before saving, ui/src/utils/CommonHelper.js:332-349).
+
+    An empty string still clears a secret, as in PocketBase 0.22.34.
     """
-    result = copy.deepcopy(dict(body))
+    result = _without_null_values(copy.deepcopy(dict(body)))
     for path in SETTINGS_SECRET_PATHS:
         parent: Any = result
         for key in path[:-1]:
@@ -229,6 +267,6 @@ def without_unchanged_settings_secrets(body: Mapping[str, Any]) -> dict[str, Any
         if not isinstance(parent, dict):
             continue
         leaf = path[-1]
-        if leaf in parent and (parent[leaf] is None or parent[leaf] == SECRET_MASK):
+        if leaf in parent and parent[leaf] == SECRET_MASK:
             parent.pop(leaf)
     return result
