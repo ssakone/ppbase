@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
 import re
+from types import SimpleNamespace
 from typing import Any
 import uuid
 
@@ -1389,6 +1390,35 @@ async def update_collection_table(
             )
 
     async with _ddl_connection(engine) as conn:
+        # A column whose live shape contradicts an unchanged field (created
+        # before the multiplicity rule) must be reconciled first: give an
+        # explicit error instead of a raw index/cast SQL error.
+        unchanged_multi_value = [
+            old_fields[key]
+            for key in sorted(common_keys)
+            if old_fields[key].type == new_fields[key].type
+            and old_fields[key].type
+            in (FieldType.SELECT, FieldType.FILE, FieldType.RELATION)
+            and not _multiplicity_changed(old_fields[key], new_fields[key])
+        ]
+        if unchanged_multi_value:
+            live_rows = await conn.execute(text(_LIVE_COLUMN_SHAPES_SQL))
+            shapes = {
+                (str(row[0]), str(row[1])): (bool(row[2]), str(row[3]))
+                for row in live_rows
+                if str(row[0]) == old_name
+            }
+            mismatches = _shape_mismatches_for(
+                SimpleNamespace(
+                    name=old_name,
+                    type=old_type,
+                    schema=unchanged_multi_value,
+                ),
+                shapes,
+            )
+            if mismatches:
+                raise MultiValueShapeMismatchError(mismatches)
+
         for stmt in stmts:
             await conn.execute(text(stmt))
 
@@ -1463,6 +1493,117 @@ async def _column_is_array(
     return None if value is None else bool(value)
 
 
+@dataclass(frozen=True)
+class MultiValueShapeMismatch:
+    """A select/file/relation column whose shape contradicts its field rule."""
+
+    collection: str
+    field: str
+    expected_array: bool
+    column_type: str
+
+    def describe(self) -> str:
+        expected = "an array column" if self.expected_array else "a scalar column"
+        return (
+            f"{self.collection}.{self.field} (needs {expected}, "
+            f"found {self.column_type})"
+        )
+
+
+class MultiValueShapeMismatchError(ValueError):
+    """Raised instead of a raw SQL error when a column needs reconciling.
+
+    A database created before the shared multiplicity rule can hold, for
+    example, a scalar ``VARCHAR(15)`` column for a PocketBase 0.22 relation
+    with ``maxSelect: null``.  Reads would expose a string where PocketBase
+    returns a list and filters, writes and collection updates would fail with
+    SQL errors, so PPBase refuses to serve or alter such a table until
+    :func:`reconcile_multi_value_columns` has converted it.
+    """
+
+    def __init__(self, mismatches: Iterable[MultiValueShapeMismatch]) -> None:
+        self.mismatches = tuple(mismatches)
+        listing = ", ".join(item.describe() for item in self.mismatches)
+        super().__init__(
+            "Some select/file/relation columns do not match their field "
+            f"multiplicity: {listing}. Convert them with "
+            "ppbase.db.schema_manager.reconcile_multi_value_columns(), for "
+            "example from an application migration, before serving or "
+            "updating these collections (see docs/relation-multiplicity.md)."
+        )
+
+
+_LIVE_COLUMN_SHAPES_SQL = (
+    "SELECT relation.relname, attribute.attname, "
+    "type.typcategory = 'A' AS is_array, "
+    "pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) "
+    "FROM pg_catalog.pg_attribute AS attribute "
+    "JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid "
+    "JOIN pg_catalog.pg_namespace AS namespace "
+    "ON namespace.oid = relation.relnamespace "
+    "JOIN pg_catalog.pg_type AS type ON type.oid = attribute.atttypid "
+    "WHERE namespace.nspname = 'public' AND relation.relkind = 'r' "
+    "AND attribute.attnum > 0 AND NOT attribute.attisdropped"
+)
+
+
+def _shape_mismatches_for(
+    collection: Any,
+    shapes: dict[tuple[str, str], tuple[bool, str]],
+) -> list[MultiValueShapeMismatch]:
+    if _collection_type(collection) == "view":
+        return []
+    name = str(getattr(collection, "name", "") or "")
+    mismatches: list[MultiValueShapeMismatch] = []
+    for field in _parse_physical_fields(collection):
+        if field.type not in (FieldType.SELECT, FieldType.FILE, FieldType.RELATION):
+            continue
+        live = shapes.get((name, field.name))
+        if live is None:
+            continue
+        expected = _is_array_field(field)
+        if live[0] != expected:
+            mismatches.append(
+                MultiValueShapeMismatch(name, field.name, expected, live[1])
+            )
+    return mismatches
+
+
+async def find_multi_value_shape_mismatches(
+    executor: SchemaExecutor,
+    collections: Iterable[Any] | None = None,
+) -> list[MultiValueShapeMismatch]:
+    """List select/file/relation columns whose live shape breaks the rule.
+
+    ``collections`` defaults to every row of ``_collections``.  An array
+    column is expected exactly when :func:`field_is_multiple` says so; legacy
+    ``VARCHAR(15)``/``VARCHAR(15)[]`` relation columns of the matching shape
+    are fine.  A collection whose stored schema cannot be parsed is skipped:
+    this check only concerns multiplicity.
+    """
+    async with _read_connection(executor) as conn:
+        if collections is None:
+            rows = await conn.execute(
+                text('SELECT "name", "type", "schema" FROM "_collections"')
+            )
+            collections = [
+                SimpleNamespace(name=row[0], type=row[1], schema=row[2])
+                for row in rows
+            ]
+        live_rows = await conn.execute(text(_LIVE_COLUMN_SHAPES_SQL))
+        shapes = {
+            (str(row[0]), str(row[1])): (bool(row[2]), str(row[3]))
+            for row in live_rows
+        }
+    mismatches: list[MultiValueShapeMismatch] = []
+    for collection in collections:
+        try:
+            mismatches.extend(_shape_mismatches_for(collection, shapes))
+        except (TypeError, ValueError):
+            continue
+    return mismatches
+
+
 async def _convert_field_multiplicity(
     connection: AsyncConnection,
     *,
@@ -1506,11 +1647,17 @@ async def _convert_field_multiplicity(
     )
     if to_multiple:
         value = f"{quoted_column}::text"
-        # PocketBase keeps a stored JSON array as the array (json_valid +
-        # json_type = 'array'). ALTER ... USING cannot run subqueries, so only
-        # JSON arrays of plain strings (no quote, backslash or control
-        # character inside an element) are split; anything else, including
-        # malformed JSON, becomes one element, exactly as PocketBase wraps it.
+        # PocketBase keeps a value that is a valid JSON array (json_valid +
+        # json_type = 'array') and wraps anything else with json_array()
+        # (v0.22.34 daos/record_table_sync.go l.217-240). ALTER ... USING
+        # cannot run subqueries, so only JSON arrays of plain strings (no
+        # quote, backslash or control character inside an element) are split
+        # here, element by element as stored ('["", "a", "a"]' gives
+        # {"", "a", "a"}; PocketBase hides the empty and duplicate items when
+        # it reads the value). Other values, malformed JSON included, become
+        # one element like in PocketBase; a valid JSON array with escaped or
+        # non-string items is kept as one element too, where PocketBase would
+        # keep the array (documented limit, docs/relation-multiplicity.md).
         await connection.execute(
             text(
                 f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} "
@@ -1638,16 +1785,15 @@ async def _recreate_field_indexes(
                     f'ON "public"."{table_name}" USING GIN ("{f.name}")',
                 )
             )
-        elif f.type == FieldType.RELATION:
-            if not relation_is_multiple(f.options):
-                index_stmts.append(
-                    (
-                        idx_name,
-                        f'CREATE INDEX IF NOT EXISTS "{idx_name}" '
-                        f'ON "public"."{table_name}" ("{f.name}") '
-                        f'WHERE "{f.name}" != \'\'',
-                    )
+        elif f.type == FieldType.RELATION and not relation_is_multiple(f.options):
+            index_stmts.append(
+                (
+                    idx_name,
+                    f'CREATE INDEX IF NOT EXISTS "{idx_name}" '
+                    f'ON "public"."{table_name}" ("{f.name}") '
+                    f'WHERE "{f.name}" != \'\'',
                 )
+            )
 
     async with _ddl_connection(engine) as conn:
         expected_tables = _expected_table_names(table_name)
