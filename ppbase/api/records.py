@@ -36,6 +36,7 @@ from ppbase.ext.registry import (
 )
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
+    RecordReferenceError,
     _ValidationErrors,
     check_record_rule,
     create_record,
@@ -315,6 +316,14 @@ async def _check_old_password(
 # ---------------------------------------------------------------------------
 
 
+# PocketBase answer when a delete would empty a required relation (v0.22.34
+# apis/record_crud.go l.445-447, v0.40.6 apis/record_crud.go l.593-595).
+_DELETE_REFERENCE_MESSAGE = (
+    "Failed to delete record. Make sure that the record is not part of a "
+    "required relation reference."
+)
+
+
 def _error_response(status: int, message: str, data: Any = None) -> JSONResponse:
     body: dict[str, Any] = {
         "status": status,
@@ -360,11 +369,14 @@ async def _relation_errors_before_hooks(
     rule_result = check_rule(rule, auth_ctx)
     if rule_result is False:
         return {}
-    if record_id is not None and isinstance(rule_result, str):
-        if not await check_record_rule(
+    if (
+        record_id is not None
+        and isinstance(rule_result, str)
+        and not await check_record_rule(
             engine, collection, record_id, rule_result, request_context
-        ):
-            return {}
+        )
+    ):
+        return {}
     return await relation_target_errors(engine, collection, data, record_id=record_id)
 
 
@@ -1135,12 +1147,15 @@ async def _apply_batch_delete(
             if not matches:
                 return _error_response(404, "The requested resource wasn't found.")
 
-        deleted = await delete_record(
-            engine,
-            collection,
-            target_record_id,
-            all_collections=all_collections,
-        )
+        try:
+            deleted = await delete_record(
+                engine,
+                collection,
+                target_record_id,
+                all_collections=all_collections,
+            )
+        except RecordReferenceError:
+            return _error_response(400, _DELETE_REFERENCE_MESSAGE)
         if not deleted:
             return _error_response(404, "The requested resource wasn't found.")
 
@@ -1893,12 +1908,15 @@ async def api_delete_record(
                 return _error_response(404, "The requested resource wasn't found.")
 
         all_colls = await get_all_collections(active_engine)
-        deleted = await delete_record(
-            active_engine,
-            collection,
-            target_record_id,
-            all_collections=all_colls,
-        )
+        try:
+            deleted = await delete_record(
+                active_engine,
+                collection,
+                target_record_id,
+                all_collections=all_colls,
+            )
+        except RecordReferenceError:
+            return _error_response(400, _DELETE_REFERENCE_MESSAGE)
 
         if not deleted:
             return _error_response(404, "The requested resource wasn't found.")
