@@ -21,6 +21,70 @@ DEFAULT_PASSWORD_MIN_LENGTH = 8
 DEFAULT_PASSWORD_MAX_LENGTH = 71
 DEFAULT_BCRYPT_COST = 10
 
+_AUTH_SYSTEM_FIELD_DEFAULTS: dict[str, dict[str, Any]] = {
+    "id": {
+        "id": "text_id",
+        "name": "id",
+        "type": "text",
+        "required": True,
+        "system": True,
+        "hidden": False,
+        "presentable": False,
+        "options": {
+            "primaryKey": True,
+            "min": 15,
+            "max": 15,
+            "pattern": "^[a-z0-9]+$",
+            "autogeneratePattern": "[a-z0-9]{15}",
+        },
+    },
+    "tokenKey": {
+        "id": "token_key",
+        "name": "tokenKey",
+        "type": "text",
+        "required": True,
+        "system": True,
+        "hidden": True,
+        "presentable": False,
+        "options": {
+            "min": 30,
+            "max": 60,
+            "pattern": "",
+            "autogeneratePattern": "[a-zA-Z0-9]{50}",
+        },
+    },
+    "email": {
+        "id": "email_field",
+        "name": "email",
+        "type": "email",
+        "required": True,
+        "system": True,
+        "hidden": False,
+        "presentable": False,
+        "options": {},
+    },
+    "emailVisibility": {
+        "id": "email_visibility",
+        "name": "emailVisibility",
+        "type": "bool",
+        "required": False,
+        "system": True,
+        "hidden": False,
+        "presentable": False,
+        "options": {},
+    },
+    "verified": {
+        "id": "verified",
+        "name": "verified",
+        "type": "bool",
+        "required": False,
+        "system": True,
+        "hidden": False,
+        "presentable": False,
+        "options": {},
+    },
+}
+
 
 def normalize_auth_password_schema(
     schema: Any,
@@ -77,10 +141,12 @@ def normalize_auth_password_schema(
             }
         )
 
+    normalized_schema = _normalize_auth_system_field_properties(normalized_schema)
+
     return normalized_schema, normalized_options
 
 
-def _normalise_schema_field(definition: dict[str, Any]) -> dict[str, Any]:
+def _normalise_field_options(definition: dict[str, Any]) -> dict[str, Any]:
     """Normalise flat PocketBase field options into PPBase's nested shape."""
     core_keys = {
         "id",
@@ -100,6 +166,13 @@ def _normalise_schema_field(definition: dict[str, Any]) -> dict[str, Any]:
     if extra or "options" in definition:
         result["options"] = {**extra, **existing}
 
+    return result
+
+
+def _normalise_schema_field(definition: dict[str, Any]) -> dict[str, Any]:
+    """Normalise and enforce PocketBase's auth password field properties."""
+    result = _normalise_field_options(definition)
+
     # PocketBase's initPasswordField() enforces these system properties on an
     # existing password field while leaving Min/Max/Pattern/Cost untouched.
     # This is deliberately separate from the legacy minPasswordLength import:
@@ -111,6 +184,46 @@ def _normalise_schema_field(definition: dict[str, Any]) -> dict[str, Any]:
     result["hidden"] = True
     result["presentable"] = False
     return result
+
+
+def _normalize_auth_system_field_properties(
+    schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reimpose PocketBase's immutable auth system-field properties."""
+    normalized = copy.deepcopy(schema)
+
+    for index, raw in enumerate(normalized):
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name")
+        defaults = _AUTH_SYSTEM_FIELD_DEFAULTS.get(str(name))
+        if defaults is None:
+            continue
+
+        if raw.get("type") != defaults["type"]:
+            normalized[index] = copy.deepcopy(defaults)
+            continue
+
+        field = _normalise_field_options(raw)
+        options = dict(field.get("options") or {})
+        field["system"] = True
+
+        if name == "id":
+            field["required"] = True
+            field["hidden"] = False
+            options["primaryKey"] = True
+            if not options.get("pattern"):
+                options["pattern"] = "^[a-z0-9]+$"
+        elif name == "tokenKey":
+            field["required"] = True
+            field["hidden"] = True
+        elif name == "email":
+            field["hidden"] = False
+
+        field["options"] = options
+        normalized[index] = field
+
+    return normalized
 
 
 def get_password_field(collection: Any | None = None) -> FieldDefinition:

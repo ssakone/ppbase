@@ -1296,6 +1296,7 @@ async def update_collection_table(
         result: dict[str, FieldDefinition] = {}
         for fdef in _parse_fields(raw):
             if collection_type == "auth" and fdef.name in {
+                "id",
                 "email",
                 "emailVisibility",
                 "email_visibility",

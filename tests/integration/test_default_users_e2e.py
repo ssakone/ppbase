@@ -35,8 +35,22 @@ class TestDefaultUsersE2E:
             },
         )
         assert reg.status_code == 200
-        assert reg.json()["collectionId"] == "_pb_users_auth_"
-        assert reg.json()["collectionName"] == "users"
+        registered = reg.json()
+        assert registered["collectionId"] == "_pb_users_auth_"
+        assert registered["collectionName"] == "users"
+        assert len(registered["id"]) == 15
+        assert "tokenKey" not in registered
+        assert "token_key" not in registered
+
+        from ppbase.db.engine import get_engine
+        from ppbase.services.record_auth_service import _get_raw_record_by_id
+        from ppbase.services.record_service import resolve_collection
+
+        engine = get_engine()
+        collection = await resolve_collection(engine, "users")
+        raw = await _get_raw_record_by_id(engine, collection, registered["id"])
+        assert raw is not None
+        assert len(raw["token_key"]) == 50
 
         # Login
         login = await app_client.post(
@@ -254,6 +268,26 @@ class TestDefaultUsersE2E:
         assert record["collectionName"] == "_superusers"
         assert record["email"] == email
         assert record["avatar"] == 0
+        assert len(record["id"]) == 15
+        assert "tokenKey" not in record
+        assert "token_key" not in record
+
+        login = await app_client.post(
+            "/api/collections/_superusers/auth-with-password",
+            json={"identity": email, "password": "securepass123"},
+        )
+        assert login.status_code == 200, login.text
+        assert login.json()["record"]["id"] == record["id"]
+
+        from ppbase.db.engine import get_engine
+        from ppbase.services.record_auth_service import _get_raw_record_by_id
+        from ppbase.services.record_service import resolve_collection
+
+        engine = get_engine()
+        collection = await resolve_collection(engine, "_superusers")
+        raw = await _get_raw_record_by_id(engine, collection, record["id"])
+        assert raw is not None
+        assert len(raw["token_key"]) == 50
 
         updated_email = f"updated_{email}"
         updated = await app_client.patch(
@@ -279,6 +313,49 @@ class TestDefaultUsersE2E:
         data = resp.json()
         assert data["password"]["enabled"] is True
         assert "email" in data["password"]["identityFields"]
+
+    async def test_auth_system_field_properties_are_reimposed_on_collection_update(
+        self, app_client: AsyncClient, admin_token: str
+    ):
+        """Auth system fields cannot be made removable or publicly exposed."""
+        headers = {"Authorization": admin_token}
+        current = await app_client.get("/api/collections/users", headers=headers)
+        assert current.status_code == 200, current.text
+        collection = current.json()
+        fields = collection["fields"]
+
+        for field in fields:
+            if field["name"] == "id":
+                field.update(required=False, system=False, hidden=True, primaryKey=False)
+            elif field["name"] == "password":
+                field.update(required=False, system=False, hidden=False)
+            elif field["name"] == "tokenKey":
+                field.update(required=False, system=False, hidden=False)
+            elif field["name"] == "email":
+                field.update(system=False, hidden=True)
+
+        updated = await app_client.patch(
+            f"/api/collections/{collection['id']}",
+            headers=headers,
+            json={"fields": fields},
+        )
+        assert updated.status_code == 200, updated.text
+        normalized = {field["name"]: field for field in updated.json()["fields"]}
+
+        assert normalized["id"]["required"] is True
+        assert normalized["id"]["system"] is True
+        assert normalized["id"]["hidden"] is False
+        assert normalized["id"]["primaryKey"] is True
+        assert normalized["id"]["autogeneratePattern"] == "[a-z0-9]{15}"
+        assert normalized["password"]["required"] is True
+        assert normalized["password"]["system"] is True
+        assert normalized["password"]["hidden"] is True
+        assert normalized["tokenKey"]["required"] is True
+        assert normalized["tokenKey"]["system"] is True
+        assert normalized["tokenKey"]["hidden"] is True
+        assert normalized["tokenKey"]["autogeneratePattern"] == "[a-zA-Z0-9]{50}"
+        assert normalized["email"]["system"] is True
+        assert normalized["email"]["hidden"] is False
 
     async def test_admin_auth_uses_superusers_collection_secret(
         self, app_client: AsyncClient, admin_token: str

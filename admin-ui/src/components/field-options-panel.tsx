@@ -12,15 +12,24 @@ import {
 } from '@/components/ui/select'
 import { TagsInput } from '@/components/tags-input'
 import { Button } from '@/components/ui/button'
+import { getLockedFieldOption } from '@/lib/collection-field-behavior'
+import { toast } from 'sonner'
 
 interface FieldOptionsPanelProps {
   field: Field
   onChange: (field: Field) => void
   collections: Collection[]
+  collectionType: 'base' | 'auth' | 'view'
 }
 
-export function FieldOptionsPanel({ field, onChange, collections }: FieldOptionsPanelProps) {
+export function FieldOptionsPanel({
+  field,
+  onChange,
+  collections,
+  collectionType,
+}: FieldOptionsPanelProps) {
   const opts = field.options || {}
+  const isSystemPassword = collectionType === 'auth' && field.system && field.name === 'password'
 
   const getOpt = <T,>(key: string, flat?: T): T | undefined => {
     const flatVal = (field as unknown as Record<string, unknown>)[key] as T | undefined
@@ -31,18 +40,42 @@ export function FieldOptionsPanel({ field, onChange, collections }: FieldOptions
     onChange({ ...field, [key]: value })
   }
 
+  const setBooleanOption = (option: 'required' | 'hidden', value: boolean) => {
+    const locked = getLockedFieldOption(field, collectionType, option)
+    if (typeof locked !== 'undefined' && value !== locked) {
+      toast.info(`The option cannot be changed for field "${field.name}".`)
+      onChange({ ...field, [option]: locked })
+      return
+    }
+    onChange({ ...field, [option]: value })
+  }
+
   return (
     <div className="space-y-4 border-t pt-3 mt-2 px-1">
-      <div className="flex items-center gap-2">
-        <Checkbox
-          id={`req-${field.name}-${field.type}`}
-          checked={!!field.required}
-          onCheckedChange={(checked) => onChange({ ...field, required: !!checked })}
-        />
-        <Label htmlFor={`req-${field.name}-${field.type}`} className="text-sm font-normal">
-          Required
-        </Label>
-      </div>
+      {!isSystemPassword && (
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id={`req-${field.name}-${field.type}`}
+              checked={!!field.required}
+              onCheckedChange={(checked) => setBooleanOption('required', !!checked)}
+            />
+            <Label htmlFor={`req-${field.name}-${field.type}`} className="text-sm font-normal">
+              Required
+            </Label>
+          </div>
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id={`hidden-${field.name}-${field.type}`}
+              checked={!!field.hidden}
+              onCheckedChange={(checked) => setBooleanOption('hidden', !!checked)}
+            />
+            <Label htmlFor={`hidden-${field.name}-${field.type}`} className="text-sm font-normal">
+              Hidden
+            </Label>
+          </div>
+        </div>
+      )}
 
       {renderTypeOptions(field.type, field, getOpt, setOpt, onChange, collections)}
     </div>
@@ -88,6 +121,68 @@ function renderTypeOptions(
             <Input
               type="text"
               placeholder="e.g. ^[a-z]+$"
+              value={getOpt<string>('pattern') ?? ''}
+              onChange={(e) => setOpt('pattern', e.target.value || undefined)}
+            />
+          </div>
+          <div className="col-span-2 space-y-1.5">
+            <Label className="text-xs">Autogenerate pattern</Label>
+            <Input
+              type="text"
+              placeholder="e.g. [a-z0-9]{30}"
+              value={getOpt<string>('autogeneratePattern') ?? ''}
+              onChange={(e) => setOpt('autogeneratePattern', e.target.value || undefined)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Generates a matching value when a new record omits this field.
+            </p>
+          </div>
+        </div>
+      )
+
+    case 'password':
+      return (
+        <div className="grid grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Min length</Label>
+            <Input
+              type="number"
+              min={1}
+              max={71}
+              placeholder="No min limit"
+              value={getOpt<number>('min') ?? ''}
+              onChange={(e) => setOpt('min', e.target.value ? parseInt(e.target.value) : undefined)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Max length</Label>
+            <Input
+              type="number"
+              min={getOpt<number>('min') ?? 1}
+              max={71}
+              placeholder="Up to 71 chars"
+              value={getOpt<number>('max') ?? ''}
+              onChange={(e) => setOpt('max', e.target.value ? parseInt(e.target.value) : undefined)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Bcrypt cost</Label>
+            <Input
+              type="number"
+              min={4}
+              max={31}
+              placeholder="Default to 10"
+              value={getOpt<number>('cost') ?? ''}
+              onChange={(e) => setOpt('cost', e.target.value ? parseInt(e.target.value) : undefined)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">
+              Pattern <span className="text-muted-foreground">(regex)</span>
+            </Label>
+            <Input
+              type="text"
+              placeholder="e.g. ^\\w+$"
               value={getOpt<string>('pattern') ?? ''}
               onChange={(e) => setOpt('pattern', e.target.value || undefined)}
             />

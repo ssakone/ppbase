@@ -198,12 +198,13 @@ export function CollectionTabs({
 
       {type !== 'view' && (
         <TabsContent value="fields" className="space-y-3">
-          <SystemFieldsDisplay type={type} />
+          <SystemFieldsDisplay type={type} fields={fields} />
 
           <FieldList
             fields={fields}
             onChange={setFields}
             collections={collections}
+            collectionType={type}
           />
 
           {showPicker && (

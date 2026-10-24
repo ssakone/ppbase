@@ -26,6 +26,7 @@ export const FIELD_TYPE_CONFIG: Record<string, FieldTypeConfig> = {
   file:     { label: 'File',        icon: 'F',  bg: '#fff7ed', color: '#ea580c', badgeClass: 'bg-orange-100 text-orange-700' },
   relation: { label: 'Relation',    icon: 'L',  bg: '#fef2f2', color: '#dc2626', badgeClass: 'bg-red-100 text-red-700' },
   // System / special field types
+  password: { label: 'Password',    icon: 'P',  bg: '#f8fafc', color: '#475569', badgeClass: 'bg-slate-100 text-slate-600' },
   autoId:   { label: 'ID',          icon: '~>', bg: '#f0f0f0', color: '#64748b', badgeClass: 'bg-slate-100 text-slate-600' },
   autodate: { label: 'Autodate',    icon: '⊞',  bg: '#f5f3ff', color: '#7c3aed', badgeClass: 'bg-purple-100 text-purple-600' },
 }

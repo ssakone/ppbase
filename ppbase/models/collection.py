@@ -209,7 +209,7 @@ class CollectionResponse(BaseModel):
         raw_schema = record.schema if isinstance(record.schema, list) else []
         if record.type == "auth":
             system_fields = [
-                {"id": "text_id", "name": "id", "type": "text", "required": True, "system": True, "hidden": False, "presentable": False, "primaryKey": True, "min": 15, "max": 15, "pattern": "^[a-z0-9]+$"},
+                {"id": "text_id", "name": "id", "type": "text", "required": True, "system": True, "hidden": False, "presentable": False, "primaryKey": True, "min": 15, "max": 15, "pattern": "^[a-z0-9]+$", "autogeneratePattern": "[a-z0-9]{15}"},
                 {"id": "password_field", "name": "password", "type": "password", "required": True, "system": True, "hidden": True, "presentable": False, "min": 8, "max": 0, "cost": 0, "pattern": ""},
                 {"id": "token_key", "name": "tokenKey", "type": "text", "required": True, "system": True, "hidden": True, "presentable": False, "min": 30, "max": 60, "autogeneratePattern": "[a-zA-Z0-9]{50}"},
                 {"id": "email_field", "name": "email", "type": "email", "required": True, "system": True, "hidden": False, "presentable": False},

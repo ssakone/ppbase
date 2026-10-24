@@ -130,6 +130,65 @@ def test_existing_password_field_gets_pocketbase_system_properties():
     assert password["options"]["min"] == 5
 
 
+def test_auth_system_field_properties_are_reimposed_like_pocketbase():
+    schema, _ = normalize_auth_password_schema(
+        [
+            {
+                "name": "id",
+                "type": "text",
+                "required": False,
+                "system": False,
+                "hidden": True,
+                "options": {
+                    "primaryKey": False,
+                    "pattern": "",
+                    "autogeneratePattern": "[a-z0-9]{15}",
+                },
+            },
+            {
+                "name": "password",
+                "type": "password",
+                "required": False,
+                "system": False,
+                "hidden": False,
+                "options": {"min": 5},
+            },
+            {
+                "name": "tokenKey",
+                "type": "text",
+                "required": False,
+                "system": False,
+                "hidden": False,
+                "options": {"autogeneratePattern": "[a-zA-Z0-9]{50}"},
+            },
+            {
+                "name": "email",
+                "type": "email",
+                "required": False,
+                "system": False,
+                "hidden": True,
+            },
+        ],
+        {},
+    )
+    fields = {field["name"]: field for field in schema}
+
+    assert fields["id"]["required"] is True
+    assert fields["id"]["system"] is True
+    assert fields["id"]["hidden"] is False
+    assert fields["id"]["options"]["primaryKey"] is True
+    assert fields["id"]["options"]["pattern"] == "^[a-z0-9]+$"
+    assert fields["password"]["required"] is True
+    assert fields["password"]["system"] is True
+    assert fields["password"]["hidden"] is True
+    assert fields["tokenKey"]["required"] is True
+    assert fields["tokenKey"]["system"] is True
+    assert fields["tokenKey"]["hidden"] is True
+    assert fields["email"]["required"] is False
+    assert fields["email"]["system"] is True
+    assert fields["email"]["hidden"] is False
+
+
 def _auth_collection_with_password_rules(minimum: int = 5, maximum: int = 0):
     return SimpleNamespace(
         id="users_id",
@@ -328,7 +387,29 @@ def test_auth_collection_response_preserves_normalized_password_minimum():
     )
     response = CollectionResponse.from_record(record)
     password = next(field for field in response.fields if field["name"] == "password")
+    id_field = next(field for field in response.fields if field["name"] == "id")
+    token_key = next(field for field in response.fields if field["name"] == "tokenKey")
     assert password["min"] == 5
+    assert id_field["primaryKey"] is True
+    assert id_field["system"] is True
+    assert id_field["autogeneratePattern"] == "[a-z0-9]{15}"
+    assert token_key["system"] is True
+    assert token_key["hidden"] is True
+    assert token_key["autogeneratePattern"] == "[a-zA-Z0-9]{50}"
+
+
+def test_base_collection_response_does_not_inject_auth_system_fields():
+    record = CollectionRecord(
+        id="posts_id",
+        name="posts",
+        type="base",
+        system=False,
+        schema=[{"name": "title", "type": "text", "required": True}],
+        indexes=[],
+        options={},
+    )
+    response = CollectionResponse.from_record(record)
+    assert [field["name"] for field in response.fields] == ["title"]
 
 
 def test_record_auth_tokens_use_official_auth_claim_type():

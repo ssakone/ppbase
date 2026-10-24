@@ -110,6 +110,17 @@ def build_record_response(
             fname = field_def.get("name", "")
             if not fname:
                 continue
+            if is_auth_collection and fname in {
+                "id",
+                "email",
+                "emailVisibility",
+                "email_visibility",
+                "verified",
+                "password",
+                "tokenKey",
+                "token_key",
+            }:
+                continue
             # Skip hidden fields unless specifically requested
             if fname in hidden and (fields_filter is None or fname not in fields_filter):
                 continue

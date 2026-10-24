@@ -20,7 +20,14 @@ import { RecordActionsMenu } from '@/components/record-actions-menu'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { useRecord, useCreateRecord, useUpdateRecord, useDeleteRecord } from '@/hooks/use-records'
 import { useCollections } from '@/hooks/use-collections'
-import type { Collection, Field, RecordModel } from '@/api/types'
+import {
+  buildRecordFormData,
+  getEditableRecordFields,
+  getPasswordMinimum,
+  getRecordEditorFields,
+  isAuthCollection as isAuthCollectionModel,
+} from '@/lib/record-editor-fields'
+import type { Collection, Field } from '@/api/types'
 
 interface RecordEditorProps {
   open: boolean
@@ -28,27 +35,6 @@ interface RecordEditorProps {
   collection: Collection
   recordId?: string | null
   duplicateData?: Record<string, unknown> | null
-}
-
-const AUTH_SYSTEM_FIELDS: Field[] = [
-  { name: 'email', type: 'email' },
-  { name: 'emailVisibility', type: 'bool' },
-  { name: 'verified', type: 'bool' },
-]
-
-function getFields(collection: Collection): Field[] {
-  const fields = collection.fields ?? collection.schema ?? []
-  const isAuthCollection = collection.type === 'auth' || collection.name === '_superusers'
-
-  if (!isAuthCollection) return fields
-
-  const existing = new Set(fields.map((field) => field.name))
-  const authSystemFields = collection.name === '_superusers'
-    ? AUTH_SYSTEM_FIELDS.filter((field) => field.name === 'email')
-    : AUTH_SYSTEM_FIELDS
-  const missingAuthFields = authSystemFields.filter((field) => !existing.has(field.name))
-
-  return [...fields, ...missingAuthFields]
 }
 
 function getRelationExpand(fields: Field[]): string | undefined {
@@ -66,7 +52,10 @@ export function RecordEditor({
 }: RecordEditorProps) {
   const navigate = useNavigate()
   const isEditing = !!recordId
-  const fields = useMemo(() => getFields(collection), [collection.id, collection.type, collection.name, collection.fields, collection.schema])
+  const fields = useMemo(
+    () => getRecordEditorFields(collection),
+    [collection],
+  )
   const relationExpand = useMemo(() => getRelationExpand(fields), [fields])
   const { data: collections } = useCollections()
   const { data: existingRecord, isLoading: isRecordLoading } = useRecord(
@@ -83,9 +72,20 @@ export function RecordEditor({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
   // Auth collection detection — includes _superusers and any collection with type=auth
-  const isSuperusersCollection = collection.name === '_superusers'
-  const isAuthCollection = collection.type === 'auth' || isSuperusersCollection
-  const visibleFields = fields.filter((field) => !(isAuthCollection && !isEditing && field.name === 'email'))
+  const isAuthCollection = isAuthCollectionModel(collection)
+  const editableFields = useMemo(
+    () => getEditableRecordFields(collection, fields),
+    [collection, fields],
+  )
+  const visibleFields = useMemo(
+    () => editableFields.filter(
+      (field) => !(isAuthCollection && !isEditing && field.name === 'email'),
+    ),
+    [editableFields, isAuthCollection, isEditing],
+  )
+  const primaryKeyField = visibleFields.find((field) => field.primaryKey)
+  const regularVisibleFields = visibleFields.filter((field) => !field.primaryKey)
+  const passwordMin = getPasswordMinimum(fields)
   const [changePassword, setChangePassword] = useState(false)
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -101,30 +101,21 @@ export function RecordEditor({
 
     // Priority: duplicateData > existingRecord (edit) > empty (create)
     if (duplicateData) {
-      // For duplicate, ensure all fields are present
-      const data: Record<string, unknown> = {}
-      for (const field of fields) {
-        data[field.name] = duplicateData[field.name] ?? null
-      }
-      setFormData(data)
+      // PocketBase duplicates regular values but always creates a new primary
+      // key and requires a new password for auth records.
+      setFormData(buildRecordFormData(editableFields, duplicateData, true))
+      setAuthEmail(isAuthCollection ? String(duplicateData.email ?? '') : '')
+      setAuthPassword('')
+      setAuthPasswordConfirm('')
     } else if (isEditing && existingRecord) {
-      const data: Record<string, unknown> = {}
-      for (const field of fields) {
-        data[field.name] = existingRecord[field.name] ?? null
-      }
-      setFormData(data)
+      setFormData(buildRecordFormData(editableFields, existingRecord))
     } else if (!isEditing) {
-      const data: Record<string, unknown> = {}
-      for (const field of fields) {
-        if (field.type === 'bool') {
-          data[field.name] = false
-        } else {
-          data[field.name] = null
-        }
-      }
-      setFormData(data)
+      setFormData(buildRecordFormData(editableFields))
+      setAuthEmail('')
+      setAuthPassword('')
+      setAuthPasswordConfirm('')
     }
-  }, [open, existingRecord, duplicateData, isEditing, fields])
+  }, [open, existingRecord, duplicateData, isEditing, editableFields, isAuthCollection])
 
   const handleFieldChange = (fieldName: string, value: unknown) => {
     console.log('[RecordEditor] handleFieldChange:', fieldName, value)
@@ -139,7 +130,10 @@ export function RecordEditor({
       if (!authEmail) { toast.error('Email is required'); return }
       if (!authPassword) { toast.error('Password is required'); return }
       if (authPassword !== authPasswordConfirm) { toast.error('Passwords do not match'); return }
-      if (authPassword.length < 8) { toast.error('Password must be at least 8 characters'); return }
+      if (authPassword.length < passwordMin) {
+        toast.error(`Password must be at least ${passwordMin} characters`)
+        return
+      }
     }
 
     const payload = {
@@ -175,8 +169,8 @@ export function RecordEditor({
       toast.error('Passwords do not match')
       return
     }
-    if (newPassword.length < 8) {
-      toast.error('Password must be at least 8 characters')
+    if (newPassword.length < passwordMin) {
+      toast.error(`Password must be at least ${passwordMin} characters`)
       return
     }
 
@@ -221,10 +215,7 @@ export function RecordEditor({
 
   const handleDuplicate = () => {
     if (!existingRecord) return
-    const data: Record<string, unknown> = {}
-    for (const field of fields) {
-      data[field.name] = existingRecord[field.name] ?? null
-    }
+    const data = buildRecordFormData(editableFields, existingRecord, true)
     // Signal parent to handle duplicate - parent will close current and open new
     window.dispatchEvent(
       new CustomEvent('ppbase:duplicate-record', {
@@ -274,6 +265,18 @@ export function RecordEditor({
               </div>
             ) : (
               <div className="space-y-4 py-4">
+                {primaryKeyField && (
+                  <RecordFieldInput
+                    field={primaryKeyField}
+                    value={formData[primaryKeyField.name]}
+                    onChange={(value) => handleFieldChange(primaryKeyField.name, value)}
+                    collections={collections}
+                    recordId={existingRecord?.id}
+                    collectionId={collection.id}
+                    recordExpand={existingRecord?.expand}
+                  />
+                )}
+
                 {/* Auth fields for create on auth collections */}
                 {!isEditing && isAuthCollection && (
                   <div className="space-y-3 pb-2 border-b">
@@ -293,7 +296,7 @@ export function RecordEditor({
                         <Input
                           id="auth-password"
                           type="password"
-                          placeholder="Min. 8 characters"
+                          placeholder={`Min. ${passwordMin} characters`}
                           value={authPassword}
                           onChange={(e) => setAuthPassword(e.target.value)}
                         />
@@ -312,7 +315,7 @@ export function RecordEditor({
                   </div>
                 )}
 
-                {visibleFields.map((field) => (
+                {regularVisibleFields.map((field) => (
                   <RecordFieldInput
                     key={field.name}
                     field={field}
@@ -324,7 +327,7 @@ export function RecordEditor({
                     recordExpand={existingRecord?.expand}
                   />
                 ))}
-                {visibleFields.length === 0 && !isAuthCollection && (
+                {regularVisibleFields.length === 0 && !primaryKeyField && !isAuthCollection && (
                   <p className="text-sm text-muted-foreground py-4">
                     This collection has no editable fields.
                   </p>
@@ -357,7 +360,7 @@ export function RecordEditor({
                           <Input
                             id="new-password"
                             type="password"
-                            placeholder="Min. 8 characters"
+                            placeholder={`Min. ${passwordMin} characters`}
                             value={newPassword}
                             onChange={(e) => setNewPassword(e.target.value)}
                           />

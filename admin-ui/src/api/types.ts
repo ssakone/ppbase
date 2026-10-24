@@ -16,9 +16,17 @@ export interface Collection {
 }
 
 export interface Field {
+  id?: string
   name: string
   type: string
   required?: boolean
+  system?: boolean
+  hidden?: boolean
+  presentable?: boolean
+  primaryKey?: boolean
+  autogeneratePattern?: string
+  cost?: number
+  help?: string
   options?: FieldOptions
   // Flat format fields (PocketBase v0.23+)
   min?: number

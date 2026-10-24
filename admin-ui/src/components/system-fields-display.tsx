@@ -1,8 +1,10 @@
 import { FIELD_TYPE_CONFIG } from '@/lib/field-types'
 import { Badge } from '@/components/ui/badge'
+import type { Field } from '@/api/types'
 
 interface SystemFieldsDisplayProps {
   type: 'base' | 'auth' | 'view'
+  fields: Field[]
 }
 
 function SystemFieldRow({
@@ -80,21 +82,24 @@ function SystemDateRow({ name, info }: { name: string; info: string }) {
   )
 }
 
-export function SystemFieldsDisplay({ type }: SystemFieldsDisplayProps) {
+export function SystemFieldsDisplay({ type, fields }: SystemFieldsDisplayProps) {
   const cfg = FIELD_TYPE_CONFIG
+  const fieldNames = new Set(fields.map((field) => field.name))
   return (
     <div className="rounded-lg border bg-muted/30 mb-3">
-      <SystemFieldRow
-        icon="T"
-        bg={cfg.text.bg}
-        color={cfg.text.color}
-        name="id"
-        badges={[{ label: 'Nonempty', variant: 'green' }]}
-      />
+      {!fieldNames.has('id') && (
+        <SystemFieldRow
+          icon="T"
+          bg={cfg.text.bg}
+          color={cfg.text.color}
+          name="id"
+          badges={[{ label: 'Nonempty', variant: 'green' }]}
+        />
+      )}
 
       {type === 'auth' && (
         <>
-          <SystemFieldRow
+          {!fieldNames.has('password') && <SystemFieldRow
             icon="P"
             bg="#f8fafc"
             color="#475569"
@@ -103,8 +108,8 @@ export function SystemFieldsDisplay({ type }: SystemFieldsDisplayProps) {
               { label: 'Nonempty', variant: 'green' },
               { label: 'Hidden', variant: 'red' },
             ]}
-          />
-          <SystemFieldRow
+          />}
+          {!fieldNames.has('tokenKey') && <SystemFieldRow
             icon="T"
             bg={cfg.text.bg}
             color={cfg.text.color}
@@ -113,26 +118,26 @@ export function SystemFieldsDisplay({ type }: SystemFieldsDisplayProps) {
               { label: 'Nonempty', variant: 'green' },
               { label: 'Hidden', variant: 'red' },
             ]}
-          />
-          <SystemFieldRow
+          />}
+          {!fieldNames.has('email') && <SystemFieldRow
             icon="@"
             bg={cfg.email.bg}
             color={cfg.email.color}
             name="email"
             badges={[{ label: 'Nonempty', variant: 'green' }]}
-          />
-          <SystemFieldRow
+          />}
+          {!fieldNames.has('emailVisibility') && <SystemFieldRow
             icon="B"
             bg={cfg.bool.bg}
             color={cfg.bool.color}
             name="emailVisibility"
-          />
-          <SystemFieldRow
+          />}
+          {!fieldNames.has('verified') && <SystemFieldRow
             icon="B"
             bg={cfg.bool.bg}
             color={cfg.bool.color}
             name="verified"
-          />
+          />}
         </>
       )}
 
