@@ -218,8 +218,12 @@ await pb.apis.enrich_records(
 
 Like PocketBase's `apis.EnrichRecords`, every expanded record must satisfy
 the `viewRule` of its collection for the current request (admins excepted),
-with the same `@request.*` context as the records API; `record_auth_response`
-expands as the authenticated record. See `docs/expand-view-rules.md`.
+with the same `@request.*` context as the records API (a JSON body as
+`@request.data`); `?expand` is appended to `default_expand`; the hidden email
+of a main auth record is removed unless the requester is an admin, its owner
+or a `manageRule` match; `record_auth_response` expands as the authenticated
+record (host loader of `pb.set_auth_record_rule_context` included). See
+`docs/expand-view-rules.md`.
 
 ### `pb.apis.record_auth_response`
 

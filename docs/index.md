@@ -231,6 +231,7 @@ All hook decorators accept `id=`, `priority=` kwargs.
 |--------|-------------|
 | `pb.configure(**kwargs)` | Override settings (must be before `start()`) |
 | `pb.set_error_compat("0.22")` | PocketBase 0.22 error envelope and messages (also from `register(pb)` at startup) |
+| `pb.set_auth_record_rule_context(loader)` | Extra `@request.auth` keys of the authenticated record for auth-response expands (`docs/expand-view-rules.md`) |
 | `pb.get_app()` | Build and return FastAPI ASGI app |
 | `pb.start(host, port)` | Start uvicorn (blocking) |
 | `pb.load_hooks("module:fn")` | Import and run a `setup(pb)` function |
