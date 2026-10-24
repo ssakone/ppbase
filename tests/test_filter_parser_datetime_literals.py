@@ -83,6 +83,6 @@ def test_relation_date_string_literals_are_bound_as_datetimes() -> None:
         current_table="boutique_sale",
     )
 
-    assert 'EXISTS (SELECT 1 FROM "customers"' in sql
-    assert '"customers"."joined_at" <= :_fp1' in sql
+    assert 'LEFT JOIN "customers" AS "__pb1" ON "__pb1"."id" = "boutique_sale"."customer"' in sql
+    assert '"__pb1"."joined_at" <= :_fp1' in sql
     assert params["_fp1"] == datetime(2026, 5, 17, 0, 0, 0, tzinfo=UTC)

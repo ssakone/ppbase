@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from time import perf_counter
 
@@ -29,6 +30,11 @@ def _coll(
         created=now,
         updated=now,
     )
+
+
+def _aliases(sql: str, table: str) -> list[str]:
+    """Main-query aliases of ``table`` (PocketBase-like LEFT JOINs)."""
+    return re.findall(rf'LEFT JOIN "{table}" AS "(__pb\d+)"', sql)
 
 
 def _rel(name: str, collection_id: str, *, max_select: int = 1) -> dict:
@@ -91,8 +97,11 @@ def test_flat_relation_index_keeps_bumo_collection_rule_fast() -> None:
     assert "user_1" in params.values()
     assert index["__flat__"] is True
     assert "relations" not in index["collections"]["business"]["relations"]["owner"]
-    assert '"business_access"."business"' in sql
-    assert 'FROM "business"' not in sql
+    # Both @collection operands share the same business_access row.
+    (access,) = _aliases(sql, "business_access")
+    (target,) = _aliases(sql, "business")
+    assert f'"{access}"."user" = :' in sql
+    assert f'"{target}"."id" = "{access}"."business"' in sql
     assert "ANY(" not in sql
 
 
@@ -110,9 +119,12 @@ def test_flat_relation_index_handles_cycles_path_based() -> None:
     )
 
     assert params == {"_fp1": "match"}
-    assert 'EXISTS (SELECT 1 FROM "cycle_b"' in sql
-    assert 'EXISTS (SELECT 1 FROM "cycle_a"' in sql
-    assert '"cycle_b"."name" = :_fp1' in sql
+    first_b, last_b = _aliases(sql, "cycle_b")
+    (middle_a,) = _aliases(sql, "cycle_a")
+    assert f'"{first_b}"."id" = "cycle_a"."to_b"' in sql
+    assert f'"{middle_a}"."id" = "{first_b}"."to_a"' in sql
+    assert f'"{last_b}"."id" = "{middle_a}"."to_b"' in sql
+    assert f'"{last_b}"."name" = :_fp1' in sql
 
 
 def test_flat_relation_index_groups_back_relation_json_path_on_same_record() -> None:
@@ -142,14 +154,15 @@ def test_flat_relation_index_groups_back_relation_json_path_on_same_record() -> 
     )
 
     assert params == {"_fp1": "user_1"}
-    assert sql.count('EXISTS (SELECT 1 FROM "business_access"') == 1
-    assert '"business_access"."business" = "business"."id"' in sql
-    assert '"business_access"."user"' in sql
+    (access,) = _aliases(sql, "business_access")
+    (roles,) = _aliases(sql, "business_roles")
+    assert sql.count("EXISTS (SELECT 1 FROM (SELECT 1)") == 1
+    assert f'"{access}"."business" = "business"."id"' in sql
+    assert f'"{access}"."user" = :_fp1' in sql
     assert (
-        'EXISTS (SELECT 1 FROM "business_roles" '
-        'WHERE "business_roles"."id" = "business_access"."role"'
+        f'LEFT JOIN "business_roles" AS "{roles}" ON "{roles}"."id" = "{access}"."role"'
     ) in sql
-    assert 'jsonb_extract_path("business_roles"."permissions", \'wallet\', \'read\')' in sql
+    assert f'jsonb_extract_path("{roles}"."permissions", \'wallet\', \'read\')' in sql
 
 
 def test_flat_relation_index_resolves_boutique_wallet_caisse_sale_paths() -> None:
@@ -174,8 +187,12 @@ def test_flat_relation_index_resolves_boutique_wallet_caisse_sale_paths() -> Non
     )
 
     assert params == {"_fp1": "ticket"}
-    assert 'EXISTS (SELECT 1 FROM "boutique_wallet"' in sql
-    assert '"boutique_wallet"."business" = "business"."id"' in sql
-    assert 'EXISTS (SELECT 1 FROM "caisse"' in sql
-    assert 'EXISTS (SELECT 1 FROM "sale"' in sql
-    assert '"sale"."name" = :_fp1' in sql
+    (wallet,) = _aliases(sql, "boutique_wallet")
+    (caisse_alias,) = _aliases(sql, "caisse")
+    (sale_alias,) = _aliases(sql, "sale")
+    assert f'"{wallet}"."business" = "business"."id"' in sql
+    assert f'"{caisse_alias}"."id" = "{wallet}"."caisse"' in sql
+    assert f'"{sale_alias}"."id" = "{caisse_alias}"."sale"' in sql
+    assert f'"{sale_alias}"."name" = :_fp1' in sql
+    # The back relation has no unique index: PocketBase multi-match.
+    assert "NOT EXISTS" in sql

@@ -527,6 +527,67 @@ def _relation_index_signature(
     )
 
 
+# PocketBase ``dbutils.ParseIndex`` (v0.22.34 tools/dbutils/index.go l.11-12,
+# l.127-207; v0.40.6 tools/dbutils/index.go l.203-214).
+_PB_INDEX_RE = re.compile(
+    r"create\s+(unique\s+)?\s*index\s*(if\s+not\s+exists\s+)?(\S*)\s+on\s+(\S*)"
+    r"\s*\(([\s\S]*)\)(?:\s*where\s+([\s\S]*))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PB_INDEX_COLUMN_RE = re.compile(
+    r"^([\s\S]+?)(?:\s+collate\s+([\w]+))?(?:\s+(asc|desc))?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PB_INDEX_TRIM = "`\"'[]\r\n\t\f\v "
+
+
+def _split_index_columns(raw: str) -> list[str]:
+    """Split on top-level commas, like PocketBase's tokenizer."""
+    columns: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote = ""
+    previous = ""
+    for char in raw:
+        if previous != "\\":
+            if char == "(" and not quote:
+                depth += 1
+            elif char == ")" and depth > 0 and not quote:
+                depth -= 1
+            elif char in "'\"`":
+                if quote == char:
+                    quote = ""
+                elif not quote:
+                    quote = char
+        if char == "," and depth == 0 and not quote:
+            columns.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(char)
+        previous = char
+    columns.append("".join(buf).strip())
+    return columns
+
+
+def _has_single_column_unique_index(column: str, indexes: Any) -> bool:
+    """PocketBase ``HasSingleColumnUniqueIndex``: WHERE clauses are ignored."""
+    for raw_index in indexes if isinstance(indexes, list) else []:
+        match = _PB_INDEX_RE.search(str(raw_index))
+        if match is None or not (match.group(1) or "").strip():
+            continue
+        names = []
+        for raw_column in _split_index_columns(match.group(5)):
+            column_match = _PB_INDEX_COLUMN_RE.match(raw_column)
+            if column_match is None:
+                continue
+            name = column_match.group(1).strip(_PB_INDEX_TRIM)
+            if name:
+                names.append(name)
+        if len(names) == 1 and names[0].lower() == column.lower():
+            return True
+    return False
+
+
 def _build_relation_index_from_collections(
     collections: list[CollectionRecord],
 ) -> RelationIndex:
@@ -579,6 +640,11 @@ def _build_relation_index_from_collections(
                 "back_field": field_name,
                 "max_select": max_select,
                 "multiple": multiple,
+                # A single back field with a single-column unique index has
+                # no PocketBase multi-match.
+                "unique": _has_single_column_unique_index(
+                    field_name, getattr(coll, "indexes", None)
+                ),
             }
 
     return result

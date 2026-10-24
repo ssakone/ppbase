@@ -2,9 +2,8 @@
 
 Every expected value comes from the official PocketBase 0.22.34 binary: the
 synthetic scenarios of ``tests/pocketbase_parity/relation_multiplicity_probe.py``
-send the same requests to PocketBase and to PPBase.  Known PPBase divergences
-that are not part of D-0019 are pinned with ``xfail(strict=True)`` and keep
-the PocketBase value.
+send the same requests to PocketBase and to PPBase.  The multi-match and
+missing-relation (LEFT JOIN) cases follow PocketBase since the WS-A3 change.
 """
 
 from __future__ import annotations
@@ -273,28 +272,15 @@ async def test_paths_ending_on_a_multi_value_field_match_pocketbase(
         ), expression
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known PPBase divergence (not D-0019): a relation path is an EXISTS "
-        "join, so a missing relation never yields the NULL leaf that "
-        "PocketBase's LEFT JOIN compares (s5 has no customer)."
-    ),
-)
 async def test_missing_relation_leaf_is_null_like_pocketbase(env: _Env) -> None:
+    """PocketBase LEFT JOINs the relation: s5 (no customer) has a NULL leaf."""
     p = await _path_env(env)
     assert await env.titles(p["sales"], 'customer.pdv = ""') == ["s5"]
     assert await env.titles(p["sales"], "customer.pdv:length = 0") == ["s3", "s5"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known PPBase divergence (not D-0019): @collection comparisons with a "
-        "non-? operator are any-match; PocketBase requires every row to match."
-    ),
-)
 async def test_collection_reference_match_all_like_pocketbase(env: _Env) -> None:
+    """A non-``?`` @collection comparison needs every row (multi-match)."""
     p = await _path_env(env)
     expression = f'@collection.{p["customers"]}.name = "c1"'
     assert await env.titles(p["sales"], expression, headers=env.admin) == []
@@ -444,16 +430,10 @@ async def test_collection_rule_any_match_is_unchanged(env: _Env) -> None:
     assert await env.titles(docs["name"], "", headers=user) == ["d1", "d2"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known PPBase divergence (not D-0019): `@collection.X.id = "
-        "@request.auth.id` is any-match in PPBase; PocketBase 0.22.34 requires "
-        "every X row to match, so it lists nothing once X has two records. "
-        "The BUMA users createRule/updateRule use this shape."
-    ),
-)
 async def test_collection_rule_match_all_like_pocketbase(env: _Env) -> None:
+    """``@collection.X.id = @request.auth.id`` needs every X row to be the
+    caller: nothing is listed once X has two records (the BUMA users
+    createRule/updateRule shape)."""
     people, user = await _auth_env(env)
     docs = await env.collection(
         {

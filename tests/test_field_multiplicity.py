@@ -7,6 +7,8 @@ Reference semantics: PocketBase v0.22.34 ``models/schema/schema_field.go``
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from ppbase.backup.canonical import (
@@ -399,8 +401,11 @@ def test_filter_traversal_joins_null_max_select_relation_as_array() -> None:
         current_table="owners",
     )
     assert params == {"_fp1": "alpha"}
-    assert "jsonb_array_elements_text" in sql  # array membership join
-    assert '"targets"."id" = "owners"."rels"' not in sql
+    # PocketBase json_each: one row per item, then the target.
+    each, target = re.findall(r'AS "(__pb\d+)"', sql)
+    assert f'LEFT JOIN LATERAL unnest("owners"."rels") AS "{each}"(value) ON TRUE' in sql
+    assert f'LEFT JOIN "targets" AS "{target}" ON "{target}"."id" = "{each}".value' in sql
+    assert "NOT EXISTS" not in sql  # ?= is any-match
 
 
 def test_direct_multi_value_comparisons_use_pocketbase_json_text() -> None:
@@ -505,13 +510,13 @@ def test_relation_path_ending_on_a_multi_value_field_uses_its_json_text() -> Non
         sql, _params = parse_filter(
             expression, relation_resolver=index, current_table="sales"
         )
-        assert 'array_to_json("customers"."pdv")::text' in sql, expression
+        assert 'array_to_json("__pb1"."pdv")::text' in sql, expression
         assert "jsonb_array_elements_text" not in sql, expression
     # A scalar leaf keeps its column.
     sql, _params = parse_filter(
         'customer.label = "x"', relation_resolver=index, current_table="sales"
     )
-    assert '"customers"."label" = :' in sql
+    assert '"__pb1"."label" = :' in sql
 
 
 def test_relation_path_modifiers_apply_to_the_leaf() -> None:
@@ -519,22 +524,24 @@ def test_relation_path_modifiers_apply_to_the_leaf() -> None:
     sql, _params = parse_filter(
         "customer.pdv:length = 2", relation_resolver=index, current_table="sales"
     )
-    assert 'COALESCE(cardinality("customers"."pdv"), 0) = 2' in sql
+    assert 'COALESCE(cardinality("__pb1"."pdv"), 0) = 2' in sql
     sql, _params = parse_filter(
         "customer.one:length = 1", relation_resolver=index, current_table="sales"
     )
-    assert "CASE WHEN COALESCE(\"customers\".\"one\"::text, '') = '' THEN 0" in sql
+    assert "CASE WHEN COALESCE(\"__pb1\".\"one\"::text, '') = '' THEN 0" in sql
     sql, _params = parse_filter(
         'customer.pdv:each ?= "x"', relation_resolver=index, current_table="sales"
     )
+    # :each joins json_each of the leaf (an empty list is one NULL row).
     assert (
-        'unnest(CASE WHEN COALESCE(cardinality(COALESCE(CAST("customers"."pdv"' in sql
-    )
+        'LEFT JOIN LATERAL unnest(COALESCE(CAST("__pb1"."pdv" AS text[]), '
+        'ARRAY[]::text[])) AS "__pb2"(value) ON TRUE'
+    ) in sql
     assert "NOT EXISTS" not in sql  # ? operators are any-match
     sql, _params = parse_filter(
         'customer.pdv:each = "x"', relation_resolver=index, current_table="sales"
     )
-    assert "AND NOT EXISTS (SELECT 1 FROM unnest(" in sql  # every item must match
+    assert "AND NOT EXISTS (SELECT 1 FROM (SELECT" in sql  # every item must match
 
 
 def test_collection_reference_leaf_and_modifiers() -> None:
@@ -545,21 +552,21 @@ def test_collection_reference_leaf_and_modifiers() -> None:
         collection_resolver=index,
         current_table="sales",
     )
-    assert 'array_to_json("customers"."pdv")::text' in sql
+    assert 'array_to_json("__pb1"."pdv")::text' in sql
     sql, _params = parse_filter(
         "@collection.customers.pdv:length ?= 2",
         relation_resolver=index,
         collection_resolver=index,
         current_table="sales",
     )
-    assert 'cardinality("customers"."pdv")' in sql
+    assert 'cardinality("__pb1"."pdv")' in sql
     sql, _params = parse_filter(
         '@collection.sales.customer.pdv ~ "x"',
         relation_resolver=index,
         collection_resolver=index,
         current_table="owners",
     )
-    assert 'array_to_json("customers"."pdv")::text' in sql
+    assert 'array_to_json("__pb2"."pdv")::text' in sql
     with pytest.raises(ValueError):
         parse_filter(
             "@collection.customers.pdv:unknown = 1",

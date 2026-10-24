@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,31 @@ AUTH_OPTIONS = {
 }
 
 Inject = Callable[[str, str, str, Any], Awaitable[None]]
+# Records the ``@request.auth.<relation path>`` values of an auth record id.
+AuthPaths = Callable[[str, dict[str, Any]], None]
+
+# ``@request.auth.role.permission.*`` paths read by the BUMA rules.
+BUMA_PERMISSION_PATHS = (
+    "isAdmin",
+    "user.create",
+    "user.update",
+    "user.remove",
+)
+
+
+def _no_auth_paths(_record_id: str, _values: dict[str, Any]) -> None:
+    """PocketBase resolves ``@request.auth.<relation path>`` itself."""
+
+
+def _permission_values(permission: dict[str, Any]) -> dict[str, Any]:
+    """``role.permission.<path>`` values; a missing key is NULL (JSON_EXTRACT)."""
+    values: dict[str, Any] = {}
+    for path in BUMA_PERMISSION_PATHS:
+        value: Any = permission
+        for key in path.split("."):
+            value = value.get(key) if isinstance(value, dict) else None
+        values[f"role.permission.{path}"] = value
+    return values
 
 
 def _rid(prefix: str, index: int) -> str:
@@ -828,19 +853,504 @@ async def validation_scenarios(
     return out
 
 
+def number_field(name: str) -> dict[str, Any]:
+    return {
+        "system": False,
+        "name": name,
+        "type": "number",
+        "required": False,
+        "presentable": False,
+        "unique": False,
+        "options": {"min": None, "max": None, "noDecimal": False},
+    }
+
+
+def json_field(name: str) -> dict[str, Any]:
+    return {
+        "system": False,
+        "name": name,
+        "type": "json",
+        "required": False,
+        "presentable": False,
+        "unique": False,
+        "options": {"maxSize": 2000000},
+    }
+
+
+# Filters of ``multimatch_scenarios``: (collection, sort key, expression).
+# ``{x}`` placeholders are replaced by the synthetic ids of the scenario.
+MULTIMATCH_FILTERS: dict[str, tuple[str, str, str]] = {
+    # Multiple relation (maxSelect null): PocketBase multi-match.
+    "rels_name_eq": ("pm_owners", "title", 'rels.name = "alpha"'),
+    "rels_name_any_eq": ("pm_owners", "title", 'rels.name ?= "alpha"'),
+    "rels_name_neq": ("pm_owners", "title", 'rels.name != "alpha"'),
+    "rels_name_any_neq": ("pm_owners", "title", 'rels.name ?!= "alpha"'),
+    "rels_n_gt_1": ("pm_owners", "title", "rels.n > 1"),
+    "rels_n_any_gt_1": ("pm_owners", "title", "rels.n ?> 1"),
+    "rels_n_gte_1": ("pm_owners", "title", "rels.n >= 1"),
+    "rels_name_like": ("pm_owners", "title", 'rels.name ~ "a"'),
+    "rels_name_not_like": ("pm_owners", "title", 'rels.name !~ "z"'),
+    "rels_id_eq_empty": ("pm_owners", "title", 'rels.id = ""'),
+    "rels_id_neq_empty": ("pm_owners", "title", 'rels.id != ""'),
+    "rels_id_eq_t1": ("pm_owners", "title", 'rels.id = "{t1}"'),
+    "rels_same_row": ("pm_owners", "title", 'rels.name = "alpha" && rels.n = 1'),
+    "rels_split_rows": ("pm_owners", "title", 'rels.name ?= "alpha" && rels.n ?= 2'),
+    "rels_or_one": ("pm_owners", "title", 'rels.name = "alpha" || one.name = "beta"'),
+    "rels_vs_title": ("pm_owners", "title", "rels.name = title"),
+    "rels_any_vs_title": ("pm_owners", "title", "rels.name ?= title"),
+    # Single relation: LEFT JOIN, NULL leaf when the target is missing.
+    "one_name_eq_empty": ("pm_owners", "title", 'one.name = ""'),
+    "one_name_neq_empty": ("pm_owners", "title", 'one.name != ""'),
+    "one_id_eq_empty": ("pm_owners", "title", 'one.id = ""'),
+    "one_id_neq_empty": ("pm_owners", "title", 'one.id != ""'),
+    "one_name_eq_null": ("pm_owners", "title", "one.name = null"),
+    "one_n_gt_0": ("pm_owners", "title", "one.n > 0"),
+    "one_name_like": ("pm_owners", "title", 'one.name ~ "a"'),
+    "one_name_not_like": ("pm_owners", "title", 'one.name !~ "zz"'),
+    "one_name_neq_beta": ("pm_owners", "title", 'one.name != "beta"'),
+    "one_name_vs_title": ("pm_owners", "title", "one.name = title"),
+    # Back relations: multi-match unless single with a unique index.
+    "back_title_eq": ("pm_owners", "title", 'pm_links_via_owner.title = "l1"'),
+    "back_title_any_eq": ("pm_owners", "title", 'pm_links_via_owner.title ?= "l1"'),
+    "back_title_neq": ("pm_owners", "title", 'pm_links_via_owner.title != "l1"'),
+    "back_id_eq_empty": ("pm_owners", "title", 'pm_links_via_owner.id = ""'),
+    "uback_title_eq": ("pm_owners", "title", 'pm_ulinks_via_owner.title = "u1"'),
+    "uback_title_neq": ("pm_owners", "title", 'pm_ulinks_via_owner.title != "u1"'),
+    "uback_id_eq_empty": ("pm_owners", "title", 'pm_ulinks_via_owner.id = ""'),
+    # @collection: every row must match a non-? operator.
+    "coll_name_eq": ("pm_owners", "title", '@collection.pm_targets.name = "alpha"'),
+    "coll_name_any_eq": (
+        "pm_owners",
+        "title",
+        '@collection.pm_targets.name ?= "alpha"',
+    ),
+    "coll_name_neq_zzz": ("pm_owners", "title", '@collection.pm_targets.name != "zzz"'),
+    "coll_n_gt_0": ("pm_owners", "title", "@collection.pm_targets.n > 0"),
+    "coll_n_gt_1": ("pm_owners", "title", "@collection.pm_targets.n > 1"),
+    "coll_n_any_gt_2": ("pm_owners", "title", "@collection.pm_targets.n ?> 2"),
+    "coll_empty_neq": ("pm_owners", "title", '@collection.pm_empty.name != "x"'),
+    "coll_empty_eq_empty": ("pm_owners", "title", '@collection.pm_empty.name = ""'),
+    "coll_empty_any_eq": ("pm_owners", "title", '@collection.pm_empty.name ?= "x"'),
+    "coll_self_title": ("pm_owners", "title", "@collection.pm_owners.title = title"),
+    "coll_self_any_title": (
+        "pm_owners",
+        "title",
+        "@collection.pm_owners.title ?= title",
+    ),
+    "coll_alias_any": (
+        "pm_owners",
+        "title",
+        '@collection.pm_targets:a.name ?= "alpha" && @collection.pm_targets:b.name ?= "beta"',
+    ),
+    "coll_path_eq": ("pm_links", "title", '@collection.pm_owners.one.name = "alpha"'),
+    "coll_path_any_eq": (
+        "pm_links",
+        "title",
+        '@collection.pm_owners.one.name ?= "alpha"',
+    ),
+    # Two hops from pm_links.
+    "hop_rels_name_eq": ("pm_links", "title", 'owner.rels.name = "alpha"'),
+    "hop_rels_name_any_eq": ("pm_links", "title", 'owner.rels.name ?= "alpha"'),
+    "hop_rels_n_gt_1": ("pm_links", "title", "owner.rels.n > 1"),
+    "hop_one_name_eq_empty": ("pm_links", "title", 'owner.one.name = ""'),
+    "hop_one_name_eq_alpha": ("pm_links", "title", 'owner.one.name = "alpha"'),
+}
+
+
+async def multimatch_scenarios(
+    client: httpx.AsyncClient,
+    admin: dict[str, str],
+    labels: Labels,
+    inject: Inject,
+) -> dict[str, Any]:
+    """Multi-match and LEFT JOIN semantics of relation, back-relation and
+    ``@collection`` paths (v0.22.34 ``tools/search/filter.go`` l.183-215,
+    l.630-706; ``resolvers/record_field_resolve_runner.go``)."""
+    targets = await _collection(
+        client,
+        admin,
+        {"name": "pm_targets", "schema": [text_field("name"), number_field("n")]},
+    )
+    await _collection(
+        client, admin, {"name": "pm_empty", "schema": [text_field("name")]}
+    )
+    owners = await _collection(
+        client,
+        admin,
+        {
+            "name": "pm_owners",
+            "schema": [
+                text_field("title"),
+                relation_field("rels", targets["id"], None),
+                relation_field("one", targets["id"], 1),
+            ],
+        },
+    )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "pm_links",
+            "schema": [text_field("title"), relation_field("owner", owners["id"], 1)],
+        },
+    )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "pm_ulinks",
+            "schema": [text_field("title"), relation_field("owner", owners["id"], 1)],
+            "indexes": [
+                'CREATE UNIQUE INDEX "pm_ulinks_unique_owner" ON "pm_ulinks" ("owner")'
+            ],
+        },
+    )
+    t1, t2, t3 = (labels.add(f"m{i}", _rid("pmtarget", i)) for i in (1, 2, 3))
+    for record_id, name, n in ((t1, "alpha", 1), (t2, "beta", 2), (t3, "gamma", 3)):
+        await _create(client, "pm_targets", {"id": record_id, "name": name, "n": n})
+    missing = labels.add("mmissing", _rid("pmmissing", 0))
+    owner_rows = {
+        "alpha": {"rels": [t1], "one": t1},
+        "beta": {"rels": [t1, t2], "one": t2},
+        "empty": {"rels": [], "one": ""},
+        "gamma": {"rels": [t3], "one": t3},
+        "orphan": {"rels": [t1], "one": ""},
+    }
+    owner_ids: dict[str, str] = {}
+    for index, (title, values) in enumerate(owner_rows.items(), start=1):
+        owner_ids[title] = labels.add(f"o_{title}", _rid("pmowner", index))
+        await _create(
+            client, "pm_owners", {"id": owner_ids[title], "title": title, **values}
+        )
+    # Stored references to a missing record (D-0021 keeps them as imported).
+    await inject("pm_owners", owner_ids["orphan"], "rels", [t1, missing])
+    await inject("pm_owners", owner_ids["orphan"], "one", missing)
+    for index, (title, owner) in enumerate(
+        (
+            ("l1", "alpha"),
+            ("l2", "alpha"),
+            ("l3", "beta"),
+            ("l4", "gamma"),
+            ("l5", None),
+        ),
+        start=1,
+    ):
+        await _create(
+            client,
+            "pm_links",
+            {"title": title, "owner": owner_ids[owner] if owner else ""},
+        )
+    for title, owner in (("u1", "alpha"), ("u2", "beta")):
+        await _create(client, "pm_ulinks", {"title": title, "owner": owner_ids[owner]})
+
+    out: dict[str, Any] = {}
+    for key, (collection, sort_key, expression) in MULTIMATCH_FILTERS.items():
+        out[key] = await _titles(
+            client,
+            collection,
+            expression.format(t1=t1, t2=t2, t3=t3),
+            key=sort_key,
+            headers=admin,
+        )
+    return out
+
+
+# The BUMA ``users`` and ``buma_pdv`` rules of the frozen schema export, on
+# synthetic collections (only the collection names differ).
+BUMA_USERS_CREATE_RULE = (
+    "@collection.pb_users.id = @request.auth.id || "
+    "@request.auth.role.permission.isAdmin = true || "
+    "@request.auth.role.permission.user.create = true"
+)
+BUMA_USERS_UPDATE_RULE = (
+    "@collection.pb_users.id = @request.auth.id || "
+    "@request.auth.role.permission.isAdmin = true || "
+    "@request.auth.role.permission.user.update = true"
+)
+BUMA_USERS_DELETE_RULE = (
+    "@request.auth.role.permission.isAdmin = true || "
+    "@request.auth.role.permission.user.remove = true"
+)
+BUMA_PDV_DELETE_RULE = "@request.auth.id != '' && (client.id = '' && agent.id = '')"
+
+
+async def buma_rule_scenarios(
+    client: httpx.AsyncClient,
+    admin: dict[str, str],
+    labels: Labels,
+    inject: Inject,
+    auth_paths: AuthPaths = _no_auth_paths,
+) -> dict[str, Any]:
+    """BUMA users create/update rules and the buma_pdv delete rule."""
+    out: dict[str, Any] = {}
+    roles = await _collection(
+        client,
+        admin,
+        {"name": "pb_roles", "schema": [text_field("name"), json_field("permission")]},
+    )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "pb_users",
+            "type": "auth",
+            "schema": [
+                text_field("name"),
+                relation_field("role", roles["id"], 1),
+            ],
+            "options": AUTH_OPTIONS,
+        },
+    )
+    # A rule can only reference its own collection once the collection exists.
+    response = await client.patch(
+        "/api/collections/pb_users",
+        headers=admin,
+        json={
+            "listRule": "",
+            "viewRule": "",
+            "createRule": BUMA_USERS_CREATE_RULE,
+            "updateRule": BUMA_USERS_UPDATE_RULE,
+            "deleteRule": BUMA_USERS_DELETE_RULE,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"pb_users rules failed: {response.text[:400]}")
+    role_ids: dict[str, str] = {}
+    permissions: dict[str, dict[str, Any]] = {}
+    for index, (name, permission) in enumerate(
+        (
+            ("plain", {}),
+            ("admin", {"isAdmin": True}),
+            ("creator", {"user": {"create": True}}),
+            ("updater", {"user": {"update": True}}),
+        ),
+        start=1,
+    ):
+        role_ids[name] = labels.add(f"role_{name}", _rid("pbrole", index))
+        permissions[name] = permission
+        await _create(
+            client,
+            "pb_roles",
+            {"id": role_ids[name], "name": name, "permission": permission},
+            headers=admin,
+        )
+
+    user_ids: dict[str, str] = {}
+    tokens: dict[str, dict[str, str]] = {"anonymous": {}, "superuser": admin}
+
+    async def add_user(label: str, role: str) -> None:
+        user_ids[label] = labels.add(label, _rid(f"pbuser{label}", 0))
+        await _create(
+            client,
+            "pb_users",
+            {
+                "id": user_ids[label],
+                "email": f"probe-{label}@example.invalid",
+                "password": USER_PASSWORD,
+                "passwordConfirm": USER_PASSWORD,
+                "name": label,
+                "role": role_ids[role],
+            },
+            headers=admin,
+        )
+        response = await client.post(
+            "/api/collections/pb_users/auth-with-password",
+            json={
+                "identity": f"probe-{label}@example.invalid",
+                "password": USER_PASSWORD,
+            },
+        )
+        response.raise_for_status()
+        tokens[label] = {"Authorization": response.json()["token"]}
+        auth_paths(user_ids[label], _permission_values(permissions[role]))
+
+    counter = {"value": 0}
+
+    async def create_as(caller: str) -> Any:
+        counter["value"] += 1
+        label = f"new{counter['value']}"
+        response = await client.post(
+            "/api/collections/pb_users/records",
+            json={
+                "email": f"probe-{label}@example.invalid",
+                "password": USER_PASSWORD,
+                "passwordConfirm": USER_PASSWORD,
+                "name": label,
+            },
+            headers=tokens[caller],
+        )
+        if response.status_code == 200:
+            labels.add(label, response.json()["id"])
+            return 200
+        return _error_shape(response)
+
+    async def update_as(caller: str, target: str, payload: dict[str, Any]) -> Any:
+        response = await client.patch(
+            f"/api/collections/pb_users/records/{user_ids[target]}",
+            json=payload,
+            headers=tokens[caller],
+        )
+        if response.status_code == 200:
+            return 200
+        return _error_shape(response)
+
+    async def user_count() -> int:
+        response = await client.get(
+            "/api/collections/pb_users/records", params={"perPage": 1}, headers=admin
+        )
+        response.raise_for_status()
+        return int(response.json()["totalItems"])
+
+    # One account: the caller is the only users row.
+    await add_user("solo", "plain")
+    out["solo_update_self"] = await update_as("solo", "solo", {"name": "solo2"})
+    out["solo_create"] = await create_as("solo")
+    out["solo_count_after_create"] = await user_count()
+    out["anonymous_create_one_row"] = await create_as("anonymous")
+
+    # Two accounts and more.
+    for label, role in (
+        ("u2", "plain"),
+        ("boss", "admin"),
+        ("creator", "creator"),
+        ("updater", "updater"),
+    ):
+        await add_user(label, role)
+    before = await user_count()
+    matrix = {
+        "plain_create": create_as("solo"),
+        "plain_update_self": update_as("solo", "solo", {"name": "solo3"}),
+        "plain_update_other": update_as("solo", "u2", {"name": "u2b"}),
+        "plain_escalate_self": update_as("solo", "solo", {"role": role_ids["admin"]}),
+        "plain_escalate_other": update_as("solo", "u2", {"role": role_ids["admin"]}),
+        "admin_role_create": create_as("boss"),
+        "admin_role_update_other": update_as("boss", "u2", {"name": "u2c"}),
+        "admin_role_update_self": update_as("boss", "boss", {"name": "boss2"}),
+        "creator_create": create_as("creator"),
+        "creator_update_other": update_as("creator", "u2", {"name": "u2d"}),
+        "updater_update_other": update_as("updater", "u2", {"name": "u2e"}),
+        "updater_create": create_as("updater"),
+        "anonymous_create": create_as("anonymous"),
+        "anonymous_update": update_as("anonymous", "u2", {"name": "u2f"}),
+        "superuser_create": create_as("superuser"),
+        "superuser_update": update_as("superuser", "u2", {"name": "u2g"}),
+    }
+    for key, call in matrix.items():
+        out[key] = await call
+    out["created_in_matrix"] = await user_count() - before
+    response = await client.get(
+        f"/api/collections/pb_users/records/{user_ids['u2']}", headers=admin
+    )
+    out["u2_after"] = {
+        "name": response.json().get("name"),
+        "role": labels(response.json().get("role")),
+    }
+    response = await client.get(
+        f"/api/collections/pb_users/records/{user_ids['solo']}", headers=admin
+    )
+    out["solo_after"] = {
+        "name": response.json().get("name"),
+        "role": labels(response.json().get("role")),
+    }
+
+    # buma_pdv.deleteRule: a missing client/agent is a NULL leaf.
+    customers = await _collection(
+        client, admin, {"name": "pb_customers", "schema": [text_field("name")]}
+    )
+    agents = await _collection(
+        client, admin, {"name": "pb_agents", "schema": [text_field("name")]}
+    )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "pb_pdv",
+            "schema": [
+                text_field("title"),
+                relation_field("client", customers["id"], 1),
+                relation_field("agent", agents["id"], 1),
+            ],
+            "deleteRule": BUMA_PDV_DELETE_RULE,
+        },
+    )
+    customer = labels.add("pb_customer", _rid("pbcustomer", 1))
+    agent = labels.add("pb_agent", _rid("pbagent", 1))
+    await _create(client, "pb_customers", {"id": customer, "name": "c"})
+    await _create(client, "pb_agents", {"id": agent, "name": "a"})
+    missing = labels.add("pb_missing", _rid("pbmissing", 0))
+    pdv_ids: dict[str, str] = {}
+    for index, (title, values) in enumerate(
+        (
+            ("none", {}),
+            ("client", {"client": customer}),
+            ("agent", {"agent": agent}),
+            ("both", {"client": customer, "agent": agent}),
+            ("orphan_client", {}),
+            ("orphan_agent", {}),
+            ("orphan_both", {}),
+            ("anon_none", {}),
+        ),
+        start=1,
+    ):
+        pdv_ids[title] = labels.add(f"pdv_{title}", _rid("pbpdv", index))
+        await _create(
+            client, "pb_pdv", {"id": pdv_ids[title], "title": title, **values}
+        )
+    await inject("pb_pdv", pdv_ids["orphan_client"], "client", missing)
+    await inject("pb_pdv", pdv_ids["orphan_agent"], "agent", missing)
+    await inject("pb_pdv", pdv_ids["orphan_both"], "client", missing)
+    await inject("pb_pdv", pdv_ids["orphan_both"], "agent", missing)
+    out["pdv_filter"] = await _titles(
+        client, "pb_pdv", "client.id = '' && agent.id = ''", headers=admin
+    )
+    out["pdv_filter_rule"] = await _titles(
+        client, "pb_pdv", BUMA_PDV_DELETE_RULE, headers=tokens["u2"]
+    )
+    response = await client.delete(
+        f"/api/collections/pb_pdv/records/{pdv_ids['anon_none']}"
+    )
+    out["pdv_delete_anonymous"] = response.status_code
+    for title, record_id in pdv_ids.items():
+        if title == "anon_none":
+            continue
+        response = await client.delete(
+            f"/api/collections/pb_pdv/records/{record_id}", headers=tokens["u2"]
+        )
+        out[f"pdv_delete_{title}"] = response.status_code
+    return out
+
+
+SCENARIO_GROUPS = (
+    "direct",
+    "paths",
+    "rules",
+    "delete",
+    "validation",
+    "multimatch",
+    "buma_rules",
+)
+
+
 async def run_scenarios(
     client: httpx.AsyncClient,
     admin: dict[str, str],
     inject: Inject,
+    groups: tuple[str, ...] = SCENARIO_GROUPS,
+    auth_paths: AuthPaths = _no_auth_paths,
 ) -> dict[str, Any]:
     labels = Labels()
-    return {
-        "direct": await direct_scenarios(client, admin, labels, inject),
-        "paths": await path_scenarios(client, admin, labels),
-        "rules": await rule_scenarios(client, admin, labels),
-        "delete": await delete_scenarios(client, admin, labels),
-        "validation": await validation_scenarios(client, admin, labels, inject),
+    runners: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {
+        "direct": lambda: direct_scenarios(client, admin, labels, inject),
+        "paths": lambda: path_scenarios(client, admin, labels),
+        "rules": lambda: rule_scenarios(client, admin, labels),
+        "delete": lambda: delete_scenarios(client, admin, labels),
+        "validation": lambda: validation_scenarios(client, admin, labels, inject),
+        "multimatch": lambda: multimatch_scenarios(client, admin, labels, inject),
+        "buma_rules": lambda: buma_rule_scenarios(
+            client, admin, labels, inject, auth_paths
+        ),
     }
+    return {group: await runners[group]() for group in groups}
 
 
 def _free_port() -> int:
@@ -918,14 +1428,18 @@ async def pocketbase_client(
                     await process.wait()
 
 
-async def run_pocketbase(binary: Path) -> dict[str, Any]:
+async def run_pocketbase(
+    binary: Path, groups: tuple[str, ...] = SCENARIO_GROUPS
+) -> dict[str, Any]:
     async with pocketbase_client(binary) as (client, data_db):
 
         async def inject(table: str, record_id: str, field: str, value: Any) -> None:
+            # A list is stored as its JSON text, a single relation id as is.
+            stored = value if isinstance(value, str) else json.dumps(value)
             with sqlite3.connect(data_db, timeout=10) as connection:
                 connection.execute(
                     f'UPDATE "{table}" SET "{field}" = ? WHERE id = ?',
-                    (json.dumps(value), record_id),
+                    (stored, record_id),
                 )
 
         response = await client.post(
@@ -934,10 +1448,41 @@ async def run_pocketbase(binary: Path) -> dict[str, Any]:
         )
         response.raise_for_status()
         admin = {"Authorization": response.json()["token"]}
-        return await run_scenarios(client, admin, inject)
+        return await run_scenarios(client, admin, inject, groups)
 
 
-async def run_ppbase(database_url: str) -> dict[str, Any]:
+@contextlib.contextmanager
+def _auth_path_context() -> Iterator[AuthPaths]:
+    """Serve ``@request.auth.<relation path>`` values to PPBase rules.
+
+    PPBase only knows the token claims; BUMA loads the caller's role in
+    ``app/auth/context.py`` and patches ``_prepare_rule_context`` the same
+    way.  The probe uses the role assigned when the caller logged in.
+    """
+    import ppbase.api.records as records_api
+
+    values_by_id: dict[str, dict[str, Any]] = {}
+    original = records_api._prepare_rule_context
+
+    def patched(request: Any, token_payload: Any, data: Any = None) -> Any:
+        auth_ctx, request_ctx = original(request, token_payload, data=data)
+        record_id = str((token_payload or {}).get("id") or "")
+        # A guest has no role: every permission path is NULL.
+        values = values_by_id.get(record_id) if record_id else _permission_values({})
+        if values:
+            request_ctx.setdefault("auth", {}).update(values)
+        return auth_ctx, request_ctx
+
+    records_api._prepare_rule_context = patched
+    try:
+        yield lambda record_id, values: values_by_id.__setitem__(record_id, values)
+    finally:
+        records_api._prepare_rule_context = original
+
+
+async def run_ppbase(
+    database_url: str, groups: tuple[str, ...] = SCENARIO_GROUPS
+) -> dict[str, Any]:
     from httpx import ASGITransport
     from sqlalchemy import select, text
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -1001,11 +1546,14 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
                         {"value": value, "id": record_id},
                     )
 
-            transport = ASGITransport(app=app)
+            transport = ASGITransport(app=app, raise_app_exceptions=False)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver", timeout=60
             ) as client:
-                return await run_scenarios(client, {"Authorization": token}, inject)
+                with _auth_path_context() as auth_paths:
+                    return await run_scenarios(
+                        client, {"Authorization": token}, inject, groups, auth_paths
+                    )
         finally:
             await close_engine()
 
@@ -1028,10 +1576,19 @@ def main() -> int:
     parser.add_argument("--pocketbase", type=Path, required=True)
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--groups",
+        default=",".join(SCENARIO_GROUPS),
+        help="comma-separated scenario groups (default: all)",
+    )
     args = parser.parse_args()
+    groups = tuple(group for group in args.groups.split(",") if group)
+    unknown = sorted(set(groups) - set(SCENARIO_GROUPS))
+    if unknown:
+        parser.error(f"unknown groups: {', '.join(unknown)}")
     args.out.mkdir(parents=True, exist_ok=True)
-    pocketbase = asyncio.run(run_pocketbase(args.pocketbase))
-    ppbase = asyncio.run(run_ppbase(args.database_url))
+    pocketbase = asyncio.run(run_pocketbase(args.pocketbase, groups))
+    ppbase = asyncio.run(run_ppbase(args.database_url, groups))
     differences = _diff(pocketbase, ppbase)
     for name, payload in (
         ("pocketbase.json", pocketbase),
