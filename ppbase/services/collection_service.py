@@ -35,6 +35,7 @@ from ppbase.models.collection import (
     CollectionUpdate,
 )
 from ppbase.services.auth_service import normalize_auth_password_schema
+from ppbase.services.secret_redaction import merge_auth_options
 
 logger = logging.getLogger(__name__)
 
@@ -475,8 +476,9 @@ async def create_collection(
     if data.type == "auth":
         from ppbase.services.auth_service import generate_default_auth_options
 
-        options = _deep_merge_dicts(
+        options = merge_auth_options(
             generate_default_auth_options(is_superusers=False),
+            {},
             options,
         )
         data.schema, options = normalize_auth_password_schema(data.schema, options)
@@ -617,11 +619,13 @@ async def update_collection(
 
             existing_options = record.options if isinstance(record.options, dict) else {}
             is_superusers = record.name == "_superusers"
-            merged = _deep_merge_dicts(
+            # Secrets are never served (secret_redaction), so a dashboard
+            # round trip sends them back absent or masked: keep the stored ones.
+            record.options = merge_auth_options(
                 generate_default_auth_options(is_superusers=is_superusers),
                 existing_options,
+                incoming_options,
             )
-            record.options = _deep_merge_dicts(merged, incoming_options)
         else:
             record.options = incoming_options
         flag_modified(record, "options")
@@ -830,13 +834,13 @@ async def _import_collections_impl(
                 existing_options = (
                     record.options if isinstance(record.options, dict) else {}
                 )
-                merged_options = _deep_merge_dicts(
+                record.options = merge_auth_options(
                     generate_default_auth_options(
                         is_superusers=record.name == "_superusers"
                     ),
                     existing_options,
+                    incoming_options,
                 )
-                record.options = _deep_merge_dicts(merged_options, incoming_options)
                 record.schema, record.options = normalize_auth_password_schema(
                     record.schema,
                     record.options,
@@ -882,8 +886,9 @@ async def _import_collections_impl(
             # Auth collections need default auth options if not provided
             if import_type == "auth":
                 from ppbase.services.auth_service import generate_default_auth_options
-                import_options = _deep_merge_dicts(
+                import_options = merge_auth_options(
                     generate_default_auth_options(is_superusers=False),
+                    {},
                     import_options,
                 )
                 import_schema, import_options = normalize_auth_password_schema(

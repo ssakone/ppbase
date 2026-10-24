@@ -496,6 +496,7 @@ def _create_restore_cutover_engine(
     return create_async_engine(
         settings.database_url,
         poolclass=NullPool,
+        hide_parameters=True,
         connect_args=dict(connect_args),
     )
 

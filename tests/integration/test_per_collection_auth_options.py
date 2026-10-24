@@ -11,8 +11,24 @@ import uuid
 import jwt as pyjwt
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _stored_token_secret(collection_name: str, token_option: str) -> str:
+    """Read a token secret from ``_collections``: the API never serves it."""
+    from ppbase.db.engine import get_engine
+
+    async with get_engine().connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT options -> :option ->> 'secret' FROM _collections "
+                "WHERE name = :name"
+            ),
+            {"option": token_option, "name": collection_name},
+        )
+        return result.scalar_one()
 
 
 class TestAuthOptionsPopulated:
@@ -26,7 +42,8 @@ class TestAuthOptionsPopulated:
         assert resp.status_code == 200
         opts = resp.json().get("options", {})
         assert "authToken" in opts
-        assert len(opts["authToken"]["secret"]) == 50
+        assert "secret" not in opts["authToken"]
+        assert len(await _stored_token_secret("_superusers", "authToken")) == 50
         # Superusers should have 1 day (86400s) auth token duration
         assert opts["authToken"]["duration"] == 86400
 
@@ -113,8 +130,11 @@ class TestAuthOptionsPopulated:
             "/api/collections/users",
             headers={"Authorization": admin_token},
         )
-        su_secret = resp_su.json()["options"]["authToken"]["secret"]
-        user_secret = resp_users.json()["options"]["authToken"]["secret"]
+        assert "secret" not in resp_su.json()["options"]["authToken"]
+        assert "secret" not in resp_users.json()["options"]["authToken"]
+        su_secret = await _stored_token_secret("_superusers", "authToken")
+        user_secret = await _stored_token_secret("users", "authToken")
+        assert su_secret and user_secret
         assert su_secret != user_secret
 
 

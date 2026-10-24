@@ -38,6 +38,8 @@ def test_restore_cutover_engine_uses_dedicated_timeouts(
             settings.database_url,
             {
                 "poolclass": NullPool,
+                # Bound values never reach SQL error messages (ppbase/db/engine.py).
+                "hide_parameters": True,
                 "connect_args": {
                     "timeout": 12.5,
                     "command_timeout": 987.0,
@@ -48,6 +50,8 @@ def test_restore_cutover_engine_uses_dedicated_timeouts(
             settings.database_url,
             {
                 "poolclass": NullPool,
+                # Bound values never reach SQL error messages (ppbase/db/engine.py).
+                "hide_parameters": True,
                 "connect_args": {
                     "timeout": 12.5,
                     "command_timeout": 987.0,

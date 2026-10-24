@@ -292,7 +292,8 @@ describe('Settings API', () => {
     expect(updated?.s3?.bucket).toBe(payload.bucket)
     expect(updated?.s3?.region).toBe(payload.region)
     expect(updated?.s3?.accessKey).toBe(payload.accessKey)
-    expect(updated?.s3?.secret).toBe(payload.secret)
+    // Secrets are served masked (PocketBase 0.22.34 models/settings/settings.go:279-334).
+    expect(updated?.s3?.secret).toBe('******')
     expect(Boolean(updated?.s3?.forcePathStyle)).toBe(true)
 
     const fetched = await pb.settings.getAll()
@@ -300,7 +301,7 @@ describe('Settings API', () => {
     expect(fetched?.s3?.bucket).toBe(payload.bucket)
     expect(fetched?.s3?.region).toBe(payload.region)
     expect(fetched?.s3?.accessKey).toBe(payload.accessKey)
-    expect(fetched?.s3?.secret).toBe(payload.secret)
+    expect(fetched?.s3?.secret).toBe('******')
     expect(Boolean(fetched?.s3?.forcePathStyle)).toBe(true)
   })
 })

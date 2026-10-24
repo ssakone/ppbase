@@ -42,6 +42,9 @@ async def init_engine(
         max_overflow=max_overflow,
         pool_pre_ping=True,
         echo=echo,
+        # Bound values include password hashes, token keys, token secrets and
+        # SMTP/S3 credentials: never copy them into error messages or logs.
+        hide_parameters=True,
         connect_args={"ssl": "disable"},
     )
     _session_factory = async_sessionmaker(

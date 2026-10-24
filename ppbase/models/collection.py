@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from ppbase.services.secret_redaction import redact_collection_options
+
 # Suppress Pydantic warning about "schema" field shadowing BaseModel.schema()
 # (deprecated v1 compat method).  We need "schema" for PocketBase API compat.
 warnings.filterwarnings("ignore", message='Field name "schema".*shadows an attribute')
@@ -227,7 +229,10 @@ class CollectionResponse(BaseModel):
             schema=raw_schema,
             fields=_schema_to_fields(raw_schema),
             indexes=record.indexes if isinstance(record.indexes, list) else [],
-            options=raw_options,
+            # Token secrets and OAuth2 client secrets are never served,
+            # superusers included (v0.40.6 core/collection_model.go:564-584);
+            # PocketBase 0.22 collections carry no secret at all.
+            options=redact_collection_options(raw_options),
             listRule=record.list_rule,
             viewRule=record.view_rule,
             createRule=record.create_rule,
