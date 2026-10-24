@@ -140,8 +140,12 @@ async def test_pocketbase_022_record_and_admin_file_tokens_open_protected_files(
             assert resp.status_code == 200, resp.text
             assert resp.content == CONTENT
 
-        # Refused like PocketBase: no token, the 0.22 session tokens (same
-        # claims, session secret) and expired file tokens.
+        # Refused, as by PocketBase: no token, the 0.22 session tokens (same
+        # claims, session secret) and expired file tokens.  The status is
+        # PPBase's 404, that of current PocketBase (v0.40.6 apis/file.go:132-133);
+        # PocketBase 0.22.34 answers 403 "Insufficient permissions to access
+        # the file resource." (v0.22.34 apis/file.go:136-138), a difference
+        # older than this branch (api/files.py).
         refused = [
             None,
             _token(record_claims, user_key + users["options"]["authToken"]["secret"]),
