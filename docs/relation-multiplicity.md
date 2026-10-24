@@ -77,11 +77,18 @@ list semantics.
 The record API (create, update, batch) also requires every referenced id to
 exist, like PocketBase's record form (`forms/validators/record_data.go`
 `checkRelationValue`, l.361-398): `validation_missing_rel_records` /
-"Failed to find all relation records with the provided ids." On update the
-whole record is validated, as in PocketBase, so an untouched orphan relation
-also fails. Internal writes (`record_service.create_record`/`update_record`
-without `validate_relations=True`) behave like PocketBase `dao.SaveRecord`
-and never check targets, so historical orphans can be imported and kept.
+"Failed to find all relation records with the provided ids." PocketBase runs
+this form validation before the `OnRecordBefore*Request` hooks, so PPBase
+checks the client payload (merged with the current record and its modifiers
+on update) before running request hooks, after the superuser-only rule (403)
+and the update visibility rule (404). On update the whole record is
+validated, as in PocketBase, so an untouched orphan relation also fails.
+Values written by a request hook, and every internal write
+(`record_service.create_record`/`update_record`, the equivalent of
+PocketBase `dao.SaveRecord`), are saved without a target lookup, so
+historical orphans can be imported and kept. The check is available as
+`record_service.relation_target_errors(engine, collection, data,
+record_id=None)`.
 
 ## Collection updates
 
