@@ -832,6 +832,26 @@ async def test_create_and_update_responses_hide_unmanaged_emails(
         )
         assert response.status_code == 200, response.text
         assert "email" not in response.json()
+
+        # The batch API (PPBase, current PocketBase) answers like update.
+        response = await app_client.post(
+            "/api/batch",
+            headers={"Authorization": tokens["other"]},
+            json={
+                "requests": [
+                    {
+                        "method": "PATCH",
+                        "url": f"/api/collections/{name}/records/{ids['member']}",
+                        "body": {},
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 200, response.text
+        (item,) = response.json()
+        assert item["status"] == 200, item
+        assert item["body"]["id"] == ids["member"]
+        assert "email" not in item["body"]
     finally:
         await app_client.delete(
             f"/api/collections/{collection['id']}",

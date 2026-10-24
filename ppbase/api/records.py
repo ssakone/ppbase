@@ -1026,6 +1026,9 @@ async def _apply_batch_create(
             if selected_record is not None:
                 record = selected_record
 
+        record = await _main_auth_record_email(
+            engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             expanded_records = await expand_records(
                 engine,
@@ -1196,6 +1199,9 @@ async def _apply_batch_update(
             if selected_record is not None:
                 record = selected_record
 
+        record = await _main_auth_record_email(
+            engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             expanded_records = await expand_records(
                 engine,
