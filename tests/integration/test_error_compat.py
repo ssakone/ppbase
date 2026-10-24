@@ -417,3 +417,46 @@ async def test_022_mode_keeps_successful_and_non_json_responses(
     assert response.status_code == 200
     payload = json.loads(response.content)
     assert "code" in payload or "message" in payload
+
+
+async def test_022_mode_keeps_the_documented_data_differences(
+    app_client: AsyncClient, error_env: dict, compat_022: None
+) -> None:
+    """Pinned PPBase ``data`` details the 0.22 mode does not rewrite.
+
+    Listed in docs/error-compat.md ("Known differences"): a duplicate email
+    (0.22.34 ``validation_invalid_email`` "The email is invalid or already
+    in use.", forms/record_upsert.go l.584-598) and a confirm-password-reset
+    without fields (0.22.34 also reports password and passwordConfirm,
+    forms/record_password_reset_confirm.go l.47-49).
+    """
+    email = f"dup-{uuid.uuid4().hex[:8]}@example.invalid"
+    body = {
+        "email": email,
+        "password": "dup-Password-1",
+        "passwordConfirm": "dup-Password-1",
+    }
+    first = await app_client.post("/api/collections/users/records", json=body)
+    assert first.status_code == 200, first.text
+    duplicate = await app_client.post("/api/collections/users/records", json=body)
+    assert duplicate.status_code == 400
+    assert duplicate.json() == {
+        "code": 400,
+        "message": "Failed to create record.",
+        "data": {
+            "email": {
+                "code": "validation_not_unique",
+                "message": "The email is already in use.",
+            }
+        },
+    }
+    reset = await app_client.post(
+        "/api/collections/users/confirm-password-reset", json={}
+    )
+    assert reset.status_code == 400
+    assert list(reset.json()) == ["code", "message", "data"]
+    assert set(reset.json()["data"]) == {"token"}
+    await app_client.delete(
+        f"/api/collections/users/records/{first.json()['id']}",
+        headers={"Authorization": error_env["admin"]},
+    )
