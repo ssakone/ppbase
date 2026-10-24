@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Absent @request.* values no longer 500; totalPages and expand key
+
+See `docs/request-static-fields.md`.
+
+- An absent `@request.*` value (anonymous caller, or a role-permission key the
+  flattened BUMA context does not declare) is resolved with PostgreSQL-safe,
+  PocketBase-equivalent equality instead of `$n IS NOT NULL`/`'' = TRUE`,
+  which asyncpg/PostgreSQL rejected. Anonymous lists of `buma_article_stockage`,
+  `buma_pdv` and the other role-permission collections return 200 with the
+  authorized rows.
+- `totalPages` of an empty result set is `0` (was `1`), matching
+  `ceil(totalItems / perPage)`.
+- A record with no expanded relation no longer carries an empty `expand: {}`;
+  the key is omitted, as in PocketBase.
+
 ### Security: hidden auth fields are not filterable/sortable
 
 See `docs/hidden-auth-fields.md`.

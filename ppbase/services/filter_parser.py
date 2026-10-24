@@ -987,6 +987,14 @@ class _FilterTransformer(Transformer):
         if date_sql is not None:
             return _guarded(date_sql)
 
+        # A ``@request.*`` static value compared with = / != : resolve it with
+        # PocketBase's empty/NULL-aware, PostgreSQL-safe equality so an absent
+        # value (anonymous caller, or a role permission key the flattened
+        # context does not declare) never raises a type error and matches the
+        # same records as PocketBase.
+        if op in {"=", "!="} and (left[0] == "macro" or right[0] == "macro"):
+            return _guarded(self._static_equal_sql(left, right, equal=op == "="))
+
         # Standard comparisons
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
@@ -1412,6 +1420,48 @@ class _FilterTransformer(Transformer):
         if kind in {"literal", "macro"}:
             return _Side(sql, "value", node)
         return _Side(sql, "column", node)
+
+    def _static_equal_sql(self, left: tuple, right: tuple, *, equal: bool) -> str:
+        """``=``/``!=`` when a ``@request.*`` static value is involved.
+
+        PocketBase binds an absent ``@request.*`` value as SQL ``NULL`` and a
+        present one as a typed param, then compares with ``resolveEqualExpr``
+        (resolvers/record_field_resolver.go l.186-223, tools/search/filter.go
+        l.290-368).  Over SQLite's loose typing ``'' = TRUE`` or ``'' = 1`` is
+        just ``false`` and ``col IS NOT NULL`` works; PostgreSQL rejects an
+        untyped ``$n IS NOT NULL`` and ``'' = TRUE``.  This builds the same
+        result with PG-safe SQL: an empty operand never equals a known
+        non-empty value, and an empty operand compared with a column matches
+        its empty/NULL rows (``COALESCE(col,'') = ''``).
+        """
+        left_side = self._side(left, None)
+        right_side = self._side(right, None)
+        left_empty = left_side.kind == "empty"
+        right_empty = right_side.kind == "empty"
+        if left_empty and right_empty:
+            return "TRUE" if equal else "FALSE"
+        if left_empty or right_empty:
+            other = right_side if left_empty else left_side
+            if other.kind != "column":
+                # Empty can never equal a known non-empty value.
+                return "FALSE" if equal else "TRUE"
+            col = self._text_cast_sql(other.sql)
+            return (
+                f"(COALESCE({col}, '') = '')"
+                if equal
+                else f"(COALESCE({col}, '') <> '')"
+            )
+        if left_side.kind == "column" and right_side.kind == "column":
+            left_col = self._text_cast_sql(left_side.sql)
+            right_col = self._text_cast_sql(right_side.sql)
+            if equal:
+                return f"COALESCE({left_col}, '') = COALESCE({right_col}, '')"
+            return (
+                f"COALESCE({left_col}, '') IS DISTINCT FROM COALESCE({right_col}, '')"
+            )
+        if equal:
+            return f"{left_side.sql} = {right_side.sql}"
+        return f"({left_side.sql} IS DISTINCT FROM {right_side.sql})"
 
     def _pb_equal_sql(self, left: _Side, right: _Side, *, equal: bool) -> str:
         """``=``/``!=`` like PocketBase ``resolveEqualExpr``.

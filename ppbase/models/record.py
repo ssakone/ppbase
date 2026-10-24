@@ -215,7 +215,9 @@ def build_list_response(
     elif per_page <= 0:
         total_pages = 0
     else:
-        total_pages = max(1, math.ceil(total_items / per_page))
+        # PocketBase: ceil(totalItems / perPage) (tools/search/provider.go
+        # l.254), so an empty result set has totalPages 0, not 1.
+        total_pages = math.ceil(total_items / per_page)
 
     return {
         "page": page,

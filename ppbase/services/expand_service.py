@@ -153,7 +153,27 @@ async def expand_records(
             request_context=request_context,
         )
 
+    # PocketBase omits the "expand" key of a record with no expanded relation
+    # (models/record.go l.545-559, daos/record_expand.go l.227-229): PPBase
+    # must not serve expand: {}.
+    for record in records:
+        _strip_empty_expand(record)
+
     return records
+
+
+def _strip_empty_expand(record: dict[str, Any]) -> None:
+    """Drop empty ``expand`` dicts recursively (PocketBase omits them)."""
+    expand = record.get("expand")
+    if not isinstance(expand, dict):
+        return
+    for value in expand.values():
+        children = value if isinstance(value, list) else [value]
+        for child in children:
+            if isinstance(child, dict):
+                _strip_empty_expand(child)
+    if not expand:
+        del record["expand"]
 
 
 async def _expand_path(
