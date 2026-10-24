@@ -407,7 +407,16 @@ class _BuiltinRouteMiddlewares:
         *,
         collection: Any | None = None,
         default_expand: str | None = None,
+        auth_record: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        """``apis.EnrichRecords``: ``?expand`` (and ``?fields``) of the request.
+
+        Every expanded record must satisfy its collection ``viewRule`` for
+        this request (admins excepted), with the same rule context as the
+        records API. ``auth_record`` evaluates the rules as that auth record
+        instead of the request auth, like PocketBase's ``RecordAuthResponse``
+        (apis/record_helpers.go l.105-116).
+        """
         if not records:
             return []
 
@@ -419,8 +428,21 @@ class _BuiltinRouteMiddlewares:
         collection_ref = await self._resolve_collection_ref(engine, collection, records[0])
 
         result_records = [dict(item) for item in records]
-        auth_payload = await self._resolve_request_auth(request)
-        request_context = self._build_request_context(request, auth_payload)
+        if auth_record is not None:
+            from ppbase.api.record_auth import _auth_response_expand_context
+
+            request_context = _auth_response_expand_context(
+                request, collection_ref, auth_record
+            )
+        else:
+            # Looked up at call time: host applications may extend the rule
+            # context of the records API (BUMA flattens role permissions).
+            from ppbase.api import records as records_api
+
+            auth_payload = await self._resolve_request_auth(request)
+            _auth_ctx, request_context = records_api._prepare_rule_context(
+                request, auth_payload
+            )
 
         expand_value = str(request.query_params.get("expand", "") or "").strip()
         if not expand_value:
@@ -452,6 +474,7 @@ class _BuiltinRouteMiddlewares:
         *,
         collection: Any | None = None,
         default_expand: str | None = None,
+        auth_record: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if record is None:
             return None
@@ -460,6 +483,7 @@ class _BuiltinRouteMiddlewares:
             [record],
             collection=collection,
             default_expand=default_expand,
+            auth_record=auth_record,
         )
         return records[0] if records else None
 
@@ -493,6 +517,7 @@ class _BuiltinRouteMiddlewares:
             dict(record),
             collection=collection_ref,
             default_expand=default_expand,
+            auth_record=record,
         )
         if enriched_record is None:
             raise ValueError("record is required.")

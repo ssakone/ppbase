@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from fastapi import Request
 from httpx import AsyncClient
 from sqlalchemy import event, text
 
@@ -659,3 +660,48 @@ async def test_list_expand_runs_one_query_per_collection_and_level(
     # customer.region: one customer query + one region query; customers: one.
     assert sum(customer_table in sql for sql in statements) == 2
     assert sum(region_table in sql for sql in statements) == 1
+
+
+async def test_pb_enrich_helpers_apply_the_view_rule(
+    app_client: AsyncClient, env: dict[str, Any]
+) -> None:
+    """``pb.apis.enrich_record`` (EnrichRecords) and ``record_auth_response``."""
+    from httpx import ASGITransport
+
+    from ppbase import PPBase
+
+    names, ids = env["names"], env["ids"]
+    app_pb = PPBase()
+
+    @app_pb.get("/ext/wsa6/sale")
+    async def enriched_sale(request: Request):
+        engine = get_engine()
+        sales = await resolve_collection(engine, names["s"])
+        record = await get_record(engine, sales, ids["s1"])
+        return await app_pb.apis.enrich_record(request, record, collection=sales)
+
+    @app_pb.get("/ext/wsa6/login")
+    async def login_as_reader(request: Request):
+        engine = get_engine()
+        users = await resolve_collection(engine, names["u"])
+        record = await get_record(engine, users, ids["reader"])
+        return await app_pb.apis.record_auth_response(
+            request, record, collection=users, default_expand="customer"
+        )
+
+    transport = ASGITransport(app=app_pb.get_app())
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        guest = (await client.get("/ext/wsa6/sale?expand=customer,customers")).json()
+        reader = (
+            await client.get(
+                "/ext/wsa6/sale?expand=customer,customers",
+                headers=_headers(env, "reader"),
+            )
+        ).json()
+        login = (await client.get("/ext/wsa6/login")).json()
+
+    assert "customer" not in guest["expand"]
+    assert _names(guest["expand"]["customers"]) == ["c3", "c1"]
+    assert _names(reader["expand"]["customer"]) == "c2"
+    # Expanded as the authenticated record, not as the (guest) requester.
+    assert _names(login["record"]["expand"]["customer"]) == "c2"
