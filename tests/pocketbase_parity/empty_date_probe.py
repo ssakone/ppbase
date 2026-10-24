@@ -19,7 +19,7 @@ disposable PostgreSQL database.
 
 Usage (from the repository root)::
 
-    python tests/pocketbase_parity/empty_date_probe.py \\
+    PYTHONPATH=. python tests/pocketbase_parity/empty_date_probe.py \\
         --pocketbase /path/to/pocketbase-0.22.34 \\
         --database-url postgresql+asyncpg://user:pass@127.0.0.1:5432/probe \\
         --out /tmp/empty-date-probe
@@ -417,6 +417,22 @@ COLLECTION_FILTERS = {
 }
 
 
+# An absent @request.* value is NULL in PocketBase (admin caller: @request.
+# is admin-only in a client filter): = / != treat it as empty, while <, <=,
+# >, >=, ~ and !~ never match.
+REQUEST_FILTERS = {
+    "eq_req_absent": "d = @request.query.nope",
+    "neq_req_absent": "d != @request.query.nope",
+    "lt_req_absent": "d < @request.query.nope",
+    "lte_req_absent": "d <= @request.query.nope",
+    "gt_req_absent": "d > @request.query.nope",
+    "gte_req_absent": "d >= @request.query.nope",
+    "req_absent_lte_field": "@request.query.nope <= d",
+    "like_req_absent": "d ~ @request.query.nope",
+    "not_like_req_absent": "d !~ @request.query.nope",
+}
+
+
 async def filter_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any:
     out: dict[str, Any] = {
         "filters": {
@@ -432,6 +448,12 @@ async def filter_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> 
                 client, "pd_dates", filter_expr=expression, headers=admin
             )
             for key, expression in COLLECTION_FILTERS.items()
+        },
+        "request_filters": {
+            key: await _titles(
+                client, "pd_dates", filter_expr=expression, headers=admin
+            )
+            for key, expression in REQUEST_FILTERS.items()
         },
         "collection_filter_anonymous": await _titles(
             client, "pd_dates", filter_expr=COLLECTION_FILTERS["lt_value"]
@@ -741,6 +763,12 @@ def _diff(left: Any, right: Any, path: str = "") -> list[dict[str, Any]]:
     return []
 
 
+def _ppbase_module() -> str:
+    import ppbase
+
+    return str(Path(ppbase.__file__).resolve().parent)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pocketbase", type=Path, required=True)
@@ -770,6 +798,9 @@ def main() -> int:
                 "differences": len(differences),
                 "known": len(differences) - len(unexpected),
                 "unexpected": len(unexpected),
+                # The PPBase actually exercised (run with PYTHONPATH=<checkout>,
+                # otherwise the installed package is imported).
+                "ppbase_module": _ppbase_module(),
             },
             indent=1,
         )

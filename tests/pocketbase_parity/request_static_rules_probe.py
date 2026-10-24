@@ -16,15 +16,18 @@ shape checks (totalPages of an empty list, and the omitted ``expand`` key),
 against an official PocketBase 0.22.34 binary and PPBase.
 
 The BUMA ``@request.auth.role.permission.*`` context flattens the role JSON
-into dotted keys (app/auth/context.py); PocketBase nests it under the auth
-record's expanded ``role`` relation.  To compare the *resolution* of an absent
-key without rebuilding BUMA's schema, the probe uses an anonymous caller for
-whom the whole ``@request.auth`` subtree is absent in both engines, which is
-the production 500 scenario.
+into dotted keys (app/auth/context.py); PocketBase resolves the same path
+through the auth record's ``role`` relation and ``json_extract`` (a missing
+key or role is NULL).  The anonymous caller is the production 500 scenario;
+the authenticated callers (``ROLE_USERS``) cover a missing key, a missing
+role and non-boolean values (``1``, ``0``, ``"true"``) against ``= true`` and
+``!= true``.  For PPBase the probe emulates BUMA's flattening by patching
+``ppbase.api.records._prepare_rule_context`` (without BUMA's declared-key
+defaults, so an undeclared key stays absent).
 
 Only synthetic records are created.  Usage (from the repository root)::
 
-    python tests/pocketbase_parity/request_static_rules_probe.py \\
+    PYTHONPATH=. python tests/pocketbase_parity/request_static_rules_probe.py \\
         --pocketbase /path/to/pocketbase-0.22.34 \\
         --database-url postgresql+asyncpg://user:pass@127.0.0.1:5432/probe \\
         --out /tmp/request-static-probe
@@ -63,6 +66,70 @@ RULE_PERM = (
     " || @request.auth.role.permission.pdv.read = true)"
     " && @request.auth.agent = agent"
 )
+
+
+RULE_PERM_NEG = (
+    "@request.auth.role.permission.pdv.read != true && @request.auth.agent = agent"
+)
+USER_PASSWORD = "probe-User-Password-1"
+# Authenticated callers: the role permission JSON of each one (PocketBase
+# resolves ``@request.auth.role.permission.pdv.read`` through the role
+# relation and ``json_extract``; a missing key or role is NULL).
+ROLE_USERS: dict[str, tuple[Any, str]] = {
+    "u_true": ({"pdv": {"read": True}}, "A1"),
+    "u_one": ({"pdv": {"read": 1}}, "A1"),
+    "u_zero": ({"pdv": {"read": 0}}, "A1"),
+    "u_str": ({"pdv": {"read": "true"}}, "A1"),
+    "u_missing_key": ({"pdv": {}}, "A1"),
+    "u_no_permission": ({}, "A1"),
+    "u_no_role": (None, "A1"),
+    "u_admin": ({"isAdmin": True}, "A2"),
+    "u_admin_str": ({"isAdmin": "true"}, "A2"),
+}
+
+
+def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
+    """BUMA app/auth/context.py ``_flatten``: nested JSON to dotted keys."""
+    if not isinstance(value, dict):
+        return {prefix: value} if prefix else {}
+    result: dict[str, Any] = {}
+    for key, child in value.items():
+        name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(child, dict):
+            result.update(flatten(child, name))
+        else:
+            result[name] = child
+    return result
+
+
+def flat_auth_context(permission: Any, agent: str) -> dict[str, Any]:
+    """The flattened ``@request.auth`` keys BUMA adds for a caller.
+
+    Unlike BUMA (which declares the keys of ``buma_apps_roles`` as False),
+    an undeclared key stays absent, i.e. NULL like PocketBase's
+    ``json_extract`` of a missing key.
+    """
+    context: dict[str, Any] = {"agent": agent}
+    if permission is not None:
+        context.update(
+            {
+                f"role.{key}": value
+                for key, value in flatten({"permission": permission}).items()
+            }
+        )
+    return context
+
+
+def json_field(name: str) -> dict[str, Any]:
+    return {
+        "system": False,
+        "name": name,
+        "type": "json",
+        "required": False,
+        "presentable": False,
+        "unique": False,
+        "options": {"maxSize": 2000000},
+    }
 
 
 def text_field(name: str) -> dict[str, Any]:
@@ -118,9 +185,16 @@ async def _create(
     return response.json()
 
 
-async def _list(client: httpx.AsyncClient, name: str, **params: Any) -> Any:
+async def _list(
+    client: httpx.AsyncClient,
+    name: str,
+    headers: dict[str, str] | None = None,
+    **params: Any,
+) -> Any:
     response = await client.get(
-        f"/api/collections/{name}/records", params={"perPage": 200, **params}
+        f"/api/collections/{name}/records",
+        params={"perPage": 200, **params},
+        headers=headers,
     )
     body: Any
     try:
@@ -132,7 +206,84 @@ async def _list(client: httpx.AsyncClient, name: str, **params: Any) -> Any:
     return body
 
 
-async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any:
+async def authenticated_scenarios(
+    client: httpx.AsyncClient,
+    admin: dict[str, str],
+    on_user: Any = None,
+) -> dict[str, Any]:
+    """The buma_pdv rule for authenticated callers with absent/non-boolean keys."""
+    roles = await _collection(
+        client, admin, {"name": "rs_roles", "schema": [json_field("permission")]}
+    )
+    users = await _collection(
+        client,
+        admin,
+        {
+            "name": "rs_users",
+            "type": "auth",
+            "schema": [text_field("agent"), relation_field("role", roles["id"])],
+            "options": {
+                "allowEmailAuth": True,
+                "allowOAuth2Auth": False,
+                "allowUsernameAuth": False,
+                "exceptEmailDomains": None,
+                "manageRule": None,
+                "minPasswordLength": 8,
+                "onlyEmailDomains": None,
+                "onlyVerified": False,
+                "requireEmail": False,
+            },
+        },
+    )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "rs_pdv_neg",
+            "schema": [text_field("name"), text_field("agent")],
+            "listRule": RULE_PERM_NEG,
+        },
+    )
+    for name, agent in (("n_empty", ""), ("n_a1", "A1"), ("n_a2", "A2")):
+        await _create(client, "rs_pdv_neg", {"name": name, "agent": agent}, admin)
+    out: dict[str, Any] = {}
+    for user, (permission, agent) in ROLE_USERS.items():
+        payload: dict[str, Any] = {
+            "email": f"{user.replace('_', '')}@example.invalid",
+            "password": USER_PASSWORD,
+            "passwordConfirm": USER_PASSWORD,
+            "agent": agent,
+        }
+        if permission is not None:
+            role = await _create(client, "rs_roles", {"permission": permission}, admin)
+            payload["role"] = role["id"]
+        record = await _create(client, "rs_users", payload, admin)
+        if on_user is not None:
+            on_user(record["id"], flat_auth_context(permission, agent))
+        response = await client.post(
+            "/api/collections/rs_users/auth-with-password",
+            json={"identity": payload["email"], "password": USER_PASSWORD},
+        )
+        response.raise_for_status()
+        headers = {"Authorization": response.json()["token"]}
+        row: dict[str, Any] = {}
+        for key, name in (
+            ("pdv", "rs_pdv"),
+            ("pdv_neg", "rs_pdv_neg"),
+            ("stk", "rs_stockage"),
+        ):
+            body = await _list(client, name, headers, sort="name")
+            row[key] = [body.get("status", 200)] + [
+                item["name"] for item in body.get("items", [])
+            ]
+        out[user] = row
+    del users
+    return out
+
+
+async def run_scenarios(
+    client: httpx.AsyncClient, admin: dict[str, str], on_user: Any = None
+) -> Any:
     # buma_article_stockage-like: the @request.auth.id rule.
     stk = await _collection(
         client,
@@ -201,6 +352,7 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any
         )
         for item in expanded.get("items", [])
     }
+    out["authenticated"] = await authenticated_scenarios(client, admin, on_user)
     del stk, pdv, rels, posts
     return out
 
@@ -339,11 +491,31 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
             token = create_admin_token(
                 admin_record, _TokenSettings(), superusers_collection=superusers
             )
+            # Emulate BUMA's flattened ``@request.auth.role.permission.*``
+            # context (app/auth/context.py) for the authenticated callers.
+            import ppbase.api.records as records_api
+
+            live: dict[str, dict[str, Any]] = {}
+            original = records_api._prepare_rule_context
+
+            def patched(request: Any, token_payload: Any, data: Any = None) -> Any:
+                auth_ctx, request_ctx = original(request, token_payload, data=data)
+                extra = live.get(str((token_payload or {}).get("id") or ""))
+                if extra:
+                    request_ctx.setdefault("auth", {}).update(extra)
+                return auth_ctx, request_ctx
+
+            records_api._prepare_rule_context = patched
             transport = ASGITransport(app=app, raise_app_exceptions=False)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://testserver", timeout=60
-            ) as client:
-                return await run_scenarios(client, {"Authorization": token})
+            try:
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://testserver", timeout=60
+                ) as client:
+                    return await run_scenarios(
+                        client, {"Authorization": token}, live.__setitem__
+                    )
+            finally:
+                records_api._prepare_rule_context = original
         finally:
             await close_engine()
 
@@ -378,7 +550,19 @@ def main() -> int:
         (args.out / name).write_text(
             json.dumps(payload, indent=1, sort_keys=True) + "\n"
         )
-    print(json.dumps({"differences": len(differences)}, indent=1))
+    import ppbase
+
+    print(
+        json.dumps(
+            {
+                "differences": len(differences),
+                # The PPBase actually exercised (run with PYTHONPATH=<checkout>,
+                # otherwise the installed package is imported).
+                "ppbase_module": str(Path(ppbase.__file__).resolve().parent),
+            },
+            indent=1,
+        )
+    )
     for row in differences:
         print(json.dumps(row, sort_keys=True))
     return 1 if differences else 0

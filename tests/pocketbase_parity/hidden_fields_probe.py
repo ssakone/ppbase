@@ -11,12 +11,21 @@ admins for a list, always for view/update/delete rules and ``@collection``/
 (apis/realtime.go l.555-590).  PPBase stores these values in its own columns
 (``password_hash``, ``token_key``, ``email_visibility``).
 
-The probe runs the same HTTP scenarios (list filters and sorts, rules,
-expand, realtime subscriptions) for four callers (guest, ordinary user,
-owner of the hidden-email record, admin) against an official PocketBase
-0.22 binary and against PPBase, then writes ``pocketbase.json``,
-``ppbase.json`` and ``diff.json`` in ``--out``.  Differences listed in
-``KNOWN_DIVERGENCES`` are reported separately.
+A system field never takes a modifier (``email:lower``, ``email:length``
+and ``id:length`` are unknown fields, l.361-395) and a dotted path must start
+with a relation, a back relation or a JSON field, so ``ph_users.password_hash``
+is a 400, not a read of the current table's column.
+
+The probe runs the same HTTP scenarios for four callers (guest, ordinary
+user, owner of the hidden-email record, admin) against an official
+PocketBase 0.22 binary and against PPBase: list filters and sorts; expand of
+relations whose target viewRule is nil or requires auth (expand keys and
+names only); realtime SSE subscriptions on ``ph_users/*`` (client filters,
+the admin-only ``@collection.``/``@request.`` check on filter and sort, and
+the email of each received record, with ``manageRule`` null then set to the
+owner); and rule validation at collection save.  It writes
+``pocketbase.json``, ``ppbase.json`` and ``diff.json`` in ``--out``.
+Differences listed in ``KNOWN_DIVERGENCES`` are reported separately.
 
 Only synthetic records are created.  Both servers listen on random loopback
 ports and are always stopped; PPBase uses ``--database-url``, which must point
@@ -24,7 +33,7 @@ to an empty, disposable PostgreSQL database.
 
 Usage (from the repository root)::
 
-    python tests/pocketbase_parity/hidden_fields_probe.py \\
+    PYTHONPATH=. python tests/pocketbase_parity/hidden_fields_probe.py \\
         --pocketbase /path/to/pocketbase-0.22.34 \\
         --database-url postgresql+asyncpg://user:pass@127.0.0.1:5432/probe \\
         --out /tmp/hidden-fields-probe
@@ -41,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -375,6 +385,27 @@ USER_FILTERS = {
     "collection_token_key": '@collection.ph_users.token_key ?!= ""',
     "collection_tokenKey": '@collection.ph_users.tokenKey ?!= ""',
     "request_email": "@request.auth.email = email",
+    # Table-qualified self references and other unresolved dotted paths.
+    "qualified_password_hash": 'ph_users.password_hash ~ "$2"',
+    "qualified_token_key": 'ph_users.token_key != ""',
+    "qualified_email_hid": 'ph_users.email = "hid@example.invalid"',
+    "qualified_name": 'ph_users.name != ""',
+    "scalar_as_relation": "password_hash.x = 1",
+    "text_as_relation": 'name.x = "a"',
+    "other_table": 'ph_posts.name != ""',
+    # Modifiers on system fields (email:lower used to drop the guard).
+    "email_lower_hid": 'email:lower = "hid@example.invalid"',
+    "email_lower_like": 'email:lower ~ "hid"',
+    "email_length": "email:length > 3",
+    "email_isset": "email:isset = true",
+    "email_each": 'email:each = "x"',
+    "emailVisibility_isset": "emailVisibility:isset = true",
+    "verified_length": "verified:length > 0",
+    "id_length": "id:length > 0",
+    "created_isset": "created:isset = true",
+    "friend_email_lower": 'friend.email:lower = "hid@example.invalid"',
+    "friend_email_length": "friend.email:length > 3",
+    "collection_email_length": "@collection.ph_users.email:length > 3",
 }
 
 POST_FILTERS = {
@@ -386,6 +417,8 @@ POST_FILTERS = {
     "authors_email": 'authors.email ~ "example"',
     "authors_any_email_hid": 'authors.email ?= "hid@example.invalid"',
     "authors_email_visibility": "authors.email_visibility ?= false",
+    "author_email_lower": 'author.email:lower = "hid@example.invalid"',
+    "qualified_users_hash": 'ph_users.password_hash != ""',
 }
 
 USER_SORTS = {
@@ -399,6 +432,8 @@ USER_SORTS = {
     "tokenKey": "tokenKey",
     "email_visibility": "email_visibility",
     "lastResetSentAt": "lastResetSentAt",
+    "qualified_email": "ph_users.email",
+    "email_lower": "email:lower",
 }
 
 
@@ -459,15 +494,166 @@ async def _collection_id(client: httpx.AsyncClient, admin: dict[str, str]) -> st
     return response.json()["id"]
 
 
+async def expand_scenarios(
+    client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """Which relations are expanded, per caller (target viewRule).
+
+    ``ph_secret`` has a nil viewRule (admin only), ``ph_guarded`` requires an
+    authenticated caller (apis/record_helpers.go l.177-210).  Only the expand
+    keys and the expanded names are compared: the serialization of expanded
+    auth records is a separate, documented gap.
+    """
+    out: dict[str, Any] = {}
+    for caller in CALLERS:
+        response = await client.get(
+            "/api/collections/ph_posts/records",
+            headers=headers[caller],
+            params={"expand": "secret,guarded,author", "sort": "name"},
+        )
+        if response.status_code != 200:
+            out[caller] = _error(response)
+            continue
+        rows: dict[str, Any] = {}
+        for item in response.json()["items"]:
+            expand = item.get("expand")
+            rows[item["name"]] = (
+                None
+                if expand is None
+                else {key: value.get("name") for key, value in sorted(expand.items())}
+            )
+        out[caller] = rows
+    return out
+
+
+# Realtime subscriptions on ph_users/* (one SSE client per caller).
+REALTIME_OPTIONS = {
+    "plain": {},
+    "filter_name": {"filter": 'name != ""'},
+    "filter_token_key": {"filter": 'token_key != ""'},
+    "filter_qualified_hash": {"filter": 'ph_users.password_hash ~ "$2"'},
+    "filter_email_hid": {"filter": 'email = "hid@example.invalid"'},
+    "filter_email_vis": {"filter": 'email = "vis@example.invalid"'},
+    "filter_email_lower": {"filter": 'email:lower ~ "hid"'},
+    "filter_collection": {"filter": "@collection.ph_users.id ?= id"},
+    "sort_only_request": {"sort": "@request.method"},
+    "filter_and_sort_request": {"filter": 'name != ""', "sort": "@request.method"},
+}
+
+
+def _topic(options: dict[str, Any]) -> str:
+    if not options:
+        return "ph_users/*"
+    payload = json.dumps({"query": options, "headers": {}}, separators=(",", ":"))
+    return "ph_users/*?options=" + urllib.parse.quote(payload, safe="")
+
+
+async def _sse_reader(
+    client: httpx.AsyncClient, ready: asyncio.Future, sink: list[dict[str, Any]]
+) -> None:
+    async with client.stream(
+        "GET", "/api/realtime", timeout=httpx.Timeout(None)
+    ) as response:
+        event: dict[str, str] = {}
+        async for line in response.aiter_lines():
+            if line:
+                key, _, value = line.partition(":")
+                event[key] = value.removeprefix(" ")
+                continue
+            if event.get("event") == "PB_CONNECT" and not ready.done():
+                ready.set_result(json.loads(event["data"])["clientId"])
+            elif event.get("data"):
+                sink.append(event)
+            event = {}
+
+
+async def realtime_round(
+    client: httpx.AsyncClient,
+    admin: dict[str, str],
+    headers: dict[str, dict[str, str]],
+    ids: dict[str, str],
+    tick: int,
+) -> dict[str, Any]:
+    topics = {_topic(options): key for key, options in REALTIME_OPTIONS.items()}
+    sinks: dict[str, list[dict[str, Any]]] = {}
+    tasks: list[asyncio.Task] = []
+    try:
+        for caller in CALLERS:
+            ready: asyncio.Future = asyncio.get_running_loop().create_future()
+            sinks[caller] = []
+            tasks.append(asyncio.create_task(_sse_reader(client, ready, sinks[caller])))
+            client_id = await asyncio.wait_for(ready, timeout=15)
+            response = await client.post(
+                "/api/realtime",
+                headers=headers[caller],
+                json={"clientId": client_id, "subscriptions": list(topics)},
+            )
+            if response.status_code not in (200, 204):
+                raise RuntimeError(f"subscribe {caller}: {response.text[:200]}")
+        await asyncio.sleep(0.5)
+        for name in ("vis", "hid"):
+            response = await client.patch(
+                f"/api/collections/ph_users/records/{ids[name]}",
+                headers=admin,
+                json={"counter": tick},
+            )
+            response.raise_for_status()
+            await asyncio.sleep(0.3)
+        await asyncio.sleep(1.5)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    out: dict[str, Any] = {}
+    for caller, events in sinks.items():
+        seen: dict[str, Any] = {key: {} for key in REALTIME_OPTIONS}
+        for event in events:
+            key = topics.get(event.get("event", ""))
+            if key is None:
+                continue
+            record = json.loads(event["data"]).get("record", {})
+            seen[key][record.get("name")] = record.get("email", "<absent>")
+        out[caller] = seen
+    return out
+
+
+async def realtime_scenarios(
+    client: httpx.AsyncClient,
+    admin: dict[str, str],
+    headers: dict[str, dict[str, str]],
+    ids: dict[str, str],
+) -> dict[str, Any]:
+    """Client filters, the admin-only filter check and the email payload.
+
+    PocketBase 0.22.34 sends a hidden email only to the record owner whose
+    manageRule check passes (apis/realtime.go l.439-447), so the second round
+    sets ``manageRule`` to the owner.
+    """
+    out = {"manage_null": await realtime_round(client, admin, headers, ids, 1)}
+    collection = (await client.get("/api/collections/ph_users", headers=admin)).json()
+    response = await client.patch(
+        f"/api/collections/{collection['id']}",
+        headers=admin,
+        json={"options": {**AUTH_OPTIONS, "manageRule": "id = @request.auth.id"}},
+    )
+    response.raise_for_status()
+    out["manage_owner"] = await realtime_round(client, admin, headers, ids, 2)
+    response = await client.patch(
+        f"/api/collections/{collection['id']}",
+        headers=admin,
+        json={"options": AUTH_OPTIONS},
+    )
+    response.raise_for_status()
+    return out
+
+
 async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any:
-    # List filters and sorts are the deterministic core of the hidden-field
-    # oracle; realtime parity is covered by the PostgreSQL integration test
-    # tests/integration/test_hidden_auth_filter_fields.py, and expand/
-    # serialization differences belong to the expand work, not this probe.
-    await dataset(client, admin)
+    ids = await dataset(client, admin)
     headers = await caller_headers(client, admin)
     return {
         "lists": await list_scenarios(client, headers),
+        "expand": await expand_scenarios(client, headers),
+        "realtime": await realtime_scenarios(client, admin, headers, ids),
         "rule_save": await rule_save_scenarios(client, admin),
     }
 
@@ -644,6 +830,12 @@ def _diff(left: Any, right: Any, path: str = "") -> list[dict[str, Any]]:
     return []
 
 
+def _ppbase_module() -> str:
+    import ppbase
+
+    return str(Path(ppbase.__file__).resolve().parent)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pocketbase", type=Path, required=True)
@@ -673,6 +865,9 @@ def main() -> int:
                 "differences": len(differences),
                 "known": len(differences) - len(unexpected),
                 "unexpected": len(unexpected),
+                # The PPBase actually exercised (run with PYTHONPATH=<checkout>,
+                # otherwise the installed package is imported).
+                "ppbase_module": _ppbase_module(),
             },
             indent=1,
         )
