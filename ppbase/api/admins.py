@@ -15,11 +15,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ppbase.api.deps import get_session, get_settings, require_admin
+from ppbase.api.deps import (
+    ADMIN_AUTH_REQUIRED_MESSAGE,
+    get_session,
+    get_settings,
+    require_admin,
+)
 from ppbase.services import admin_service
 
 router = APIRouter()
@@ -193,7 +198,7 @@ async def auth_refresh(
             status_code=401,
             detail={
                 "status": 401,
-                "message": "The request requires admin authorization token to be set.",
+                "message": ADMIN_AUTH_REQUIRED_MESSAGE,
                 "data": {},
             },
         )
@@ -299,10 +304,12 @@ async def update_admin(
 @router.delete("/{admin_id}", status_code=204)
 async def delete_admin(
     admin_id: str,
+    request: Request,
     _admin: dict = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ):
     """Delete an admin (cannot delete the last one)."""
+    superusers_collection = await admin_service._get_superusers_collection(session)
     deleted = await admin_service.delete_admin(session, admin_id)
     if not deleted:
         # Either not found or last admin
@@ -325,6 +332,12 @@ async def delete_admin(
             },
         )
     await session.commit()
+
+    # Realtime clients of the deleted admin become guests, as in PocketBase
+    # (v0.22.34 apis/realtime.go:269-280, unregisterClientsByAuthModel).
+    manager = getattr(request.app.state, "subscription_manager", None)
+    if manager is not None and superusers_collection is not None:
+        manager.unset_auth_record(str(superusers_collection.id), admin_id)
 
 
 @router.post("/{admin_id}/change-password")

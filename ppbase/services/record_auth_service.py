@@ -26,6 +26,7 @@ from ppbase.services.auth_service import (
     get_collection_token_config,
     get_password_cost,
     hash_password,
+    is_purpose_token_type,
     validate_password_value,
     verify_password,
     verify_purpose_token,
@@ -125,6 +126,26 @@ async def _update_record_columns(
     params = {**updates, "_rid": record_id}
     async with engine.begin() as conn:
         await conn.execute(text(sql), params)
+
+
+def _purpose_token_matches(
+    unverified: dict[str, Any],
+    collection: CollectionRecord,
+    expected_type: str,
+) -> bool:
+    """Pre-check the unverified claims of a record purpose token.
+
+    The type is the PPBase purpose type or PocketBase 0.22 ``authRecord``
+    (see ``auth_service.LEGACY_RECORD_TOKEN_TYPE``); the signature is checked
+    afterwards with the record ``token_key`` plus the purpose secret.  A token
+    of another auth collection is refused, as PocketBase does
+    (v0.22.34 forms/record_verification_confirm.go:66-68,
+    forms/record_password_reset_confirm.go:67-69,
+    forms/record_email_change_confirm.go:68-70).
+    """
+    if not is_purpose_token_type(unverified.get("type"), expected_type):
+        return False
+    return unverified.get("collectionId") == collection.id
 
 
 def _otp_config(collection: CollectionRecord) -> tuple[int, int]:
@@ -619,7 +640,7 @@ async def confirm_verification(
     except _jwt.InvalidTokenError:
         return False
 
-    if unverified.get("type") != "verification":
+    if not _purpose_token_matches(unverified, collection, "verification"):
         return False
 
     record_id = unverified.get("id")
@@ -633,7 +654,9 @@ async def confirm_verification(
     token_key = row.get("token_key", "")
     ver_secret, _ = get_collection_token_config(collection, 'verificationToken')
     secret = token_key + ver_secret
-    payload = verify_purpose_token(token_str, secret, "verification")
+    payload = verify_purpose_token(
+        token_str, secret, "verification", accept_legacy_record_type=True
+    )
     if payload is None:
         return False
 
@@ -724,7 +747,7 @@ async def confirm_password_reset(
             }
         }
 
-    if unverified.get("type") != "passwordReset":
+    if not _purpose_token_matches(unverified, collection, "passwordReset"):
         return False, {
             "token": {
                 "code": "validation_invalid_token",
@@ -753,7 +776,9 @@ async def confirm_password_reset(
     token_key_val = row.get("token_key", "")
     reset_secret, _ = get_collection_token_config(collection, 'passwordResetToken')
     secret = token_key_val + reset_secret
-    payload = verify_purpose_token(token_str, secret, "passwordReset")
+    payload = verify_purpose_token(
+        token_str, secret, "passwordReset", accept_legacy_record_type=True
+    )
     if payload is None:
         return False, {
             "token": {
@@ -773,11 +798,19 @@ async def confirm_password_reset(
 
     new_hash = hash_password(password, cost=get_password_cost(collection))
     new_token_key = generate_token_key()
+    updates: dict[str, Any] = {"password_hash": new_hash, "token_key": new_token_key}
+    # A reset proves the ownership of the unchanged email: PocketBase marks
+    # the record verified (v0.22.34 forms/record_password_reset_confirm.go:96-106,
+    # v0.40.6 apis/record_auth_password_reset_confirm.go:42-48).  The
+    # ``_superusers`` table has no ``verified`` column.
+    if (
+        "verified" in row
+        and not row["verified"]
+        and payload.get("email") == row.get("email")
+    ):
+        updates["verified"] = True
 
-    await _update_record_columns(
-        engine, collection, record_id,
-        {"password_hash": new_hash, "token_key": new_token_key},
-    )
+    await _update_record_columns(engine, collection, record_id, updates)
     return True, None
 
 
@@ -876,7 +909,7 @@ async def confirm_email_change(
     except _jwt.InvalidTokenError:
         return False, _invalid_email_change_token_error()
 
-    if unverified.get("type") != "emailChange":
+    if not _purpose_token_matches(unverified, collection, "emailChange"):
         return False, _invalid_email_change_token_error()
 
     record_id = unverified.get("id")
@@ -889,7 +922,12 @@ async def confirm_email_change(
 
     token_key_val = row.get("token_key", "")
     secret, _ = get_collection_token_config(collection, 'emailChangeToken')
-    payload = verify_purpose_token(token_str, token_key_val + secret, "emailChange")
+    payload = verify_purpose_token(
+        token_str,
+        token_key_val + secret,
+        "emailChange",
+        accept_legacy_record_type=True,
+    )
     if payload is None:
         return False, _invalid_email_change_token_error()
 

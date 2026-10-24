@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from ppbase.api.deps import get_optional_auth
+from ppbase.api.deps import RECORD_AUTH_REQUIRED_MESSAGE, get_optional_auth
 from ppbase.db.engine import get_engine
 from ppbase.ext.events import RecordAuthRequestEvent
 from ppbase.ext.registry import (
@@ -1115,15 +1115,17 @@ async def api_auth_refresh(
     if auth is not None:
         auth_type = auth.get("type")
         if auth_type in {"auth", "authRecord"} and auth.get("collectionId") != collection.id:
+            # The message names the collection of the token's record
+            # (v0.22.34 apis/middlewares.go:102-105, v0.40.6 apis/middlewares.go
+            # RequireSameCollectionContextAuth).
+            token_collection = auth.get("collectionName") or collection.name
             return _error_response(
                 403,
-                f"The request requires auth record from {collection.name} collection.",
+                f"The request requires auth record from {token_collection} collection.",
             )
         if auth_type == "admin" and collection.name != "_superusers":
-            return _error_response(
-                403,
-                f"The request requires auth record from {collection.name} collection.",
-            )
+            # An admin token loads no auth record (v0.22.34 apis/middlewares.go:97-100).
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
     event = RecordAuthRequestEvent(
         app=request.app,
@@ -1144,7 +1146,7 @@ async def api_auth_refresh(
         token_str = token_str.strip()
 
         if not token_str:
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
         settings = request.app.state.settings
         from ppbase.services.record_auth_service import (
@@ -1154,13 +1156,13 @@ async def api_auth_refresh(
 
         payload = await verify_record_auth_token(engine, collection, token_str, settings)
         if payload is None:
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
         payload["_raw_token"] = token_str
         e.payload = payload
         result = await auth_refresh(engine, collection, payload, settings)
         if result is None:
-            return _error_response(401, "The request requires valid auth token to be set.")
+            return _error_response(401, RECORD_AUTH_REQUIRED_MESSAGE)
 
         rule_request_context = _build_rule_request_context(
             request,
@@ -1594,11 +1596,14 @@ async def api_request_email_change(
         )
 
     # A record token from another auth collection is valid, but cannot be used
-    # to change emails in this collection.
+    # to change emails in this collection; the message names the token's
+    # collection (v0.22.34 apis/record_auth.go:53 RequireSameContextRecordAuth,
+    # apis/middlewares.go:102-105).
     if auth.get("collectionId") != collection.id:
+        token_collection = auth.get("collectionName") or collection.name
         return _error_response(
             403,
-            "The authorized record model is not allowed to perform this action.",
+            f"The request requires auth record from {token_collection} collection.",
         )
 
     token_str = _extract_auth_token(request)

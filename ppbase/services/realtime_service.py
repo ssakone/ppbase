@@ -38,8 +38,9 @@ class RealtimeSession:
     response_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     subscriptions: list[RealtimeSubscription] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # ``collectionId:id`` of the auth record of the last accepted subscription
+    # request, ``None`` while the client is a guest (see api/realtime.py).
     auth_key: str | None = None
-    auth_key_set: bool = False
 
 
 @dataclass
@@ -240,6 +241,27 @@ class SubscriptionManager:
         """Get a client session by ID."""
         return self.sessions.get(client_id)
 
+    def unset_auth_record(self, collection_id: str, record_id: str) -> int:
+        """Turn the clients authenticated as a deleted auth record into guests.
+
+        PocketBase unsets the auth model of every client associated with a
+        deleted auth record or admin (v0.22.34 ``apis/realtime.go:241-253`` and
+        ``:269-280``): later events are checked without auth and the next
+        subscription request may carry any authorization.  Returns the number
+        of affected clients.
+        """
+        key = f"{collection_id}:{record_id}"
+        affected = 0
+        for session in list(self.sessions.values()):
+            if session.auth_key != key:
+                continue
+            session.auth_key = None
+            for subscription in list(session.subscriptions):
+                subscription.auth_token = None
+                subscription.auth_payload = None
+            affected += 1
+        return affected
+
 
 async def broadcast_record_change(
     subscription_manager: SubscriptionManager,
@@ -336,6 +358,19 @@ async def broadcast_record_change(
                 )
             except Exception as exc:
                 logger.error("Failed to queue event for client %s: %s", client_id, exc)
+
+    # PocketBase checks the delete event while the deleted account is still
+    # authenticated, then unsets that auth state on its clients (v0.22.34
+    # apis/realtime.go:269-280 and :310-336).
+    if (
+        action == "delete"
+        and collection is not None
+        and getattr(collection, "type", None) == "auth"
+    ):
+        subscription_manager.unset_auth_record(
+            str(getattr(collection, "id", "") or ""),
+            record_id,
+        )
 
 
 async def _send_realtime_message(
