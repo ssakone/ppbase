@@ -19,10 +19,15 @@ back relation, an auth ``users`` collection with a ``manageRule``, a rule on
 through the ``users.role`` relation; PPBase core only reads flat
 ``@request.auth`` keys, so the PPBase side installs the same kind of live
 role context that BUMA's ``app/auth/context.py`` installs (flattened
-``role.permission.*`` keys).  It then runs the same HTTP list/view/create/
-update/auth/realtime requests for seven callers and a list of error requests,
-and writes ``pocketbase.json``, ``ppbase.json`` and ``diff.json`` in
-``--out``.  ``created``/``updated`` timestamps and the auth ``username``
+``role.permission.*`` keys), for the requester (records API) and, through
+``pb.set_auth_record_rule_context``, for the authenticated record of an auth
+response.  It then runs the same HTTP list/view/create/update/auth/realtime
+requests for seven callers, the email visibility of listed, created and
+updated auth records (``manageRule``), a list of error requests (form
+validation errors of create/update/auth by caller, a ``createRule``
+mismatch, list parse errors) and the route guards (``$apis`` middlewares in
+``pb_hooks`` against ``pb.apis``), and writes ``pocketbase.json``,
+``ppbase.json`` and ``diff.json`` in ``--out``.  ``created``/``updated`` timestamps and the auth ``username``
 (PPBase has no username column on a fresh auth collection) are dropped
 before the comparison.  Differences listed in ``KNOWN_DIVERGENCES`` are
 reported separately.
@@ -72,6 +77,8 @@ C = {  # collection ids (15 chars, PocketBase id format)
     "bcustomer": "wsa6colbcust001",
     "sale": "wsa6colsale0001",
     "note": "wsa6colnote0001",
+    "strict": "wsa6colstrict01",
+    "members": "wsa6colmembers1",
 }
 N = {key: f"wsa6_{key}" for key in C}
 R = {  # record ids
@@ -94,6 +101,7 @@ R = {  # record ids
     "s2": "wsa6sale0000002",
     "s3": "wsa6sale0000003",
     "n1": "wsa6note0000001",
+    "st1": "wsa6strict00001",
 }
 USERS = ("manager", "reader", "visible", "plain", "rolereader", "rolenone")
 CALLERS = ("guest", "plain", "reader", "manager", "rolereader", "rolenone", "admin")
@@ -103,6 +111,7 @@ CUSTOMER_RULE = (
 )
 MANAGE_RULE = "managers.id ?= @request.auth.id"
 TAG_RULE = '@request.data.reveal = true || @request.query.reveal = "1"'
+STRICT_CREATE_RULE = "title != 'nope'"
 BUMA_CUSTOMER_RULE = (
     "@request.auth.id != '' && (@request.auth.role.permission.isAdmin = true "
     "|| @request.auth.role.permission.customer.read = true)"
@@ -178,23 +187,38 @@ KNOWN_DIVERGENCES: dict[str, str] = {
     "errors.confirm_verification_bad_token.body.data.token.message": (
         "same case as the data code"
     ),
-    # Main (not expanded) auth records: PPBase applies emailVisibility, the
-    # owner and admins, but not the manageRule of
-    # autoIgnoreAuthRecordsEmailVisibility (apis/record_helpers.go
-    # l.245-276) that EnrichRecords also applies to the listed records.
-    "expand.main_auth_list.*": (
-        "Open: the manageRule email visibility of listed/viewed auth records "
-        "(not expanded ones) is not implemented by the records API."
+    # Pre-existing, outside WS-A6 (open): PPBase requires manage access to
+    # set emailVisibility on create; 0.22.34 lets any creator set it
+    # (forms/record_upsert.go l.380-381, only Verified is guarded, l.514-522).
+    "writes.signup_members_visible.*": (
+        "Open (pre-existing): PPBase answers 403 'The authorized record model is "
+        "not allowed to perform this action.' to a guest signup that sets "
+        "emailVisibility without manage access; 0.22.34 accepts it."
     ),
+    # Route guards: the 0.22 mode rewrites the message, never the status.
+    **{
+        f"guards.{route}.{caller}.{key}": (
+            f"PPBase answers 403 where 0.22.34 {guard} answers {status} "
+            f"(apis/middlewares.go l.{line}); message identical, status not "
+            "rewritten."
+        )
+        for route, guard, status, line, callers in (
+            ("guest_only", "RequireGuestOnly", 400, 37, ("reader", "plain", "admin")),
+            ("record_auth", "RequireRecordAuth", 401, 77, ("admin",)),
+            ("admin_auth", "RequireAdminAuth", 401, 119, ("reader", "plain")),
+        )
+        for caller in callers
+        for key in ("status", "body.code")
+    },
 }
 
 
-def text_field(name: str) -> dict[str, Any]:
+def text_field(name: str, required: bool = False) -> dict[str, Any]:
     return {
         "system": False,
         "name": name,
         "type": "text",
-        "required": False,
+        "required": required,
         "presentable": False,
         "unique": False,
         "options": {"min": None, "max": None, "pattern": ""},
@@ -315,7 +339,6 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> None:
             "type": "auth",
             "schema": [relation_field("role", C["roles"], 1)],
             **RULES_PUBLIC,
-            "updateRule": None,
             "deleteRule": None,
             "options": {**AUTH_OPTIONS, "manageRule": None},
         },
@@ -372,6 +395,46 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> None:
             "viewRule": BUMA_CUSTOMER_RULE,
         },
     )
+    users = await _ok(
+        await client.get(f"/api/collections/{C['users']}", headers=admin), "users"
+    )
+    await _ok(
+        await client.patch(
+            f"/api/collections/{C['users']}",
+            headers=admin,
+            json={
+                "schema": [
+                    *users["schema"],
+                    relation_field("bcustomer", C["bcustomer"], 1),
+                ]
+            },
+        ),
+        "users.bcustomer",
+    )
+    await _collection(
+        client,
+        admin,
+        "members",
+        {
+            "type": "auth",
+            "schema": [text_field("name")],
+            **RULES_PUBLIC,
+            "options": {**AUTH_OPTIONS, "manageRule": None},
+        },
+    )
+    await _collection(
+        client,
+        admin,
+        "strict",
+        {
+            "schema": [
+                text_field("title", required=True),
+                relation_field("region", C["region"], 1),
+            ],
+            **RULES_PUBLIC,
+            "createRule": STRICT_CREATE_RULE,
+        },
+    )
     await _collection(
         client,
         admin,
@@ -418,13 +481,14 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> None:
         "role_none",
         {"name": "none", "permission": {"isAdmin": False, "customer": {"read": False}}},
     )
+    await _create(client, admin, "bcustomer", "b1", {"name": "b1"})
     extra = {
         "manager": {},
         "reader": {},
         "visible": {"emailVisibility": True},
         "plain": {"managers": [R["manager"]]},
-        "rolereader": {"role": R["role_read"]},
-        "rolenone": {"role": R["role_none"]},
+        "rolereader": {"role": R["role_read"], "bcustomer": R["b1"]},
+        "rolenone": {"role": R["role_none"], "bcustomer": R["b1"]},
     }
     for key in USERS:
         await _create(
@@ -471,7 +535,7 @@ async def dataset(client: httpx.AsyncClient, admin: dict[str, str]) -> None:
             f"{key}.customer",
         )
     await _create(client, admin, "tag", "t1", {"name": "t1"})
-    await _create(client, admin, "bcustomer", "b1", {"name": "b1"})
+    await _create(client, admin, "strict", "st1", {"title": "t1"})
     await _create(
         client,
         admin,
@@ -624,6 +688,53 @@ async def write_scenarios(
             "update": updated,
             "delete": deleted.status_code,
         }
+    users = f"/api/collections/{N['users']}/records"
+    for caller in ("guest", "admin"):
+        record_id = f"wsa6usign{caller[:5]:0<6}"
+        response = await client.post(
+            users,
+            headers=headers[caller],
+            json={
+                "id": record_id,
+                "email": f"sign-{caller}@example.invalid",
+                "emailVisibility": False,
+                "password": PASSWORD,
+                "passwordConfirm": PASSWORD,
+            },
+        )
+        signup = {"status": response.status_code, "body": _clean(_json(response))}
+        await client.delete(f"{users}/{record_id}", headers=headers["admin"])
+        result[f"signup_{caller}"] = signup
+    # No manageRule: a guest signup response hides the new email unless
+    # emailVisibility (EnrichRecord, apis/record_crud.go l.289).
+    members = f"/api/collections/{N['members']}/records"
+    for name, extra in (("hidden", {}), ("visible", {"emailVisibility": True})):
+        record_id = f"wsa6member{name[:5]:0<5}"
+        response = await client.post(
+            members,
+            json={
+                "id": record_id,
+                "email": f"member-{name}@example.invalid",
+                "password": PASSWORD,
+                "passwordConfirm": PASSWORD,
+                **extra,
+            },
+        )
+        result[f"signup_members_{name}"] = {
+            "status": response.status_code,
+            "body": _clean(_json(response)),
+        }
+        await client.delete(f"{members}/{record_id}", headers=headers["admin"])
+    # The update response of an auth record with a hidden email: shown to
+    # its owner, a manageRule match (plain is managed by manager) and admins.
+    for caller in ("guest", "reader", "manager", "plain", "admin"):
+        response = await client.patch(
+            f"{users}/{R['plain']}", headers=headers[caller], json={}
+        )
+        result[f"update_auth_{caller}"] = {
+            "status": response.status_code,
+            "body": _clean(_json(response)),
+        }
     return result
 
 
@@ -631,10 +742,18 @@ async def auth_scenarios(
     client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for key in ("plain", "reader"):
+    # rolereader/rolenone: the BUMA role rule on bcustomer, evaluated as the
+    # authenticated record (PPBase: set_auth_record_rule_context).
+    expands = {
+        "plain": "customer,managers",
+        "reader": "customer,managers",
+        "rolereader": "bcustomer",
+        "rolenone": "bcustomer",
+    }
+    for key, expand in expands.items():
         response = await client.post(
             f"/api/collections/{N['users']}/auth-with-password",
-            params={"expand": "customer,managers"},
+            params={"expand": expand},
             json={"identity": f"{key}@example.invalid", "password": PASSWORD},
         )
         body = _json(response)
@@ -645,7 +764,7 @@ async def auth_scenarios(
         response = await client.post(
             f"/api/collections/{N['users']}/auth-refresh",
             headers=headers[key],
-            params={"expand": "customer,managers"},
+            params={"expand": expand},
         )
         body = _json(response)
         refresh = {
@@ -725,9 +844,55 @@ async def error_scenarios(
 ) -> dict[str, Any]:
     note = f"/api/collections/{N['note']}/records"
     sale = f"/api/collections/{N['sale']}/records"
+    strict = f"/api/collections/{N['strict']}/records"
     users = f"/api/collections/{N['users']}"
     raw_json = {"content-type": "application/json"}
+    missing_customer = {"json": {"customer": "zzzzzzzzzzzzzzz"}}
     cases: dict[str, tuple[str, str, dict[str, Any]]] = {
+        # Form validation errors: unwrapped for an update (any caller) and
+        # an admin's create, "Failed to create record." for a user's create.
+        **{
+            f"update_missing_relation_{caller}": (
+                "PATCH",
+                f"{sale}/{R['s2']}",
+                {**missing_customer, "headers": caller},
+            )
+            for caller in ("guest", "reader", "admin")
+        },
+        **{
+            f"update_blank_required_{caller}": (
+                "PATCH",
+                f"{strict}/{R['st1']}",
+                {"json": {"title": ""}, "headers": caller},
+            )
+            for caller in ("guest", "admin")
+        },
+        **{
+            f"create_required_{caller}": (
+                "POST",
+                strict,
+                {"json": {}, "headers": caller},
+            )
+            for caller in ("guest", "reader", "admin")
+        },
+        "create_missing_relation_admin": (
+            "POST",
+            sale,
+            {**missing_customer, "headers": "admin"},
+        ),
+        "create_rule_failed": ("POST", strict, {"json": {"title": "nope"}}),
+        "password_missing_password": (
+            "POST",
+            f"{users}/auth-with-password",
+            {"json": {"identity": "plain@example.invalid"}},
+        ),
+        "password_empty_body": ("POST", f"{users}/auth-with-password", {"json": {}}),
+        "admin_password_empty_body": (
+            "POST",
+            "/api/admins/auth-with-password",
+            {"json": {}},
+        ),
+        "list_bad_per_page": ("GET", sale, {"params": {"perPage": "abc"}}),
         "list_admin_only": ("GET", note, {}),
         "view_admin_only": ("GET", f"{note}/{R['n1']}", {}),
         "create_admin_only": ("POST", note, {"json": {}}),
@@ -858,6 +1023,60 @@ async def error_scenarios(
     return result
 
 
+# Route guards: PocketBase 0.22.34 ``$apis`` middlewares (pb_hooks) and
+# their PPBase ``pb.apis`` counterparts, as documented in
+# docs/error-compat.md.
+GUARD_HOOKS = """
+routerAdd("GET", "/wsa6/guest", (c) => c.json(200, {"ok": true}), $apis.requireGuestOnly())
+routerAdd("GET", "/wsa6/record", (c) => c.json(200, {"ok": true}),
+    $apis.requireRecordAuth("@USERS@"))
+routerAdd("GET", "/wsa6/admin", (c) => c.json(200, {"ok": true}), $apis.requireAdminAuth())
+routerAdd("GET", "/wsa6/any", (c) => c.json(200, {"ok": true}),
+    $apis.requireAdminOrRecordAuth())
+routerAdd("GET", "/wsa6/owner/:id", (c) => c.json(200, {"ok": true}),
+    $apis.requireAdminOrOwnerAuth("id"))
+""".replace("@USERS@", N["users"])
+
+
+def register_ppbase_guards(pb: Any) -> None:
+    guards = {
+        "/wsa6/guest": pb.apis.require_guest_only(),
+        "/wsa6/record": pb.apis.require_auth(N["users"]),
+        "/wsa6/admin": pb.apis.require_superuser_auth(),
+        "/wsa6/any": pb.apis.require_auth(),
+        "/wsa6/owner/{id}": pb.apis.require_superuser_or_owner_auth("id"),
+    }
+    for index, (path, guard) in enumerate(guards.items()):
+
+        async def ok() -> dict[str, bool]:
+            return {"ok": True}
+
+        ok.__name__ = f"wsa6_guard_{index}"
+        pb.get(path, middlewares=[guard])(ok)
+
+
+async def guard_scenarios(
+    client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    routes = {
+        "guest_only": "/wsa6/guest",
+        "record_auth": "/wsa6/record",
+        "admin_auth": "/wsa6/admin",
+        "admin_or_record": "/wsa6/any",
+        "admin_or_owner": f"/wsa6/owner/{R['reader']}",
+    }
+    result: dict[str, Any] = {}
+    for name, url in routes.items():
+        result[name] = {}
+        for caller in ("guest", "reader", "plain", "admin"):
+            response = await client.get(url, headers=headers[caller])
+            result[name][caller] = {
+                "status": response.status_code,
+                "body": _json(response),
+            }
+    return result
+
+
 async def run_scenarios(
     client: httpx.AsyncClient, admin: dict[str, str]
 ) -> dict[str, Any]:
@@ -869,6 +1088,7 @@ async def run_scenarios(
         "auth": await auth_scenarios(client, headers),
         "realtime": await realtime_scenarios(client, headers),
         "errors": await error_scenarios(client, headers),
+        "guards": await guard_scenarios(client, headers),
     }
 
 
@@ -894,6 +1114,9 @@ async def _wait_health(client: httpx.AsyncClient, what: str) -> None:
 @contextlib.asynccontextmanager
 async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
     with tempfile.TemporaryDirectory(prefix="ppbase-pb-expand-probe-") as root:
+        hooks = Path(root) / "pb_hooks"
+        hooks.mkdir()
+        (hooks / "wsa6_guards.pb.js").write_text(GUARD_HOOKS)
         flags = [
             "--dir",
             str(Path(root) / "pb_data"),
@@ -977,14 +1200,13 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from ppbase.app import create_app
-    from ppbase.config import Settings
     from ppbase.db.engine import get_engine
     from ppbase.db.system_tables import ParamRecord
+    from ppbase.ext.flask_like_pb import FlaskLikePB
 
     install_buma_like_role_context()
     with tempfile.TemporaryDirectory(prefix="ppbase-expand-probe-") as root:
-        settings = Settings(
+        pb = FlaskLikePB(
             database_url=database_url,
             jwt_secret="probe-secret-key-for-expand-rules-00000001",
             auto_migrate=False,
@@ -994,12 +1216,17 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
             migrations_dir=str(Path(root) / "migrations"),
             hooks_dir=str(Path(root) / "hooks"),
             log_level="WARNING",
-            error_compat="0.22",
         )
+        # BUMA's hookup: app/hooks/register.py and its auth-record context.
+        pb.set_error_compat("0.22")
+        pb.set_auth_record_rule_context(
+            lambda _engine, auth: BUMA_ROLE_CONTEXT.get(str(auth.get("id") or ""), {})
+        )
+        register_ppbase_guards(pb)
         port = _free_port()
         server = uvicorn.Server(
             uvicorn.Config(
-                create_app(settings),
+                pb.get_app(),
                 host="127.0.0.1",
                 port=port,
                 log_level="warning",
