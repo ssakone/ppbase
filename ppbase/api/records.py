@@ -35,6 +35,7 @@ from ppbase.ext.registry import (
     get_extension_registry,
 )
 from ppbase.services.expand_service import expand_records
+from ppbase.services.filter_parser import FilterFieldError
 from ppbase.services.record_service import (
     RecordReferenceError,
     _ValidationErrors,
@@ -133,6 +134,10 @@ def _prepare_rule_context(
 # l.319-345): only admins may use these in the ``filter``/``sort`` of a list
 # request; the list handler checks it first (apis/record_crud.go l.50-53).
 _ADMIN_ONLY_RULE_FIELDS = ("@collection.", "@request.")
+
+# Opaque 400 message PocketBase returns for any filter/sort parse error,
+# including an unresolved field (``NewBadRequestError("", err)``).
+_FILTER_FIELD_ERROR_MESSAGE = "Something went wrong while processing your request."
 
 
 def _admin_only_rule_fields_error(
@@ -1451,7 +1456,14 @@ async def api_list_records(
                 fields=e.fields,
                 skip_total=bool(e.skip_total),
                 request_context=request_context,
+                # Hidden auth fields (email emailVisibility guard, hidden
+                # columns) are searchable only by admins (record_crud.go l.57).
+                allow_hidden=_is_superuser_payload(e.auth),
             )
+        except FilterFieldError:
+            # PocketBase wraps an unresolved filter/sort field in an opaque
+            # 400 (NewBadRequestError("", err), record_crud.go l.82-84).
+            return _error_response(400, _FILTER_FIELD_ERROR_MESSAGE)
         except ValueError as exc:
             return _error_response(400, str(exc))
 

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Security: hidden auth fields are not filterable/sortable
+
+See `docs/hidden-auth-fields.md`.
+
+- A filter, sort or rule may no longer reference `password`,
+  `passwordHash`/`password_hash`, `tokenKey`/`token_key`, `email_visibility`
+  or `lastResetSentAt`; PocketBase 0.22.34 returns the same opaque 400 for
+  every caller. This closes an anonymous oracle on the bcrypt hash, token key
+  and masked emails (`users.listRule` is `""`).
+- A non-admin list request and a realtime client filter restrict an `email`
+  comparison to `emailVisibility = TRUE`; admins and server-evaluated access
+  rules carry no guard. `emailVisibility`/`verified`/`username` resolve to
+  their columns.
+- Realtime subscriptions enforce the `@collection.`/`@request.` admin-only
+  check on both the `filter` and `sort` options and evaluate the client
+  filter without hidden-field access.
+- Auth record create now accepts PocketBase's `emailVisibility` wire name (it
+  previously ignored it, leaving visibility always off).
+
 ### Empty dates served, filtered and sorted like PocketBase
 
 See `docs/empty-dates.md`.

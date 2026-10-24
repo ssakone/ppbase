@@ -40,7 +40,13 @@ from ppbase.models.record import (
     build_record_response,
     format_datetime,
 )
-from ppbase.services.filter_parser import parse_filter, parse_sort
+from ppbase.services.filter_parser import (
+    _AUTH_FIELD_COLUMNS,
+    _AUTH_RESOLVABLE_SYSTEM_FIELDS,
+    FilterFieldError,
+    parse_filter,
+    parse_sort,
+)
 from ppbase.services.write_barrier import require_mutation_write_barrier
 
 logger = logging.getLogger(__name__)
@@ -630,6 +636,10 @@ def _build_relation_index_from_collections(
         collections_meta[table] = {
             "id": str(coll.id),
             "table": table,
+            # Collection type lets the filter parser resolve the auth system
+            # fields (email/username/verified/emailVisibility) and reject the
+            # hidden ones (password_hash, token_key, ...).
+            "type": _collection_type(coll),
             "fields": fields,
             "relations": relations,
         }
@@ -761,8 +771,14 @@ async def list_records(
     fields: str | None = None,
     skip_total: bool = False,
     request_context: dict[str, Any] | None = None,
+    allow_hidden: bool = True,
 ) -> dict[str, Any]:
     """List records with filtering, sorting, and pagination.
+
+    ``allow_hidden`` follows PocketBase's resolver flag: admins (and
+    server-evaluated callers) see hidden auth fields, a non-admin list request
+    does not, so an ``email`` filter is restricted to ``emailVisibility = TRUE``
+    (apis/record_crud.go l.57-64).
 
     Returns a paginated response dict.
     """
@@ -786,6 +802,7 @@ async def list_records(
             relation_resolver,
             collection_resolver,
             table,
+            allow_hidden=allow_hidden,
         )
 
     # Build ORDER BY clause
@@ -803,25 +820,32 @@ async def list_records(
     if sort:
         sort_parts = parse_sort(sort)
         if sort_parts:
-            # Validate sort fields exist in the collection schema or are system fields
+            # Validate sort fields exist in the collection schema or are system
+            # fields.  Like a filter, PocketBase resolves only base-model
+            # fields, schema fields and (auth) username/verified/
+            # emailVisibility/email; any other name (password_hash, tokenKey,
+            # ...) is a 400 for every caller.  Sort has no email visibility
+            # guard (resolvers/record_field_resolve_runner.go l.356-374).
             system_fields = {"id", "created", "updated"}
             schema_field_names = {f.name for f in schema_fields}
             valid_fields = system_fields | schema_field_names
-            for col_expr, _dir in sort_parts:
+            if col_type == "auth":
+                valid_fields |= _AUTH_RESOLVABLE_SYSTEM_FIELDS
+            resolved_parts: list[tuple[str, str]] = []
+            for col_expr, direction in sort_parts:
                 # col_expr is quoted like '"fieldname"' or a function like 'RANDOM()'
                 col_name = col_expr.strip('"')
-                if (
-                    col_name not in valid_fields
-                    and not col_expr.endswith("()")
-                    and col_name != "ctid"
-                ):
-                    raise ValueError(
-                        f"Invalid sort field: {col_name}. "
-                        f"Available fields: {', '.join(sorted(valid_fields))}."
-                    )
+                if col_expr.endswith("()") or col_name == "ctid":
+                    resolved_parts.append((col_expr, direction))
+                    continue
+                if col_name not in valid_fields:
+                    raise FilterFieldError(f"unknown sort field {col_name!r}")
+                column = _AUTH_FIELD_COLUMNS.get(col_name, col_name)
+                resolved_parts.append((f'"{column}"', direction))
             date_fields = {f.name for f in schema_fields if f.type == FieldType.DATE}
             order_sql = ", ".join(
-                _sort_term(col, direction, date_fields) for col, direction in sort_parts
+                _sort_term(col, direction, date_fields)
+                for col, direction in resolved_parts
             )
 
     # Clamp pagination (PocketBase normalizes invalid values instead of rejecting)
@@ -1093,12 +1117,16 @@ async def create_record(
             data.pop("emailVisibility", None)
             data.pop("verified", None)
         else:
-            if "email_visibility" not in data:
-                columns["email_visibility"] = False
-            else:
-                columns["email_visibility"] = bool(
-                    data.pop("email_visibility", False)
+            # Accept PocketBase's wire name ``emailVisibility`` as well as the
+            # snake_case alias; otherwise a client can never turn visibility on.
+            if "email_visibility" in data or "emailVisibility" in data:
+                raw_visibility = data.pop(
+                    "email_visibility", data.pop("emailVisibility", False)
                 )
+                data.pop("emailVisibility", None)
+                columns["email_visibility"] = bool(raw_visibility)
+            else:
+                columns["email_visibility"] = False
             if "verified" not in data:
                 columns["verified"] = False
             else:
@@ -1946,12 +1974,15 @@ async def check_record_rule(
     record_id: str,
     rule_filter: str,
     request_context: dict[str, Any] | None = None,
+    allow_hidden: bool = True,
 ) -> bool:
     """Check if a record matches a rule filter expression.
 
     Used for view/update/delete rule enforcement.  Parses the rule as a
     PocketBase filter expression and runs it as a WHERE clause against the
-    record's row.
+    record's row.  ``allow_hidden`` follows PocketBase's resolver flag: a
+    server-evaluated access rule allows hidden auth fields (no emailVisibility
+    guard), a client-supplied realtime filter does not.
 
     Returns True if the record matches the rule, False otherwise.
     """
@@ -1967,6 +1998,7 @@ async def check_record_rule(
         relation_resolver,
         collection_resolver,
         table,
+        allow_hidden=allow_hidden,
     )
     sql = (
         f'SELECT 1 FROM "{table}" WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'

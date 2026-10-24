@@ -126,6 +126,56 @@ _SYSTEM_FIELD_TYPES = {
 }
 
 
+class FilterFieldError(ValueError):
+    """A filter/sort references a field PocketBase does not resolve.
+
+    PocketBase 0.22.34 resolves only base-model fields, the collection's
+    schema fields and, for auth collections, ``username``/``verified``/
+    ``emailVisibility``/``email`` (``resolvableSystemFieldNames``,
+    resolvers/record_field_resolve_runner.go l.718-732).  Any other name
+    (``password``, ``passwordHash``/``password_hash``, ``tokenKey``/
+    ``token_key``, ``email_visibility``, ``lastResetSentAt``...) is an
+    "unknown field" error for every caller, admin included.  The API maps
+    this to the same opaque 400 PocketBase returns.
+    """
+
+
+# Auth system fields PocketBase resolves by name in a filter/sort.
+_AUTH_RESOLVABLE_SYSTEM_FIELDS = frozenset(
+    {"username", "verified", "emailVisibility", "email"}
+)
+# PocketBase auth field name -> PPBase physical column.
+_AUTH_FIELD_COLUMNS = {"emailVisibility": "email_visibility"}
+_EMAIL_VISIBILITY_COLUMN = "email_visibility"
+# Auth system field names (every spelling PPBase may store in the schema or
+# keep as a physical column).  On an auth collection these are resolvable only
+# through ``_AUTH_RESOLVABLE_SYSTEM_FIELDS`` — never as a plain schema field,
+# even when PPBase persists them in the collection schema, since PocketBase
+# 0.22.34 keeps them out of ``collection.Schema`` entirely.
+_AUTH_SYSTEM_FIELD_NAMES = frozenset(
+    {
+        "email",
+        "emailVisibility",
+        "email_visibility",
+        "verified",
+        "username",
+        "password",
+        "passwordConfirm",
+        "oldPassword",
+        "passwordHash",
+        "password_hash",
+        "tokenKey",
+        "token_key",
+        "lastResetSentAt",
+        "last_reset_sent_at",
+        "lastVerificationSentAt",
+        "last_verification_sent_at",
+        "lastLoginAlertSentAt",
+        "last_login_alert_sent_at",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # PocketBase LEFT JOIN paths and multi-match
 # ---------------------------------------------------------------------------
@@ -188,6 +238,10 @@ class _PathOperand:
     multi_match: _MultiMatch | None
     field_type: str = ""
     is_json: bool = False
+    # ``emailVisibility = TRUE`` on the leaf alias when the leaf is an auth
+    # ``email`` resolved without hidden-field access (PocketBase AfterBuild,
+    # applied to the main query only, never inside the multi-match subquery).
+    email_guard: str | None = None
     # Id of the leaf row when the leaf is a nullable date: PPBase stores an
     # empty date as NULL, so only a NULL id means a missing row (SQL NULL in
     # PocketBase, where the empty date is '').
@@ -294,6 +348,10 @@ class _ResolvedPath:
     # Column read on the last table (the JSON column for a JSON path).
     leaf_field: str = ""
     json_path: tuple[str, ...] = ()
+    # Table of the last segment and whether that leaf is an auth ``email``
+    # resolved without hidden-field access (needs the emailVisibility guard).
+    leaf_table: str = ""
+    email_guard: bool = False
 
 
 @dataclass(frozen=True)
@@ -340,8 +398,16 @@ class _FilterTransformer(Transformer):
         relation_resolver: dict[str, dict[str, Any]] | None = None,
         collection_resolver: dict[str, dict[str, Any]] | None = None,
         current_table: str | None = None,
+        allow_hidden: bool = True,
     ) -> None:
         super().__init__()
+        # Whether hidden auth fields are allowed without extra conditions
+        # (PocketBase ``allowHiddenFields``): true for admins and for
+        # server-evaluated rules, false for a non-admin list/realtime filter.
+        # Only affects the ``email`` emailVisibility guard; non-resolvable
+        # fields are rejected either way (0.22.34 has no hidden-field flag,
+        # resolvers/record_field_resolve_runner.go l.356-374).
+        self._allow_hidden = allow_hidden
         self._param_counter = 0
         self._params: dict[str, Any] = {}
         self._request_context = request_context or {}
@@ -505,6 +571,53 @@ class _FilterTransformer(Transformer):
         fields = self._resolver_fields(self._relation_resolver)
         field_info = fields.get(safe_field) if isinstance(fields, dict) else None
         return field_info if isinstance(field_info, dict) else None
+
+    def _table_meta(self, table_name: str | None) -> dict[str, Any] | None:
+        """Flat metadata (``fields``/``type``) of a table, if the resolver has it."""
+        if not table_name:
+            return None
+        safe = _sanitize_ident(str(table_name))
+        for resolver in (self._relation_resolver, self._collection_resolver):
+            if self._is_flat_resolver(resolver):
+                meta = self._flat_collection(resolver, safe)
+                if meta:
+                    return meta
+        return None
+
+    def _resolve_leaf_column(
+        self,
+        table_name: str | None,
+        field_name: str,
+        *,
+        allow_guard: bool = True,
+    ) -> tuple[str, bool]:
+        """Map a leaf field to its physical column, rejecting hidden fields.
+
+        Returns ``(physical_column, needs_email_guard)``.  Raises
+        :class:`FilterFieldError` for a field PocketBase 0.22.34 would not
+        resolve.  Enforced only when the resolver knows the table (system
+        and metadata-less tables stay permissive).
+        """
+        field = _sanitize_ident(str(field_name))
+        meta = self._table_meta(table_name)
+        if meta is None:
+            return field, False
+        is_auth = meta.get("type") == "auth"
+        fields = meta.get("fields")
+        # An auth system field is never a plain schema field even when PPBase
+        # stores it in the schema: it resolves only via the auth branch below.
+        known = (
+            isinstance(fields, dict)
+            and field in fields
+            and not (is_auth and field in _AUTH_SYSTEM_FIELD_NAMES)
+        )
+        if field in _SYSTEM_FIELD_TYPES or known:
+            return field, False
+        if is_auth and field in _AUTH_RESOLVABLE_SYSTEM_FIELDS:
+            column = _AUTH_FIELD_COLUMNS.get(field, field)
+            guard = allow_guard and field == "email" and not self._allow_hidden
+            return column, guard
+        raise FilterFieldError(f"unknown filter field {field_name!r}")
 
     def _is_multi_value_field(self, table_name: str | None, field_name: str) -> bool:
         """Return whether a current-collection field stores an array."""
@@ -671,6 +784,7 @@ class _FilterTransformer(Transformer):
         fields: dict[str, dict[str, Any]] | None = None,
         allow_unresolved: bool = True,
         context: str = "field path",
+        email_guard_allowed: bool = True,
     ) -> _ResolvedPath | None:
         """Resolve a PocketBase dotted path into SQL and traversal steps.
 
@@ -714,12 +828,17 @@ class _FilterTransformer(Transformer):
                     if isinstance(field_info, dict)
                     else _SYSTEM_FIELD_TYPES.get(part, "")
                 )
+                column, email_guard = self._resolve_leaf_column(
+                    current_table, part, allow_guard=email_guard_allowed
+                )
                 return _ResolvedPath(
                     steps,
-                    self._column_expr_for_table(current_table, part),
+                    self._column_expr_for_table(current_table, column),
                     field_type=field_type,
                     leaf_multiple=self._info_is_multiple(field_info),
-                    leaf_field=part,
+                    leaf_field=column,
+                    leaf_table=current_table,
+                    email_guard=email_guard,
                 )
 
             field_info = current_fields.get(part) if isinstance(current_fields, dict) else None
@@ -807,15 +926,24 @@ class _FilterTransformer(Transformer):
                 )
                 return ("sql_ref", json_sql, resolved.is_json, resolved.field_type)
 
+        if len(parts) == 1:
+            # Single current-collection field: reject fields PocketBase does
+            # not resolve (password_hash, token_key, ...) and add the email
+            # visibility guard for a non-admin caller.
+            column, email_guard = self._resolve_leaf_column(
+                self._current_table, parts[0]
+            )
+            if modifier:
+                return ("field_modifier", column, modifier)
+            field_type = self._field_type_for_table(self._current_table, column)
+            guard_sql = None
+            if email_guard:
+                guard_sql = f"{self._field_expr(_EMAIL_VISIBILITY_COLUMN)} = TRUE"
+            return ("field", column, field_type, guard_sql)
+
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
-        field_name = ".".join(parts)
-        field_type = (
-            self._field_type_for_table(self._current_table, field_name)
-            if len(parts) == 1
-            else ""
-        )
-        return ("field", field_name, field_type)
+        return ("field", ".".join(parts), "")
 
     # -- Comparisons ---------------------------------------------------------
 
@@ -845,9 +973,19 @@ class _FilterTransformer(Transformer):
         # ── Regular comparisons ────────────────────────────────────────
         left_sql = self._operand_to_sql(left)
         right_sql = self._operand_to_sql(right)
+
+        def _guarded(sql: str) -> str:
+            # PocketBase wraps the whole comparison with the auth email
+            # visibility guard (AfterBuild); it attaches to the specific
+            # comparison, not the whole ``||`` filter.
+            for node in (left, right):
+                if isinstance(node, tuple) and node[0] == "field" and len(node) > 3 and node[3]:
+                    sql = f"({sql} AND {node[3]})"
+            return sql
+
         date_sql = _empty_date_condition(self, left, left_sql, op, right, right_sql)
         if date_sql is not None:
-            return date_sql
+            return _guarded(date_sql)
 
         # Standard comparisons
         if op in _STANDARD_OPS:
@@ -855,33 +993,33 @@ class _FilterTransformer(Transformer):
             # NULL special handling
             if right[0] == "null":
                 if sql_op == "=":
-                    return f"{left_sql} IS NULL"
+                    return _guarded(f"{left_sql} IS NULL")
                 elif sql_op == "!=":
-                    return f"{left_sql} IS NOT NULL"
+                    return _guarded(f"{left_sql} IS NOT NULL")
             if left[0] == "null":
                 if sql_op == "=":
-                    return f"{right_sql} IS NULL"
+                    return _guarded(f"{right_sql} IS NULL")
                 elif sql_op == "!=":
-                    return f"{right_sql} IS NOT NULL"
-            return f"{left_sql} {sql_op} {right_sql}"
+                    return _guarded(f"{right_sql} IS NOT NULL")
+            return _guarded(f"{left_sql} {sql_op} {right_sql}")
 
         # LIKE / NOT LIKE
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
-            return self._like_comparison_sql(left_sql, right, right_sql, sql_op)
+            return _guarded(self._like_comparison_sql(left_sql, right, right_sql, sql_op))
 
         # ANY standard operators (for array columns)
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
-            return self._scalar_or_array_any_sql(left_sql, right_sql, sql_op)
+            return _guarded(self._scalar_or_array_any_sql(left_sql, right_sql, sql_op))
 
         # ANY LIKE operators
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
             pattern_sql = self._like_pattern_sql(right, right_sql)
-            return self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op)
+            return _guarded(self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op))
 
-        return f"{left_sql} = {right_sql}"
+        return _guarded(f"{left_sql} = {right_sql}")
 
     # -- @collection comparison helpers --------------------------------------
 
@@ -1006,15 +1144,22 @@ class _FilterTransformer(Transformer):
         """Resolve the ``path`` of ``@collection.<coll_name>.<path>``."""
         if len(field_path) == 1:
             info = self._collection_resolver_field_info(coll_name, field_path[0])
+            # ``@collection`` paths set PocketBase's allowHiddenFields=true
+            # (prepare(), runner l.123-126): no email guard, but unknown
+            # fields (tokenKey...) are still rejected.
+            column, _ = self._resolve_leaf_column(
+                coll_name, field_path[0], allow_guard=False
+            )
             return _ResolvedPath(
                 [],
-                self._qualified_column(coll_name, field_path[0]),
+                self._qualified_column(coll_name, column),
                 field_type=self._field_type_for_collection_resolver(
                     coll_name,
                     field_path[0],
                 ),
                 leaf_multiple=self._info_is_multiple(info),
-                leaf_field=field_path[0],
+                leaf_field=column,
+                leaf_table=coll_name,
             )
 
         if self._is_flat_resolver(self._collection_resolver):
@@ -1031,6 +1176,7 @@ class _FilterTransformer(Transformer):
             fields=fields if isinstance(fields, dict) else {},
             allow_unresolved=False,
             context="@collection relation traversal",
+            email_guard_allowed=False,
         )
         if resolved is None:
             raise ValueError(
@@ -1236,12 +1382,18 @@ class _FilterTransformer(Transformer):
                     row_id=mm_row_id,
                 )
 
+        email_guard = None
+        if resolved.email_guard:
+            # AfterBuild guard on the main-query leaf alias only (never the
+            # multi-match subquery); a missing join row leaves it NULL/false.
+            email_guard = f"{self._column_of(deepest, _EMAIL_VISIBILITY_COLUMN)} = TRUE"
         return _PathOperand(
             leaf_sql,
             self._alias_closure(deepest),
             mm,
             field_type=resolved.field_type,
             is_json=resolved.is_json,
+            email_guard=email_guard,
             row_id=self._column_of(deepest, "id") if date_leaf else None,
         )
 
@@ -1468,6 +1620,10 @@ class _FilterTransformer(Transformer):
                     right_mm, right_side, op, left_side, path_is_left=False
                 )
                 sql = f"({sql} AND {mm_sql})"
+
+        for path in (left_path, right_path):
+            if path is not None and path.email_guard:
+                sql = f"({sql} AND {path.email_guard})"
 
         aliases: frozenset[str] = frozenset()
         for path in (left_path, right_path):
@@ -2131,6 +2287,7 @@ def parse_filter(
     relation_resolver: dict[str, dict[str, Any]] | None = None,
     collection_resolver: dict[str, dict[str, Any]] | None = None,
     current_table: str | None = None,
+    allow_hidden: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Parse a PocketBase filter expression into a SQL WHERE clause.
 
@@ -2169,6 +2326,7 @@ def parse_filter(
         relation_resolver,
         collection_resolver,
         current_table,
+        allow_hidden=allow_hidden,
     )
     try:
         where_sql = transformer.finish(transformer.render(transformer.transform(tree)))

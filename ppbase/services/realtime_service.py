@@ -439,43 +439,78 @@ async def _is_subscription_allowed_for_event(
         request_context["headers"] = _normalize_request_headers(
             subscription.options_headers
         )
-    rule_result = check_rule(rule, auth_ctx)
+    is_admin = bool(auth_ctx and auth_ctx.get("is_admin"))
 
-    # Optional per-subscription filter
     filter_value = subscription.options_query.get("filter")
     filter_expr = filter_value.strip() if isinstance(filter_value, str) else ""
-    if filter_expr:
-        if rule_result is True:
-            rule_result = filter_expr
-        elif isinstance(rule_result, str):
-            rule_result = f"({rule_result}) && ({filter_expr})"
+    sort_value = subscription.options_query.get("sort")
 
+    # PocketBase runs checkForAdminOnlyRuleFields only when a non-empty client
+    # filter is present, and then scans both the filter and the sort options
+    # (apis/realtime.go l.568-574): a guest/record using @collection. or
+    # @request. in either is silently denied.
+    if filter_expr and not is_admin:
+        for value in (filter_expr, sort_value):
+            if isinstance(value, str) and (
+                "@collection." in value or "@request." in value
+            ):
+                return False
+
+    # 1. Access rule.  CanAccessRecord resolves it with hidden fields allowed
+    #    (apis/realtime.go l.577, allowHiddenFields=true): an ``email`` rule
+    #    is NOT restricted to visible emails here, unlike a client filter.
+    rule_result = check_rule(rule, auth_ctx)
     if rule_result is False:
         return False
-    if rule_result is True:
-        return True
+    if isinstance(rule_result, str):
+        if action == "delete":
+            return False
+        try:
+            matched = await check_record_rule(
+                engine,
+                collection,
+                record_id,
+                rule_result,
+                request_context,
+                allow_hidden=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Realtime rule check failed for %s/%s: %s",
+                collection.name,
+                record_id,
+                exc,
+            )
+            return False
+        if not matched:
+            return False
 
-    # For expression rules we need the row to exist in DB.
-    # Delete events are dropped in this case to avoid leaking protected activity.
-    if action == "delete":
-        return False
+    # 2. Client subscription filter, resolved like a non-admin list filter
+    #    (NewRecordFieldResolver(..., false), apis/realtime.go l.586): an
+    #    ``email`` filter is restricted to emailVisibility = TRUE and a hidden
+    #    field (tokenKey...) denies the event.
+    if filter_expr:
+        if action == "delete":
+            return False
+        try:
+            return await check_record_rule(
+                engine,
+                collection,
+                record_id,
+                filter_expr,
+                request_context,
+                allow_hidden=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Realtime filter check failed for %s/%s: %s",
+                collection.name,
+                record_id,
+                exc,
+            )
+            return False
 
-    try:
-        return await check_record_rule(
-            engine,
-            collection,
-            record_id,
-            rule_result,
-            request_context,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Realtime rule check failed for %s/%s: %s",
-            collection.name,
-            record_id,
-            exc,
-        )
-        return False
+    return True
 
 
 def _parse_fields(fields_param: str | None) -> set[str] | None:
