@@ -71,7 +71,13 @@ class TestTokenIsolation:
     async def test_token_from_collection_a_cannot_refresh_on_b(
         self, app_client: AsyncClient, admin_token: str, auth_collection: dict
     ):
-        """Token from users collection should not refresh on a different collection."""
+        """Token from users collection should not refresh on a different collection.
+
+        A valid record token of another auth collection gets 403 naming the
+        token's collection: v0.22.34 apis/middlewares.go:102-105 and v0.40.6
+        apis/middlewares.go:164-167; measured on the 0.22.34 binary (403, "The
+        request requires auth record from users collection.").
+        """
         coll_b_name = f"team_{uuid.uuid4().hex[:8]}"
         await self._create_auth_collection(app_client, admin_token, coll_b_name)
 
@@ -83,12 +89,15 @@ class TestTokenIsolation:
             f"/api/collections/{coll_b_name}/auth-refresh",
             headers={"Authorization": token_a},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["message"] == (
+            "The request requires auth record from users collection."
+        )
 
     async def test_token_from_collection_b_cannot_refresh_on_a(
         self, app_client: AsyncClient, admin_token: str, auth_collection: dict
     ):
-        """Token from collection B should not refresh on users."""
+        """Token from collection B should not refresh on users (403, see above)."""
         coll_b_name = f"staff_{uuid.uuid4().hex[:8]}"
         await self._create_auth_collection(app_client, admin_token, coll_b_name)
 
@@ -99,7 +108,10 @@ class TestTokenIsolation:
             "/api/collections/users/auth-refresh",
             headers={"Authorization": token_b},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["message"] == (
+            f"The request requires auth record from {coll_b_name} collection."
+        )
 
     async def test_admin_token_cannot_refresh_on_user_collection(
         self, app_client: AsyncClient, admin_token: str, auth_collection: dict
@@ -125,12 +137,18 @@ class TestTokenIsolation:
         assert resp.status_code == 401
 
     async def test_forged_authrecord_with_unknown_collection_is_anonymous(
-        self, app_client: AsyncClient, auth_collection: dict
+        self, app_client: AsyncClient, admin_token: str, auth_collection: dict
     ):
-        """Invalid optional auth must behave like no auth on public resources."""
+        """Invalid optional auth must behave like no auth on public resources.
+
+        The public collection is created here: other tests change the rules of
+        ``users``, which made this test depend on the order of the suite.
+        """
+        collection_name = f"public_{uuid.uuid4().hex[:8]}"
+        await self._create_auth_collection(app_client, admin_token, collection_name)
         email = f"forged_{uuid.uuid4().hex[:8]}@example.com"
         reg = await app_client.post(
-            "/api/collections/users/records",
+            f"/api/collections/{collection_name}/records",
             json={
                 "email": email,
                 "password": "securepass123",
@@ -151,10 +169,10 @@ class TestTokenIsolation:
         forged = pyjwt.encode(forged_payload, _ATTACKER_SECRET, algorithm="HS256")
 
         anonymous_resp = await app_client.get(
-            f"/api/collections/users/records/{user['id']}",
+            f"/api/collections/{collection_name}/records/{user['id']}",
         )
         forged_resp = await app_client.get(
-            f"/api/collections/users/records/{user['id']}",
+            f"/api/collections/{collection_name}/records/{user['id']}",
             headers={"Authorization": forged},
         )
 
