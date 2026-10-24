@@ -30,6 +30,7 @@ from ppbase.core.storage_safety import validate_collection_id
 from ppbase.db.schema_manager import (
     create_collection_table,
     delete_collection_table,
+    reconcile_multi_value_columns,
     update_collection_table,
 )
 from ppbase.db.system_tables import CollectionRecord, MigrationRecord
@@ -791,6 +792,26 @@ class MigrationApp:
                 await create_collection_table(self._session, record)
 
         return record
+
+    async def reconcile_multi_value_columns(
+        self,
+        id_or_name: str,
+        field_names: list[str] | tuple[str, ...] | None = None,
+    ) -> list[str]:
+        """Convert pre-rule select/file/relation columns of one collection.
+
+        Runs :func:`ppbase.db.schema_manager.reconcile_multi_value_columns`
+        inside the migration transaction, so the conversion rolls back with
+        the migration.  Returns the converted field names: ``[]`` when the
+        columns already have the shape of their rule (a database created
+        after the rule, or a second run).
+        """
+        record = await self.find_collection(id_or_name)
+        return await reconcile_multi_value_columns(
+            self._session,
+            record,
+            field_names=field_names,
+        )
 
     async def execute_sql(self, sql: str, params: dict | None = None) -> Any:
         """Execute raw SQL within the migration transaction."""

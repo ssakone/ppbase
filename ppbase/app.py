@@ -161,6 +161,21 @@ async def _lifespan(app: FastAPI):
         else:
             logger.info("Startup migration application disabled")
 
+        # Never serve a table whose select/file/relation column shape breaks
+        # the multiplicity rule (for example a PocketBase 0.22 maxSelect-null
+        # relation created as a scalar column before the rule): it would
+        # expose strings instead of lists and fail filters and writes. An
+        # application migration calling reconcile_multi_value_columns() runs
+        # above, before this check.
+        from ppbase.db.schema_manager import (
+            MultiValueShapeMismatchError,
+            find_multi_value_shape_mismatches,
+        )
+
+        shape_mismatches = await find_multi_value_shape_mismatches(engine)
+        if shape_mismatches:
+            raise MultiValueShapeMismatchError(shape_mismatches)
+
         # Load runtime settings only after migrations have completed.
         async with session_factory() as session:
             settings_stmt = select(ParamRecord.value).where(

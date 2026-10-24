@@ -30,6 +30,10 @@ from ppbase.backup.schema_contract import (
     SchemaContractError,
     TableSpec,
 )
+from ppbase.models.field_multiplicity import (
+    relation_is_multiple,
+    select_or_file_is_multiple,
+)
 from ppbase.models.field_types import FieldDefinition, FieldType
 
 
@@ -237,27 +241,17 @@ def _field_column_spec(field: FieldDefinition) -> ColumnSpec:
             default="now()",
         )
     if field_type in (FieldType.SELECT, FieldType.FILE):
-        max_select = options.get("maxSelect", 1) or 1
-        if max_select > 1:
+        if select_or_file_is_multiple(options):
             return ColumnSpec(
                 name=name, type="text[]", nullable=False, default="'{}'::text[]"
             )
         return ColumnSpec(name=name, type="text", nullable=False, default="''::text")
     if field_type == FieldType.RELATION:
-        max_select = options.get("maxSelect", 1) or 1
-        if max_select > 1:
+        if relation_is_multiple(options):
             return ColumnSpec(
-                name=name,
-                type="character varying(15)[]",
-                nullable=False,
-                default="'{}'::character varying[]",
+                name=name, type="text[]", nullable=False, default="'{}'::text[]"
             )
-        return ColumnSpec(
-            name=name,
-            type="character varying(15)",
-            nullable=False,
-            default="''::character varying",
-        )
+        return ColumnSpec(name=name, type="text", nullable=False, default="''::text")
     if field_type == FieldType.JSON:
         return ColumnSpec(
             name=name, type="jsonb", nullable=False, default="'null'::jsonb"
@@ -271,6 +265,35 @@ def _field_column_spec(field: FieldDefinition) -> ColumnSpec:
         )
     # Matches the ``_col_ddl`` fallback for an unknown type.
     return ColumnSpec(name=name, type="text", nullable=False, default="''::text")
+
+
+# Relation columns created before relation ids became unbounded TEXT (see
+# ppbase.models.field_multiplicity). They are a PPBase-authored shape and keep
+# working, so a live legacy column with the matching multiplicity is accepted.
+_LEGACY_RELATION_COLUMNS: dict[bool, tuple[str, str]] = {
+    False: ("character varying(15)", "''::character varying"),
+    True: ("character varying(15)[]", "'{}'::character varying[]"),
+}
+
+
+def _legacy_relation_column_spec(
+    field: FieldDefinition,
+    live_type: str | None,
+) -> ColumnSpec | None:
+    """Return the legacy spec when ``live_type`` is the pre-TEXT relation shape."""
+    if field.type != FieldType.RELATION or live_type is None:
+        return None
+    legacy_type, legacy_default = _LEGACY_RELATION_COLUMNS[
+        relation_is_multiple(field.options)
+    ]
+    if live_type != legacy_type:
+        return None
+    return ColumnSpec(
+        name=field.name,
+        type=legacy_type,
+        nullable=False,
+        default=legacy_default,
+    )
 
 
 def _parse_schema_fields(schema_raw: Any) -> list[FieldDefinition]:
@@ -303,16 +326,29 @@ def _parse_schema_fields(schema_raw: Any) -> list[FieldDefinition]:
 
 
 def build_collection_table_spec(
-    *, name: str, kind: str, schema_raw: Any
+    *,
+    name: str,
+    kind: str,
+    schema_raw: Any,
+    live_column_types: dict[str, str] | None = None,
 ) -> TableSpec:
-    """Return the canonical :class:`TableSpec` for a base/auth collection."""
+    """Return the canonical :class:`TableSpec` for a base/auth collection.
+
+    ``live_column_types`` (column name -> ``format_type``) lets a relation
+    column keep its legacy ``VARCHAR(15)`` shape when it still has it.
+    """
     if kind not in ("base", "auth"):
         raise CanonicalModelError(f"collection {name!r} has non-table kind {kind!r}")
     fields = _parse_schema_fields(schema_raw)
+    live_types = live_column_types or {}
     columns: list[ColumnSpec] = list(_BASE_COLUMNS)
     if kind == "auth":
         columns.extend(_AUTH_COLUMNS)
-    columns.extend(_field_column_spec(field) for field in fields)
+    for field in fields:
+        columns.append(
+            _legacy_relation_column_spec(field, live_types.get(field.name))
+            or _field_column_spec(field)
+        )
     return TableSpec(
         name=name,
         kind=kind,
@@ -334,6 +370,18 @@ async def build_canonical_tables(pg_conn: Any) -> dict[str, TableSpec]:
     rows = await pg_conn.fetch(
         'SELECT name, type, schema FROM public."_collections"'
     )
+    live_rows = await pg_conn.fetch(
+        "SELECT c.relname, a.attname, "
+        "pg_catalog.format_type(a.atttypid, a.atttypmod) AS coltype "
+        "FROM pg_catalog.pg_attribute a "
+        "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+        "AND a.attnum > 0 AND NOT a.attisdropped"
+    )
+    live_types: dict[str, dict[str, str]] = {}
+    for live in live_rows:
+        live_types.setdefault(str(live[0]), {})[str(live[1])] = str(live[2])
     for row in rows:
         name = row["name"]
         if not isinstance(name, str) or not name:
@@ -350,7 +398,10 @@ async def build_canonical_tables(pg_conn: Any) -> dict[str, TableSpec]:
             continue
         table_kind = "auth" if kind == "auth" else "base"
         canonical[name] = build_collection_table_spec(
-            name=name, kind=table_kind, schema_raw=row["schema"]
+            name=name,
+            kind=table_kind,
+            schema_raw=row["schema"],
+            live_column_types=live_types.get(name),
         )
     return canonical
 

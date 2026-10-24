@@ -34,7 +34,8 @@ export interface Field {
   pattern?: string
   onlyInt?: boolean
   values?: string[]
-  maxSelect?: number
+  // null: PocketBase 0.22 unlimited multiple relation (kept as-is)
+  maxSelect?: number | null
   collectionId?: string
   cascadeDelete?: boolean
   maxSize?: number
@@ -50,7 +51,8 @@ export interface FieldOptions {
   pattern?: string
   onlyInt?: boolean
   values?: string[]
-  maxSelect?: number
+  // null: PocketBase 0.22 unlimited multiple relation (kept as-is)
+  maxSelect?: number | null
   collectionId?: string
   cascadeDelete?: boolean
   maxSize?: number

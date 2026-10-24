@@ -36,13 +36,16 @@ from ppbase.ext.registry import (
 )
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
+    RecordReferenceError,
     _ValidationErrors,
     check_record_rule,
     create_record,
     delete_record,
     get_all_collections,
     get_record,
+    has_relation_fields,
     list_records,
+    relation_target_errors,
     resolve_collection,
     update_record,
 )
@@ -313,6 +316,14 @@ async def _check_old_password(
 # ---------------------------------------------------------------------------
 
 
+# PocketBase answer when a delete would empty a required relation (v0.22.34
+# apis/record_crud.go l.445-447, v0.40.6 apis/record_crud.go l.593-595).
+_DELETE_REFERENCE_MESSAGE = (
+    "Failed to delete record. Make sure that the record is not part of a "
+    "required relation reference."
+)
+
+
 def _error_response(status: int, message: str, data: Any = None) -> JSONResponse:
     body: dict[str, Any] = {
         "status": status,
@@ -333,6 +344,40 @@ def _validation_message(base: str, errors: dict[str, Any]) -> str:
         field_names = ", ".join(errors.keys())
         return f"{base} Validation failed for: {field_names}."
     return base
+
+
+async def _relation_errors_before_hooks(
+    engine: Any,
+    collection: Any,
+    data: Any,
+    *,
+    rule: str | None,
+    auth_ctx: dict[str, Any] | None,
+    request_context: dict[str, Any],
+    record_id: str | None = None,
+) -> dict[str, Any]:
+    """PocketBase-ordered relation target check for record API writes.
+
+    PocketBase answers 403 for a superuser-only rule and 404 for an
+    inaccessible record before it validates the submitted form, then validates
+    it before the ``OnRecordBefore*Request`` hooks (v0.22.34
+    ``apis/record_crud.go``).  The access checks are only replayed here to
+    keep that order; the default handlers still enforce them.
+    """
+    if not isinstance(data, dict) or not has_relation_fields(collection):
+        return {}
+    rule_result = check_rule(rule, auth_ctx)
+    if rule_result is False:
+        return {}
+    if (
+        record_id is not None
+        and isinstance(rule_result, str)
+        and not await check_record_rule(
+            engine, collection, record_id, rule_result, request_context
+        )
+    ):
+        return {}
+    return await relation_target_errors(engine, collection, data, record_id=record_id)
 
 
 def _response_json_body(response: JSONResponse) -> dict[str, Any]:
@@ -746,6 +791,24 @@ async def _apply_batch_create(
     query: dict[str, str],
     all_collections: list[Any],
 ) -> tuple[int, Any] | JSONResponse:
+    if has_relation_fields(collection):
+        auth_ctx, request_context = _build_batch_rule_context(
+            request, auth, "POST", dict(data), query
+        )
+        relation_errors = await _relation_errors_before_hooks(
+            engine,
+            collection,
+            data,
+            rule=collection.create_rule,
+            auth_ctx=auth_ctx,
+            request_context=request_context,
+        )
+        if relation_errors:
+            return _error_response(
+                400,
+                _validation_message("Failed to create record.", relation_errors),
+                relation_errors,
+            )
     event = RecordRequestEvent(
         app=request.app,
         request=request,
@@ -884,6 +947,25 @@ async def _apply_batch_update(
     query: dict[str, str],
     all_collections: list[Any],
 ) -> tuple[int, Any] | JSONResponse:
+    if has_relation_fields(collection):
+        auth_ctx, request_context = _build_batch_rule_context(
+            request, auth, "PATCH", dict(data), query
+        )
+        relation_errors = await _relation_errors_before_hooks(
+            engine,
+            collection,
+            data,
+            rule=collection.update_rule,
+            auth_ctx=auth_ctx,
+            request_context=request_context,
+            record_id=record_id,
+        )
+        if relation_errors:
+            return _error_response(
+                400,
+                _validation_message("Failed to update record.", relation_errors),
+                relation_errors,
+            )
     event = RecordRequestEvent(
         app=request.app,
         request=request,
@@ -1065,12 +1147,15 @@ async def _apply_batch_delete(
             if not matches:
                 return _error_response(404, "The requested resource wasn't found.")
 
-        deleted = await delete_record(
-            engine,
-            collection,
-            target_record_id,
-            all_collections=all_collections,
-        )
+        try:
+            deleted = await delete_record(
+                engine,
+                collection,
+                target_record_id,
+                all_collections=all_collections,
+            )
+        except RecordReferenceError:
+            return _error_response(400, _DELETE_REFERENCE_MESSAGE)
         if not deleted:
             return _error_response(404, "The requested resource wasn't found.")
 
@@ -1473,6 +1558,22 @@ async def api_create_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
+        if has_relation_fields(collection):
+            auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
+            relation_errors = await _relation_errors_before_hooks(
+                active_engine,
+                collection,
+                data,
+                rule=collection.create_rule,
+                auth_ctx=auth_ctx,
+                request_context=request_context,
+            )
+            if relation_errors:
+                return _error_response(
+                    400,
+                    _validation_message("Failed to create record.", relation_errors),
+                    relation_errors,
+                )
         event = RecordRequestEvent(
             app=request.app,
             request=request,
@@ -1722,6 +1823,23 @@ async def api_update_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
+        if has_relation_fields(collection):
+            auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
+            relation_errors = await _relation_errors_before_hooks(
+                active_engine,
+                collection,
+                data,
+                rule=collection.update_rule,
+                auth_ctx=auth_ctx,
+                request_context=request_context,
+                record_id=recordId,
+            )
+            if relation_errors:
+                return _error_response(
+                    400,
+                    _validation_message("Failed to update record.", relation_errors),
+                    relation_errors,
+                )
         event = RecordRequestEvent(
             app=request.app,
             request=request,
@@ -1790,12 +1908,15 @@ async def api_delete_record(
                 return _error_response(404, "The requested resource wasn't found.")
 
         all_colls = await get_all_collections(active_engine)
-        deleted = await delete_record(
-            active_engine,
-            collection,
-            target_record_id,
-            all_collections=all_colls,
-        )
+        try:
+            deleted = await delete_record(
+                active_engine,
+                collection,
+                target_record_id,
+                all_collections=all_colls,
+            )
+        except RecordReferenceError:
+            return _error_response(400, _DELETE_REFERENCE_MESSAGE)
 
         if not deleted:
             return _error_response(404, "The requested resource wasn't found.")

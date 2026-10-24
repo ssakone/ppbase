@@ -10,7 +10,7 @@ import json as _json
 import logging
 import mimetypes
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -20,6 +20,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from ppbase.core.id_generator import generate_id
 from ppbase.core.storage_safety import StorageSafetyError, validate_record_id
 from ppbase.db.system_tables import CollectionRecord
+from ppbase.models.field_multiplicity import (
+    prepare_relation_value,
+    relation_is_multiple,
+    relation_max_select,
+    select_or_file_is_multiple,
+    select_or_file_max_select,
+    to_unique_string_list,
+)
 from ppbase.models.field_types import (
     _EMAIL_RE,
     FieldDefinition,
@@ -287,11 +295,22 @@ def _collection_field_metadata(collection: CollectionRecord) -> dict[str, dict[s
     return fields
 
 
+# PocketBase's own representation of an unlimited relation once upgraded from
+# 0.22 (v0.23.0 migrations/1717233556_v0.23_migrate.go l.844-848).
+_UNLIMITED_MAX_SELECT = 2147483647
+
+
 def _relation_targets(
     collection: CollectionRecord,
     by_id: dict[str, CollectionRecord],
     by_name: dict[str, CollectionRecord],
 ) -> list[tuple[str, CollectionRecord, int]]:
+    """Return ``(field, target, max_select)`` for relation fields.
+
+    ``max_select > 1`` exactly when the shared relation rule says multiple:
+    ``maxSelect: null`` (an unlimited 0.22 relation) is reported as
+    ``2147483647``, the value PocketBase's v0.23 upgrade gives it.
+    """
     targets: list[tuple[str, CollectionRecord, int]] = []
     schema: list[dict[str, Any]] = collection.schema or []
     for raw in schema:
@@ -304,8 +323,192 @@ def _relation_targets(
         target = by_id.get(str(target_ref)) or by_name.get(str(target_ref))
         if not field_name or target is None:
             continue
-        targets.append((field_name, target, int(opts.get("maxSelect", 1) or 1)))
+        if relation_is_multiple(opts):
+            max_select = relation_max_select(opts) or _UNLIMITED_MAX_SELECT
+        else:
+            max_select = 1
+        targets.append((field_name, target, max_select))
     return targets
+
+
+_MISSING_REL_COLLECTION_ERROR = {
+    "code": "validation_missing_rel_collection",
+    "message": "Relation connection is missing or cannot be accessed.",
+}
+_MISSING_REL_RECORDS_ERROR = {
+    "code": "validation_missing_rel_records",
+    "message": "Failed to find all relation records with the provided ids.",
+}
+
+
+async def _relation_target_errors(
+    engine: AsyncEngine,
+    schema_fields: list[FieldDefinition],
+    values: dict[str, Any],
+    *,
+    skip: set[str],
+) -> dict[str, dict[str, str]]:
+    """Return errors for relation ids that do not exist in their target.
+
+    Mirrors PocketBase 0.22.34 ``forms/validators/record_data.go``
+    ``checkRelationValue`` (l.361-398; v0.40.6 ``core/field_relation.go``
+    l.198-237): every id must exist in the target collection, otherwise the
+    field fails with ``validation_missing_rel_records``.  Orphan ids are
+    reported, never removed or rewritten.
+    """
+    errors: dict[str, dict[str, str]] = {}
+    for field_def in schema_fields:
+        if field_def.type != FieldType.RELATION or field_def.name in skip:
+            continue
+        ids = to_unique_string_list(values.get(field_def.name))
+        if not ids:
+            continue
+        target_ref = (field_def.options or {}).get("collectionId")
+        target = (
+            await resolve_collection(engine, str(target_ref)) if target_ref else None
+        )
+        if target is None:
+            errors[field_def.name] = dict(_MISSING_REL_COLLECTION_ERROR)
+            continue
+        count_sql = text(
+            f'SELECT COUNT(*) FROM "{_table_name(target)}" '
+            'WHERE "id" = ANY(CAST(:ids AS text[]))'
+        )
+        async with engine.connect() as conn:
+            total = (await conn.execute(count_sql, {"ids": ids})).scalar_one()
+        if int(total) != len(ids):
+            errors[field_def.name] = dict(_MISSING_REL_RECORDS_ERROR)
+    return errors
+
+
+def _relation_field_definitions(collection: Any) -> list[FieldDefinition]:
+    """Return the relation fields of a collection (nested or flat schema)."""
+    raw_schema = getattr(collection, "schema", None)
+    if not isinstance(raw_schema, list):
+        return []
+    fields: list[FieldDefinition] = []
+    for definition in raw_schema:
+        if not isinstance(definition, dict):
+            continue
+        normalized = _normalize_field(definition)
+        if normalized.get("type") != "relation":
+            continue
+        fields.append(FieldDefinition(**normalized))
+    return fields
+
+
+def has_relation_fields(collection: Any) -> bool:
+    """Return whether a collection defines at least one relation field."""
+    return bool(_relation_field_definitions(collection))
+
+
+def _merged_form_value(
+    field: FieldDefinition,
+    current: dict[str, Any],
+    data: dict[str, Any],
+) -> Any:
+    """Current value of ``field`` with the request value and modifiers applied."""
+    value = current.get(field.name)
+    for key, raw in data.items():
+        if key == field.name:
+            value = raw
+        elif key == f"{field.name}+":
+            value = _apply_append(value, raw, field)
+        elif key == f"+{field.name}":
+            value = _apply_prepend(value, raw, field)
+        elif key == f"{field.name}-":
+            value = _apply_remove(value, raw, field)
+    return value
+
+
+def _field_error(exc: FieldValidationError) -> dict[str, str]:
+    return {"code": exc.code, "message": exc.message}
+
+
+async def relation_target_errors(
+    engine: AsyncEngine,
+    collection: Any,
+    data: dict[str, Any],
+    *,
+    record_id: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Validate relation ids like PocketBase's record form, before hooks run.
+
+    PocketBase validates the submitted form (current record values merged
+    with the request data and its modifiers) before triggering the
+    ``OnRecordBefore*Request`` hooks (v0.22.34 ``apis/record_crud.go`` and
+    ``forms/record_upsert.go`` l.472-563 ``Validate``, l.744-830 ``Submit``).
+    Values a hook writes afterwards are saved without this check.  On update
+    every relation of the record is checked, changed or not.
+
+    Returns ``{}`` when every referenced id exists (the request continues and
+    the regular validation runs after the hooks, as before) or when the record
+    does not exist (the caller answers 404).  When an id is missing, the
+    returned errors are those PocketBase's ``RecordDataValidator`` reports
+    together (v0.22.34 ``forms/validators/record_data.go`` l.52-97): for each
+    relation the required and ``maxSelect`` checks come before the target
+    lookup (l.361-398), and the other schema fields of the form are validated
+    too.  File fields (uploads are processed later) and auth system fields
+    are not part of this merge.
+    """
+    relation_fields = _relation_field_definitions(collection)
+    if not relation_fields or not isinstance(data, dict):
+        return {}
+
+    current: dict[str, Any] = {}
+    if record_id is not None:
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        f'SELECT * FROM "{_table_name(collection)}" '
+                        'WHERE "id" = :id LIMIT 1'
+                    ),
+                    {"id": record_id},
+                )
+            ).mappings().first()
+        if row is None:
+            return {}
+        current = dict(row)
+
+    errors: dict[str, dict[str, str]] = {}
+    lookups: list[FieldDefinition] = []
+    values: dict[str, Any] = {}
+    for field in relation_fields:
+        try:
+            values[field.name] = validate_field_value(
+                field,
+                _merged_form_value(field, current, data),
+            )
+        except FieldValidationError as exc:
+            errors[field.name] = _field_error(exc)
+            continue
+        lookups.append(field)
+
+    missing = await _relation_target_errors(engine, lookups, values, skip=set())
+    if not missing:
+        return {}
+    errors.update(missing)
+
+    auth_collection = _collection_type(collection) == "auth"
+    for field in _get_schema_fields(collection):
+        if field.name in errors or field.type in (
+            FieldType.RELATION,
+            FieldType.AUTODATE,
+            FieldType.FILE,
+        ):
+            continue
+        if auth_collection and (
+            field.name in _AUTH_COLUMNS_HANDLED_SEPARATELY
+            or field.type == FieldType.PASSWORD
+        ):
+            continue
+        try:
+            validate_field_value(field, _merged_form_value(field, current, data))
+        except FieldValidationError as exc:
+            errors[exc.field_name] = _field_error(exc)
+    # PocketBase serializes its error map with sorted keys.
+    return dict(sorted(errors.items()))
 
 
 def _relation_index_signature(
@@ -359,12 +562,14 @@ def _build_relation_index_from_collections(
         table = _table_name(coll)
         relations = collections_meta[table]["relations"]
         for field_name, target, max_select in _relation_targets(coll, by_id, by_name):
+            multiple = max_select > 1
             target_table = _table_name(target)
             relations[field_name] = {
                 "kind": "forward",
                 "field": field_name,
                 "table": target_table,
                 "max_select": max_select,
+                "multiple": multiple,
             }
 
             back_key = f"{table}_via_{field_name}"
@@ -373,6 +578,7 @@ def _build_relation_index_from_collections(
                 "table": table,
                 "back_field": field_name,
                 "max_select": max_select,
+                "multiple": multiple,
             }
 
     return result
@@ -686,6 +892,10 @@ async def create_record(
     Validates all fields, generates an ID, and sets timestamps.
     Handles file uploads if files dict is provided.
 
+    Relation targets are not looked up here, like PocketBase
+    ``dao.SaveRecord``; the record API checks them first with
+    :func:`relation_target_errors`.
+
     For auth collections, handles password hashing, token_key generation,
     and auth system column defaults.
 
@@ -835,14 +1045,14 @@ async def create_record(
                     upload_has_error = True
             if upload_has_error:
                 continue
-            max_select = field_def.options.get("maxSelect", 1) or 1
+            file_multiple = select_or_file_is_multiple(field_def.options)
             try:
                 saved_names = save_files(
                     collection.id,
                     record_id,
                     field_name,
                     file_list,
-                    max_select,
+                    select_or_file_max_select(field_def.options),
                     lease=require_mutation_write_barrier(),
                 )
             except Exception:
@@ -853,7 +1063,7 @@ async def create_record(
                 )
                 raise
             saved_upload_names.extend(saved_names)
-            if max_select == 1:
+            if not file_multiple:
                 data[field_name] = saved_names[0] if saved_names else ""
             else:
                 data[field_name] = saved_names
@@ -1111,8 +1321,7 @@ async def update_record(
     def _coerce_file_value(
         field_def: FieldDefinition, values: list[str]
     ) -> str | list[str]:
-        max_select = field_def.options.get("maxSelect", 1) or 1
-        if max_select > 1:
+        if select_or_file_is_multiple(field_def.options):
             return values
         return values[-1] if values else ""
 
@@ -1173,14 +1382,13 @@ async def update_record(
             if upload_has_error:
                 continue
 
-            max_select = field_def.options.get("maxSelect", 1) or 1
             try:
                 saved_names = save_files(
                     collection.id,
                     record_id,
                     field_name,
                     file_list,
-                    max_select,
+                    select_or_file_max_select(field_def.options),
                     lease=require_mutation_write_barrier(),
                 )
             except Exception:
@@ -1343,7 +1551,11 @@ def _apply_append(
         inc = float(new_values) if new_values is not None else 0.0
         return cur + inc
 
-    # Multi-value fields (select, relation, file)
+    if field_def.type == FieldType.RELATION:
+        # PrepareValueWithModifier: ToUniqueStringSlice(base) + ToUniqueStringSlice(new)
+        return to_unique_string_list(current) + to_unique_string_list(new_values)
+
+    # Multi-value fields (select, file)
     cur_list = _coerce_modifier_values(current)
     if isinstance(new_values, list):
         cur_list.extend(new_values)
@@ -1362,6 +1574,9 @@ def _apply_prepend(
         cur = float(current) if current is not None else 0.0
         inc = float(new_values) if new_values is not None else 0.0
         return cur + inc
+
+    if field_def.type == FieldType.RELATION:
+        return to_unique_string_list(new_values) + to_unique_string_list(current)
 
     cur_list = _coerce_modifier_values(current)
     prepend_values: list[Any]
@@ -1384,6 +1599,11 @@ def _apply_remove(
         cur = float(current) if current is not None else 0.0
         dec = float(remove_values) if remove_values is not None else 0.0
         return cur - dec
+
+    if field_def.type == FieldType.RELATION:
+        # list.SubtractSlice(ToUniqueStringSlice(base), ToUniqueStringSlice(value))
+        removed = set(to_unique_string_list(remove_values))
+        return [v for v in to_unique_string_list(current) if v not in removed]
 
     cur_list = _coerce_modifier_values(current)
     if isinstance(remove_values, list):
@@ -1409,6 +1629,24 @@ def _coerce_modifier_values(value: Any) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 
+class RecordReferenceError(Exception):
+    """Deleting a record would empty a required relation that references it.
+
+    Same condition and message as PocketBase ``deleteRefRecords`` (v0.22.34
+    ``daos/record.go`` l.764-766, v0.40.6 ``core/record_model.go``
+    l.1633-1635); the record API answers 400 like ``apis/record_crud.go``
+    (v0.22.34 l.445-447, v0.40.6 l.593-595).
+    """
+
+    def __init__(self, record_id: str, collection_name: str) -> None:
+        self.record_id = record_id
+        self.collection_name = collection_name
+        super().__init__(
+            "the record cannot be deleted because it is part of a required "
+            f"reference in record {record_id} ({collection_name} collection)"
+        )
+
+
 async def delete_record(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -1416,12 +1654,20 @@ async def delete_record(
     *,
     all_collections: list[CollectionRecord] | None = None,
 ) -> bool:
-    """Delete a record by ID.
+    """Delete a record by ID like PocketBase ``Dao.DeleteRecord``.
 
-    Handles cascade deletes for relation fields when configured.
-    Deletes associated files from disk.
+    The row is deleted first, then every relation that references it is
+    cleaned up (v0.22.34 ``daos/record.go`` l.619-776, v0.40.6
+    ``core/record_model.go`` l.1490-1646): the id is removed from each
+    referencing record, a referencing record is cascade-deleted only when its
+    relation has ``cascadeDelete`` and no id is left, and the delete fails
+    with :class:`RecordReferenceError` when a required relation would become
+    empty.  Reference cleanup needs ``all_collections`` (every caller passes
+    it) and, like PocketBase, must run inside one transaction: callers use
+    ``run_record_storage_transaction``.
 
-    Returns True if a record was deleted, False if not found.
+    Deletes the files captured from the deleted row.  Returns ``True`` if a
+    record was deleted, ``False`` if not found.
     """
     from ppbase.services.file_storage import delete_files
 
@@ -1451,17 +1697,17 @@ async def delete_record(
             elif raw_value:
                 files_to_delete.append(str(raw_value))
 
-    # Handle cascade deletes
-    if all_collections:
-        await _cascade_delete(engine, collection, record_id, all_collections)
-
-    # Delete the record
+    # Delete the record before its references, like PocketBase: an A <-> B
+    # cascade then terminates instead of recursing forever.
     delete_sql = f'DELETE FROM "{table}" WHERE "id" = :id'
     async with engine.begin() as conn:
         await conn.execute(text(delete_sql), {"id": record_id})
 
         # Send PostgreSQL NOTIFY for realtime updates
         await _notify_record_change(conn, collection.name, record_id, "delete")
+
+    if all_collections:
+        await _cascade_record_delete(engine, collection, record_id, all_collections)
 
     # Delete only the references captured from the deleted row. Historical
     # orphans are intentionally left for a janitor rather than risking a
@@ -1479,54 +1725,130 @@ async def delete_record(
     return True
 
 
-async def _cascade_delete(
+def _collection_references(
+    collection: CollectionRecord,
+    all_collections: list[CollectionRecord],
+) -> list[tuple[CollectionRecord, list[FieldDefinition]]]:
+    """Relation fields that point to ``collection``, like PocketBase.
+
+    ``FindCollectionReferences`` (v0.22.34 ``daos/collection.go`` l.85) sorted by
+    collection name as ``cascadeRecordDelete`` does; view collections are
+    skipped.
+    """
+    references: list[tuple[CollectionRecord, list[FieldDefinition]]] = []
+    for other in sorted(all_collections, key=lambda item: str(item.name)):
+        if _collection_type(other) == "view":
+            continue
+        fields = [
+            field
+            for field in _relation_field_definitions(other)
+            if str((field.options or {}).get("collectionId") or "") == str(collection.id)
+        ]
+        if fields:
+            references.append((other, fields))
+    return references
+
+
+async def _cascade_record_delete(
     engine: AsyncEngine,
     collection: CollectionRecord,
     record_id: str,
     all_collections: list[CollectionRecord],
 ) -> None:
-    """Find and delete records in other collections that reference this record
-    with cascadeDelete enabled."""
-    for other_coll in all_collections:
-        schema: list[dict[str, Any]] = other_coll.schema or []
-        for field_raw in schema:
-            if field_raw.get("type") != "relation":
-                continue
-            opts = field_raw.get("options", {})
-            if opts.get("collectionId") != collection.id:
-                continue
-            if not opts.get("cascadeDelete", False):
-                continue
+    """Remove ``record_id`` from every relation that references it.
 
-            field_name = field_raw.get("name", "")
-            if not field_name:
-                continue
-
-            other_table = _table_name(other_coll)
-            max_select = opts.get("maxSelect", 1) or 1
-
-            if max_select > 1:
-                # Array column: find records where array contains this ID
-                find_sql = (
-                    f'SELECT "id" FROM "{other_table}" WHERE :rid = ANY("{field_name}")'
-                )
-            else:
-                # Scalar column
-                find_sql = (
-                    f'SELECT "id" FROM "{other_table}" WHERE "{field_name}" = :rid'
-                )
-
+    Port of PocketBase ``cascadeRecordDelete``/``deleteRefRecords`` (v0.22.34
+    ``daos/record.go`` l.659-776, v0.40.6 ``core/record_model.go``
+    l.1520-1646): the referencing ids are listed first and each record is read
+    again right before it is changed.
+    """
+    for ref_collection, fields in _collection_references(collection, all_collections):
+        ref_table = _table_name(ref_collection)
+        same_collection = str(ref_collection.id) == str(collection.id)
+        for field in fields:
+            multiple = relation_is_multiple(field.options)
+            column = '"' + field.name.replace('"', '""') + '"'
+            condition = f":rid = ANY({column})" if multiple else f"{column} = :rid"
+            find_sql = f'SELECT "id" FROM "{ref_table}" WHERE {condition}'
+            if same_collection:
+                find_sql += ' AND "id" <> :rid'
             async with engine.connect() as conn:
-                result = await conn.execute(text(find_sql), {"rid": record_id})
-                related_ids = [dict(r)["id"] for r in result.mappings().all()]
+                result = await conn.execute(
+                    text(find_sql + ' ORDER BY "id"'),
+                    {"rid": record_id},
+                )
+                ref_ids = [str(value) for value in result.scalars().all()]
 
-            for related_id in related_ids:
-                await delete_record(
+            for ref_id in ref_ids:
+                await _delete_relation_reference(
                     engine,
-                    other_coll,
-                    related_id,
+                    ref_collection,
+                    ref_id,
+                    field,
+                    record_id,
+                    multiple=multiple,
                     all_collections=all_collections,
                 )
+
+
+async def _delete_relation_reference(
+    engine: AsyncEngine,
+    ref_collection: CollectionRecord,
+    ref_id: str,
+    field: FieldDefinition,
+    deleted_id: str,
+    *,
+    multiple: bool,
+    all_collections: list[CollectionRecord],
+) -> None:
+    """``deleteRefRecords`` for one referencing record."""
+    ref_table = _table_name(ref_collection)
+    column = '"' + field.name.replace('"', '""') + '"'
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(f'SELECT {column} FROM "{ref_table}" WHERE "id" = :id'),
+                {"id": ref_id},
+            )
+        ).first()
+    if row is None:
+        return  # already deleted by an earlier cascade
+
+    # GetStringSlice + unset the last occurrence of the deleted id.
+    ids = to_unique_string_list(row[0])
+    for index in range(len(ids) - 1, -1, -1):
+        if ids[index] == deleted_id:
+            del ids[index]
+            break
+
+    if (field.options or {}).get("cascadeDelete") and not ids:
+        await delete_record(
+            engine,
+            ref_collection,
+            ref_id,
+            all_collections=all_collections,
+        )
+        return
+
+    if field.required and not ids:
+        raise RecordReferenceError(ref_id, ref_collection.name)
+
+    # SaveNoValidate: store the prepared value and refresh ``updated``; the
+    # other relations of the record may still reference deleted records.
+    value = prepare_relation_value(ids, multiple=multiple)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                f'UPDATE "{ref_table}" SET {column} = :value, "updated" = :updated '
+                'WHERE "id" = :id'
+            ),
+            {
+                "value": _serialize_for_pg(value, field),
+                "updated": datetime.now(UTC),
+                "id": ref_id,
+            },
+        )
+        await _notify_record_change(conn, ref_collection.name, ref_id, "update")
 
 
 # ---------------------------------------------------------------------------

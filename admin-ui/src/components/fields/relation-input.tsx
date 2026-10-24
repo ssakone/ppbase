@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { RelationPickerDialog } from '@/components/fields/relation-picker-dialog'
 import type { FieldInputProps } from '@/components/record-field-input'
 import { getRelationDisplayValue } from '@/lib/format-cell'
+import { isRelationMultiple } from '@/lib/field-multiplicity'
 import { truncateId } from '@/lib/utils'
 import type { RecordModel } from '@/api/types'
 
@@ -34,9 +35,9 @@ function toExpandedRecords(rawExpand: unknown): RecordModel[] {
 
 export function RelationInput({ field, value, onChange, collections, recordExpand, recordId }: FieldInputProps) {
   const opts = field.options ?? field
-  const maxSelect = opts.maxSelect ?? 1
   const collectionId = opts.collectionId
-  const isMulti = maxSelect > 1
+  // maxSelect: null (PocketBase 0.22) is an unlimited multiple relation.
+  const isMulti = isRelationMultiple(field)
   const isEditing = !!recordId
 
   const targetCollection = collections?.find((c) => c.id === collectionId)

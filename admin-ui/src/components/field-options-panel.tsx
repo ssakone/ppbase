@@ -13,6 +13,11 @@ import {
 import { TagsInput } from '@/components/tags-input'
 import { Button } from '@/components/ui/button'
 import { getLockedFieldOption } from '@/lib/collection-field-behavior'
+import {
+  hasUnlimitedRelationMaxSelect,
+  parseRelationMaxSelectChoice,
+  relationMaxSelectChoice,
+} from '@/lib/field-multiplicity'
 import { toast } from 'sonner'
 
 interface FieldOptionsPanelProps {
@@ -293,13 +298,22 @@ function renderTypeOptions(
             <div className="space-y-1.5">
               <Label className="text-xs">Max select</Label>
               <Select
-                value={String(getOpt<number>('maxSelect') ?? 1)}
-                onValueChange={(v) => setOpt('maxSelect', parseInt(v))}
+                value={relationMaxSelectChoice(field)}
+                onValueChange={(v) => setOpt('maxSelect', parseRelationMaxSelectChoice(v))}
               >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  {hasUnlimitedRelationMaxSelect(field) && (
+                    // PocketBase 0.22 "Multiple" with no max limit: kept as null.
+                    <SelectItem value="null">Multiple (no max limit)</SelectItem>
+                  )}
+                  {!['null', '1', '5', '10', '999'].includes(relationMaxSelectChoice(field)) && (
+                    <SelectItem value={relationMaxSelectChoice(field)}>
+                      Multiple ({relationMaxSelectChoice(field)})
+                    </SelectItem>
+                  )}
                   <SelectItem value="1">Single (1)</SelectItem>
                   <SelectItem value="5">Multiple (5)</SelectItem>
                   <SelectItem value="10">Multiple (10)</SelectItem>
