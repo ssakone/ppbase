@@ -129,6 +129,40 @@ def _prepare_rule_context(
     return auth_ctx, request_context
 
 
+# PocketBase 0.22.34 ``checkForAdminOnlyRuleFields`` (apis/record_helpers.go
+# l.319-345): only admins may use these in the ``filter``/``sort`` of a list
+# request; the list handler checks it first (apis/record_crud.go l.50-53).
+_ADMIN_ONLY_RULE_FIELDS = ("@collection.", "@request.")
+
+
+def _admin_only_rule_fields_error(
+    auth: dict[str, Any] | None,
+    *,
+    filter_value: str | None,
+    sort_value: str | None,
+) -> JSONResponse | None:
+    """403 when a guest or a record uses an admin-only filter/sort field."""
+    if _is_superuser_payload(auth):
+        return None
+    for value in (filter_value, sort_value):
+        if not value:
+            continue
+        for field in _ADMIN_ONLY_RULE_FIELDS:
+            if field in value:
+                return _error_response(403, f"Only admins can filter by {field}")
+    return None
+
+
+def _is_superuser_payload(token_payload: dict[str, Any] | None) -> bool:
+    """The superuser test of ``_prepare_rule_context``."""
+    if not token_payload:
+        return False
+    return token_payload.get("type") == "admin" or (
+        token_payload.get("type") in {"auth", "authRecord"}
+        and token_payload.get("collectionName") == "_superusers"
+    )
+
+
 # Auth collection managed fields during create that require manageRule
 # (or superuser).
 _AUTH_MANAGED_CREATE_FIELDS = frozenset(
@@ -1366,6 +1400,12 @@ async def api_list_records(
     collection = await resolve_collection(engine, collectionIdOrName)
     if collection is None:
         return _error_response(404, "Missing collection context.")
+
+    forbidden = _admin_only_rule_fields_error(
+        auth, filter_value=filter, sort_value=sort
+    )
+    if forbidden is not None:
+        return forbidden
 
     event = RecordRequestEvent(
         app=request.app,
