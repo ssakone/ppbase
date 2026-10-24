@@ -795,6 +795,29 @@ async def validation_scenarios(
         json={"title": "x", "lim": [t1, t2, missing]},
     )
     out["create_too_many_with_orphan"] = _error_shape(response)
+    # @request.data.<relation>:length counts list.ToUniqueStringSlice(value):
+    # '["v1",1]' decodes partially to ["v1", '["v1",1]'] (2 items), so the
+    # update rule passes and the form then reports the unknown second id.
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "pr_vlength",
+            "schema": [
+                text_field("title"),
+                relation_field("rels", targets["id"], None),
+            ],
+            "updateRule": "@request.data.rels:length = 2",
+        },
+    )
+    counted = await _create(
+        client, "pr_vlength", {"title": "len", "rels": [t1]}, headers=admin
+    )
+    response = await client.patch(
+        f"/api/collections/pr_vlength/records/{counted['id']}",
+        json={"rels": json.dumps([t1, 1])},
+    )
+    out["length_of_partially_decoded_json"] = _error_shape(response)
     created = await _create(client, "pr_valid", {"title": "ok", "rels": [t1]})
     await inject("pr_valid", created["id"], "rels", [missing, t1])
     response = await client.patch(

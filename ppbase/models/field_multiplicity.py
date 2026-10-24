@@ -228,12 +228,41 @@ def _go_cast_string(value: Any) -> str:
     return ""
 
 
+def _unmarshal_string_slice(value: str) -> list[str]:
+    """``json.Unmarshal(value, &[]string)`` then PocketBase's fallback.
+
+    Go decodes a JSON array element by element: a string is kept, ``null``
+    leaves ``""`` and any other item leaves ``""`` with a type error.  On any
+    error PocketBase appends the raw string (``tools/list/list.go``
+    l.123-127), so ``'["a",1]'`` gives ``["a", "", '["a",1]']`` before
+    ``NonzeroUniques``.  Invalid JSON or a non-array value gives ``[value]``.
+    """
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return [value]
+    if not isinstance(decoded, list):
+        return [value]
+    items: list[str] = []
+    type_error = False
+    for item in decoded:
+        if isinstance(item, str):
+            items.append(item)
+        else:
+            items.append("")
+            type_error = type_error or item is not None
+    if type_error:
+        items.append(value)
+    return items
+
+
 def to_unique_string_list(value: Any) -> list[str]:
     """Port of PocketBase ``list.ToUniqueStringSlice`` (v0.22.34 l.110-140).
 
     ``None`` -> ``[]``; a string is one element unless it contains ``[`` and
-    decodes as a JSON array of strings; lists are cast element by element.
-    Empty strings and duplicates are dropped, keeping the first occurrence.
+    decodes as a JSON array (Go partial decoding, see
+    ``_unmarshal_string_slice``); lists are cast element by element.  Empty
+    strings and duplicates are dropped, keeping the first occurrence.
     """
     items: list[str]
     if value is None:
@@ -242,16 +271,7 @@ def to_unique_string_list(value: Any) -> list[str]:
         if value == "":
             items = []
         elif "[" in value:
-            try:
-                decoded = json.loads(value)
-            except ValueError:
-                decoded = None
-            if isinstance(decoded, list) and all(
-                isinstance(item, str) or item is None for item in decoded
-            ):
-                items = ["" if item is None else item for item in decoded]
-            else:
-                items = [value]
+            items = _unmarshal_string_slice(value)
         else:
             items = [value]
     elif isinstance(value, (list, tuple)):

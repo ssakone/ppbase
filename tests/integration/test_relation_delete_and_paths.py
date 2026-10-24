@@ -689,6 +689,26 @@ async def test_relation_errors_are_merged_with_the_other_field_errors(
     assert list(response.json()["data"]) == ["lim"]
     assert response.json()["data"]["lim"]["code"] == "validation_max_select_constraint"
 
+    # @request.data.rels:length counts list.ToUniqueStringSlice: the
+    # partially decoded '["t1",1]' has 2 items, so the rule passes (no 404)
+    # and the form reports the unknown second id, like PocketBase 0.22.34.
+    counted = await env.collection(
+        {
+            "name": env.name("vl_length"),
+            "schema": [_text("title"), _relation("rels", targets["id"], None)],
+            "updateRule": "@request.data.rels:length = 2",
+        }
+    )
+    record = await env.create(
+        counted["name"], {"title": "len", "rels": [t1]}, headers=env.admin
+    )
+    response = await env.client.patch(
+        f"/api/collections/{counted['name']}/records/{record['id']}",
+        json={"rels": json.dumps([t1, 1])},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["data"]["rels"]["code"] == "validation_missing_rel_records"
+
     created = await env.create(valid["name"], {"title": "ok", "rels": [t1]})
     collection = await resolve_collection(get_engine(), valid["name"])
     async with get_engine().begin() as conn:

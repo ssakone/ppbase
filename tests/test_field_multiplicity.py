@@ -168,6 +168,15 @@ def test_api_metadata_keeps_explicit_null_max_select() -> None:
         ('["a", null, ""]', ["a"]),
         ("[not json", ["[not json"]),
         ("[1,2]", ["[1,2]"]),
+        # Go json.Unmarshal partial decoding, observed on PocketBase 0.22.34
+        # (stored raw value, then GET): a type error keeps the decoded strings
+        # and appends the raw value; null items are dropped silently.
+        ('["aaaaaaaaaaaaaaa",1]', ["aaaaaaaaaaaaaaa", '["aaaaaaaaaaaaaaa",1]']),
+        ('["aaaaaaaaaaaaaaa",null]', ["aaaaaaaaaaaaaaa"]),
+        ('[["aaaaaaaaaaaaaaa"]]', ['[["aaaaaaaaaaaaaaa"]]']),
+        ('[""]', []),
+        ('["aaaaaaaaaaaaaaa"', ['["aaaaaaaaaaaaaaa"']),
+        ('{"a":"["}', ['{"a":"["}']),
         (["b", "a", "b", "", None], ["b", "a"]),
         ([1, 2.5, 3.0, True, {"x": 1}], ["1", "2.5", "3", "true"]),
         (7, ["7"]),
