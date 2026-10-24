@@ -796,7 +796,14 @@ async def confirm_password_reset(
             }
         }
 
-    new_hash = hash_password(password, cost=get_password_cost(collection))
+    try:
+        new_hash = hash_password(password, cost=get_password_cost(collection))
+    except ValueError:
+        # bcrypt refuses more than 72 bytes, which a password of at most 71
+        # characters can reach.  PocketBase 0.22.34 accepts up to 100 bytes
+        # here (forms/record_password_reset_confirm.go:48), then SetPassword
+        # fails (:92-93): measured, 400 with empty data, never a 500.
+        return False, {}
     new_token_key = generate_token_key()
     updates: dict[str, Any] = {"password_hash": new_hash, "token_key": new_token_key}
     # A reset proves the ownership of the unchanged email: PocketBase marks

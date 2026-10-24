@@ -45,12 +45,27 @@ _EMAIL_MAX_BYTES = 255  # forms/admin_password_reset_request.go:52
 # forms/admin_password_reset_confirm.go:45 and forms/admin_upsert.go:78:
 # validation.Length(10, 72), counted in bytes like every ozzo Length rule.
 _ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX = 10, 72
+_BCRYPT_MAX_BYTES = 72
 
 
 def _admin_password_error(password: str) -> dict[str, str] | None:
     """0.22.34 admin password rule; an empty password is left to ``Required``."""
     if password and not _ADMIN_PASSWORD_MIN <= byte_length(password) <= _ADMIN_PASSWORD_MAX:
         return length_error(_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX)
+    return None
+
+
+def _bcrypt_limit_error(password: str) -> dict[str, Any] | None:
+    """Over 72 bytes bcrypt refuses to hash; answer like a v0.40.6 superuser.
+
+    Only for the PPBase routes without a PocketBase 0.22 counterpart (``init``,
+    ``change-password``): their own rule counts characters, so a password of
+    at most 71 characters can still exceed bcrypt's 72 bytes.  v0.40.6 reports
+    the bcrypt error of a superuser password (``core/field_password.go:170-172``)
+    as ``validation_invalid_value`` (``tools/router/error.go:206-217``).
+    """
+    if byte_length(password) > _BCRYPT_MAX_BYTES:
+        return {"password": {"code": "validation_invalid_value", "message": "Invalid value."}}
     return None
 
 
@@ -152,6 +167,9 @@ async def init_admin(
                 },
             },
         )
+    bcrypt_error = _bcrypt_limit_error(body.password)
+    if bcrypt_error:
+        raise _bad_request("An error occurred while validating the submitted data.", bcrypt_error)
 
     from ppbase.services.admin_service import _admin_to_dict, _get_superusers_collection
     from ppbase.services.auth_service import create_admin_token
@@ -525,6 +543,9 @@ async def change_password(
                 },
             },
         )
+    bcrypt_error = _bcrypt_limit_error(body.password)
+    if bcrypt_error:
+        raise _bad_request("An error occurred while validating the submitted data.", bcrypt_error)
 
     admin = await admin_service.update_admin(
         session, admin_id, {"password": body.password}

@@ -11,11 +11,14 @@ with an empty error (``400``, ``data: {}``).
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
+import jwt as pyjwt
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 
 pytestmark = pytest.mark.asyncio
 
@@ -25,6 +28,13 @@ LENGTH_10_72 = {
     "message": "The length must be between 10 and 72.",
 }
 LONG = "é" * 37  # 37 characters, 74 bytes
+
+
+async def _one(sql: str, **params: Any) -> Any:
+    from ppbase.db.engine import get_engine
+
+    async with get_engine().connect() as conn:
+        return (await conn.execute(text(sql), params)).mappings().first()
 
 
 def _error(response) -> tuple[str, dict[str, Any]]:
@@ -70,5 +80,63 @@ async def test_admin_create_and_update_count_bytes(
     login = await app_client.post(
         "/api/admins/auth-with-password",
         json={"identity": created.json()["email"], "password": "é" * 6},
+    )
+    assert login.status_code == 200, login.text
+
+
+async def test_ppbase_change_password_refuses_more_than_72_bytes(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """PPBase-only route: v0.40.6 reports the bcrypt error as validation_invalid_value."""
+    created = await app_client.post(
+        "/api/admins",
+        headers={"Authorization": admin_token},
+        json={"email": f"change_{uuid.uuid4().hex[:10]}@example.com", "password": "first-pass-123"},
+    )
+    assert created.status_code == 200, created.text
+    resp = await app_client.post(
+        f"/api/admins/{created.json()['id']}/change-password",
+        headers={"Authorization": admin_token},
+        json={"password": LONG, "passwordConfirm": LONG},
+    )
+    assert resp.status_code == 400, resp.text
+    assert _error(resp) == (
+        "An error occurred while validating the submitted data.",
+        {"password": {"code": "validation_invalid_value", "message": "Invalid value."}},
+    )
+
+
+async def test_record_reset_over_72_bytes_is_a_400(app_client: AsyncClient) -> None:
+    password = "securepass123"
+    email = f"reset_{uuid.uuid4().hex[:10]}@example.com"
+    made = await app_client.post(
+        "/api/collections/users/records",
+        json={"email": email, "password": password, "passwordConfirm": password},
+    )
+    assert made.status_code == 200, made.text
+    collection = await _one("SELECT id, options FROM _collections WHERE name = 'users'")
+    for long_password in (LONG, "é" * 50):
+        record = await _one("SELECT token_key FROM users WHERE id = :id", id=made.json()["id"])
+        token = pyjwt.encode(
+            {
+                "exp": int(time.time()) + 600,
+                "id": made.json()["id"],
+                "type": "authRecord",
+                "collectionId": collection["id"],
+                "email": email,
+            },
+            record["token_key"] + collection["options"]["passwordResetToken"]["secret"],
+            algorithm="HS256",
+        )
+        resp = await app_client.post(
+            "/api/collections/users/confirm-password-reset",
+            json={"token": token, "password": long_password, "passwordConfirm": long_password},
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["data"] == {}
+    # Nothing changed: the old password still signs in.
+    login = await app_client.post(
+        "/api/collections/users/auth-with-password",
+        json={"identity": email, "password": password},
     )
     assert login.status_code == 200, login.text
