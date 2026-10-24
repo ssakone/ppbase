@@ -760,6 +760,73 @@ def _filter_needs_relation_index(filter_expression: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+async def auth_email_visible_ids(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    rows: list[dict[str, Any]],
+    request_context: dict[str, Any] | None,
+) -> set[str]:
+    """Auth rows whose email the requester sees despite ``emailVisibility``.
+
+    ``autoIgnoreAuthRecordsEmailVisibility`` of the listed/viewed records
+    (v0.22.34 apis/record_helpers.go l.153-158, l.216-279, also v0.40.6
+    ``autoResolveRecordsFlags``): every record for an admin and the records
+    matched by the collection ``manageRule`` with the request context
+    (hidden fields allowed).  The requester's own record and visible emails
+    are handled by :func:`build_record_response`.  A ``manageRule`` that
+    fails to evaluate shows no extra email (0.22.34 then also skips the
+    expand of the main records, which PPBase does not reproduce).
+    """
+    from ppbase.services.expand_service import is_admin_auth
+
+    candidates = [
+        str(row.get("id", ""))
+        for row in rows
+        if row.get("id") and not bool(row.get("email_visibility", False))
+    ]
+    if not candidates or not isinstance(request_context, dict):
+        return set()
+    if is_admin_auth(request_context.get("auth")):
+        return set(candidates)
+    options = collection.options if isinstance(collection.options, dict) else {}
+    manage_rule = options.get("manageRule")
+    if manage_rule is None or str(manage_rule) == "":
+        return set()
+
+    table = _table_name(collection)
+    try:
+        relation_resolver, collection_resolver = await _build_filter_resolvers(
+            engine, collection, str(manage_rule)
+        )
+        where_sql, params = parse_filter(
+            str(manage_rule),
+            request_context,
+            relation_resolver,
+            collection_resolver,
+            table,
+            allow_hidden=True,
+        )
+        params["_email_visible_ids"] = candidates
+        sql = (
+            f'SELECT "{table}"."id" AS "id" FROM "{table}" '
+            f'WHERE "{table}"."id" = ANY(CAST(:_email_visible_ids AS text[])) '
+            f"AND ({where_sql})"
+        )
+        async with engine.connect() as conn:
+            if conn.in_transaction():
+                async with conn.begin_nested():
+                    result = await conn.execute(text(sql), params)
+                    found = result.mappings().all()
+            else:
+                found = (await conn.execute(text(sql), params)).mappings().all()
+    except Exception as exc:  # noqa: BLE001 - only the extra emails are lost
+        logger.debug(
+            "manageRule email visibility of %s not applied: %s", collection.name, exc
+        )
+        return set()
+    return {str(row["id"]) for row in found}
+
+
 async def list_records(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -905,6 +972,11 @@ async def list_records(
         raw_auth = request_context.get("auth")
         if isinstance(raw_auth, dict):
             auth_payload = raw_auth
+    email_visible: set[str] = set()
+    if _is_auth and apply_email_visibility:
+        email_visible = await auth_email_visible_ids(
+            engine, collection, rows, request_context
+        )
     items = [
         build_record_response(
             row,
@@ -916,7 +988,9 @@ async def list_records(
             is_auth_collection=_is_auth,
             is_view_collection=_is_view,
             request_auth=auth_payload,
-            apply_email_visibility=apply_email_visibility,
+            apply_email_visibility=(
+                apply_email_visibility and str(row.get("id", "")) not in email_visible
+            ),
         )
         for row in rows
     ]
@@ -970,6 +1044,10 @@ async def get_record(
         raw_auth = request_context.get("auth")
         if isinstance(raw_auth, dict):
             auth_payload = raw_auth
+    if _is_auth and apply_email_visibility:
+        apply_email_visibility = not await auth_email_visible_ids(
+            engine, collection, [row_dict], request_context
+        )
     return build_record_response(
         row_dict,
         collection.id,

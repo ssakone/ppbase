@@ -40,6 +40,7 @@ from ppbase.services.filter_parser import FilterFieldError
 from ppbase.services.record_service import (
     RecordReferenceError,
     _ValidationErrors,
+    auth_email_visible_ids,
     check_record_rule,
     create_record,
     delete_record,
@@ -428,6 +429,39 @@ def _update_validation_error(
         ),
         "form",
     )
+
+
+async def _main_auth_record_email(
+    engine: Any,
+    collection: Any,
+    record: dict[str, Any],
+    auth: dict[str, Any] | None,
+    request_context: dict[str, Any],
+) -> dict[str, Any]:
+    """The email visibility of a created/updated auth record response.
+
+    PocketBase enriches the create and update responses like a view
+    (v0.22.34 apis/record_crud.go l.289, l.381 -> EnrichRecord ->
+    autoIgnoreAuthRecordsEmailVisibility, apis/record_helpers.go
+    l.216-279): a hidden email is shown only to an admin, the record's
+    owner or a ``manageRule`` match.
+    """
+    if (getattr(collection, "type", "base") or "base") != "auth":
+        return record
+    record_id = str(record.get("id", "") or "")
+    if "email" not in record or bool(record.get("emailVisibility", False)):
+        return record
+    if _is_superuser_payload(auth) or _is_self_auth_target(auth, collection, record_id):
+        return record
+    visible = await auth_email_visible_ids(
+        engine,
+        collection,
+        [{"id": record_id, "email_visibility": False}],
+        request_context,
+    )
+    if record_id in visible:
+        return record
+    return {key: value for key, value in record.items() if key != "email"}
 
 
 async def _relation_errors_before_hooks(
@@ -1639,6 +1673,9 @@ async def api_create_record(
                     )
                 )
 
+        record = await _main_auth_record_email(
+            active_engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             all_colls = await get_all_collections(active_engine)
             records = await expand_records(
@@ -1904,6 +1941,9 @@ async def api_update_record(
         if record is None:
             return _error_response(404, "The requested resource wasn't found.")
 
+        record = await _main_auth_record_email(
+            active_engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             all_colls = await get_all_collections(active_engine)
             records = await expand_records(

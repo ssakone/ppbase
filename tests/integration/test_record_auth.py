@@ -67,7 +67,10 @@ class TestRegistration:
         assert resp.status_code == 200, resp.text
         data = resp.json()
 
-        assert data["email"] == "alice@example.com"
+        # PocketBase enriches the create response like a view: a guest does
+        # not see the hidden email of the new record (v0.22.34
+        # apis/record_crud.go l.289, apis/record_helpers.go l.216-279).
+        assert "email" not in data
         assert data["verified"] is False
         assert "emailVisibility" in data
         assert data["emailVisibility"] is False
@@ -1246,7 +1249,8 @@ class TestEndToEndFlows:
         )
         assert reg_resp.status_code == 200
         user = reg_resp.json()
-        assert user["email"] == email
+        # Hidden email of the new record, as in PocketBase's create response.
+        assert "email" not in user
 
         # Login
         login_resp = await app_client.post(
@@ -1652,7 +1656,9 @@ class TestEmailValidation:
             },
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["email"] == email
+        # The guest's create response hides the email (emailVisibility false).
+        assert "email" not in resp.json()
+        assert resp.json()["emailVisibility"] is False
 
 
 # =========================================================================

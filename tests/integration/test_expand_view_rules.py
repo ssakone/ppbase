@@ -55,6 +55,17 @@ CUSTOMER_RULE = (
     "public = true || (@request.auth.id != '' && readers.id ?= @request.auth.id)"
 )
 MANAGE_RULE = "managers.id ?= @request.auth.id"
+AUTH_OPTIONS = {
+    "allowEmailAuth": True,
+    "allowOAuth2Auth": False,
+    "allowUsernameAuth": True,
+    "exceptEmailDomains": None,
+    "manageRule": None,
+    "minPasswordLength": 8,
+    "onlyEmailDomains": None,
+    "onlyVerified": False,
+    "requireEmail": False,
+}
 # The exact buma_customer rule; BUMA flattens role.permission.* into the
 # request auth context (app/auth/context.py).
 BUMA_CUSTOMER_RULE = (
@@ -705,3 +716,124 @@ async def test_pb_enrich_helpers_apply_the_view_rule(
     assert _names(reader["expand"]["customer"]) == "c2"
     # Expanded as the authenticated record, not as the (guest) requester.
     assert _names(login["record"]["expand"]["customer"]) == "c2"
+
+
+# ---------------------------------------------------------------------------
+# Main auth records: manageRule email visibility (EnrichRecords)
+# ---------------------------------------------------------------------------
+
+
+async def test_listed_and_viewed_auth_emails_follow_the_manage_rule(
+    app_client: AsyncClient, env: dict[str, Any]
+) -> None:
+    """``autoIgnoreAuthRecordsEmailVisibility`` of the main records.
+
+    v0.22.34 apis/record_helpers.go l.153-158 and l.216-279, probe group
+    ``expand.main_auth_list``: an admin sees every email, the owner its own,
+    a ``manageRule`` match the managed ones (plain is managed by manager).
+    """
+    names, ids = env["names"], env["ids"]
+    url = f"/api/collections/{names['u']}/records"
+    expected = {
+        "admin": {"manager", "reader", "visible", "plain"},
+        "manager": {"manager", "visible", "plain"},
+        "reader": {"reader", "visible"},
+        "plain": {"visible", "plain"},
+        # The 0.22.34 pitfall: "managers.id ?= ''" matches a guest for the
+        # users without managers (NULL compares equal to '').
+        "guest": {"manager", "reader", "visible"},
+    }
+    for caller, keys in expected.items():
+        response = await app_client.get(
+            url,
+            headers=_headers(env, caller),
+            params={"fields": "id,email", "perPage": "50"},
+        )
+        assert response.status_code == 200, response.text
+        shown = {item["id"] for item in response.json()["items"] if "email" in item}
+        assert shown == {ids[key] for key in keys}, caller
+        view = await app_client.get(
+            f"{url}/{ids['plain']}", headers=_headers(env, caller)
+        )
+        assert view.status_code == 200, view.text
+        assert ("email" in view.json()) is ("plain" in keys), caller
+
+
+async def test_create_and_update_responses_hide_unmanaged_emails(
+    app_client: AsyncClient, admin_token: str, env: dict[str, Any]
+) -> None:
+    """EnrichRecord of the create/update responses (record_crud.go l.289, l.381)."""
+    sfx = uuid.uuid4().hex[:8]
+    name = f"xm_{sfx}"
+    collection = await _collection(
+        app_client,
+        admin_token,
+        {
+            "name": name,
+            "type": "auth",
+            "schema": [],
+            "deleteRule": None,
+            "options": AUTH_OPTIONS,
+        },
+    )
+    try:
+        response = await app_client.patch(
+            f"/api/collections/{collection['id']}",
+            headers={"Authorization": admin_token},
+            json={
+                "schema": [_relation("managers", collection["id"], None)],
+                "options": {**AUTH_OPTIONS, "manageRule": MANAGE_RULE},
+            },
+        )
+        assert response.status_code == 200, response.text
+        ids: dict[str, str] = {}
+        tokens: dict[str, str | None] = {"guest": None, "admin": admin_token}
+        for key in ("boss", "member", "other"):
+            ids[key] = await _create(
+                app_client,
+                admin_token,
+                name,
+                {
+                    "email": f"{key}-{sfx}@example.invalid",
+                    "emailVisibility": False,
+                    "password": PASSWORD,
+                    "passwordConfirm": PASSWORD,
+                    **({"managers": [ids["boss"]]} if key == "member" else {}),
+                },
+            )
+            tokens[key] = await _login(app_client, name, f"{key}-{sfx}@example.invalid")
+        expected = {
+            "guest": False,
+            "other": False,
+            "boss": True,
+            "member": True,
+            "admin": True,
+        }
+        for caller, shown in expected.items():
+            token = tokens[caller]
+            response = await app_client.patch(
+                f"/api/collections/{name}/records/{ids['member']}",
+                headers={"Authorization": token} if token else {},
+                json={},
+            )
+            assert response.status_code == 200, response.text
+            assert ("email" in response.json()) is shown, caller
+
+        # Create: "other" is not the new record's owner nor its manager.
+        response = await app_client.post(
+            f"/api/collections/{name}/records",
+            headers={"Authorization": tokens["other"]},
+            json={
+                "email": f"new-{sfx}@example.invalid",
+                "password": PASSWORD,
+                "passwordConfirm": PASSWORD,
+                "managers": [ids["boss"]],
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert "email" not in response.json()
+    finally:
+        await app_client.delete(
+            f"/api/collections/{collection['id']}",
+            headers={"Authorization": admin_token},
+        )
