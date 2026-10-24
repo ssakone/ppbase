@@ -229,10 +229,16 @@ class TestCollectionSecrets:
         before = _secrets(await _stored_options(name))
         headers = {"Authorization": admin_token}
         served = (await app_client.get(f"/api/collections/{name}", headers=headers)).json()
+        # What an export carries: no token secret, providers without clientSecret.
+        exported = copy.deepcopy(served)
+        for option in TOKEN_OPTIONS:
+            exported["options"].get(option, {}).pop("secret", None)
+        for provider in exported["options"]["oauth2"]["providers"]:
+            provider.pop("clientSecret", None)
         resp = await app_client.put(
             "/api/collections/import",
             headers=headers,
-            json={"collections": [served], "deleteMissing": False},
+            json={"collections": [exported], "deleteMissing": False},
         )
         assert resp.status_code == 204, resp.text
         assert _secrets(await _stored_options(name)) == before
