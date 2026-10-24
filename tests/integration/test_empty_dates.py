@@ -116,7 +116,9 @@ async def dates_env(app_client: AsyncClient, admin_token: str) -> Any:
     tn, dn = targets["name"], dates["name"]
     t_empty = (await _create(app_client, tn, {"name": "t_empty", "td": ""}))["id"]
     t_full = (
-        await _create(app_client, tn, {"name": "t_full", "td": "2024-03-01 10:00:00.000Z"})
+        await _create(
+            app_client, tn, {"name": "t_full", "td": "2024-03-01 10:00:00.000Z"}
+        )
     )["id"]
     rows = (
         ("a", {"d": "", "e": "", "other": t_empty}),
@@ -466,7 +468,14 @@ async def test_view_records_match_pocketbase(
     assert response.status_code == 200, response.text
     items = response.json()["items"]
     # No created/updated column: PocketBase omits both keys for a view.
-    assert sorted(items[0]) == ["collectionId", "collectionName", "d", "id", "td", "title"]
+    assert sorted(items[0]) == [
+        "collectionId",
+        "collectionName",
+        "d",
+        "id",
+        "td",
+        "title",
+    ]
     assert {item["title"]: [item["d"], item["td"]] for item in items} == {
         "a": ["", ""],
         "b": ["", "2024-03-01 10:00:00.000Z"],
@@ -476,7 +485,9 @@ async def test_view_records_match_pocketbase(
         "f": ["2025-01-01 12:00:00.123Z", ""],
         "g": ["", ""],
     }
-    one = (await app_client.get(f"/api/collections/{view}/records/{items[0]['id']}")).json()
+    one = (
+        await app_client.get(f"/api/collections/{view}/records/{items[0]['id']}")
+    ).json()
     assert "created" not in one and "updated" not in one
     created_items = (
         await app_client.get(

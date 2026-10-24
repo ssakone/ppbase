@@ -152,7 +152,7 @@ def test_date_comparisons_treat_null_as_the_empty_text(
 def test_date_like_uses_the_pocketbase_text_of_the_date() -> None:
     sql, params = _sql('d !~ "2024"')
     assert sql == (
-        "COALESCE(to_char(\"t\".\"d\" AT TIME ZONE 'UTC', "
+        'COALESCE(to_char("t"."d" AT TIME ZONE \'UTC\', '
         "'YYYY-MM-DD HH24:MI:SS.MS\"Z\"'), '')::text NOT ILIKE :_fp2"
     )
     assert params["_fp2"] == "%2024%"
