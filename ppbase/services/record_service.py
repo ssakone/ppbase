@@ -21,6 +21,7 @@ from ppbase.core.id_generator import generate_id
 from ppbase.core.storage_safety import StorageSafetyError, validate_record_id
 from ppbase.db.system_tables import CollectionRecord
 from ppbase.models.field_multiplicity import (
+    prepare_relation_value,
     relation_is_multiple,
     relation_max_select,
     select_or_file_is_multiple,
@@ -391,6 +392,84 @@ async def _relation_target_errors(
         if int(total) != len(ids):
             errors[field_def.name] = dict(_MISSING_REL_RECORDS_ERROR)
     return errors
+
+
+def _relation_field_definitions(collection: Any) -> list[FieldDefinition]:
+    """Return the relation fields of a collection (nested or flat schema)."""
+    raw_schema = getattr(collection, "schema", None)
+    if not isinstance(raw_schema, list):
+        return []
+    fields: list[FieldDefinition] = []
+    for definition in raw_schema:
+        if not isinstance(definition, dict):
+            continue
+        normalized = _normalize_field(definition)
+        if normalized.get("type") != "relation":
+            continue
+        fields.append(FieldDefinition(**normalized))
+    return fields
+
+
+def has_relation_fields(collection: Any) -> bool:
+    """Return whether a collection defines at least one relation field."""
+    return bool(_relation_field_definitions(collection))
+
+
+async def relation_target_errors(
+    engine: AsyncEngine,
+    collection: Any,
+    data: dict[str, Any],
+    *,
+    record_id: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Validate relation ids like PocketBase's record form, before hooks run.
+
+    PocketBase validates the submitted form (current record values merged
+    with the request data and its modifiers) before triggering the
+    ``OnRecordBefore*Request`` hooks (v0.22.34 ``apis/record_crud.go`` and
+    ``forms/record_upsert.go`` ``Validate``/``Submit``).  Values a hook writes
+    afterwards are saved without this check.  On update every relation of the
+    record is checked, changed or not.  Returns ``{}`` when the record does
+    not exist (the caller answers 404).
+    """
+    fields = _relation_field_definitions(collection)
+    if not fields or not isinstance(data, dict):
+        return {}
+
+    current: dict[str, Any] = {}
+    if record_id is not None:
+        columns = ", ".join('"' + f.name.replace('"', '""') + '"' for f in fields)
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        f'SELECT {columns} FROM "{_table_name(collection)}" '
+                        'WHERE "id" = :id LIMIT 1'
+                    ),
+                    {"id": record_id},
+                )
+            ).mappings().first()
+        if row is None:
+            return {}
+        current = dict(row)
+
+    values: dict[str, Any] = {}
+    for field in fields:
+        value = current.get(field.name)
+        for key, raw in data.items():
+            if key == field.name:
+                value = raw
+            elif key == f"{field.name}+":
+                value = _apply_append(value, raw, field)
+            elif key == f"+{field.name}":
+                value = _apply_prepend(value, raw, field)
+            elif key == f"{field.name}-":
+                value = _apply_remove(value, raw, field)
+        values[field.name] = prepare_relation_value(
+            value,
+            multiple=relation_is_multiple(field.options),
+        )
+    return await _relation_target_errors(engine, fields, values, skip=set())
 
 
 def _relation_index_signature(
@@ -768,17 +847,15 @@ async def create_record(
     collection: CollectionRecord,
     data: dict[str, Any],
     files: dict[str, list[tuple[str, bytes]]] | None = None,
-    *,
-    validate_relations: bool = False,
 ) -> dict[str, Any]:
     """Create a new record in the collection.
 
     Validates all fields, generates an ID, and sets timestamps.
     Handles file uploads if files dict is provided.
 
-    ``validate_relations`` additionally requires every referenced relation
-    record to exist, like PocketBase's record API form.  Internal callers
-    (the equivalent of PocketBase ``dao.SaveRecord``) leave it disabled.
+    Relation targets are not looked up here, like PocketBase
+    ``dao.SaveRecord``; the record API checks them first with
+    :func:`relation_target_errors`.
 
     For auth collections, handles password hashing, token_key generation,
     and auth system column defaults.
@@ -973,16 +1050,6 @@ async def create_record(
                     "code": exc.code,
                     "message": exc.message,
                 }
-
-        if validate_relations:
-            errors.update(
-                await _relation_target_errors(
-                    engine,
-                    schema_fields,
-                    columns,
-                    skip=set(errors),
-                )
-            )
     except BaseException:
         _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         raise
@@ -1066,18 +1133,12 @@ async def update_record(
     record_id: str,
     data: dict[str, Any],
     files: dict[str, list[tuple[str, bytes]]] | None = None,
-    *,
-    validate_relations: bool = False,
 ) -> dict[str, Any] | None:
     """Update an existing record.
 
     Supports ``field+`` (append) and ``field-`` (remove) modifiers for
     multi-value fields (select, relation, file).
     Handles file uploads if files dict is provided.
-
-    ``validate_relations`` requires every relation id of the resulting record
-    (changed or not) to exist, like PocketBase's record API form, which
-    validates the whole record data on update.
 
     Returns the updated record dict, or None if not found.
     """
@@ -1354,20 +1415,6 @@ async def update_record(
                     "code": exc.code,
                     "message": exc.message,
                 }
-
-        if validate_relations:
-            final_values = {
-                name: updates[name] if name in updates else raw_row.get(name)
-                for name in field_map
-            }
-            errors.update(
-                await _relation_target_errors(
-                    engine,
-                    schema_fields,
-                    final_values,
-                    skip=set(errors),
-                )
-            )
     except BaseException:
         _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         raise

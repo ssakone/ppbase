@@ -114,7 +114,12 @@ def test_non_multi_value_types_are_never_multiple() -> None:
 def test_field_options_merges_flat_and_nested_like_the_collection_model() -> None:
     nested = {"name": "rels", "type": "relation", "options": {"maxSelect": None}}
     flat = {"name": "rels", "type": "relation", "maxSelect": None, "collectionId": "x"}
-    both = {"name": "rels", "type": "relation", "maxSelect": 1, "options": {"maxSelect": None}}
+    both = {
+        "name": "rels",
+        "type": "relation",
+        "maxSelect": 1,
+        "options": {"maxSelect": None},
+    }
     assert field_options(nested) == {"maxSelect": None}
     assert field_options(flat) == {"maxSelect": None, "collectionId": "x"}
     assert field_options(both) == {"maxSelect": None}  # nested options win
@@ -222,7 +227,10 @@ def test_validate_relation_keeps_long_orphan_element() -> None:
 def test_relation_modifiers_follow_pocketbase_list_semantics() -> None:
     field = _relation(None)
     assert _apply_append(["a"], ["b", "a"], field) == ["a", "b", "a"]
-    assert validate_field_value(field, _apply_append(["a"], ["b", "a"], field)) == ["a", "b"]
+    assert validate_field_value(field, _apply_append(["a"], ["b", "a"], field)) == [
+        "a",
+        "b",
+    ]
     assert _apply_append("a", '["b","c"]', field) == ["a", "b", "c"]
     assert _apply_prepend(["a"], "c", field) == ["c", "a"]
     assert _apply_remove(["a", "b"], '["a"]', field) == ["b"]
@@ -235,10 +243,10 @@ def test_relation_modifiers_follow_pocketbase_list_semantics() -> None:
 
 
 def test_relation_columns_are_unbounded_text_like_pocketbase() -> None:
-    assert _col_ddl(_relation(None)) == '"rels" TEXT[] NOT NULL DEFAULT \'{}\''
-    assert _col_ddl(_relation(5)) == '"rels" TEXT[] NOT NULL DEFAULT \'{}\''
+    assert _col_ddl(_relation(None)) == "\"rels\" TEXT[] NOT NULL DEFAULT '{}'"
+    assert _col_ddl(_relation(5)) == "\"rels\" TEXT[] NOT NULL DEFAULT '{}'"
     for options in (1, 0, _ABSENT):
-        assert _col_ddl(_relation(options)) == '"rels" TEXT NOT NULL DEFAULT \'\''
+        assert _col_ddl(_relation(options)) == "\"rels\" TEXT NOT NULL DEFAULT ''"
 
 
 def test_select_and_file_columns_are_unchanged() -> None:
@@ -246,8 +254,8 @@ def test_select_and_file_columns_are_unchanged() -> None:
         name="s", type=FieldType.SELECT, options={"maxSelect": None, "values": ["a"]}
     )
     file_many = FieldDefinition(name="f", type=FieldType.FILE, options={"maxSelect": 3})
-    assert _col_ddl(select_null) == '"s" TEXT NOT NULL DEFAULT \'\''
-    assert _col_ddl(file_many) == '"f" TEXT[] NOT NULL DEFAULT \'{}\''
+    assert _col_ddl(select_null) == "\"s\" TEXT NOT NULL DEFAULT ''"
+    assert _col_ddl(file_many) == "\"f\" TEXT[] NOT NULL DEFAULT '{}'"
 
 
 def test_array_detection_and_managed_indexes_follow_the_rule() -> None:
@@ -285,10 +293,16 @@ def test_canonical_backup_specs_match_the_new_ddl_and_accept_legacy_shapes() -> 
 
     legacy_multi = _legacy_relation_column_spec(_relation(5), "character varying(15)[]")
     legacy_single = _legacy_relation_column_spec(_relation(1), "character varying(15)")
-    assert legacy_multi is not None and legacy_multi.default == "'{}'::character varying[]"
-    assert legacy_single is not None and legacy_single.default == "''::character varying"
+    assert (
+        legacy_multi is not None and legacy_multi.default == "'{}'::character varying[]"
+    )
+    assert (
+        legacy_single is not None and legacy_single.default == "''::character varying"
+    )
     # A scalar legacy column is not a valid shape for a multiple relation.
-    assert _legacy_relation_column_spec(_relation(None), "character varying(15)") is None
+    assert (
+        _legacy_relation_column_spec(_relation(None), "character varying(15)") is None
+    )
     assert _legacy_relation_column_spec(_relation(None), "text[]") is None
 
     spec = build_collection_table_spec(
@@ -320,13 +334,23 @@ class _Collection:
 
 
 def _collections():
-    targets = _Collection("target_coll_id1", "targets", [{"name": "name", "type": "text"}])
+    targets = _Collection(
+        "target_coll_id1", "targets", [{"name": "name", "type": "text"}]
+    )
     owners = _Collection(
         "owner_coll_id01",
         "owners",
         [
-            {"name": "rels", "type": "relation", "options": {"collectionId": "target_coll_id1", "maxSelect": None}},
-            {"name": "one", "type": "relation", "options": {"collectionId": "target_coll_id1", "maxSelect": 1}},
+            {
+                "name": "rels",
+                "type": "relation",
+                "options": {"collectionId": "target_coll_id1", "maxSelect": None},
+            },
+            {
+                "name": "one",
+                "type": "relation",
+                "options": {"collectionId": "target_coll_id1", "maxSelect": 1},
+            },
         ],
     )
     return targets, owners
@@ -336,7 +360,10 @@ def test_relation_targets_report_unlimited_as_the_pocketbase_upgrade_value() -> 
     targets, owners = _collections()
     by_id = {c.id: c for c in (targets, owners)}
     by_name = {c.name: c for c in (targets, owners)}
-    result = {name: limit for name, _target, limit in _relation_targets(owners, by_id, by_name)}
+    result = {
+        name: limit
+        for name, _target, limit in _relation_targets(owners, by_id, by_name)
+    }
     assert result == {"rels": 2147483647, "one": 1}
 
 
@@ -370,11 +397,15 @@ def test_filter_traversal_joins_null_max_select_relation_as_array() -> None:
 def test_direct_multi_value_comparisons_use_pocketbase_json_text() -> None:
     index = _build_relation_index_from_collections(list(_collections()))
     for expression in ('rels = "x"', 'rels ?= "x"', 'rels ~ "x"', 'rels ?!~ "x"'):
-        sql, _params = parse_filter(expression, relation_resolver=index, current_table="owners")
+        sql, _params = parse_filter(
+            expression, relation_resolver=index, current_table="owners"
+        )
         assert 'array_to_json("owners"."rels")::text' in sql, expression
         assert "jsonb_array_elements_text" not in sql, expression
     # Single relations keep their plain column.
-    sql, _params = parse_filter('one = "x"', relation_resolver=index, current_table="owners")
+    sql, _params = parse_filter(
+        'one = "x"', relation_resolver=index, current_table="owners"
+    )
     assert "array_to_json" not in sql
 
 
@@ -404,5 +435,7 @@ def test_list_request_value_any_match_unnests_a_text_array() -> None:
 
 def test_direct_multi_value_ordering_operators_compare_json_text() -> None:
     index = _build_relation_index_from_collections(list(_collections()))
-    sql, _params = parse_filter('rels ?> "a"', relation_resolver=index, current_table="owners")
+    sql, _params = parse_filter(
+        'rels ?> "a"', relation_resolver=index, current_table="owners"
+    )
     assert sql.startswith('array_to_json("owners"."rels")::text > :')

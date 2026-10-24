@@ -16,10 +16,15 @@ from typing import Any
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from ppbase.db.engine import get_engine
 from ppbase.db.schema_manager import reconcile_multi_value_columns
-from ppbase.services.realtime_service import SubscriptionManager, broadcast_record_change
+from ppbase.ext.registry import HOOK_RECORD_CREATE_REQUEST, ExtensionRegistry
+from ppbase.services.realtime_service import (
+    SubscriptionManager,
+    broadcast_record_change,
+)
 from ppbase.services.record_service import (
     create_record,
     get_record,
@@ -276,7 +281,9 @@ async def test_internal_writes_keep_orphans_and_long_elements_unchanged(
     assert len(joined) == 31
 
     # A string written by internal code becomes a one-element list.
-    updated = await update_record(engine, owners, record["id"], {"rels": relation_env["t1"]})
+    updated = await update_record(
+        engine, owners, record["id"], {"rels": relation_env["t1"]}
+    )
     assert updated is not None and updated["rels"] == [relation_env["t1"]]
     # A list written to a single relation keeps the last id.
     updated = await update_record(
@@ -392,7 +399,9 @@ async def test_expand_returns_lists_in_field_order(
 ) -> None:
     t1, t2 = relation_env["t1"], relation_env["t2"]
     missing = "missing" + relation_env["suffix"]
-    await _create(app_client, relation_env, {"title": "two", "rels": [t2, t1], "one": t2})
+    await _create(
+        app_client, relation_env, {"title": "two", "rels": [t2, t1], "one": t2}
+    )
     engine = get_engine()
     owners = await resolve_collection(engine, relation_env["owners"]["name"])
     await create_record(engine, owners, {"title": "zorphan", "rels": [missing, t1]})
@@ -450,14 +459,19 @@ async def test_collection_update_without_change_keeps_type_and_values(
     )
     before = await _list(app_client, relation_env)
     # Once with the nested 0.22 schema, once with the flat fields the dashboard sends back.
-    for body in ({"schema": current.json()["schema"]}, {"schema": current.json()["fields"]}):
+    for body in (
+        {"schema": current.json()["schema"]},
+        {"schema": current.json()["fields"]},
+    ):
         response = await app_client.patch(
             f"/api/collections/{owners['id']}",
             headers={"Authorization": admin_token},
             json=body,
         )
         assert response.status_code == 200, response.text
-        options = {field["name"]: field for field in response.json()["schema"]}["rels"]["options"]
+        options = {field["name"]: field for field in response.json()["schema"]}["rels"][
+            "options"
+        ]
         assert options["maxSelect"] is None
         assert (await _column_types(owners["name"]))["rels"][0] == "text[]"
         assert await _list(app_client, relation_env) == before
@@ -488,7 +502,9 @@ async def test_multiplicity_changes_convert_values_like_pocketbase(
     )
     assert response.status_code == 200, response.text
     assert (await _column_types(owners["name"]))["rels"] == ("text", "''::text")
-    assert (await _index_methods(owners["name"]))[f"idx_{owners['name']}_rels"] == "btree"
+    assert (await _index_methods(owners["name"]))[
+        f"idx_{owners['name']}_rels"
+    ] == "btree"
     # multiple -> single keeps the last element (PocketBase json_extract '$[#-1]').
     assert [(i["title"], i["rels"]) for i in await _list(app_client, relation_env)] == [
         ("a", t2),
@@ -524,10 +540,25 @@ async def test_current_format_relations_are_unchanged(
         {
             "name": f"rel_flat_{relation_env['suffix']}",
             "fields": [
-                {"name": "zero", "type": "relation", "collectionId": target_id, "maxSelect": 0},
-                {"name": "one", "type": "relation", "collectionId": target_id, "maxSelect": 1},
+                {
+                    "name": "zero",
+                    "type": "relation",
+                    "collectionId": target_id,
+                    "maxSelect": 0,
+                },
+                {
+                    "name": "one",
+                    "type": "relation",
+                    "collectionId": target_id,
+                    "maxSelect": 1,
+                },
                 {"name": "absent", "type": "relation", "collectionId": target_id},
-                {"name": "two", "type": "relation", "collectionId": target_id, "maxSelect": 2},
+                {
+                    "name": "two",
+                    "type": "relation",
+                    "collectionId": target_id,
+                    "maxSelect": 2,
+                },
             ],
         },
     )
@@ -544,13 +575,20 @@ async def test_current_format_relations_are_unchanged(
         )
         assert response.status_code == 200, response.text
         body = response.json()
-        assert (body["zero"], body["one"], body["absent"], body["two"]) == (t2, t1, t2, [t1, t2])
+        assert (body["zero"], body["one"], body["absent"], body["two"]) == (
+            t2,
+            t1,
+            t2,
+            [t1, t2],
+        )
         too_many = await app_client.post(
             f"/api/collections/{flat['name']}/records",
             json={"two": [t1, t2, t3]},
         )
         assert too_many.status_code == 400
-        assert too_many.json()["data"]["two"]["code"] == "validation_max_select_constraint"
+        assert (
+            too_many.json()["data"]["two"]["code"] == "validation_max_select_constraint"
+        )
     finally:
         await app_client.delete(
             f"/api/collections/{flat['id']}", headers={"Authorization": admin_token}
@@ -596,7 +634,9 @@ async def test_legacy_varchar_relation_columns_keep_working(
                     )
                 )
                 await conn.execute(
-                    text(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" SET DEFAULT {default}')
+                    text(
+                        f'ALTER TABLE "{table}" ALTER COLUMN "{column}" SET DEFAULT {default}'
+                    )
                 )
         columns = await _column_types(table)
         assert columns["rels"][0] == "character varying(15)[]"
@@ -636,21 +676,32 @@ async def test_legacy_varchar_relation_columns_keep_working(
         }
         for expression, titles in expected.items():
             response = await app_client.get(
-                path, params={"filter": expression, "sort": "title", "expand": "rels,one"}
+                path,
+                params={"filter": expression, "sort": "title", "expand": "rels,one"},
             )
             assert response.status_code == 200, (expression, response.text)
-            assert [item["title"] for item in response.json()["items"]] == titles, expression
+            assert [item["title"] for item in response.json()["items"]] == titles, (
+                expression
+            )
 
-        listed = await app_client.get(path, params={"sort": "title", "expand": "rels,one"})
+        listed = await app_client.get(
+            path, params={"sort": "title", "expand": "rels,one"}
+        )
         item = listed.json()["items"][0]
-        assert [record["name"] for record in item["expand"]["rels"]] == ["beta", "alpha", "gamma"]
+        assert [record["name"] for record in item["expand"]["rels"]] == [
+            "beta",
+            "alpha",
+            "gamma",
+        ]
         assert item["expand"]["one"]["name"] == "gamma"
 
         # A 31-character orphan does not fit the legacy column: it is refused
         # by PostgreSQL rather than silently truncated.
         joined = f"{t1},{t2}"
-        with pytest.raises(Exception):
-            await update_record(get_engine(), collection, first.json()["id"], {"rels": [joined]})
+        with pytest.raises(DBAPIError):
+            await update_record(
+                get_engine(), collection, first.json()["id"], {"rels": [joined]}
+            )
         unchanged = await get_record(get_engine(), collection, first.json()["id"])
         assert unchanged is not None and unchanged["rels"] == [t2, t1, t3]
     finally:
@@ -671,7 +722,10 @@ async def test_reconcile_converts_a_pre_rule_scalar_relation_column(
         admin_token,
         {
             "name": f"rel_scalar_{relation_env['suffix']}",
-            "schema": [{"name": "title", "type": "text"}, _relation("rels", target_id, 1)],
+            "schema": [
+                {"name": "title", "type": "text"},
+                _relation("rels", target_id, 1),
+            ],
         },
     )
     table = created["name"]
@@ -680,7 +734,9 @@ async def test_reconcile_converts_a_pre_rule_scalar_relation_column(
     try:
         async with engine.begin() as conn:
             await conn.execute(text(f'DROP INDEX IF EXISTS "idx_{table}_rels"'))
-            await conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "rels" DROP DEFAULT'))
+            await conn.execute(
+                text(f'ALTER TABLE "{table}" ALTER COLUMN "rels" DROP DEFAULT')
+            )
             await conn.execute(
                 text(f'ALTER TABLE "{table}" ALTER COLUMN "rels" TYPE VARCHAR(15)')
             )
@@ -693,9 +749,15 @@ async def test_reconcile_converts_a_pre_rule_scalar_relation_column(
                     "WHERE \"rels\" != ''"
                 )
             )
-            for rid, value in (("aaaaaaaaaaaaaa1", ""), ("aaaaaaaaaaaaaa2", t1), ("aaaaaaaaaaaaaa3", "[]")):
+            for rid, value in (
+                ("aaaaaaaaaaaaaa1", ""),
+                ("aaaaaaaaaaaaaa2", t1),
+                ("aaaaaaaaaaaaaa3", "[]"),
+            ):
                 await conn.execute(
-                    text(f'INSERT INTO "{table}" (id, title, rels) VALUES (:id, :title, :v)'),
+                    text(
+                        f'INSERT INTO "{table}" (id, title, rels) VALUES (:id, :title, :v)'
+                    ),
                     {"id": rid, "title": rid, "v": value},
                 )
             # The pre-rule metadata already said maxSelect: null (PocketBase 0.22 export).
@@ -704,7 +766,9 @@ async def test_reconcile_converts_a_pre_rule_scalar_relation_column(
                 _relation("rels", target_id, None),
             ]
             await conn.execute(
-                text('UPDATE "_collections" SET schema = CAST(:s AS jsonb) WHERE id = :id'),
+                text(
+                    'UPDATE "_collections" SET schema = CAST(:s AS jsonb) WHERE id = :id'
+                ),
                 {"s": json.dumps(schema), "id": created["id"]},
             )
         collection = await resolve_collection(engine, table)
@@ -734,7 +798,9 @@ async def test_reconcile_converts_a_pre_rule_scalar_relation_column(
         # Replay is a no-op.
         assert await reconcile_multi_value_columns(engine, collection) == []
         with pytest.raises(ValueError):
-            await reconcile_multi_value_columns(engine, collection, field_names=["nope"])
+            await reconcile_multi_value_columns(
+                engine, collection, field_names=["nope"]
+            )
     finally:
         await app_client.delete(
             f"/api/collections/{created['id']}", headers={"Authorization": admin_token}
@@ -796,7 +862,12 @@ async def test_buma_wallet_manager_rules_match_pocketbase(
             },
         )
         ids = {}
-        for name, managers in (("w1", ["u1"]), ("w2", ["u2", "u1"]), ("w3", []), ("w4", ["u3"])):
+        for name, managers in (
+            ("w1", ["u1"]),
+            ("w2", ["u2", "u1"]),
+            ("w3", []),
+            ("w4", ["u3"]),
+        ):
             response = await app_client.post(
                 f"/api/collections/{wallets['name']}/records",
                 headers={"Authorization": admin_token},
@@ -807,7 +878,10 @@ async def test_buma_wallet_manager_rules_match_pocketbase(
         engine = get_engine()
         collection = await resolve_collection(engine, wallets["name"])
         await update_record(
-            engine, collection, ids["w4"], {"managers": [f"{users['u1']},{users['u3']}"]}
+            engine,
+            collection,
+            ids["w4"],
+            {"managers": [f"{users['u1']},{users['u3']}"]},
         )
 
         expected_lists = {"u1": ["w1", "w2", "w4"], "u2": ["w2"], "u3": ["w4"]}
@@ -815,7 +889,10 @@ async def test_buma_wallet_manager_rules_match_pocketbase(
             token = (
                 await app_client.post(
                     f"/api/collections/{auth_name}/auth-with-password",
-                    json={"identity": f"{label}-{suffix}@example.invalid", "password": "ws-a-Password-123"},
+                    json={
+                        "identity": f"{label}-{suffix}@example.invalid",
+                        "password": "ws-a-Password-123",
+                    },
                 )
             ).json()["token"]
             listed = await app_client.get(
@@ -834,8 +911,146 @@ async def test_buma_wallet_manager_rules_match_pocketbase(
     finally:
         if wallets is not None:
             await app_client.delete(
-                f"/api/collections/{wallets['id']}", headers={"Authorization": admin_token}
+                f"/api/collections/{wallets['id']}",
+                headers={"Authorization": admin_token},
             )
         await app_client.delete(
-            f"/api/collections/{auth.json()['id']}", headers={"Authorization": admin_token}
+            f"/api/collections/{auth.json()['id']}",
+            headers={"Authorization": admin_token},
         )
+
+
+async def test_hook_values_skip_the_relation_check_like_pocketbase(
+    app_client: AsyncClient,
+    relation_env: dict,
+) -> None:
+    """PocketBase validates the submitted form before request hooks run.
+
+    A value written by an ``OnRecordBeforeCreateRequest`` hook (BUMA sets
+    ``author`` this way) is saved without a target lookup, while an orphan
+    sent by the client is refused before any hook runs.
+    """
+    owners = relation_env["owners"]["name"]
+    orphan = "orphan" + relation_env["suffix"] + "0"
+    app = app_client._transport.app
+    previous_registry = getattr(app.state, "extension_registry", None)
+    registry = previous_registry or ExtensionRegistry()
+    app.state.extension_registry = registry
+    hook = registry.hooks.get(HOOK_RECORD_CREATE_REQUEST)
+    seen: list[dict] = []
+
+    async def write_orphan(event):
+        if getattr(event.collection, "name", "") == owners:
+            seen.append(dict(event.data))
+            event.data["rels"] = [orphan]
+        return await event.next()
+
+    hook_id = hook.bind_func(write_orphan)
+    try:
+        accepted = await app_client.post(
+            f"/api/collections/{owners}/records",
+            json={"title": "hooked", "rels": [relation_env["t1"]]},
+        )
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["rels"] == [orphan]
+
+        refused = await app_client.post(
+            f"/api/collections/{owners}/records",
+            json={"title": "client", "rels": [orphan]},
+        )
+        assert refused.status_code == 400, refused.text
+        assert (
+            refused.json()["data"]["rels"]["code"] == "validation_missing_rel_records"
+        )
+        assert len(seen) == 1  # the hook did not run for the refused request
+    finally:
+        hook.unbind(hook_id)
+        app.state.extension_registry = previous_registry
+
+
+async def test_access_errors_come_before_relation_validation(
+    app_client: AsyncClient,
+    admin_token: str,
+    relation_env: dict,
+) -> None:
+    """403 for superuser-only rules and 404 for hidden records come first."""
+    target_id = relation_env["targets"]["id"]
+    suffix = relation_env["suffix"]
+    orphan = "orphan" + suffix + "0"
+    locked = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"rel_locked_{suffix}",
+            "schema": [
+                {"name": "title", "type": "text"},
+                _relation("rels", target_id, None),
+            ],
+            "listRule": None,
+            "viewRule": None,
+            "createRule": None,
+            "updateRule": "title = 'open'",
+            "deleteRule": None,
+        },
+    )
+    try:
+        response = await app_client.post(
+            f"/api/collections/{locked['name']}/records", json={"rels": [orphan]}
+        )
+        assert response.status_code == 403, response.text
+
+        hidden = await app_client.post(
+            f"/api/collections/{locked['name']}/records",
+            headers={"Authorization": admin_token},
+            json={"title": "closed"},
+        )
+        assert hidden.status_code == 200, hidden.text
+        response = await app_client.patch(
+            f"/api/collections/{locked['name']}/records/{hidden.json()['id']}",
+            json={"rels": [orphan]},
+        )
+        assert response.status_code == 404, response.text
+
+        opened = await app_client.patch(
+            f"/api/collections/{locked['name']}/records/{hidden.json()['id']}",
+            headers={"Authorization": admin_token},
+            json={"title": "open"},
+        )
+        assert opened.status_code == 200, opened.text
+        response = await app_client.patch(
+            f"/api/collections/{locked['name']}/records/{hidden.json()['id']}",
+            json={"rels": [orphan]},
+        )
+        assert response.status_code == 400, response.text
+        assert (
+            response.json()["data"]["rels"]["code"] == "validation_missing_rel_records"
+        )
+    finally:
+        await app_client.delete(
+            f"/api/collections/{locked['id']}", headers={"Authorization": admin_token}
+        )
+
+
+async def test_batch_writes_check_relation_targets(
+    app_client: AsyncClient,
+    admin_token: str,
+    relation_env: dict,
+) -> None:
+    owners = relation_env["owners"]["name"]
+    orphan = "orphan" + relation_env["suffix"] + "0"
+    response = await app_client.post(
+        "/api/batch",
+        headers={"Authorization": admin_token},
+        json={
+            "requests": [
+                {
+                    "method": "POST",
+                    "url": f"/api/collections/{owners}/records",
+                    "body": {"title": "batch", "rels": [orphan]},
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    failure = response.json()["data"]["requests"]["0"]["response"]
+    assert failure["data"]["rels"]["code"] == "validation_missing_rel_records"
