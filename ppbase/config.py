@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8090
     dev: bool = False
+    # PocketBase 0.22 error compatibility ("" = PPBase, "0.22" = the
+    # {code, message, data} envelope and 0.22.34 messages); host apps can
+    # also call pb.set_error_compat("0.22"). See docs/error-compat.md.
+    error_compat: str = ""
 
     # ---- Storage ----
     data_dir: str = "./pb_data"

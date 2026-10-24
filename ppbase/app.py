@@ -354,6 +354,11 @@ def create_app(
     app.state.extension_routes_mounted = 0
     app.state.rate_limit_settings_version = 0
     app.state.backup_maintenance = False
+    from ppbase.middleware.error_compat import normalize_error_compat
+
+    app.state.error_compat = normalize_error_compat(
+        getattr(settings, "error_compat", "")
+    )
 
     @app.middleware("http")
     async def _backup_restore_maintenance(request: Request, call_next):
@@ -571,5 +576,11 @@ def create_app(
             },
             status_code=400,
         )
+
+    # Outermost: PocketBase 0.22 error envelope/messages when the app enables
+    # it (app.state.error_compat); a pass-through otherwise.
+    from ppbase.middleware.error_compat import ErrorCompatMiddleware
+
+    app.add_middleware(ErrorCompatMiddleware)
 
     return app

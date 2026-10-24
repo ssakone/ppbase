@@ -574,6 +574,37 @@ class FlaskLikePB:
         self.settings = Settings(**self._settings_kwargs)  # type: ignore[arg-type]
         return self
 
+    def set_error_compat(self, mode: str | None) -> FlaskLikePB:
+        """Select the error compatibility mode of the app.
+
+        ``"0.22"`` makes every PPBase JSON error answer exactly like
+        PocketBase 0.22.34 (``{"code", "message", "data"}`` and the 0.22.34
+        messages, see ``docs/error-compat.md``); ``""``/``None`` restores
+        PPBase's own envelope (the default). Callable before the app is built
+        and from a hooks ``register(pb)`` function at startup. Equivalent to
+        ``PPBASE_ERROR_COMPAT``.
+        """
+        from ppbase.middleware.error_compat import (
+            normalize_error_compat,
+            set_error_compat,
+        )
+
+        normalized = normalize_error_compat(mode)
+        self._settings_kwargs["error_compat"] = normalized
+        self.settings.error_compat = normalized
+        if self._app is not None:
+            set_error_compat(self._app, normalized)
+        return self
+
+    @property
+    def error_compat(self) -> str:
+        """The active error compatibility mode (``""`` or ``"0.22"``)."""
+        if self._app is not None:
+            from ppbase.middleware.error_compat import get_error_compat
+
+            return get_error_compat(self._app)
+        return str(getattr(self.settings, "error_compat", "") or "")
+
     def get_app(self):
         """Build and return the FastAPI app instance."""
         if self._app is None:
