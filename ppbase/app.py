@@ -423,6 +423,11 @@ def create_app(
     app.add_middleware(RateLimitMiddleware)
     app.add_middleware(RequestLoggerMiddleware)
 
+    # Outermost: PocketBase 0.22's error key ``code`` next to ``status``.
+    from ppbase.middleware.error_envelope import ErrorEnvelopeCodeMiddleware
+
+    app.add_middleware(ErrorEnvelopeCodeMiddleware)
+
     # API routes
     from ppbase.api.router import (
         api_router,

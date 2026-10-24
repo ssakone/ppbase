@@ -287,6 +287,7 @@ async def test_restore_maintenance_uses_pocketbase_error_shape() -> None:
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "5"
     assert response.json() == {
+        "code": 503,
         "status": 503,
         "message": (
             "PPBase is temporarily read-only while a destructive backup "
