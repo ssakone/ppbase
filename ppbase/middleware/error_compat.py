@@ -23,6 +23,14 @@ response (status >= 400): a body that is exactly a PPBase envelope becomes
 api_error.go l.67-75).  Any other JSON body, for example a host route that
 already answers ``{"code", ...}`` or a custom ``{"message"}``, is left as is.
 Status codes are never changed.
+
+The body alone does not always tell which 0.22.34 error a response stands
+for (an admin's and a user's record create validation errors, or two route
+guards, share a PPBase body but not a 0.22.34 message).  The handler that
+knows it then tags its error response with :func:`mark_error` (or a guard
+raises with :func:`error_kind_headers`): a private ``x-ppbase-error-kind``
+header naming one of :func:`error_kinds`, set only while the mode is on and
+always removed by the middleware.  A tagged error skips the message table.
 """
 
 from __future__ import annotations
@@ -54,6 +62,89 @@ _DEFAULT_MESSAGES = {
     403: "You are not allowed to perform this request.",
     404: "The requested resource wasn't found.",
 }
+
+#: Private response header naming the PocketBase 0.22.34 error a handler
+#: reproduces (a key of ``_ERROR_KINDS``).  Only set while the 0.22 mode is
+#: on, and always stripped by :class:`ErrorCompatMiddleware`.
+ERROR_KIND_HEADER = "x-ppbase-error-kind"
+_ERROR_KIND_HEADER_BYTES = ERROR_KIND_HEADER.encode("latin-1")
+
+
+@dataclass(frozen=True)
+class _ErrorKind:
+    """A 0.22.34 error that the response body alone does not identify."""
+
+    #: ``""``: the default message of the status (``NewXxxError("", err)``).
+    message: str = ""
+    #: ``True``: 0.22.34 passes a non-validation error, so ``data`` is ``{}``.
+    clear_data: bool = False
+    source: str = ""
+
+
+_ERROR_KINDS: dict[str, _ErrorKind] = {
+    "form": _ErrorKind(
+        source="apis/base.go l.75-80: a form validation error returned "
+        "unwrapped becomes NewBadRequestError('', err) with its fields as data "
+        "(record update, any caller: apis/record_crud.go l.372 form.Submit -> "
+        "forms/record_upsert.go l.744-747; record create by an admin: "
+        "record_crud.go l.280, the createRule DrySubmit l.215-261 being "
+        "skipped; admin auth-with-password: apis/admin.go l.92, "
+        "forms/admin_login.go l.53-56)"
+    ),
+    "create_rule_failed": _ErrorKind(
+        "Failed to create record.",
+        clear_data=True,
+        source="apis/record_crud.go l.250-261: a createRule that does not match "
+        "fails the DrySubmit lookup (l.251-253), a plain error wrapped as "
+        "NewBadRequestError('Failed to create record.', testErr): no "
+        "validation data (apis/api_error.go l.77-90)",
+    ),
+    "query": _ErrorKind(
+        clear_data=True,
+        source="apis/record_crud.go l.83-86: a search provider parse error "
+        "(filter, sort, page, perPage, skipTotal) is NewBadRequestError('', "
+        "err); err is not a validation error, so safeErrorsData gives {} "
+        "(apis/api_error.go l.77-90)",
+    ),
+    "guest_only": _ErrorKind(
+        "The request can be accessed only by guests.",
+        source="apis/middlewares.go l.37 (RequireGuestOnly)",
+    ),
+    "record_auth_required": _ErrorKind(
+        "The request requires valid record authorization token to be set.",
+        source="apis/middlewares.go l.77 (RequireRecordAuth), "
+        "l.99 (RequireSameContextRecordAuth)",
+    ),
+    "record_collection_forbidden": _ErrorKind(
+        "The authorized record model is not allowed to perform this action.",
+        source="apis/middlewares.go l.82 (RequireRecordAuth), "
+        "l.169 (RequireAdminOrRecordAuth)",
+    ),
+    "admin_auth_required": _ErrorKind(
+        "The request requires valid admin authorization token to be set.",
+        source="apis/middlewares.go l.119 (RequireAdminAuth), "
+        "l.147 (RequireAdminAuthOnlyIfAny)",
+    ),
+    "admin_or_record_auth_required": _ErrorKind(
+        "The request requires admin or record authorization token to be set.",
+        source="apis/middlewares.go l.165 (RequireAdminOrRecordAuth), "
+        "l.193 (RequireAdminOrOwnerAuth)",
+    ),
+    "owner_forbidden": _ErrorKind(
+        "You are not allowed to perform this request.",
+        source="apis/middlewares.go l.204 (RequireAdminOrOwnerAuth)",
+    ),
+}
+
+# forms/validators/record_data.go l.21 and l.79-83: every required schema
+# field of a record form fails with this error.
+_RECORD_REQUIRED = "Missing required value."
+
+# ozzo-validation ``validation.Required`` ("cannot be blank", sentenized by
+# resolveSafeErrorItem, apis/api_error.go l.117-130), the 0.22.34 form
+# counterpart of pydantic's missing-field message.
+_PYDANTIC_MISSING = "Field required"
+_OZZO_REQUIRED = "Cannot be blank."
 
 
 def normalize_error_compat(mode: Any) -> str:
@@ -87,6 +178,43 @@ def get_error_compat(app: Any) -> str:
     return str(getattr(state, "error_compat", "") or "")
 
 
+def error_kinds() -> dict[str, _ErrorKind]:
+    """The error kinds a handler can tag (for documentation and tests)."""
+    return dict(_ERROR_KINDS)
+
+
+def _checked_kind(kind: str) -> str:
+    if kind not in _ERROR_KINDS:
+        raise ValueError(f"Unknown error compatibility kind {kind!r}.")
+    return kind
+
+
+def error_kind_headers(app: Any, kind: str) -> dict[str, str] | None:
+    """Headers tagging an error with ``kind`` when the 0.22 mode is on.
+
+    For errors raised as ``HTTPException(..., headers=...)``; ``None`` (no
+    header at all) while the mode is off, so PPBase's own responses are
+    unchanged.
+    """
+    _checked_kind(kind)
+    if get_error_compat(app) != POCKETBASE_022:
+        return None
+    return {ERROR_KIND_HEADER: kind}
+
+
+def mark_error(request: Any, response: Any, kind: str) -> Any:
+    """Tag an error response with the 0.22.34 error it reproduces.
+
+    A no-op while the mode is off.  ``request`` is the Starlette request (or
+    anything with an ``app``); returns ``response`` for chaining.
+    """
+    _checked_kind(kind)
+    app = getattr(request, "app", None)
+    if app is not None and get_error_compat(app) == POCKETBASE_022:
+        response.headers[ERROR_KIND_HEADER] = kind
+    return response
+
+
 def sentenize(message: str) -> str:
     """PocketBase ``inflector.Sentenize`` + ``TrimSpace`` (v0.22.34)."""
     text = message.strip()
@@ -113,6 +241,10 @@ class _MessageRule:
     data: dict[str, Any] | None = None
     # Apply only when the PPBase data is exactly {field: {"code": code}}.
     data_codes: dict[str, str] | None = None
+    # Apply only when this predicate accepts the PPBase data.
+    data_match: Callable[[Any], bool] | None = None
+    # The 0.22.34 data, computed from the PPBase data.
+    data_transform: Callable[[Any], Any] | None = None
     source: str = ""
 
     def apply(
@@ -125,6 +257,8 @@ class _MessageRule:
         if self.path is not None and not self.path.match(path):
             return None
         if self.data_codes is not None and _data_codes(data) != self.data_codes:
+            return None
+        if self.data_match is not None and not self.data_match(data):
             return None
         if self.pattern is not None:
             match = self.pattern.match(message)
@@ -143,10 +277,47 @@ def _data_codes(data: Any) -> dict[str, str] | None:
     return codes
 
 
+def _is_required_fields_data(data: Any) -> bool:
+    """PPBase's password-login form errors: ``{field: {} | required}``."""
+    if not isinstance(data, dict) or not data:
+        return False
+    failing = 0
+    for value in data.values():
+        if value == {}:
+            continue
+        if not isinstance(value, dict) or value.get("code") != "validation_required":
+            return False
+        failing += 1
+    return failing > 0
+
+
+def _failing_fields(data: Any) -> dict[str, Any]:
+    """Only the failing fields, like ozzo ``ValidateStruct``."""
+    return {key: value for key, value in data.items() if value != {}}
+
+
+def _ozzo_required_messages(data: Any) -> Any:
+    """Pydantic's missing-field text in ozzo ``Required`` words."""
+    if not isinstance(data, dict):
+        return data
+    result: dict[str, Any] = {}
+    for key, value in data.items():
+        if (
+            isinstance(value, dict)
+            and value.get("code") == "validation_required"
+            and value.get("message") == _PYDANTIC_MISSING
+        ):
+            value = {**value, "message": _OZZO_REQUIRED}
+        result[key] = value
+    return result
+
+
 _COLLECTION_ROUTE = re.compile(r"^/api/collections/[^/]+/")
-_RECORD_LIST_ROUTE = re.compile(r"^/api/collections/[^/]+/records/?$")
 _PASSWORD_AUTH_ROUTE = re.compile(
     r"^/api/(?:collections/[^/]+|admins)/auth-with-password/?$"
+)
+_RECORD_PASSWORD_AUTH_ROUTE = re.compile(
+    r"^/api/collections/[^/]+/auth-with-password/?$"
 )
 _RECORD_WRITE_ROUTE = re.compile(r"^/api/collections/[^/]+/records(?:/[^/]+)?/?$")
 _AUTH_FORM_ROUTE = re.compile(
@@ -256,21 +427,26 @@ _MESSAGE_RULES: tuple[_MessageRule, ...] = (
     ),
     _MessageRule(
         400,
-        pattern=re.compile(
-            r"^(Failed to (?:create|update) record\.) Validation failed for: .*$"
-        ),
-        replacement=r"\1",
+        pattern=re.compile(r"^Failed to update record\. Validation failed for: .*$"),
+        replacement="Something went wrong while processing your request.",
         path=_RECORD_WRITE_ROUTE,
-        source="apis/record_crud.go l.286 (create), l.378 (update): no field list",
+        methods=frozenset({"PATCH"}),
+        source="apis/record_crud.go l.372 form.Submit: an update validation "
+        "error is returned unwrapped for every caller (forms/record_upsert.go "
+        "l.744-747; only a persistence error is 'Failed to update record.', "
+        "l.377-379) and becomes NewBadRequestError('', err) in apis/base.go "
+        "l.75-80",
     ),
     _MessageRule(
         400,
-        pattern=re.compile(r"^(?!Query string is too large)(?s:.*)$"),
-        replacement="Something went wrong while processing your request.",
-        path=_RECORD_LIST_ROUTE,
-        methods=frozenset({"GET"}),
-        source="apis/record_crud.go l.82-86: a filter/sort parse error is "
-        "NewBadRequestError('', err), without the parser text",
+        pattern=re.compile(r"^Failed to create record\. Validation failed for: .*$"),
+        replacement="Failed to create record.",
+        path=_RECORD_WRITE_ROUTE,
+        methods=frozenset({"POST"}),
+        source="apis/record_crud.go l.250-261: the createRule DrySubmit of a "
+        "non-admin validates the form first (forms/record_upsert.go l.702) and "
+        "wraps the error, without a field list (an admin's create validation "
+        "error is tagged 'form' by the handler: l.280, apis/base.go l.75-80)",
     ),
     _MessageRule(
         404,
@@ -298,6 +474,20 @@ _MESSAGE_RULES: tuple[_MessageRule, ...] = (
     _MessageRule(
         400,
         messages=("Failed to authenticate.",),
+        replacement="Something went wrong while processing your request.",
+        path=_RECORD_PASSWORD_AUTH_ROUTE,
+        methods=frozenset({"POST"}),
+        data_match=_is_required_fields_data,
+        data_transform=_failing_fields,
+        source="apis/record_auth.go l.311 form.Submit: a missing identity or "
+        "password fails forms/record_password_login.go l.43-46 before the "
+        "'Failed to authenticate.' interceptor (l.56-57, record_auth.go "
+        "l.316-317), so it is NewBadRequestError('', err) (apis/base.go "
+        "l.75-80) with only the failing fields",
+    ),
+    _MessageRule(
+        400,
+        messages=("Failed to authenticate.",),
         replacement="Failed to authenticate.",
         path=_PASSWORD_AUTH_ROUTE,
         data={},
@@ -312,6 +502,44 @@ _MESSAGE_RULES: tuple[_MessageRule, ...] = (
 def message_rules() -> tuple[_MessageRule, ...]:
     """The translation table (for documentation and tests)."""
     return _MESSAGE_RULES
+
+
+def compat_record_errors(
+    request: Any, collection: Any, errors: dict[str, Any]
+) -> dict[str, Any]:
+    """The 0.22.34 ``data`` of a record form error (unchanged while off).
+
+    PocketBase 0.22.34 reports every missing required *schema* field as
+    "Missing required value." (``validation_required``,
+    forms/validators/record_data.go l.21, l.79-83); auth system fields
+    (``email``, ``password``, ...) keep ozzo's "Cannot be blank."
+    (forms/record_upsert.go l.472-563).  PPBase words both "Cannot be
+    blank." (bool: "Must be true.").  Only the handler knows the schema, so
+    it passes the collection.
+    """
+    app = getattr(request, "app", None)
+    if app is None or get_error_compat(app) != POCKETBASE_022:
+        return errors
+    if not isinstance(errors, dict):
+        return errors
+    schema = getattr(collection, "schema", None) or []
+    fields = {
+        str(field.get("name", ""))
+        for field in schema
+        if isinstance(field, dict) and not field.get("system", False)
+    }
+    if str(getattr(collection, "type", "") or "") == "auth":
+        fields -= {"email", "emailVisibility", "verified", "username", "password"}
+    result: dict[str, Any] = {}
+    for key, value in errors.items():
+        if (
+            key in fields
+            and isinstance(value, dict)
+            and value.get("code") == "validation_required"
+        ):
+            value = {**value, "message": _RECORD_REQUIRED}
+        result[key] = value
+    return result
 
 
 def _ppbase_error(body: Any) -> tuple[str, Any] | None:
@@ -344,19 +572,30 @@ def pocketbase_022_error(
     *,
     method: str = "GET",
     path: str = "/",
+    kind: str | None = None,
 ) -> dict[str, Any] | None:
-    """The PocketBase 0.22.34 error body of a PPBase error body, else ``None``."""
+    """The PocketBase 0.22.34 error body of a PPBase error body, else ``None``.
+
+    ``kind`` is the tag of :func:`mark_error`; an unknown tag is ignored.
+    """
     parsed = _ppbase_error(body)
     if parsed is None:
         return None
     message, data = parsed
-    for rule in _MESSAGE_RULES:
-        replacement = rule.apply(status, message, method.upper(), path, data)
-        if replacement is not None:
-            message = replacement
-            if rule.data is not None:
-                data = json.loads(json.dumps(rule.data))
-            break
+    spec = _ERROR_KINDS.get(kind) if kind else None
+    if spec is not None:
+        message = spec.message
+        data = {} if spec.clear_data else _ozzo_required_messages(data)
+    else:
+        for rule in _MESSAGE_RULES:
+            replacement = rule.apply(status, message, method.upper(), path, data)
+            if replacement is not None:
+                message = replacement
+                if rule.data is not None:
+                    data = json.loads(json.dumps(rule.data))
+                elif rule.data_transform is not None:
+                    data = rule.data_transform(data)
+                break
     message = sentenize(message) or _DEFAULT_MESSAGES.get(status, "")
     # safeErrorsData: always a JSON object (api_error.go l.77-90).
     return {
@@ -391,21 +630,31 @@ class ErrorCompatMiddleware:
         method = str(scope.get("method", "GET")).upper()
         path = str(scope.get("path", "/"))
         start: Message | None = None
+        error_kind: str | None = None
         chunks: list[bytes] = []
 
         async def wrapped_send(message: Message) -> None:
-            nonlocal start
-            kind = message.get("type")
-            if kind == "http.response.start":
+            nonlocal start, error_kind
+            message_type = message.get("type")
+            if message_type == "http.response.start":
                 status = int(message.get("status", 200))
                 headers = list(message.get("headers", []))
+                marker = _header(headers, _ERROR_KIND_HEADER_BYTES)
+                if marker is not None:
+                    error_kind = marker.decode("latin-1")
+                    headers = [
+                        (key, value)
+                        for key, value in headers
+                        if key.lower() != _ERROR_KIND_HEADER_BYTES
+                    ]
+                    message = {**message, "headers": headers}
                 content_type = (_header(headers, b"content-type") or b"").lower()
                 if status >= 400 and content_type.startswith(b"application/json"):
                     start = message
                     return
                 await send(message)
                 return
-            if kind == "http.response.body" and start is not None:
+            if message_type == "http.response.body" and start is not None:
                 chunks.append(message.get("body", b"") or b"")
                 if message.get("more_body", False):
                     return
@@ -419,7 +668,9 @@ class ErrorCompatMiddleware:
                 decoded = json.loads(raw.decode("utf-8")) if raw else None
             except (UnicodeDecodeError, ValueError):
                 decoded = None
-            rewritten = pocketbase_022_error(status, decoded, method=method, path=path)
+            rewritten = pocketbase_022_error(
+                status, decoded, method=method, path=path, kind=error_kind
+            )
             if rewritten is None:
                 await send(start_message)
                 await send(

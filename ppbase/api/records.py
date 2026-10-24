@@ -34,6 +34,7 @@ from ppbase.ext.registry import (
     HOOK_RECORD_VIEW_REQUEST,
     get_extension_registry,
 )
+from ppbase.middleware.error_compat import compat_record_errors, mark_error
 from ppbase.services.expand_service import expand_records
 from ppbase.services.filter_parser import FilterFieldError
 from ppbase.services.record_service import (
@@ -383,6 +384,50 @@ def _validation_message(base: str, errors: dict[str, Any]) -> str:
         field_names = ", ".join(errors.keys())
         return f"{base} Validation failed for: {field_names}."
     return base
+
+
+def _create_validation_error(
+    request: Request,
+    auth: dict[str, Any] | None,
+    collection: Any,
+    errors: dict[str, Any],
+) -> JSONResponse:
+    """A record create form validation error.
+
+    PocketBase 0.22.34 validates a non-admin create in the createRule
+    ``DrySubmit`` and wraps its error as "Failed to create record."
+    (apis/record_crud.go l.250-261), but returns an admin's form error
+    unwrapped (l.280, apis/base.go l.75-80): the 0.22 error mode needs the
+    difference, which the body does not carry.
+    """
+    response = _error_response(
+        400,
+        _validation_message("Failed to create record.", errors),
+        compat_record_errors(request, collection, errors),
+    )
+    if _is_superuser_payload(auth):
+        mark_error(request, response, "form")
+    return response
+
+
+def _update_validation_error(
+    request: Request, collection: Any, errors: dict[str, Any]
+) -> JSONResponse:
+    """A record update form validation error.
+
+    PocketBase 0.22.34 returns it unwrapped for every caller
+    (apis/record_crud.go l.372, forms/record_upsert.go l.744-747; only a
+    persistence error is "Failed to update record.", l.377-379).
+    """
+    return mark_error(
+        request,
+        _error_response(
+            400,
+            _validation_message("Failed to update record.", errors),
+            compat_record_errors(request, collection, errors),
+        ),
+        "form",
+    )
 
 
 async def _relation_errors_before_hooks(
@@ -1463,9 +1508,12 @@ async def api_list_records(
         except FilterFieldError:
             # PocketBase wraps an unresolved filter/sort field in an opaque
             # 400 (NewBadRequestError("", err), record_crud.go l.82-84).
-            return _error_response(400, _FILTER_FIELD_ERROR_MESSAGE)
+            return mark_error(
+                request, _error_response(400, _FILTER_FIELD_ERROR_MESSAGE), "query"
+            )
         except ValueError as exc:
-            return _error_response(400, str(exc))
+            # Same 0.22.34 error for a filter/sort parse error (l.83-86).
+            return mark_error(request, _error_response(400, str(exc)), "query")
 
         if e.expand and result["items"]:
             all_colls = await get_all_collections(e.engine or engine)
@@ -1542,11 +1590,7 @@ async def api_create_record(
                 active_engine, collection, payload, files=payload_files
             )
         except _ValidationErrors as exc:
-            return _error_response(
-                400,
-                _validation_message("Failed to create record.", exc.errors),
-                exc.errors,
-            )
+            return _create_validation_error(request, e.auth, collection, exc.errors)
         except Exception:
             import logging
 
@@ -1563,15 +1607,19 @@ async def api_create_record(
             )
             if not matches:
                 raise _AbortWithResponse(
-                    _error_response(
-                        400,
-                        "Failed to create record.",
-                        {
-                            "rule": {
-                                "code": "validation_rule_failed",
-                                "message": "Action not allowed.",
-                            }
-                        },
+                    mark_error(
+                        request,
+                        _error_response(
+                            400,
+                            "Failed to create record.",
+                            {
+                                "rule": {
+                                    "code": "validation_rule_failed",
+                                    "message": "Action not allowed.",
+                                }
+                            },
+                        ),
+                        "create_rule_failed",
                     )
                 )
 
@@ -1621,10 +1669,8 @@ async def api_create_record(
                 request_context=request_context,
             )
             if relation_errors:
-                return _error_response(
-                    400,
-                    _validation_message("Failed to create record.", relation_errors),
-                    relation_errors,
+                return _create_validation_error(
+                    request, auth, collection, relation_errors
                 )
         event = RecordRequestEvent(
             app=request.app,
@@ -1822,15 +1868,21 @@ async def api_update_record(
                         target_record_id,
                         payload.get("oldPassword"),
                     ):
-                        return _error_response(
-                            400,
-                            "Failed to update record.",
-                            {
-                                "oldPassword": {
-                                    "code": "validation_invalid_old_password",
-                                    "message": "Missing or invalid old password.",
-                                }
-                            },
+                        # 0.22.34 checks oldPassword in the form validation
+                        # (forms/record_upsert.go l.626-637).
+                        return mark_error(
+                            request,
+                            _error_response(
+                                400,
+                                "Failed to update record.",
+                                {
+                                    "oldPassword": {
+                                        "code": "validation_invalid_old_password",
+                                        "message": "Missing or invalid old password.",
+                                    }
+                                },
+                            ),
+                            "form",
                         )
 
         try:
@@ -1842,11 +1894,7 @@ async def api_update_record(
                 files=payload_files,
             )
         except _ValidationErrors as exc:
-            return _error_response(
-                400,
-                _validation_message("Failed to update record.", exc.errors),
-                exc.errors,
-            )
+            return _update_validation_error(request, collection, exc.errors)
         except Exception:
             import logging
 
@@ -1887,11 +1935,7 @@ async def api_update_record(
                 record_id=recordId,
             )
             if relation_errors:
-                return _error_response(
-                    400,
-                    _validation_message("Failed to update record.", relation_errors),
-                    relation_errors,
-                )
+                return _update_validation_error(request, collection, relation_errors)
         event = RecordRequestEvent(
             app=request.app,
             request=request,

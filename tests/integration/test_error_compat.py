@@ -21,7 +21,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from httpx import AsyncClient
 
-from ppbase.middleware.error_compat import set_error_compat
+from ppbase.middleware.error_compat import ERROR_KIND_HEADER, set_error_compat
 
 pytestmark = pytest.mark.asyncio
 
@@ -35,29 +35,55 @@ async def error_env(app_client: AsyncClient, admin_token: str) -> AsyncIterator[
     sfx = uuid.uuid4().hex[:8]
     locked = f"errc_locked_{sfx}"
     open_name = f"errc_open_{sfx}"
+    ids: dict[str, str] = {}
     for name, rule in ((locked, None), (open_name, "")):
+        schema = [
+            {
+                "name": "title",
+                "type": "text",
+                "required": True,
+                "options": {"min": None, "max": None, "pattern": ""},
+            }
+        ]
+        if rule == "":
+            schema.append(
+                {
+                    "name": "ref",
+                    "type": "relation",
+                    "required": False,
+                    "options": {
+                        "collectionId": ids[locked],
+                        "cascadeDelete": False,
+                        "minSelect": None,
+                        "maxSelect": 1,
+                        "displayFields": None,
+                    },
+                }
+            )
         response = await app_client.post(
             "/api/collections",
             headers={"Authorization": admin_token},
             json={
                 "name": name,
                 "type": "base",
-                "schema": [
-                    {
-                        "name": "title",
-                        "type": "text",
-                        "required": True,
-                        "options": {"min": None, "max": None, "pattern": ""},
-                    }
-                ],
+                "schema": schema,
                 "listRule": rule,
                 "viewRule": rule,
-                "createRule": rule,
+                # A user's create goes through the createRule check.
+                "createRule": "title != 'nope'" if rule == "" else rule,
                 "updateRule": rule,
                 "deleteRule": rule,
             },
         )
         assert response.status_code == 200, response.text
+        ids[name] = response.json()["id"]
+    response = await app_client.post(
+        f"/api/collections/{open_name}/records",
+        headers={"Authorization": admin_token},
+        json={"title": "t1"},
+    )
+    assert response.status_code == 200, response.text
+    ids["record"] = response.json()["id"]
 
     app = _app(app_client)
 
@@ -89,7 +115,13 @@ async def error_env(app_client: AsyncClient, admin_token: str) -> AsyncIterator[
         app.add_api_route(path, endpoint, methods=["GET"])
         added.append(app.router.routes[-1])
     try:
-        yield {"locked": locked, "open": open_name, "prefix": f"/api/errc-{sfx}"}
+        yield {
+            "locked": locked,
+            "open": open_name,
+            "prefix": f"/api/errc-{sfx}",
+            "record": ids["record"],
+            "admin": admin_token,
+        }
     finally:
         for route in added:
             app.router.routes.remove(route)
@@ -106,6 +138,9 @@ async def compat_022(app_client: AsyncClient) -> AsyncIterator[None]:
         set_error_compat(app, "")
 
 
+GENERIC = "Something went wrong while processing your request."
+
+
 async def _cases(client: AsyncClient, env: dict) -> dict[str, Any]:
     locked, open_name, prefix = env["locked"], env["open"], env["prefix"]
     results: dict[str, Any] = {}
@@ -114,6 +149,8 @@ async def _cases(client: AsyncClient, env: dict) -> dict[str, Any]:
         response = await client.request(method, url, **kwargs)
         assert response.headers["content-type"].startswith("application/json"), key
         assert int(response.headers["content-length"]) == len(response.content), key
+        # The private 0.22 error-kind tag never leaves PPBase.
+        assert ERROR_KIND_HEADER not in response.headers, key
         results[key] = (response.status_code, response.json())
 
     await record("list_admin_only", "GET", f"/api/collections/{locked}/records")
@@ -135,6 +172,47 @@ async def _cases(client: AsyncClient, env: dict) -> dict[str, Any]:
     await record(
         "create_validation", "POST", f"/api/collections/{open_name}/records", json={}
     )
+    admin = {"Authorization": env["admin"]}
+    records_url = f"/api/collections/{open_name}/records"
+    record_url = f"{records_url}/{env['record']}"
+    missing_ref = {"title": "x", "ref": "zzzzzzzzzzzzzzz"}
+    await record("create_validation_admin", "POST", records_url, json={}, headers=admin)
+    await record(
+        "create_missing_relation_admin",
+        "POST",
+        records_url,
+        json=missing_ref,
+        headers=admin,
+    )
+    await record("create_missing_relation", "POST", records_url, json=missing_ref)
+    await record("create_rule_failed", "POST", records_url, json={"title": "nope"})
+    await record("update_validation", "PATCH", record_url, json={"title": ""})
+    await record(
+        "update_validation_admin",
+        "PATCH",
+        record_url,
+        json={"title": ""},
+        headers=admin,
+    )
+    await record(
+        "update_missing_relation", "PATCH", record_url, json={"ref": "zzzzzzzzzzzzzzz"}
+    )
+    await record(
+        "password_missing_password",
+        "POST",
+        "/api/collections/users/auth-with-password",
+        json={"identity": "nobody@example.invalid"},
+    )
+    await record(
+        "password_empty_body",
+        "POST",
+        "/api/collections/users/auth-with-password",
+        json={},
+    )
+    await record(
+        "admin_password_empty_body", "POST", "/api/admins/auth-with-password", json={}
+    )
+    await record("list_bad_per_page", "GET", records_url, params={"perPage": "abc"})
     await record("refresh_without_token", "POST", "/api/collections/users/auth-refresh")
     await record("admin_route_without_token", "GET", "/api/collections")
     await record(
@@ -196,6 +274,40 @@ async def test_default_mode_keeps_the_ppbase_envelope(
     assert results["create_validation"][1]["message"].startswith(
         "Failed to create record. Validation failed for: title"
     )
+    # PPBase's own wording of the form errors, unchanged by default.
+    blank = {"code": "validation_required", "message": "Cannot be blank."}
+    assert results["create_validation_admin"] == (
+        400,
+        {
+            "status": 400,
+            "message": "Failed to create record. Validation failed for: title.",
+            "data": {"title": blank},
+        },
+    )
+    assert results["update_validation"] == (
+        400,
+        {
+            "status": 400,
+            "message": "Failed to update record. Validation failed for: title.",
+            "data": {"title": blank},
+        },
+    )
+    assert results["create_rule_failed"][1]["data"] == {
+        "rule": {"code": "validation_rule_failed", "message": "Action not allowed."}
+    }
+    assert results["password_missing_password"] == (
+        400,
+        {
+            "status": 400,
+            "message": "Failed to authenticate.",
+            "data": {"identity": {}, "password": blank},
+        },
+    )
+    assert results["admin_password_empty_body"][1]["data"]["identity"] == {
+        "code": "validation_required",
+        "message": "Field required",
+    }
+    assert set(results["list_bad_per_page"][1]["data"]) == {"perPage"}
 
 
 async def test_022_mode_answers_like_pocketbase_022(
@@ -225,6 +337,19 @@ async def test_022_mode_answers_like_pocketbase_022(
         "invalid_filter": (400, "Something went wrong while processing your request."),
         "unknown_route": (404, "Not Found."),
         "internal_error": (500, "Boom."),
+        # 0.22.34 binary (probe errors group): an update form error and an
+        # admin's create form error are unwrapped, a user's create wrapped.
+        "create_validation_admin": (400, GENERIC),
+        "create_missing_relation_admin": (400, GENERIC),
+        "create_missing_relation": (400, "Failed to create record."),
+        "create_rule_failed": (400, "Failed to create record."),
+        "update_validation": (400, GENERIC),
+        "update_validation_admin": (400, GENERIC),
+        "update_missing_relation": (400, GENERIC),
+        "password_missing_password": (400, GENERIC),
+        "password_empty_body": (400, GENERIC),
+        "admin_password_empty_body": (400, GENERIC),
+        "list_bad_per_page": (400, GENERIC),
     }
     for key, (status, message) in expected.items():
         got_status, body = results[key]
@@ -238,6 +363,31 @@ async def test_022_mode_answers_like_pocketbase_022(
     )
     # 0.22.34: "Invalid login credentials." is not a validation error.
     assert results["password_bad_credentials"][1]["data"] == {}
+    required = {"code": "validation_required", "message": "Missing required value."}
+    blank = {"code": "validation_required", "message": "Cannot be blank."}
+    missing_rel = {
+        "code": "validation_missing_rel_records",
+        "message": "Failed to find all relation records with the provided ids.",
+    }
+    for key in ("create_validation", "create_validation_admin", "update_validation"):
+        assert results[key][1]["data"] == {"title": required}, key
+    for key in (
+        "create_missing_relation",
+        "create_missing_relation_admin",
+        "update_missing_relation",
+    ):
+        assert results[key][1]["data"] == {"ref": missing_rel}, key
+    assert results["create_rule_failed"][1]["data"] == {}
+    assert results["password_missing_password"][1]["data"] == {"password": blank}
+    assert results["password_empty_body"][1]["data"] == {
+        "identity": blank,
+        "password": blank,
+    }
+    assert results["admin_password_empty_body"][1]["data"] == {
+        "identity": blank,
+        "password": blank,
+    }
+    assert results["list_bad_per_page"][1]["data"] == {}
 
     # Host bodies that are not a PPBase envelope, and successes, are untouched.
     assert results["legacy_code_body"] == (

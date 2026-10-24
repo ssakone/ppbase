@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from types import SimpleNamespace
+
 import pytest
+from starlette.responses import JSONResponse
 
 from ppbase.config import Settings
 from ppbase.ext.flask_like_pb import FlaskLikePB
 from ppbase.middleware.error_compat import (
+    ERROR_KIND_HEADER,
+    ErrorCompatMiddleware,
+    error_kind_headers,
+    error_kinds,
+    mark_error,
     message_rules,
     normalize_error_compat,
     pocketbase_022_error,
     sentenize,
+    set_error_compat,
 )
 
 
@@ -126,6 +137,22 @@ def test_sentenize_matches_pocketbase_inflector() -> None:
             "/api/collections/x/records",
             "Failed to create record.",
         ),
+        # 0.22.34 returns an update form validation error unwrapped.
+        (
+            400,
+            "Failed to update record. Validation failed for: title.",
+            "PATCH",
+            "/api/collections/x/records/abc",
+            "Something went wrong while processing your request.",
+        ),
+        # A persistence error keeps its 0.22.34 wording.
+        (
+            400,
+            "Failed to update record.",
+            "PATCH",
+            "/api/collections/x/records/abc",
+            "Failed to update record.",
+        ),
         (
             404,
             "Collection 'posts' not found.",
@@ -174,17 +201,28 @@ def test_message_translation(
 
 
 def test_list_parse_errors_and_bad_credentials() -> None:
+    parse_error = {
+        "status": 400,
+        "message": "Invalid filter syntax: Unexpected end.",
+        "data": {},
+    }
+    list_path = "/api/collections/posts/records"
     rewritten = pocketbase_022_error(
-        400,
-        {
-            "status": 400,
-            "message": "Invalid filter syntax: Unexpected end.",
-            "data": {},
-        },
-        method="GET",
-        path="/api/collections/posts/records",
+        400, parse_error, method="GET", path=list_path, kind="query"
     )
-    assert rewritten["message"] == "Something went wrong while processing your request."
+    assert rewritten == {
+        "code": 400,
+        "message": "Something went wrong while processing your request.",
+        "data": {},
+    }
+    # Untagged (for example a host list-request hook's own 400): kept.
+    untagged = pocketbase_022_error(400, parse_error, method="GET", path=list_path)
+    assert untagged["message"] == "Invalid filter syntax: Unexpected end."
+    hook_error = {"status": 400, "message": "Période invalide", "data": {}}
+    assert (
+        pocketbase_022_error(400, hook_error, method="GET", path=list_path)["message"]
+        == "Période invalide."
+    )
     credentials = {
         "status": 400,
         "message": "Failed to authenticate.",
@@ -204,11 +242,156 @@ def test_list_parse_errors_and_bad_credentials() -> None:
             "message": "Failed to authenticate.",
             "data": {},
         }
-    other = {**credentials, "data": {"identity": {"code": "validation_required"}}}
+    other = {**credentials, "data": {"identity": {"code": "validation_invalid"}}}
     rewritten = pocketbase_022_error(
         400, other, method="POST", path="/api/collections/users/auth-with-password"
     )
     assert rewritten["data"] == other["data"]
+
+
+def test_password_login_form_errors_are_unwrapped() -> None:
+    blank = {"code": "validation_required", "message": "Cannot be blank."}
+    path = "/api/collections/users/auth-with-password"
+    for data, expected in (
+        ({"identity": {}, "password": blank}, {"password": blank}),
+        (
+            {"identity": blank, "password": blank},
+            {"identity": blank, "password": blank},
+        ),
+    ):
+        body = {"status": 400, "message": "Failed to authenticate.", "data": data}
+        assert pocketbase_022_error(400, body, method="POST", path=path) == {
+            "code": 400,
+            "message": "Something went wrong while processing your request.",
+            "data": expected,
+        }
+    # No failing field: not a form error.
+    body = {"status": 400, "message": "Failed to authenticate.", "data": {"a": {}}}
+    rewritten = pocketbase_022_error(400, body, method="POST", path=path)
+    assert rewritten["message"] == "Failed to authenticate."
+
+
+def test_tagged_errors_take_the_0_22_message_of_their_kind() -> None:
+    body = {
+        "status": 400,
+        "message": "Failed to create record. Validation failed for: title.",
+        "data": {
+            "title": {"code": "validation_required", "message": "Cannot be blank."},
+            "identity": {"code": "validation_required", "message": "Field required"},
+        },
+    }
+    rewritten = pocketbase_022_error(
+        400, body, method="POST", path="/api/collections/x/records", kind="form"
+    )
+    assert rewritten == {
+        "code": 400,
+        "message": "Something went wrong while processing your request.",
+        "data": {
+            "title": {"code": "validation_required", "message": "Cannot be blank."},
+            "identity": {"code": "validation_required", "message": "Cannot be blank."},
+        },
+    }
+    guards = {
+        "guest_only": (403, "The request can be accessed only by guests."),
+        "record_auth_required": (
+            401,
+            "The request requires valid record authorization token to be set.",
+        ),
+        "record_collection_forbidden": (
+            403,
+            "The authorized record model is not allowed to perform this action.",
+        ),
+        "admin_auth_required": (
+            401,
+            "The request requires valid admin authorization token to be set.",
+        ),
+        "admin_or_record_auth_required": (
+            401,
+            "The request requires admin or record authorization token to be set.",
+        ),
+        "owner_forbidden": (403, "You are not allowed to perform this request."),
+    }
+    for kind, (status, message) in guards.items():
+        guard_body = {"status": status, "message": "x", "data": {}}
+        assert pocketbase_022_error(status, guard_body, kind=kind) == {
+            "code": status,
+            "message": message,
+            "data": {},
+        }
+    # An unknown tag is ignored (the table applies).
+    plain = {"status": 403, "message": "Only superusers can perform this action."}
+    assert pocketbase_022_error(403, plain, kind="nope")["message"] == (
+        "Only admins can perform this action."
+    )
+
+
+def test_marking_is_a_no_op_while_the_mode_is_off() -> None:
+    app = SimpleNamespace(state=SimpleNamespace())
+    request = SimpleNamespace(app=app)
+    response = JSONResponse({"status": 400, "message": "x", "data": {}}, 400)
+    mark_error(request, response, "form")
+    assert ERROR_KIND_HEADER not in response.headers
+    assert error_kind_headers(app, "form") is None
+    set_error_compat(app, "0.22")
+    mark_error(request, response, "form")
+    assert response.headers[ERROR_KIND_HEADER] == "form"
+    assert error_kind_headers(app, "query") == {ERROR_KIND_HEADER: "query"}
+    with pytest.raises(ValueError):
+        mark_error(request, response, "nope")
+
+
+def _run_middleware(mode: str, status: int, headers: dict[str, str]) -> tuple:
+    app = SimpleNamespace(state=SimpleNamespace(error_compat=mode))
+
+    async def inner(scope, receive, send) -> None:
+        response = JSONResponse(
+            {"status": status, "message": "Failed to update record.", "data": {}},
+            status_code=status,
+            headers=headers,
+        )
+        await response(scope, receive, send)
+
+    sent: list[dict] = []
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http",
+        "method": "PATCH",
+        "path": "/api/collections/x/records/abc",
+        "headers": [],
+        "app": app,
+    }
+    asyncio.run(ErrorCompatMiddleware(inner)(scope, receive, send))
+    start_headers = dict(sent[0]["headers"])
+    return start_headers, json.loads(sent[1]["body"])
+
+
+def test_middleware_consumes_the_kind_header() -> None:
+    headers, body = _run_middleware("0.22", 400, {ERROR_KIND_HEADER: "form"})
+    assert ERROR_KIND_HEADER.encode() not in headers
+    assert int(headers[b"content-length"]) == len(
+        json.dumps(body, separators=(",", ":"))
+    )
+    assert body == {
+        "code": 400,
+        "message": "Something went wrong while processing your request.",
+        "data": {},
+    }
+    # A tag on a success is removed too.
+    headers, body = _run_middleware("0.22", 200, {ERROR_KIND_HEADER: "form"})
+    assert ERROR_KIND_HEADER.encode() not in headers
+    assert body["status"] == 200
+    # Untagged update persistence error: kept.
+    _headers, body = _run_middleware("0.22", 400, {})
+    assert body["message"] == "Failed to update record."
+    # Mode off: untouched.
+    _headers, body = _run_middleware("", 400, {})
+    assert body == {"status": 400, "message": "Failed to update record.", "data": {}}
 
 
 def test_starlette_detail_bodies_are_translated() -> None:
@@ -254,3 +437,5 @@ def test_every_rule_cites_its_pocketbase_source() -> None:
     for rule in message_rules():
         assert rule.source and "l." in rule.source, rule
         assert rule.replacement, rule
+    for kind, spec in error_kinds().items():
+        assert spec.source and "l." in spec.source, kind

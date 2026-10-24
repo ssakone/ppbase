@@ -259,7 +259,10 @@ class _BuiltinRouteMiddlewares:
             if hasattr(event, "load_auth"):
                 await event.load_auth()
             if getattr(event, "has_auth")():
-                raise event._http_error(403, "The request is allowed only for guest clients.")
+                # 0.22.34 RequireGuestOnly (apis/middlewares.go l.37, with 400).
+                raise event._http_error(
+                    403, "The request is allowed only for guest clients.", kind="guest_only"
+                )
             return await event.next()
 
         return _middleware
@@ -267,9 +270,22 @@ class _BuiltinRouteMiddlewares:
     def require_auth(self, *collections: str) -> MiddlewareHandler:
         allowed_collections = self._normalize_collections(collections)
 
+        # PocketBase 0.22.34 counterpart (only for the 0.22 error mode):
+        # RequireAdminOrRecordAuth without collections or with _superusers
+        # allowed, RequireRecordAuth otherwise (apis/middlewares.go l.72-86,
+        # l.158-173).
+        admins_allowed = not allowed_collections or "_superusers" in allowed_collections
+        missing_kind = (
+            "admin_or_record_auth_required" if admins_allowed else "record_auth_required"
+        )
+
         async def _middleware(event: Any):
             if hasattr(event, "load_auth"):
                 await event.load_auth()
+            if not event.has_auth():
+                raise event._http_error(
+                    401, "The request requires authentication.", kind=missing_kind
+                )
             auth = getattr(event, "require_auth")()
             if not allowed_collections:
                 return await event.next()
@@ -278,7 +294,8 @@ class _BuiltinRouteMiddlewares:
                 str(auth.get("collectionName", "")).strip(),
                 str(auth.get("collectionId", "")).strip(),
             }
-            if str(auth.get("type", "")).strip() == "admin":
+            is_admin = str(auth.get("type", "")).strip() == "admin"
+            if is_admin:
                 auth_collections.add("_superusers")
             auth_collections.discard("")
 
@@ -286,6 +303,10 @@ class _BuiltinRouteMiddlewares:
                 raise event._http_error(
                     403,
                     "The authorized auth model is not allowed to perform this action.",
+                    # RequireRecordAuth answers an admin token l.77 (with 401).
+                    kind="record_auth_required"
+                    if is_admin
+                    else "record_collection_forbidden",
                 )
             return await event.next()
 
@@ -295,10 +316,19 @@ class _BuiltinRouteMiddlewares:
         async def _middleware(event: Any):
             if hasattr(event, "load_auth"):
                 await event.load_auth()
+            # 0.22.34 RequireAdminAuth (apis/middlewares.go l.119, always 401).
             if not getattr(event, "has_auth")():
-                raise event._http_error(401, "The request requires authentication.")
+                raise event._http_error(
+                    401,
+                    "The request requires authentication.",
+                    kind="admin_auth_required",
+                )
             if not getattr(event, "is_superuser")():
-                raise event._http_error(403, "Only superusers can perform this action.")
+                raise event._http_error(
+                    403,
+                    "Only superusers can perform this action.",
+                    kind="admin_auth_required",
+                )
             return await event.next()
 
         return _middleware
@@ -315,6 +345,13 @@ class _BuiltinRouteMiddlewares:
             if getattr(event, "is_superuser")():
                 return await event.next()
 
+            # 0.22.34 RequireAdminOrOwnerAuth (apis/middlewares.go l.183-209).
+            if not event.has_auth():
+                raise event._http_error(
+                    401,
+                    "The request requires authentication.",
+                    kind="admin_or_record_auth_required",
+                )
             auth = getattr(event, "require_auth_record")()
             auth_id = str(auth.get("id", "")).strip()
             target_id = str(getattr(event, "path_params", {}).get(owner_key, "")).strip()
@@ -322,6 +359,7 @@ class _BuiltinRouteMiddlewares:
                 raise event._http_error(
                     403,
                     "The authorized auth model is not allowed to perform this action.",
+                    kind="owner_forbidden",
                 )
             return await event.next()
 

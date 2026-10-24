@@ -533,16 +533,26 @@ def create_app(
 
     # Custom exception handler: PocketBase returns flat error objects, not
     # FastAPI's default {"detail": ...} wrapper.
+    from ppbase.middleware.error_compat import (
+        ERROR_KIND_HEADER,
+        error_kind_headers,
+    )
+
     @app.exception_handler(HTTPException)
     async def _pocketbase_error_handler(
         request: Request, exc: HTTPException
     ) -> JSONResponse:
         detail = exc.detail
+        # Only the 0.22 error-kind tag of a guard is forwarded (and only
+        # while that mode is on): other exception headers stay dropped.
+        kind = (getattr(exc, "headers", None) or {}).get(ERROR_KIND_HEADER)
+        headers = error_kind_headers(request.app, kind) if kind else None
         if isinstance(detail, dict) and "status" in detail:
             # Already a PocketBase-format error dict
             return JSONResponse(
                 content=detail,
                 status_code=exc.status_code,
+                headers=headers,
             )
         # Fallback: wrap plain string errors
         return JSONResponse(
@@ -552,6 +562,7 @@ def create_app(
                 "data": {},
             },
             status_code=exc.status_code,
+            headers=headers,
         )
 
     # Handle Pydantic request validation errors in PocketBase format.
@@ -560,14 +571,19 @@ def create_app(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         data: dict = {}
+        query_only = True
         for err in exc.errors():
             loc = err.get("loc", ())
+            if not loc or loc[0] not in ("query", "path"):
+                query_only = False
             # Field name is typically the last element after "body"
             field_name = str(loc[-1]) if loc else "unknown"
             data[field_name] = {
                 "code": "validation_required",
                 "message": err.get("msg", "Invalid value."),
             }
+        # PocketBase 0.22.34: a bad page/perPage/skipTotal is a search
+        # provider parse error, a bad body a form validation error.
         return JSONResponse(
             content={
                 "status": 400,
@@ -575,6 +591,9 @@ def create_app(
                 "data": data,
             },
             status_code=400,
+            headers=error_kind_headers(
+                request.app, "query" if query_only else "form"
+            ),
         )
 
     # Outermost: PocketBase 0.22 error envelope/messages when the app enables
