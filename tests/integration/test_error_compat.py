@@ -5,7 +5,7 @@ messages are unchanged.  ``"0.22"`` mode: the same requests answer the
 ``{"code", "message", "data"}`` envelope of PocketBase 0.22.34
 (apis/api_error.go l.11-15) with its messages; the expected 0.22 bodies are
 the PocketBase 0.22.34 binary results of
-``tests/pocketbase_parity/error_compat_probe.py``.
+``tests/pocketbase_parity/expand_rules_probe.py`` (errors group).
 """
 
 from __future__ import annotations
@@ -143,6 +143,12 @@ async def _cases(client: AsyncClient, env: dict) -> dict[str, Any]:
         "/api/collections/users/auth-with-password",
         json={"identity": "nobody@example.invalid", "password": "wrong-password"},
     )
+    await record(
+        "invalid_filter",
+        "GET",
+        f"/api/collections/{open_name}/records",
+        params={"filter": "(("},
+    )
     await record("unknown_route", "GET", "/api/errc-unknown-route")
     await record("internal_error", "GET", f"{prefix}/boom")
     await record("legacy_code_body", "GET", f"{prefix}/legacy-code")
@@ -184,6 +190,7 @@ async def test_default_mode_keeps_the_ppbase_envelope(
         500,
         {"status": 500, "message": "boom", "data": {}},
     )
+    assert results["invalid_filter"][1]["message"].startswith("Invalid filter syntax")
     # Starlette's own body for an unknown route is unchanged too.
     assert results["unknown_route"] == (404, {"detail": "Not Found"})
     assert results["create_validation"][1]["message"].startswith(
@@ -215,6 +222,7 @@ async def test_022_mode_answers_like_pocketbase_022(
             "The request requires valid admin authorization token to be set.",
         ),
         "password_bad_credentials": (400, "Failed to authenticate."),
+        "invalid_filter": (400, "Something went wrong while processing your request."),
         "unknown_route": (404, "Not Found."),
         "internal_error": (500, "Boom."),
     }
@@ -228,6 +236,8 @@ async def test_022_mode_answers_like_pocketbase_022(
         results["create_validation"][1]["data"]["title"]["code"]
         == "validation_required"
     )
+    # 0.22.34: "Invalid login credentials." is not a validation error.
+    assert results["password_bad_credentials"][1]["data"] == {}
 
     # Host bodies that are not a PPBase envelope, and successes, are untouched.
     assert results["legacy_code_body"] == (

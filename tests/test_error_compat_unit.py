@@ -152,6 +152,44 @@ def test_message_translation(
     assert list(rewritten) == ["code", "message", "data"]
 
 
+def test_list_parse_errors_and_bad_credentials() -> None:
+    rewritten = pocketbase_022_error(
+        400,
+        {
+            "status": 400,
+            "message": "Invalid filter syntax: Unexpected end.",
+            "data": {},
+        },
+        method="GET",
+        path="/api/collections/posts/records",
+    )
+    assert rewritten["message"] == "Something went wrong while processing your request."
+    credentials = {
+        "status": 400,
+        "message": "Failed to authenticate.",
+        "data": {
+            "identity": {
+                "code": "validation_invalid_credentials",
+                "message": "Invalid login credentials.",
+            }
+        },
+    }
+    for path in (
+        "/api/collections/users/auth-with-password",
+        "/api/admins/auth-with-password",
+    ):
+        assert pocketbase_022_error(400, credentials, method="POST", path=path) == {
+            "code": 400,
+            "message": "Failed to authenticate.",
+            "data": {},
+        }
+    other = {**credentials, "data": {"identity": {"code": "validation_required"}}}
+    rewritten = pocketbase_022_error(
+        400, other, method="POST", path="/api/collections/users/auth-with-password"
+    )
+    assert rewritten["data"] == other["data"]
+
+
 def test_starlette_detail_bodies_are_translated() -> None:
     assert pocketbase_022_error(
         405, {"detail": "Method Not Allowed"}, method="DELETE", path="/api/health"

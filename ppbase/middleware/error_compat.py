@@ -111,14 +111,20 @@ class _MessageRule:
     path: re.Pattern[str] | None = None
     methods: frozenset[str] | None = None
     data: dict[str, Any] | None = None
+    # Apply only when the PPBase data is exactly {field: {"code": code}}.
+    data_codes: dict[str, str] | None = None
     source: str = ""
 
-    def apply(self, status: int, message: str, method: str, path: str) -> str | None:
+    def apply(
+        self, status: int, message: str, method: str, path: str, data: Any = None
+    ) -> str | None:
         if status != self.status:
             return None
         if self.methods is not None and method not in self.methods:
             return None
         if self.path is not None and not self.path.match(path):
+            return None
+        if self.data_codes is not None and _data_codes(data) != self.data_codes:
             return None
         if self.pattern is not None:
             match = self.pattern.match(message)
@@ -126,7 +132,22 @@ class _MessageRule:
         return self.replacement if message in self.messages else None
 
 
+def _data_codes(data: Any) -> dict[str, str] | None:
+    if not isinstance(data, dict):
+        return None
+    codes = {}
+    for key, value in data.items():
+        if not isinstance(value, dict) or not isinstance(value.get("code"), str):
+            return None
+        codes[str(key)] = value["code"]
+    return codes
+
+
 _COLLECTION_ROUTE = re.compile(r"^/api/collections/[^/]+/")
+_RECORD_LIST_ROUTE = re.compile(r"^/api/collections/[^/]+/records/?$")
+_PASSWORD_AUTH_ROUTE = re.compile(
+    r"^/api/(?:collections/[^/]+|admins)/auth-with-password/?$"
+)
 _RECORD_WRITE_ROUTE = re.compile(r"^/api/collections/[^/]+/records(?:/[^/]+)?/?$")
 _AUTH_FORM_ROUTE = re.compile(
     r"^/api/collections/[^/]+/(?:auth-with-password|auth-with-oauth2"
@@ -239,6 +260,26 @@ _MESSAGE_RULES: tuple[_MessageRule, ...] = (
         path=_RECORD_WRITE_ROUTE,
         source="apis/record_crud.go l.286 (create), l.378 (update): no field list",
     ),
+    _MessageRule(
+        400,
+        pattern=re.compile(r"^(?!Query string is too large)(?s:.*)$"),
+        replacement="Something went wrong while processing your request.",
+        path=_RECORD_LIST_ROUTE,
+        methods=frozenset({"GET"}),
+        source="apis/record_crud.go l.82-86: a filter/sort parse error is "
+        "NewBadRequestError('', err), without the parser text",
+    ),
+    _MessageRule(
+        400,
+        messages=("Failed to authenticate.",),
+        replacement="Failed to authenticate.",
+        path=_PASSWORD_AUTH_ROUTE,
+        data={},
+        data_codes={"identity": "validation_invalid_credentials"},
+        source="apis/record_auth.go l.316-317 and apis/admin.go l.97-98: the "
+        "'Invalid login credentials.' error is not a validation error, so "
+        "safeErrorsData gives {} (apis/api_error.go l.77-90)",
+    ),
 )
 
 
@@ -284,7 +325,7 @@ def pocketbase_022_error(
         return None
     message, data = parsed
     for rule in _MESSAGE_RULES:
-        replacement = rule.apply(status, message, method.upper(), path)
+        replacement = rule.apply(status, message, method.upper(), path, data)
         if replacement is not None:
             message = replacement
             if rule.data is not None:
