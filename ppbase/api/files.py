@@ -919,8 +919,9 @@ async def serve_file(
     """Serve a file from local or S3-compatible storage.
 
     ``HEAD`` is served like ``GET`` without a body, as by PocketBase
-    (v0.22.34 ``apis/file.go`` l.40-41; v0.40.6 l.45, where Go's router
-    matches ``HEAD`` with a ``GET`` pattern).
+    (v0.22.34 ``apis/file.go`` l.40-41; v0.40.6 ``apis/file.go`` l.45 on
+    ``net/http``'s ``ServeMux``, ``tools/router/router.go`` l.74 and l.131,
+    whose ``GET`` patterns also match ``HEAD``).
     """
     try:
         # Cached thumbnails and ordinary reads stay lock-free.  This first pass
