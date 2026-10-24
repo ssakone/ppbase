@@ -9,15 +9,22 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import jwt
+
 from ppbase.core.id_generator import generate_id
-from ppbase.db.system_tables import SuperuserRecord
+from ppbase.db.system_tables import ParamRecord, SuperuserRecord
 from ppbase.services.auth_service import (
     create_admin_token,
+    create_token,
     generate_token_key,
+    get_collection_token_config,
     get_password_cost,
     hash_password,
     verify_password,
 )
+
+# PocketBase 0.22.34 forms/admin_password_reset_request.go:35 (2 minutes).
+ADMIN_PASSWORD_RESET_RESEND_SECONDS = 120
 
 
 async def _get_superusers_collection(session: AsyncSession):
@@ -127,18 +134,134 @@ async def update_admin(
         admin.email = data["email"]
         admin.token_key = generate_token_key()
     if "password" in data and data["password"]:
-        superusers_collection = await _get_superusers_collection(session)
-        admin.password_hash = hash_password(
-            data["password"],
-            cost=get_password_cost(superusers_collection),
-        )
-        admin.token_key = generate_token_key()
+        await set_admin_password(session, admin, data["password"])
     if "avatar" in data:
         admin.avatar = data["avatar"]
 
     admin.updated = datetime.now(timezone.utc)
     await session.flush()
     return admin
+
+
+async def set_admin_password(
+    session: AsyncSession,
+    admin: SuperuserRecord,
+    password: str,
+) -> None:
+    """Set a new password like PocketBase 0.22.34 ``Admin.SetPassword``.
+
+    The token key is renewed (previous sessions and reset links are revoked)
+    and the password reset throttle is cleared (models/admin.go:42-61).
+    """
+    superusers_collection = await _get_superusers_collection(session)
+    admin.password_hash = hash_password(
+        password,
+        cost=get_password_cost(superusers_collection),
+    )
+    admin.token_key = generate_token_key()
+    admin.last_reset_sent_at = None
+
+
+def create_admin_password_reset_token(
+    admin: SuperuserRecord,
+    superusers_collection: Any,
+) -> str:
+    """PocketBase 0.22.34 ``tokens.NewAdminResetPasswordToken`` (tokens/admin.go:19-26).
+
+    Claims ``id``, ``type=admin`` and ``email``, signed with the admin token key
+    plus the reset secret (``adminPasswordResetToken`` in 0.22, the
+    ``_superusers`` ``passwordResetToken`` option in PPBase).
+    """
+    secret, duration = get_collection_token_config(
+        superusers_collection, "passwordResetToken"
+    )
+    return create_token(
+        {"id": admin.id, "type": "admin", "email": admin.email},
+        admin.token_key + secret,
+        duration,
+    )
+
+
+async def find_admin_by_password_reset_token(
+    session: AsyncSession,
+    token: str,
+) -> SuperuserRecord | None:
+    """PocketBase 0.22.34 ``FindAdminByToken`` with the reset secret.
+
+    Only the signature (admin token key plus reset secret) and the expiry are
+    checked, never the type claim (daos/admin.go:52-78,
+    forms/admin_password_reset_confirm.go:50-62).
+    """
+    try:
+        unverified = jwt.decode(token, options={"verify_signature": False})
+    except jwt.InvalidTokenError:
+        return None
+    admin_id = unverified.get("id")
+    if not isinstance(admin_id, str) or not admin_id:
+        return None
+    admin = await session.get(SuperuserRecord, admin_id)
+    if admin is None:
+        return None
+    superusers_collection = await _get_superusers_collection(session)
+    if superusers_collection is None:
+        return None
+    secret, _ = get_collection_token_config(superusers_collection, "passwordResetToken")
+    try:
+        jwt.decode(token, admin.token_key + secret, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+    return admin
+
+
+async def request_password_reset(
+    session: AsyncSession,
+    email: str,
+    settings: Any,
+    *,
+    base_url: str = "",
+) -> bool:
+    """E-mail a password reset link to the admin with exactly ``email``.
+
+    PocketBase 0.22.34 forms/admin_password_reset_request.go:63-89: unknown
+    e-mail, or a link sent less than 120 seconds ago, sends nothing; the send
+    time is stored only once the message is accepted.  Returns whether a
+    message was sent.
+    """
+    from ppbase.services.mail_service import send_admin_password_reset_email
+
+    admin = await get_admin_by_email(session, email)
+    if admin is None:
+        return False
+    last_sent = admin.last_reset_sent_at
+    if last_sent is not None:
+        elapsed = (datetime.now(timezone.utc) - last_sent).total_seconds()
+        if elapsed < ADMIN_PASSWORD_RESET_RESEND_SECONDS:
+            return False
+    superusers_collection = await _get_superusers_collection(session)
+    if superusers_collection is None:
+        return False
+
+    app_name = ""
+    settings_row = (
+        await session.execute(select(ParamRecord.value).where(ParamRecord.key == "settings"))
+    ).scalar_one_or_none()
+    if isinstance(settings_row, dict) and isinstance(settings_row.get("meta"), dict):
+        app_name = str(settings_row["meta"].get("appName", "") or "")
+
+    token = create_admin_password_reset_token(admin, superusers_collection)
+    sent = await send_admin_password_reset_email(
+        admin.email,
+        token,
+        settings,
+        base_url=base_url,
+        app_name=app_name,
+    )
+    if not sent:
+        await session.rollback()
+        return False
+    admin.last_reset_sent_at = datetime.now(timezone.utc)
+    await session.commit()
+    return True
 
 
 async def delete_admin(session: AsyncSession, admin_id: str) -> bool:

@@ -4,6 +4,8 @@ Endpoints:
     POST   /api/admins/init               (public, first-run only)
     POST   /api/admins/auth-with-password
     POST   /api/admins/auth-refresh
+    POST   /api/admins/request-password-reset   (PocketBase 0.22)
+    POST   /api/admins/confirm-password-reset   (PocketBase 0.22)
     GET    /api/admins
     POST   /api/admins
     GET    /api/admins/{id}
@@ -13,9 +15,12 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
+import logging
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,9 +30,16 @@ from ppbase.api.deps import (
     get_settings,
     require_admin,
 )
+from ppbase.db.engine import get_async_session, get_engine
+from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services import admin_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# PocketBase 0.22.34 validation wording, measured on the official binary.
+_BLANK = {"code": "validation_required", "message": "Cannot be blank."}
+_ADMIN_PASSWORD_MIN, _ADMIN_PASSWORD_MAX = 10, 72  # forms/admin_password_reset_confirm.go:45
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +215,131 @@ async def auth_refresh(
             },
         )
     return result
+
+
+async def _json_object_or_error(request: Request) -> dict[str, Any]:
+    """Body of a PocketBase 0.22 form: a JSON object, empty meaning ``{}``."""
+    raw = await request.body()
+    if not raw.strip():
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise _bad_request("An error occurred while loading the submitted data.")
+    return body
+
+
+def _bad_request(message: str, data: dict[str, Any] | None = None) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={"status": 400, "message": message, "data": data or {}},
+    )
+
+
+def _string_fields(body: dict[str, Any], *names: str) -> dict[str, str]:
+    """Go binds JSON strings only: any other value is a loading error."""
+    values: dict[str, str] = {}
+    for name in names:
+        value = body.get(name)
+        if value is None:
+            values[name] = ""
+        elif isinstance(value, str):
+            values[name] = value
+        else:
+            raise _bad_request("An error occurred while loading the submitted data.")
+    return values
+
+
+async def _send_admin_password_reset(email: str, settings: Any, base_url: str) -> None:
+    """Background part of the reset request: errors are never shown to the client."""
+    try:
+        async for session in get_async_session():
+            await admin_service.request_password_reset(
+                session, email, settings, base_url=base_url
+            )
+    except Exception as exc:  # pragma: no cover - logged, like PocketBase's FireAndForget
+        logger.error("Failed to send admin password reset request: %s", type(exc).__name__)
+
+
+@router.post("/request-password-reset", status_code=204)
+async def request_password_reset(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    settings: Any = Depends(get_settings),
+):
+    """PocketBase 0.22 admin password reset request (apis/admin.go:21, :111-154).
+
+    Answers 204 for any valid e-mail, known or not, before anything is sent
+    (protection against admin enumeration); the link is sent in the background.
+    """
+    body = await _json_object_or_error(request)
+    email = _string_fields(body, "email")["email"]
+    if not email:
+        raise _bad_request("An error occurred while validating the form.", {"email": _BLANK})
+    if len(email) > 255 or not _EMAIL_RE.match(email):
+        raise _bad_request(
+            "An error occurred while validating the form.",
+            {"email": {"code": "validation_is_email", "message": "Must be a valid email address."}},
+        )
+
+    from ppbase.api.record_auth import _resolve_public_base_url
+
+    base_url = await _resolve_public_base_url(request, get_engine())
+    background_tasks.add_task(_send_admin_password_reset, email, settings, base_url)
+    return Response(status_code=204)
+
+
+@router.post("/confirm-password-reset", status_code=204)
+async def confirm_password_reset(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """PocketBase 0.22 admin password reset confirmation (apis/admin.go:22, :156-186).
+
+    The token is checked like ``forms/admin_password_reset_confirm.go:41-62``:
+    signature with the admin token key plus the reset secret, never the type.
+    On success the token key is renewed, revoking every session and link.
+    """
+    body = await _json_object_or_error(request)
+    values = _string_fields(body, "token", "password", "passwordConfirm")
+    token, password, confirm = values["token"], values["password"], values["passwordConfirm"]
+
+    errors: dict[str, Any] = {}
+    admin = None
+    if not token:
+        errors["token"] = _BLANK
+    else:
+        admin = await admin_service.find_admin_by_password_reset_token(session, token)
+        if admin is None:
+            errors["token"] = {
+                "code": "validation_invalid_token",
+                "message": "Invalid or expired token.",
+            }
+    if not password:
+        errors["password"] = _BLANK
+    elif not _ADMIN_PASSWORD_MIN <= len(password) <= _ADMIN_PASSWORD_MAX:
+        errors["password"] = {
+            "code": "validation_length_out_of_range",
+            "message": (
+                f"The length must be between {_ADMIN_PASSWORD_MIN} and {_ADMIN_PASSWORD_MAX}."
+            ),
+        }
+    if not confirm:
+        errors["passwordConfirm"] = _BLANK
+    elif confirm != password:
+        errors["passwordConfirm"] = {
+            "code": "validation_values_mismatch",
+            "message": "Values don't match.",
+        }
+    if errors:
+        raise _bad_request("Something went wrong while processing your request.", errors)
+
+    await admin_service.set_admin_password(session, admin, password)
+    admin.updated = datetime.now(timezone.utc)
+    await session.commit()
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
