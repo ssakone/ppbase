@@ -35,7 +35,6 @@ from ppbase.ext.registry import (
     get_extension_registry,
 )
 from ppbase.services.expand_service import expand_records
-from ppbase.services.filter_parser import FilterFieldError
 from ppbase.services.record_service import (
     RecordReferenceError,
     _ValidationErrors,
@@ -1457,15 +1456,15 @@ async def api_list_records(
                 skip_total=bool(e.skip_total),
                 request_context=request_context,
                 # Hidden auth fields (email emailVisibility guard, hidden
-                # columns) are searchable only by admins (record_crud.go l.57).
+                # columns) are searchable only by admins
+                # (apis/record_crud.go l.59-66).
                 allow_hidden=_is_superuser_payload(e.auth),
             )
-        except FilterFieldError:
-            # PocketBase wraps an unresolved filter/sort field in an opaque
-            # 400 (NewBadRequestError("", err), record_crud.go l.82-84).
+        except ValueError:
+            # PocketBase wraps every filter/sort error (syntax, unknown or
+            # hidden field, bad modifier...) in an opaque 400
+            # (NewBadRequestError("", err), apis/record_crud.go l.83-86).
             return _error_response(400, _FILTER_FIELD_ERROR_MESSAGE)
-        except ValueError as exc:
-            return _error_response(400, str(exc))
 
         if e.expand and result["items"]:
             all_colls = await get_all_collections(e.engine or engine)

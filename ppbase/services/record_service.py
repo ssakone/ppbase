@@ -43,6 +43,7 @@ from ppbase.models.record import (
 from ppbase.services.filter_parser import (
     _AUTH_FIELD_COLUMNS,
     _AUTH_RESOLVABLE_SYSTEM_FIELDS,
+    _AUTH_SYSTEM_FIELD_NAMES,
     FilterFieldError,
     parse_filter,
     parse_sort,
@@ -760,6 +761,30 @@ def _filter_needs_relation_index(filter_expression: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# strconv.ParseBool true spellings (Go standard library).
+_GO_TRUE_STRINGS = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+
+
+def _go_to_bool(value: Any) -> bool:
+    """``cast.ToBool`` of PocketBase's record upsert form.
+
+    PocketBase 0.22.34 loads ``emailVisibility``/``verified`` with
+    ``cast.ToBool`` (forms/record_upsert.go l.380-384; spf13/cast v1.7.1):
+    a string goes through ``strconv.ParseBool`` and anything unparsable is
+    false, so the multipart/JSON strings ``"false"``/``"0"`` are false, not
+    Python-truthy.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value in _GO_TRUE_STRINGS
+    return False
+
+
 async def list_records(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -778,7 +803,7 @@ async def list_records(
     ``allow_hidden`` follows PocketBase's resolver flag: admins (and
     server-evaluated callers) see hidden auth fields, a non-admin list request
     does not, so an ``email`` filter is restricted to ``emailVisibility = TRUE``
-    (apis/record_crud.go l.57-64).
+    (apis/record_crud.go l.59-66).
 
     Returns a paginated response dict.
     """
@@ -830,7 +855,13 @@ async def list_records(
             schema_field_names = {f.name for f in schema_fields}
             valid_fields = system_fields | schema_field_names
             if col_type == "auth":
-                valid_fields |= _AUTH_RESOLVABLE_SYSTEM_FIELDS
+                # Same resolution as the filter parser: an auth system name is
+                # never a plain schema field, and ``username`` needs the
+                # physical column PPBase only has when the schema declares it.
+                valid_fields -= _AUTH_SYSTEM_FIELD_NAMES
+                valid_fields |= _AUTH_RESOLVABLE_SYSTEM_FIELDS - {"username"}
+                if "username" in schema_field_names:
+                    valid_fields.add("username")
             resolved_parts: list[tuple[str, str]] = []
             for col_expr, direction in sort_parts:
                 # col_expr is quoted like '"fieldname"' or a function like 'RANDOM()'
@@ -1124,13 +1155,13 @@ async def create_record(
                     "email_visibility", data.pop("emailVisibility", False)
                 )
                 data.pop("emailVisibility", None)
-                columns["email_visibility"] = bool(raw_visibility)
+                columns["email_visibility"] = _go_to_bool(raw_visibility)
             else:
                 columns["email_visibility"] = False
             if "verified" not in data:
                 columns["verified"] = False
             else:
-                columns["verified"] = bool(data.pop("verified", False))
+                columns["verified"] = _go_to_bool(data.pop("verified", False))
 
     # Build field map for file handling
     field_map = {f.name: f for f in schema_fields}
@@ -1397,11 +1428,11 @@ async def update_record(
             data.pop("verified", None)
         else:
             if "email_visibility" in data:
-                updates["email_visibility"] = bool(data.pop("email_visibility"))
+                updates["email_visibility"] = _go_to_bool(data.pop("email_visibility"))
             elif "emailVisibility" in data:
-                updates["email_visibility"] = bool(data.pop("emailVisibility"))
+                updates["email_visibility"] = _go_to_bool(data.pop("emailVisibility"))
             if "verified" in data:
-                updates["verified"] = bool(data.pop("verified"))
+                updates["verified"] = _go_to_bool(data.pop("verified"))
 
     field_map = {f.name: f for f in schema_fields}
 

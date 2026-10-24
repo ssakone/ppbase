@@ -590,6 +590,7 @@ class _FilterTransformer(Transformer):
         field_name: str,
         *,
         allow_guard: bool = True,
+        modifier: str | None = None,
     ) -> tuple[str, bool]:
         """Map a leaf field to its physical column, rejecting hidden fields.
 
@@ -597,6 +598,17 @@ class _FilterTransformer(Transformer):
         :class:`FilterFieldError` for a field PocketBase 0.22.34 would not
         resolve.  Enforced only when the resolver knows the table (system
         and metadata-less tables stay permissive).
+
+        A system field (``id``/``created``/``updated`` and, on an auth
+        collection, ``username``/``verified``/``emailVisibility``/``email``)
+        never takes a modifier: PocketBase matches the whole ``prop`` (e.g.
+        ``email:lower``) against ``resolvableSystemFieldNames``, then looks the
+        bare name up in ``collection.Schema``, which never holds a system
+        field, and fails with "unknown field" (v0.22.34
+        resolvers/record_field_resolve_runner.go l.361-395;
+        ``splitModifier`` even rejects ``lower``, record_field_resolver.go
+        l.286-301).  Without this, ``email:lower``/``email:length``/
+        ``email:isset`` would read a masked email with no visibility guard.
         """
         field = _sanitize_ident(str(field_name))
         meta = self._table_meta(table_name)
@@ -609,11 +621,28 @@ class _FilterTransformer(Transformer):
         known = (
             isinstance(fields, dict)
             and field in fields
+            and field not in _SYSTEM_FIELD_TYPES
             and not (is_auth and field in _AUTH_SYSTEM_FIELD_NAMES)
         )
-        if field in _SYSTEM_FIELD_TYPES or known:
+        if known:
             return field, False
-        if is_auth and field in _AUTH_RESOLVABLE_SYSTEM_FIELDS:
+        if field in _SYSTEM_FIELD_TYPES or (
+            is_auth and field in _AUTH_RESOLVABLE_SYSTEM_FIELDS
+        ):
+            if modifier:
+                raise FilterFieldError(
+                    f"unknown filter field {field_name!r} (modifier {modifier!r})"
+                )
+            if field in _SYSTEM_FIELD_TYPES:
+                return field, False
+            if field == "username" and not (
+                isinstance(fields, dict) and "username" in fields
+            ):
+                # PocketBase always has the column; PPBase creates none for a
+                # generic auth collection (BUMA declares it as a schema field,
+                # docs/hidden-auth-fields.md): a 400, never SQL on a missing
+                # column (HTTP 500).
+                raise FilterFieldError(f"unknown filter field {field_name!r}")
             column = _AUTH_FIELD_COLUMNS.get(field, field)
             guard = allow_guard and field == "email" and not self._allow_hidden
             return column, guard
@@ -785,6 +814,7 @@ class _FilterTransformer(Transformer):
         allow_unresolved: bool = True,
         context: str = "field path",
         email_guard_allowed: bool = True,
+        modifier: str | None = None,
     ) -> _ResolvedPath | None:
         """Resolve a PocketBase dotted path into SQL and traversal steps.
 
@@ -829,7 +859,10 @@ class _FilterTransformer(Transformer):
                     else _SYSTEM_FIELD_TYPES.get(part, "")
                 )
                 column, email_guard = self._resolve_leaf_column(
-                    current_table, part, allow_guard=email_guard_allowed
+                    current_table,
+                    part,
+                    allow_guard=email_guard_allowed,
+                    modifier=modifier,
                 )
                 return _ResolvedPath(
                     steps,
@@ -912,6 +945,7 @@ class _FilterTransformer(Transformer):
                 relations=self._relation_resolver,
                 fields=self._resolver_fields(self._relation_resolver),
                 allow_unresolved=True,
+                modifier=modifier,
             )
             if resolved is not None and resolved.steps:
                 return (
@@ -930,8 +964,10 @@ class _FilterTransformer(Transformer):
             # Single current-collection field: reject fields PocketBase does
             # not resolve (password_hash, token_key, ...) and add the email
             # visibility guard for a non-admin caller.
+            # A system field with a modifier (``email:lower``...) is an
+            # unknown field, so the guard can never be dropped here.
             column, email_guard = self._resolve_leaf_column(
-                self._current_table, parts[0]
+                self._current_table, parts[0], modifier=modifier
             )
             if modifier:
                 return ("field_modifier", column, modifier)
@@ -941,6 +977,16 @@ class _FilterTransformer(Transformer):
                 guard_sql = f"{self._field_expr(_EMAIL_VISIBILITY_COLUMN)} = TRUE"
             return ("field", column, field_type, guard_sql)
 
+        # A dotted path whose first segment is neither a relation, a back
+        # relation nor a JSON field does not resolve in PocketBase ("failed
+        # to resolve field" / "is not a valid relation", v0.22.34
+        # resolvers/record_field_resolve_runner.go l.517-523 and l.635-636):
+        # it is never emitted as raw SQL, otherwise
+        # ``users.password_hash`` would read the current table's hidden column
+        # and ``other.col`` would reference a table missing from FROM.  Only a
+        # parser without collection metadata keeps the legacy raw path.
+        if self._table_meta(self._current_table) is not None:
+            raise FilterFieldError(f"unknown filter field {'.'.join(parts)!r}")
         if modifier:
             return ("field_modifier", ".".join(parts), modifier)
         return ("field", ".".join(parts), "")
@@ -994,6 +1040,10 @@ class _FilterTransformer(Transformer):
         # same records as PocketBase.
         if op in {"=", "!="} and (left[0] == "macro" or right[0] == "macro"):
             return _guarded(self._static_equal_sql(left, right, equal=op == "="))
+        if op in {"<", "<=", ">", ">="} and (left[0] == "macro" or right[0] == "macro"):
+            folded = self._static_order_sql(left, op, right)
+            if folded is not None:
+                return _guarded(folded)
 
         # Standard comparisons
         if op in _STANDARD_OPS:
@@ -1148,15 +1198,17 @@ class _FilterTransformer(Transformer):
         self,
         coll_name: str,
         field_path: tuple[str, ...],
+        modifier: str | None = None,
     ) -> _ResolvedPath:
         """Resolve the ``path`` of ``@collection.<coll_name>.<path>``."""
         if len(field_path) == 1:
             info = self._collection_resolver_field_info(coll_name, field_path[0])
             # ``@collection`` paths set PocketBase's allowHiddenFields=true
             # (prepare(), runner l.123-126): no email guard, but unknown
-            # fields (tokenKey...) are still rejected.
+            # fields (tokenKey...) and modified system fields are still
+            # rejected.
             column, _ = self._resolve_leaf_column(
-                coll_name, field_path[0], allow_guard=False
+                coll_name, field_path[0], allow_guard=False, modifier=modifier
             )
             return _ResolvedPath(
                 [],
@@ -1185,6 +1237,7 @@ class _FilterTransformer(Transformer):
             allow_unresolved=False,
             context="@collection relation traversal",
             email_guard_allowed=False,
+            modifier=modifier,
         )
         if resolved is None:
             raise ValueError(
@@ -1320,8 +1373,11 @@ class _FilterTransformer(Transformer):
         else:
             coll_name = _sanitize_ident(str(node[1]))
             field_path = tuple(_sanitize_ident(str(part)) for part in node[2])
-            resolved = self._resolve_collection_path(coll_name, field_path)
-            modifier = None if resolved.is_json else (node[4] if len(node) > 4 else None)
+            raw_modifier = node[4] if len(node) > 4 else None
+            resolved = self._resolve_collection_path(
+                coll_name, field_path, raw_modifier
+            )
+            modifier = None if resolved.is_json else raw_modifier
             collection = (coll_name, str(node[3]))
 
         # Main query: shared joins.
@@ -1451,6 +1507,18 @@ class _FilterTransformer(Transformer):
                 if equal
                 else f"(COALESCE({col}, '') <> '')"
             )
+        left_known, left_value = self._static_value(left_side)
+        right_known, right_value = self._static_value(right_side)
+        if left_known and right_known:
+            # Two values known while parsing (a present ``@request.*`` value
+            # and a literal, ``true``/``false`` or another request value):
+            # PocketBase compares them in SQLite without any column affinity
+            # (``true`` is the integer ``1``, filter.go l.249-262), so a
+            # number/boolean never equals a text and ``1 = true``.  Folding
+            # the result never binds a non-boolean to a boolean parameter
+            # (asyncpg DataError, HTTP 500).
+            same = _sqlite_compare(left_value, right_value) == 0
+            return "TRUE" if same == equal else "FALSE"
         if left_side.kind == "column" and right_side.kind == "column":
             left_col = self._text_cast_sql(left_side.sql)
             right_col = self._text_cast_sql(right_side.sql)
@@ -1462,6 +1530,46 @@ class _FilterTransformer(Transformer):
         if equal:
             return f"{left_side.sql} = {right_side.sql}"
         return f"({left_side.sql} IS DISTINCT FROM {right_side.sql})"
+
+    def _static_value(self, side: _Side) -> tuple[bool, Any]:
+        """``(True, value)`` for an operand whose value is known while parsing.
+
+        Literals and bound ``@request.*`` values are known; a column, a JSON
+        path or a SQL macro (``@now``...) is not.
+        """
+        node = side.node
+        if isinstance(node, tuple) and node and node[0] == "literal":
+            return True, node[1]
+        if self._is_bound_param(side.sql):
+            return True, self._params[side.sql[1:]]
+        if side.sql in {"TRUE", "FALSE"}:
+            return True, side.sql == "TRUE"
+        return False, None
+
+    def _static_order_sql(self, left: tuple, op: str, right: tuple) -> str | None:
+        """``<``/``<=``/``>``/``>=`` between two values known while parsing.
+
+        Only used when a ``@request.*`` macro is involved.  SQLite compares
+        them by storage class (NULL yields NULL, numbers sort before text);
+        PostgreSQL would instead infer one parameter type from the other and
+        reject a mismatching value (HTTP 500).
+        """
+        left_side = self._side(left, None)
+        right_side = self._side(right, None)
+        left_known, left_value = self._static_value(left_side)
+        right_known, right_value = self._static_value(right_side)
+        if not (left_known and right_known):
+            return None
+        if left_value is None or right_value is None:
+            return "NULL"
+        order = _sqlite_compare(left_value, right_value)
+        result = {
+            "<": order < 0,
+            "<=": order <= 0,
+            ">": order > 0,
+            ">=": order >= 0,
+        }[op]
+        return "TRUE" if result else "FALSE"
 
     def _pb_equal_sql(self, left: _Side, right: _Side, *, equal: bool) -> str:
         """``=``/``!=`` like PocketBase ``resolveEqualExpr``.
@@ -2242,32 +2350,33 @@ class _FilterTransformer(Transformer):
             method = self._request_context.get("method", "")
             pname = self._next_param(method)
             return f":{pname}"
+        # An absent ``@request.*`` value is SQL NULL, like PocketBase
+        # (``extractNestedMapVal`` fails, ``case nil`` -> ``NULL``, v0.22.34
+        # resolvers/record_field_resolver.go l.162-192): it equals only an
+        # empty operand and never satisfies ``<``/``>``/``~``, whereas a
+        # present '' is an empty string.
         if name.startswith("request.headers."):
             field = name[len("request.headers."):]
             headers = self._request_context.get("headers", {})
-            val = ""
+            val = None
             if isinstance(headers, dict):
                 normalized = field.lower().replace("-", "_")
                 # Header macros can use either header-name or header_name style.
-                val = (
-                    headers.get(normalized)
-                    or headers.get(field.lower())
-                    or headers.get(field)
-                    or ""
-                )
+                for key in (normalized, field.lower(), field):
+                    if headers.get(key):
+                        val = headers[key]
+                        break
+                else:
+                    for key in (normalized, field.lower(), field):
+                        if key in headers:
+                            val = headers[key]
+                            break
             pname = self._next_param(val)
             return f":{pname}"
         if name.startswith("request.auth."):
             field = name[len("request.auth."):]
             auth = self._request_context.get("auth", {})
-            if field == "id":
-                val = auth.get("id", "")
-            elif field == "collectionId":
-                val = auth.get("collectionId", "")
-            elif field == "collectionName":
-                val = auth.get("collectionName", "")
-            else:
-                val = auth.get(field, "")
+            val = auth.get(field) if isinstance(auth, dict) else None
             pname = self._next_param(self._request_value(val))
             return f":{pname}"
         if name.startswith("request.data.") or name.startswith("request.body."):
@@ -2313,13 +2422,17 @@ class _FilterTransformer(Transformer):
                 pname = self._next_param(lowered)
                 return f":{pname}"
 
-            pname = self._next_param(self._request_value(val) if has_field else "")
+            pname = self._next_param(self._request_value(val) if has_field else None)
             return f":{pname}"
         if name.startswith("request.query."):
             field = name[len("request.query."):]
             query = self._request_context.get("query", {})
-            val = query.get(field, "")
-            pname = self._next_param(val)
+            val = query.get(field) if isinstance(query, dict) else None
+            pname = self._next_param(self._request_value(val))
+            return f":{pname}"
+        if name.startswith("request."):
+            # Any other ``@request.*`` key is absent: NULL.
+            pname = self._next_param(None)
             return f":{pname}"
         # Fallback: treat unknown macros as empty string
         pname = self._next_param("")
@@ -2563,6 +2676,32 @@ def _empty_date_sql(
 _EMPTY_VS_EMPTY = {"<": False, "<=": True, ">": False, ">=": True, "=": True, "!=": False}
 _EMPTY_VS_DATE = {"<": True, "<=": True, ">": False, ">=": False, "=": False, "!=": True}
 _DATE_VS_EMPTY = {"<": False, "<=": False, ">": True, ">=": True, "=": False, "!=": True}
+
+
+def _sqlite_storage(value: Any) -> tuple[int, Any]:
+    """SQLite storage class rank and comparable value of a bound Go value.
+
+    The Go driver binds a bool as the integer 1/0 and a number as INTEGER or
+    REAL; a string is TEXT and bytes a BLOB.  SQLite orders NULL < numbers <
+    TEXT < BLOB and compares TEXT with the BINARY collation (byte order of
+    UTF-8, i.e. code point order).
+    """
+    if isinstance(value, bool):
+        return 1, int(value)
+    if isinstance(value, (int, float)):
+        return 1, value
+    if isinstance(value, (bytes, bytearray)):
+        return 3, bytes(value)
+    return 2, value if isinstance(value, str) else str(value)
+
+
+def _sqlite_compare(left: Any, right: Any) -> int:
+    """-1/0/1 comparison of two non-NULL values without column affinity."""
+    left_rank, left_value = _sqlite_storage(left)
+    right_rank, right_value = _sqlite_storage(right)
+    if left_rank != right_rank:
+        return -1 if left_rank < right_rank else 1
+    return (left_value > right_value) - (left_value < right_value)
 
 
 def _bool_sql(value: bool | None) -> str:

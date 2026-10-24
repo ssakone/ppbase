@@ -277,3 +277,294 @@ async def test_realtime_subscription_filters_follow_hidden_field_rules(
     # @request.* in sort alone (no filter) is not checked; with a filter it is.
     assert await _received(manager, sort_only) == ["hid", "vis"]
     assert await _received(manager, sort_req) == []
+
+
+async def _status(app_client: AsyncClient, name: str, token: str, **params) -> int:
+    response = await app_client.get(
+        f"/api/collections/{name}/records",
+        headers={"Authorization": token} if token else {},
+        params={"perPage": 200, **params},
+    )
+    if response.status_code == 400:
+        assert response.json()["message"] == _OPAQUE_400, response.text
+    return response.status_code
+
+
+async def test_qualified_paths_and_modified_auth_fields_are_rejected(
+    app_client: AsyncClient, hidden_env: dict
+) -> None:
+    # A table-qualified self reference used to reach the raw column
+    # (``users.password_hash`` -> 200 prefix oracle) and a modifier used to
+    # drop the email visibility guard; PocketBase 0.22.34 answers 400.
+    name, suffix = hidden_env["name"], hidden_env["suffix"]
+    filters = (
+        f'{name}.password_hash ~ "$2"',
+        f'{name}.token_key != ""',
+        f'{name}.email = "hid_{suffix}@example.invalid"',
+        f'{name}.name != ""',
+        f'email:lower = "hid_{suffix}@example.invalid"',
+        'email:lower ~ "hid"',
+        "email:length > 3",
+        "email:isset = true",
+        'email:each = "x"',
+        "verified:isset = true",
+        "id:length > 0",
+        "password_hash.x = 1",
+        'name.x = "a"',
+        'username = "a"',  # no physical username column on this collection
+    )
+    for token in ("", hidden_env["user"], hidden_env["admin"]):
+        for value in filters:
+            assert await _status(app_client, name, token, filter=value) == 400, value
+        assert await _status(app_client, name, token, sort="username") == 400
+        assert await _status(app_client, name, token, sort=f"{name}.email") == 400
+    # Another collection's table is not in FROM: 400, never a 500.
+    other = await _admin(
+        app_client,
+        hidden_env["admin"],
+        {
+            "name": f"hf_other_{suffix}",
+            "schema": [{"name": "name", "type": "text"}],
+            "listRule": "",
+        },
+    )
+    assert (
+        await _status(
+            app_client, other["name"], "", filter=f'{name}.password_hash != ""'
+        )
+        == 400
+    )
+
+
+async def test_realtime_email_modifier_filter_is_denied(
+    app_client: AsyncClient, hidden_env: dict
+) -> None:
+    name, ids = hidden_env["name"], hidden_env["ids"]
+    engine = get_engine()
+    collection = await resolve_collection(engine, name)
+    manager = SubscriptionManager()
+    guest = await _subscribe(manager, f"{name}/*", None, filter='email:lower ~ "hid"')
+    qualified = await _subscribe(
+        manager, f"{name}/*", None, filter=f'{name}.password_hash ~ "$2"'
+    )
+    for user in ("vis", "hid"):
+        await broadcast_record_change(
+            manager,
+            name,
+            ids[user],
+            "update",
+            {"id": ids[user], "name": user},
+            engine=engine,
+            collection=collection,
+        )
+    assert await _received(manager, guest) == []
+    assert await _received(manager, qualified) == []
+
+
+async def _emails(manager, client) -> dict[str, object]:
+    session = manager.get_session(client)
+    seen: dict[str, object] = {}
+    while session is not None and not session.response_queue.empty():
+        event = await asyncio.wait_for(session.response_queue.get(), timeout=1.0)
+        record = event["data"]["record"]
+        seen[record.get("name")] = record.get("email", "<absent>")
+    return seen
+
+
+async def test_realtime_payload_hides_masked_emails_like_pocketbase(
+    app_client: AsyncClient, hidden_env: dict
+) -> None:
+    # PocketBase 0.22.34 sends a hidden email only to the record owner whose
+    # manageRule check passes (apis/realtime.go l.439-447): not to guests,
+    # other users or admins, and not to the owner when manageRule is null.
+    from ppbase.services.record_service import get_record
+
+    name, ids, suffix = hidden_env["name"], hidden_env["ids"], hidden_env["suffix"]
+    engine = get_engine()
+    owner = {
+        "id": ids["hid"],
+        "type": "authRecord",
+        "collectionName": name,
+        "collectionId": hidden_env["id"],
+    }
+    admin_auth = {"id": "admin", "type": "admin"}
+
+    async def round_(manage_rule):
+        response = await app_client.patch(
+            f"/api/collections/{name}",
+            headers={"Authorization": hidden_env["admin"]},
+            json={
+                "options": {
+                    "manageRule": manage_rule,
+                    "allowUsernameAuth": True,
+                    "minPasswordLength": 6,
+                }
+            },
+        )
+        assert response.status_code == 200, response.text
+        collection = await resolve_collection(engine, name)
+        manager = SubscriptionManager()
+        clients = {
+            "guest": await _subscribe(manager, f"{name}/*", None),
+            "owner": await _subscribe(manager, f"{name}/*", owner),
+            "admin": await _subscribe(manager, f"{name}/*", admin_auth),
+            "owner_filtered": await _subscribe(
+                manager, f"{name}/*", owner, filter='name != ""'
+            ),
+        }
+        for user in ("vis", "hid"):
+            await broadcast_record_change(
+                manager,
+                name,
+                ids[user],
+                "update",
+                await get_record(engine, collection, ids[user]),
+                engine=engine,
+                collection=collection,
+            )
+        return {key: await _emails(manager, c) for key, c in clients.items()}
+
+    visible = f"vis_{suffix}@example.invalid"
+    hidden = f"hid_{suffix}@example.invalid"
+    for rule in (None, "id = 'nobody'"):
+        for key, seen in (await round_(rule)).items():
+            assert seen == {"vis": visible, "hid": "<absent>"}, (rule, key, seen)
+    allowed = await round_("id = @request.auth.id")
+    for key in ("guest", "admin"):
+        assert allowed[key] == {"vis": visible, "hid": "<absent>"}
+    for key in ("owner", "owner_filtered"):
+        assert allowed[key] == {"vis": visible, "hid": hidden}
+    await round_(None)
+
+
+async def test_email_visibility_and_verified_parse_like_cast_to_bool(
+    app_client: AsyncClient, hidden_env: dict
+) -> None:
+    # PocketBase loads emailVisibility/verified with cast.ToBool
+    # (forms/record_upsert.go l.380-384): "false"/"0" are false, not truthy.
+    name, suffix = hidden_env["name"], hidden_env["suffix"]
+    admin = {"Authorization": hidden_env["admin"]}
+    pwd = "hidden-Pw-123456"
+    cases = (
+        ("false", False),
+        ("0", False),
+        ("f", False),
+        ("no", False),
+        ("true", True),
+        ("1", True),
+        ("T", True),
+    )
+    for index, (raw, expected) in enumerate(cases):
+        response = await app_client.post(
+            f"/api/collections/{name}/records",
+            headers=admin,
+            data={
+                "email": f"cast{index}_{suffix}@example.invalid",
+                "emailVisibility": raw,
+                "verified": raw,
+                "password": pwd,
+                "passwordConfirm": pwd,
+                "name": f"cast{index}",
+            },
+            files={"avatar_unused": ("a.txt", b"x", "text/plain")},
+        )
+        assert response.status_code == 200, response.text
+        record = response.json()
+        assert record["emailVisibility"] is expected, raw
+        assert record["verified"] is expected, raw
+        # JSON strings follow the same rule, on update too.
+        response = await app_client.patch(
+            f"/api/collections/{name}/records/{record['id']}",
+            headers=admin,
+            json={"emailVisibility": raw, "verified": raw},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["emailVisibility"] is expected, raw
+        assert response.json()["verified"] is expected, raw
+        response = await app_client.patch(
+            f"/api/collections/{name}/records/{record['id']}",
+            headers=admin,
+            data={"emailVisibility": raw},
+            files={"avatar_unused": ("a.txt", b"x", "text/plain")},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["emailVisibility"] is expected, raw
+        await app_client.delete(
+            f"/api/collections/{name}/records/{record['id']}", headers=admin
+        )
+
+
+async def test_expand_applies_the_target_view_rule(
+    app_client: AsyncClient, hidden_env: dict
+) -> None:
+    # PocketBase expandFetch (apis/record_helpers.go l.177-210): a nil
+    # viewRule is admin-only, any other rule filters the related records; a
+    # relation with nothing visible has no expand key.
+    admin, suffix = hidden_env["admin"], hidden_env["suffix"]
+    secret = await _admin(
+        app_client,
+        admin,
+        {
+            "name": f"hf_secret_{suffix}",
+            "schema": [{"name": "name", "type": "text"}],
+            "listRule": None,
+            "viewRule": None,
+        },
+    )
+    guarded = await _admin(
+        app_client,
+        admin,
+        {
+            "name": f"hf_guarded_{suffix}",
+            "schema": [{"name": "name", "type": "text"}],
+            "listRule": "",
+            "viewRule": '@request.auth.id != ""',
+        },
+    )
+    posts = await _admin(
+        app_client,
+        admin,
+        {
+            "name": f"hf_posts_{suffix}",
+            "schema": [
+                {"name": "name", "type": "text"},
+                {
+                    "name": "secret",
+                    "type": "relation",
+                    "options": {"collectionId": secret["id"], "maxSelect": 1},
+                },
+                {
+                    "name": "guarded",
+                    "type": "relation",
+                    "options": {"collectionId": guarded["id"], "maxSelect": 1},
+                },
+            ],
+            "listRule": "",
+            "viewRule": "",
+        },
+    )
+    s1 = await _create(app_client, secret["name"], {"name": "s1"}, admin)
+    g1 = await _create(app_client, guarded["name"], {"name": "g1"}, admin)
+    await _create(
+        app_client,
+        posts["name"],
+        {"name": "p1", "secret": s1["id"], "guarded": g1["id"]},
+        admin,
+    )
+    await _create(app_client, posts["name"], {"name": "p2", "secret": s1["id"]}, admin)
+
+    async def expanded(token: str) -> dict:
+        response = await app_client.get(
+            f"/api/collections/{posts['name']}/records",
+            headers={"Authorization": token} if token else {},
+            params={"expand": "secret,guarded", "sort": "name"},
+        )
+        assert response.status_code == 200, response.text
+        return {
+            item["name"]: sorted(item["expand"]) if "expand" in item else None
+            for item in response.json()["items"]
+        }
+
+    assert await expanded("") == {"p1": None, "p2": None}
+    assert await expanded(hidden_env["user"]) == {"p1": ["guarded"], "p2": None}
+    assert await expanded(admin) == {"p1": ["guarded", "secret"], "p2": ["secret"]}

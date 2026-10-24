@@ -307,11 +307,14 @@ async def broadcast_record_change(
                     continue
 
             sub_event_data = event_data
+            # Auth records are serialized per subscriber: PocketBase decides
+            # the email visibility for each client (apis/realtime.go
+            # l.439-447).
             if (
                 engine is not None
                 and collection is not None
                 and action != "delete"
-                and sub.options_query
+                and (sub.options_query or _is_auth_collection(collection))
             ):
                 maybe_event_data = await _build_subscription_event_data(
                     engine=engine,
@@ -447,7 +450,7 @@ async def _is_subscription_allowed_for_event(
 
     # PocketBase runs checkForAdminOnlyRuleFields only when a non-empty client
     # filter is present, and then scans both the filter and the sort options
-    # (apis/realtime.go l.568-574): a guest/record using @collection. or
+    # (apis/realtime.go l.567-574): a guest/record using @collection. or
     # @request. in either is silently denied.
     if filter_expr and not is_admin:
         for value in (filter_expr, sort_value):
@@ -457,8 +460,11 @@ async def _is_subscription_allowed_for_event(
                 return False
 
     # 1. Access rule.  CanAccessRecord resolves it with hidden fields allowed
-    #    (apis/realtime.go l.577, allowHiddenFields=true): an ``email`` rule
-    #    is NOT restricted to visible emails here, unlike a client filter.
+    #    (apis/realtime.go l.561, daos/record.go l.567 allowHiddenFields=true):
+    #    an ``email`` rule is NOT restricted to visible emails here, unlike a
+    #    client filter.  ``check_record_rule`` defaults to allow_hidden=True;
+    #    the call keeps its historical 5-argument shape for extensions that
+    #    wrap or replace it.
     rule_result = check_rule(rule, auth_ctx)
     if rule_result is False:
         return False
@@ -472,7 +478,6 @@ async def _is_subscription_allowed_for_event(
                 record_id,
                 rule_result,
                 request_context,
-                allow_hidden=True,
             )
         except Exception as exc:
             logger.warning(
@@ -486,7 +491,7 @@ async def _is_subscription_allowed_for_event(
             return False
 
     # 2. Client subscription filter, resolved like a non-admin list filter
-    #    (NewRecordFieldResolver(..., false), apis/realtime.go l.586): an
+    #    (NewRecordFieldResolver(..., false), apis/realtime.go l.577): an
     #    ``email`` filter is restricted to emailVisibility = TRUE and a hidden
     #    field (tokenKey...) denies the event.
     if filter_expr:
@@ -501,7 +506,7 @@ async def _is_subscription_allowed_for_event(
                 request_context,
                 allow_hidden=False,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - deny on error, like PocketBase
             logger.warning(
                 "Realtime filter check failed for %s/%s: %s",
                 collection.name,
@@ -529,6 +534,60 @@ def _apply_fields_filter(record: dict[str, Any], fields_param: str | None) -> di
     return {k: v for k, v in record.items() if k in fields}
 
 
+def _is_auth_collection(collection: Any) -> bool:
+    return str(getattr(collection, "type", "") or "").strip().lower() == "auth"
+
+
+async def _realtime_shows_hidden_email(
+    *,
+    engine: AsyncEngine,
+    collection: Any,
+    record_id: str,
+    subscription: RealtimeSubscription,
+    auth_ctx: dict[str, Any] | None,
+    request_context: dict[str, Any],
+) -> bool:
+    """Whether a realtime client receives an auth record's hidden email.
+
+    PocketBase 0.22.34 serializes the broadcast record with
+    ``PublicExport`` and ignores the email visibility only when the client's
+    auth id is the record id AND ``canAccessRecord`` passes the collection
+    ``manageRule`` (apis/realtime.go l.439-447): an admin or a manager never
+    receives another account's hidden email, and the owner receives its own
+    only if the manage rule allows it (nil: admin only; '': everyone).  The
+    client filter of ``canAccessRecord`` already passed for this event.
+    (Since v0.23 the owner always, and managers too, see it: v0.40.6
+    apis/realtime.go l.690-696.)
+    """
+    from ppbase.services import record_service
+    from ppbase.services.rule_engine import check_rule
+
+    auth = subscription.auth_payload or {}
+    if not auth or str(auth.get("id") or "") != str(record_id):
+        return False
+    options = getattr(collection, "options", None) or {}
+    manage_rule = options.get("manageRule") if isinstance(options, dict) else None
+    rule_result = check_rule(manage_rule, auth_ctx)
+    if isinstance(rule_result, bool):
+        return rule_result
+    try:
+        return await record_service.check_record_rule(
+            engine,
+            collection,
+            record_id,
+            rule_result,
+            request_context,
+        )
+    except Exception as exc:  # noqa: BLE001 - deny on error, like PocketBase
+        logger.warning(
+            "Realtime manage rule check failed for %s/%s: %s",
+            getattr(collection, "name", ""),
+            record_id,
+            exc,
+        )
+        return False
+
+
 async def _build_subscription_event_data(
     *,
     engine: AsyncEngine,
@@ -542,7 +601,7 @@ async def _build_subscription_event_data(
     from ppbase.services.expand_service import expand_records
     from ppbase.services.record_service import get_all_collections, get_record
 
-    _auth_ctx, request_context = _build_rule_context(subscription.auth_payload)
+    auth_ctx, request_context = _build_rule_context(subscription.auth_payload)
     if subscription.options_query:
         request_context["query"] = dict(subscription.options_query)
     if subscription.options_headers:
@@ -552,14 +611,26 @@ async def _build_subscription_event_data(
 
     record = dict(base_record) if isinstance(base_record, dict) else None
     if record is None:
-        record = await get_record(
-            engine,
-            collection,
-            record_id,
-            request_context=request_context,
-        )
+        # The email visibility is decided below with PocketBase's realtime
+        # rule, not with the list/view rule of ``get_record``.
+        record = await get_record(engine, collection, record_id)
         if record is None:
             return None
+
+    if (
+        _is_auth_collection(collection)
+        and "email" in record
+        and not record.get("emailVisibility")
+        and not await _realtime_shows_hidden_email(
+            engine=engine,
+            collection=collection,
+            record_id=record_id,
+            subscription=subscription,
+            auth_ctx=auth_ctx,
+            request_context=request_context,
+        )
+    ):
+        record.pop("email", None)
 
     expand_value = subscription.options_query.get("expand")
     expand = expand_value.strip() if isinstance(expand_value, str) else ""

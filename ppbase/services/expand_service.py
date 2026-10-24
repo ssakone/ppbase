@@ -111,6 +111,72 @@ async def _batch_fetch_records(
     return records
 
 
+def _is_superuser_context(request_context: dict[str, Any]) -> bool:
+    """Whether the request context belongs to an admin (superuser)."""
+    auth = request_context.get("auth")
+    if not isinstance(auth, dict):
+        return False
+    auth_type = auth.get("type")
+    return auth_type == "admin" or (
+        auth_type in {"auth", "authRecord"}
+        and auth.get("collectionName") == "_superusers"
+    )
+
+
+async def _viewable_ids(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    record_ids: list[str],
+    request_context: dict[str, Any] | None,
+) -> set[str] | None:
+    """Ids of ``record_ids`` the caller may see through an expand.
+
+    PocketBase 0.22.34 fetches expanded records with ``expandFetch``
+    (apis/record_helpers.go l.177-210): admins see everything; otherwise a
+    nil ``viewRule`` fails the whole relation ("only admins can view"), an
+    empty one allows every record, and any other rule filters the related
+    records with ``allowHiddenFields=true``.  A failed relation is simply not
+    expanded (``ExpandRecords`` only collects the error, daos/record_expand.go
+    l.43-54, and the API logs it).
+    ``None`` means "every id"; a caller without request context (internal
+    use) is trusted.
+    """
+    if request_context is None or _is_superuser_context(request_context):
+        return None
+    rule = getattr(collection, "view_rule", None)
+    if rule is None:
+        return set()
+    if rule == "":
+        return None
+
+    from ppbase.services.filter_parser import parse_filter
+    from ppbase.services.record_service import _build_filter_resolvers
+
+    try:
+        relation_resolver, collection_resolver = await _build_filter_resolvers(
+            engine, collection, rule
+        )
+        where_sql, params = parse_filter(
+            rule,
+            request_context,
+            relation_resolver,
+            collection_resolver,
+            collection.name,
+            allow_hidden=True,
+        )
+    except ValueError:
+        return set()
+    placeholders = ", ".join(f":_vid{i}" for i in range(len(record_ids)))
+    params.update({f"_vid{i}": rid for i, rid in enumerate(record_ids)})
+    sql = (
+        f'SELECT "id" FROM "{collection.name}" '
+        f'WHERE "id" IN ({placeholders}) AND ({where_sql})'
+    )
+    async with engine.connect() as conn:
+        result = await conn.execute(text(sql), params)
+        return {str(row[0]) for row in result.all()}
+
+
 async def expand_records(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -220,6 +286,15 @@ async def _expand_path(
 
     if not all_ids:
         return
+
+    # Only the related records the caller may view (target viewRule).
+    viewable = await _viewable_ids(
+        engine, target_coll, sorted(all_ids), request_context
+    )
+    if viewable is not None:
+        all_ids &= viewable
+        if not all_ids:
+            return
 
     # Batch fetch related records
     related_rows = await _batch_fetch_records(engine, target_coll, list(all_ids))
