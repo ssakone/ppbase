@@ -497,3 +497,35 @@ async def test_bodies_are_bound_like_pocketbase(
         json={"identity": admin["email"], "password": "multipart-pass-1"},
     )
     assert login.status_code == 200, login.text
+
+
+async def test_reset_email_refreshes_updated(
+    app_client: AsyncClient, admin_token: str, sent_mails
+) -> None:
+    """SaveAdmin refreshes ``updated`` with ``lastResetSentAt`` (measured on 0.22.34)."""
+    from ppbase.db.engine import get_engine
+
+    admin = await _create_admin(app_client, admin_token)
+
+    async def updated_and_sent() -> Any:
+        async with get_engine().connect() as conn:
+            result = await conn.execute(
+                text("SELECT updated, last_reset_sent_at FROM _superusers WHERE id = :id"),
+                {"id": admin["id"]},
+            )
+            return result.mappings().first()
+
+    before = await updated_and_sent()
+    resp = await app_client.post(
+        "/api/admins/request-password-reset", json={"email": admin["email"]}
+    )
+    assert resp.status_code == 204
+    assert len(sent_mails) == 1
+    after = await updated_and_sent()
+    assert after["last_reset_sent_at"] is not None
+    assert after["updated"] == after["last_reset_sent_at"]
+    assert after["updated"] > before["updated"]
+    listed = await app_client.get(
+        f"/api/admins/{admin['id']}", headers={"Authorization": admin_token}
+    )
+    assert listed.json()["updated"] != listed.json()["created"]

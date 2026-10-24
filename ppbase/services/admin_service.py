@@ -259,7 +259,11 @@ async def request_password_reset(
     if not sent:
         await session.rollback()
         return False
-    admin.last_reset_sent_at = datetime.now(timezone.utc)
+    # SaveAdmin also refreshes ``updated`` (forms/admin_password_reset_request.go:84-87,
+    # daos/base.go RefreshUpdated); measured on 0.22.34, both get the same time.
+    now = datetime.now(timezone.utc)
+    admin.last_reset_sent_at = now
+    admin.updated = now
     await session.commit()
     return True
 
