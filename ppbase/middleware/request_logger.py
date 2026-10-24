@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from typing import Any, Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -56,8 +56,14 @@ _SENSITIVE_KEYS = (
 )
 
 
+# Stored instead of a body that cannot be parsed and redacted key by key.
+_MALFORMED_BODY = "[REDACTED MALFORMED BODY]"
+
+
 def _normalize_key(key: str) -> str:
-    return "".join(ch for ch in key.lower() if ch.isalnum() or ch == "_")
+    # casefold, not lower: PocketBase 0.22 forms match keys under Unicode case
+    # folding, so ``pa\u017f\u017fword`` (long s) is bound as ``password``.
+    return "".join(ch for ch in key.casefold() if ch.isalnum() or ch == "_")
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -166,10 +172,46 @@ def _decode_body(body: bytes, content_type: str | None) -> Any:
     if normalized_type == "application/json":
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            return text
+        except (ValueError, RecursionError):
+            # Invalid JSON (or digits and nesting beyond Python's limits)
+            # cannot be redacted key by key: never store it as is.
+            return _MALFORMED_BODY
+
+    if normalized_type == "application/x-www-form-urlencoded":
+        return _redact_form_body(text)
 
     return text
+
+
+def _redact_json_text(text: str) -> str:
+    try:
+        return json.dumps(_redact_sensitive(json.loads(text)))
+    except (ValueError, RecursionError, TypeError):
+        return "[REDACTED]"
+
+
+def _redact_form_body(text: str) -> str:
+    """Key-by-key redaction of an urlencoded body, failing closed.
+
+    The PocketBase 0.22 admin password reset routes read urlencoded bodies
+    (``ppbase/api/legacy_forms.py``): their ``token`` and ``password`` must be
+    redacted like those of a JSON body.  A pair holding ``;`` is dropped by
+    the form parser but redacted here; ``@jsonPayload`` is redacted as JSON.
+    """
+    pairs: list[tuple[str, str]] = []
+    for part in text.split("&"):
+        if not part:
+            continue
+        raw_key, _sep, raw_value = part.partition("=")
+        key = unquote_plus(raw_key)
+        if ";" in part or _is_sensitive_key(key):
+            value = "[REDACTED]"
+        elif key == "@jsonPayload":
+            value = _redact_json_text(unquote_plus(raw_value))
+        else:
+            value = unquote_plus(raw_value)
+        pairs.append((key, value))
+    return urlencode(pairs)
 
 
 async def _write_log(app_state, entry: dict) -> None:
@@ -204,6 +246,14 @@ async def _write_log(app_state, entry: dict) -> None:
                 session.add(row)
     except Exception as exc:
         logger.debug("Request log write failed: %s", exc)
+
+
+def _safe_payload(body: bytes, content_type: str | None) -> Any:
+    """Redacted body for the log; logging must never break a completed request."""
+    try:
+        return _redact_sensitive(_decode_body(body, content_type))
+    except Exception:  # RecursionError on very deep JSON, among others
+        return _MALFORMED_BODY
 
 
 class RequestLoggerMiddleware(BaseHTTPMiddleware):
@@ -257,7 +307,7 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         )
 
         request_payload = (
-            _redact_sensitive(_decode_body(request_body_bytes, request_content_type))
+            _safe_payload(request_body_bytes, request_content_type)
             if should_capture_request
             else None
         )
@@ -269,7 +319,7 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
                 response_chunks.append(chunk)
 
             response_body = b"".join(response_chunks)
-            response_payload = _redact_sensitive(_decode_body(response_body, response_content_type))
+            response_payload = _safe_payload(response_body, response_content_type)
 
             response = Response(
                 content=response_body,
