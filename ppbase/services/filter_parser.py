@@ -170,6 +170,8 @@ class _MultiMatch:
     from_sql: str
     value: str
     record_id: str | None = None
+    # Id of the leaf row for a nullable date leaf (see ``_PathOperand``).
+    row_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,10 @@ class _PathOperand:
     multi_match: _MultiMatch | None
     field_type: str = ""
     is_json: bool = False
+    # Id of the leaf row when the leaf is a nullable date: PPBase stores an
+    # empty date as NULL, so only a NULL id means a missing row (SQL NULL in
+    # PocketBase, where the empty date is '').
+    row_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +358,9 @@ class _FilterTransformer(Transformer):
         self._joins: dict[str, _Join] = {}
         self._join_keys: dict[tuple[Any, ...], str] = {}
         self._alias_counter = 0
+        # Set while building a multi-match condition, which is negated: its
+        # date comparisons must be TRUE/FALSE/NULL exactly like PocketBase's.
+        self._exact_dates = False
 
     def _next_param(self, value: Any) -> str:
         self._param_counter += 1
@@ -836,6 +845,9 @@ class _FilterTransformer(Transformer):
         # ── Regular comparisons ────────────────────────────────────────
         left_sql = self._operand_to_sql(left)
         right_sql = self._operand_to_sql(right)
+        date_sql = _empty_date_condition(self, left, left_sql, op, right, right_sql)
+        if date_sql is not None:
+            return date_sql
 
         # Standard comparisons
         if op in _STANDARD_OPS:
@@ -1175,6 +1187,11 @@ class _FilterTransformer(Transformer):
             self._register_join,
         )
         multi_match = multi_match or collection is not None
+        date_leaf = (
+            not resolved.is_json
+            and modifier is None
+            and resolved.field_type in _NULLABLE_DATE_FIELD_TYPES
+        )
 
         # Multi-match subquery: the same joins with their own aliases.
         mm: _MultiMatch | None = None
@@ -1197,7 +1214,8 @@ class _FilterTransformer(Transformer):
                     None,
                     f'LEFT JOIN "{collection[0]}" AS "@ALIAS@" ON TRUE',
                 )
-            mm_leaf, _deepest, _multi = self._join_path(mm_root, resolved, modifier, make)
+            mm_leaf, mm_deepest, _multi = self._join_path(mm_root, resolved, modifier, make)
+            mm_row_id = self._column_of(mm_deepest, "id") if date_leaf else None
             if collection is None and self._current_table:
                 # Joins from the current record: list every record's rows
                 # and match them on the id (decorrelated, PostgreSQL can
@@ -1209,11 +1227,13 @@ class _FilterTransformer(Transformer):
                     ).replace(_BASE_REF, base),
                     value=mm_leaf.replace(_BASE_REF, base),
                     record_id=f"{base}.\"id\"",
+                    row_id=mm_row_id,
                 )
             else:
                 mm = _MultiMatch(
                     from_sql='(SELECT 1) AS "__pbm_row" ' + " ".join(clauses),
                     value=mm_leaf,
+                    row_id=mm_row_id,
                 )
 
         return _PathOperand(
@@ -1222,12 +1242,14 @@ class _FilterTransformer(Transformer):
             mm,
             field_type=resolved.field_type,
             is_json=resolved.is_json,
+            row_id=self._column_of(deepest, "id") if date_leaf else None,
         )
 
     def _side(self, node: tuple, path: _PathOperand | None) -> _Side:
         """Classify an operand like ``resolveEqualExpr`` (filter.go l.290-401)."""
         if path is not None:
-            return _Side(path.sql, "column", ("sql_ref", path.sql), is_json=path.is_json)
+            node = ("sql_ref", path.sql, path.is_json, path.field_type, path.row_id)
+            return _Side(path.sql, "column", node, is_json=path.is_json)
         sql = self._operand_to_sql(node)
         kind = node[0] if isinstance(node, tuple) and node else ""
         if kind == "null" or sql == "NULL":
@@ -1289,6 +1311,18 @@ class _FilterTransformer(Transformer):
                 ref_is_left=ref_is_left,
             )
         base_op = op.removeprefix("?")
+        if self._exact_dates or base_op not in {"=", "!="}:
+            date_sql = _empty_date_condition(
+                self,
+                left.node,
+                left.sql,
+                base_op,
+                right.node,
+                right.sql,
+                exact=self._exact_dates,
+            )
+            if date_sql is not None:
+                return date_sql
         if base_op in {"=", "!="}:
             return self._pb_equal_sql(left, right, equal=base_op == "=")
         if base_op in _LIKE_OPS:
@@ -1314,6 +1348,18 @@ class _FilterTransformer(Transformer):
             return failing
         return "(" + " OR ".join([failing, *(f"{v} IS NULL" for v in values)]) + ")"
 
+    @staticmethod
+    def _multi_match_value(alias: str, mm: _MultiMatch, side: _Side) -> tuple[_Side, str]:
+        """The subquery value of a multi-match and the SQL that is NULL when
+        the joined row is missing (the value itself, or the leaf row id of a
+        nullable date leaf, whose NULL value is an empty date)."""
+        value = f'"{alias}"."v"'
+        if mm.row_id is None:
+            return _Side(value, "column", ("sql_ref", value), is_json=side.is_json), value
+        row_id = f'"{alias}"."r"'
+        node = ("sql_ref", value, False, side.node[3], row_id)
+        return _Side(value, "column", node), row_id
+
     def _many_vs_one_sql(
         self,
         mm: _MultiMatch,
@@ -1324,14 +1370,17 @@ class _FilterTransformer(Transformer):
         path_is_left: bool,
     ) -> str:
         alias = self._next_alias("__pbsm")
-        value = f'"{alias}"."v"'
-        value_side = _Side(value, "column", ("sql_ref", value), is_json=path_side.is_json)
-        condition = (
-            self._compare_sides(value_side, op, other)
-            if path_is_left
-            else self._compare_sides(other, op, value_side)
-        )
-        failure = self._multi_match_failure(condition, op, [value])
+        value_side, missing = self._multi_match_value(alias, mm, path_side)
+        self._exact_dates = True
+        try:
+            condition = (
+                self._compare_sides(value_side, op, other)
+                if path_is_left
+                else self._compare_sides(other, op, value_side)
+            )
+        finally:
+            self._exact_dates = False
+        failure = self._multi_match_failure(condition, op, [missing])
         if mm.record_id is not None:
             failure = f'"{alias}"."__pbm_id" = {_BASE_REF}."id" AND {failure}'
         return (
@@ -1342,7 +1391,8 @@ class _FilterTransformer(Transformer):
     @staticmethod
     def _multi_match_select(mm: _MultiMatch) -> str:
         record_id = f', {mm.record_id} AS "__pbm_id"' if mm.record_id else ""
-        return f'SELECT {mm.value} AS "v"{record_id} FROM {mm.from_sql}'
+        row_id = f', {mm.row_id} AS "r"' if mm.row_id else ""
+        return f'SELECT {mm.value} AS "v"{record_id}{row_id} FROM {mm.from_sql}'
 
     def _many_vs_many_sql(
         self,
@@ -1354,14 +1404,14 @@ class _FilterTransformer(Transformer):
     ) -> str:
         left_alias = self._next_alias("__pbml")
         right_alias = self._next_alias("__pbmr")
-        left_value = f'"{left_alias}"."v"'
-        right_value = f'"{right_alias}"."v"'
-        condition = self._compare_sides(
-            _Side(left_value, "column", ("sql_ref", left_value), is_json=left.is_json),
-            op,
-            _Side(right_value, "column", ("sql_ref", right_value), is_json=right.is_json),
-        )
-        failure = self._multi_match_failure(condition, op, [left_value, right_value])
+        left_side, left_missing = self._multi_match_value(left_alias, left_mm, left)
+        right_side, right_missing = self._multi_match_value(right_alias, right_mm, right)
+        self._exact_dates = True
+        try:
+            condition = self._compare_sides(left_side, op, right_side)
+        finally:
+            self._exact_dates = False
+        failure = self._multi_match_failure(condition, op, [left_missing, right_missing])
         right_on = "TRUE"
         if right_mm.record_id is not None:
             right_on = f'"{right_alias}"."__pbm_id" = {_BASE_REF}."id"'
@@ -2176,3 +2226,231 @@ def parse_sort(sort_str: str) -> list[tuple[str, str]]:
             result.append((f'"{part}"', direction))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Empty dates
+# ---------------------------------------------------------------------------
+#
+# PocketBase stores an empty date as '' (``TEXT DEFAULT '' NOT NULL``,
+# v0.22.34 models/schema/schema_field.go l.163, v0.40.6 core/field_date.go
+# l.109-110) and compares dates as SQLite text: ``=``/``!=`` treat '' and
+# NULL alike (``resolveEqualExpr``, v0.22.34 tools/search/filter.go
+# l.290-368, v0.40.6 l.340-422), while ``<``, ``<=``, ``>``, ``>=``, ``~``
+# and ``!~`` compare the stored text directly (v0.22.34 l.155-176), so ''
+# sorts before every date.  PPBase stores the empty date as NULL in a
+# ``TIMESTAMPTZ NULL`` column; the SQL below gives that NULL the semantics
+# of ''.  The ``null`` identifier stays SQL NULL for ``<``-like operators,
+# as in PocketBase.
+
+# Only ``date`` columns are nullable; ``autodate`` columns are NOT NULL.
+_NULLABLE_DATE_FIELD_TYPES = {"date"}
+_FLIPPED_STANDARD_OPS = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+
+def _date_operand_kind(parser: _FilterTransformer, node: Any, sql: str) -> str:
+    """Classify a comparison operand for the empty-date semantics.
+
+    ``"date"`` is a nullable date column (NULL stands for ''), ``"empty"`` an
+    empty string value, ``"null"`` the ``null`` identifier or a missing
+    request value, ``"value"`` anything else (date literal, macro, column).
+    """
+    kind = node[0] if isinstance(node, tuple) and node else ""
+    # A ``sql_ref`` whose third item is True is a JSON path, never a column.
+    is_column = kind == "field" or (kind == "sql_ref" and node[2:3] != (True,))
+    if is_column and parser._operand_field_type(node) in _NULLABLE_DATE_FIELD_TYPES:
+        return "date"
+    if kind == "null":
+        return "null"
+    if parser._is_bound_param(sql):
+        value = parser._params[sql[1:]]
+        if value is None:
+            return "null"
+        if value == "":
+            return "empty"
+    return "value"
+
+
+def _date_row_sql(node: Any) -> str | None:
+    """Leaf row id of a relation-path date operand (``_PathOperand.row_id``)."""
+    if isinstance(node, tuple) and len(node) >= 5 and node[0] == "sql_ref":
+        return node[4]
+    return None
+
+
+def _and_sql(*terms: str | None) -> str:
+    """``AND`` of the given terms; ``None`` terms are TRUE."""
+    kept = [term for term in terms if term]
+    if not kept:
+        return "TRUE"
+    return kept[0] if len(kept) == 1 else "(" + " AND ".join(kept) + ")"
+
+
+def _pb_date_text_sql(sql: str, row_sql: str | None = None) -> str:
+    """The text PocketBase stores for a date: '' or ``YYYY-MM-DD HH:MM:SS.mmmZ``.
+
+    With ``row_sql`` (relation path leaf), a missing row stays SQL NULL.
+    """
+    text = (
+        f"COALESCE(to_char({sql} AT TIME ZONE 'UTC', "
+        "'YYYY-MM-DD HH24:MI:SS.MS\"Z\"'), '')"
+    )
+    if row_sql is None:
+        return text
+    return f"(CASE WHEN {row_sql} IS NOT NULL THEN {text} END)"
+
+
+def _empty_date_sql(
+    date_sql: str,
+    sql_op: str,
+    other_sql: str,
+    other_kind: str,
+    date_row: str | None = None,
+    other_row: str | None = None,
+) -> str:
+    """Compare a nullable date column like the SQLite text PocketBase stores.
+
+    ``date_row``/``other_row`` are the leaf row ids of relation paths: a
+    missing row is SQL NULL in PocketBase too, only the NULL of an existing
+    row is an empty date.  ``None`` means that the row always exists.
+    """
+    d, o = date_sql, other_sql
+    d_row = None if date_row is None else f"{date_row} IS NOT NULL"
+    d_empty = _and_sql(f"{d} IS NULL", d_row)
+    if other_kind == "date":
+        o_row = None if other_row is None else f"{other_row} IS NOT NULL"
+        o_empty = _and_sql(f"{o} IS NULL", o_row)
+        return {
+            "=": f"({d} IS NOT DISTINCT FROM {o})",
+            "!=": f"({d} IS DISTINCT FROM {o})",
+            "<": f"({d} < {o} OR {_and_sql(d_empty, f'{o} IS NOT NULL')})",
+            "<=": f"({d} <= {o} OR {_and_sql(d_empty, o_row)})",
+            ">": f"({d} > {o} OR {_and_sql(f'{d} IS NOT NULL', o_empty)})",
+            ">=": f"({d} >= {o} OR {_and_sql(o_empty, d_row)})",
+        }[sql_op]
+    if other_kind == "empty":
+        return {
+            "=": f"{d} IS NULL",
+            "!=": f"{d} IS NOT NULL",
+            "<": "FALSE",
+            "<=": d_empty,
+            ">": f"{d} IS NOT NULL",
+            ">=": _and_sql(d_row),
+        }[sql_op]
+    if other_kind == "null":
+        if sql_op in {"=", "!="}:
+            return f"{d} IS {'' if sql_op == '=' else 'NOT '}NULL"
+        return f"{d} {sql_op} NULL"
+    return {
+        "=": f"{d} = {o}",
+        "!=": f"({d} <> {o} OR {d} IS NULL)",
+        "<": f"({d} < {o} OR {d_empty})",
+        "<=": f"({d} <= {o} OR {d_empty})",
+        ">": f"{d} > {o}",
+        ">=": f"{d} >= {o}",
+    }[sql_op]
+
+
+# SQLite text order of PocketBase dates: '' (empty) before any date.
+_EMPTY_VS_EMPTY = {"<": False, "<=": True, ">": False, ">=": True, "=": True, "!=": False}
+_EMPTY_VS_DATE = {"<": True, "<=": True, ">": False, ">=": False, "=": False, "!=": True}
+_DATE_VS_EMPTY = {"<": False, "<=": False, ">": True, ">=": True, "=": False, "!=": True}
+
+
+def _bool_sql(value: bool | None) -> str:
+    return "NULL" if value is None else ("TRUE" if value else "FALSE")
+
+
+def _exact_date_sql(
+    d: str,
+    sql_op: str,
+    o: str,
+    other_kind: str,
+    date_row: str | None,
+    other_row: str | None,
+) -> str:
+    """``d op o`` with PocketBase's exact three-valued result.
+
+    PocketBase compares the stored text: '' for an empty date (before any
+    date), SQL NULL only for a missing row; ``=``/``!=`` follow
+    ``resolveEqualExpr`` (v0.22.34 tools/search/filter.go l.290-368).  A
+    multi-match negates the condition (``NOT (...)``, l.680-706), so an empty
+    date must give TRUE or FALSE there, never the NULL of PPBase's column.
+    """
+    equal_op = sql_op in {"=", "!="}
+    whens: list[str] = []
+    if other_kind == "date":
+        if equal_op:
+            # COALESCE(a, '') = COALESCE(b, ''): a missing row is ''.
+            distinct = "IS NOT DISTINCT FROM" if sql_op == "=" else "IS DISTINCT FROM"
+            return f"({d} {distinct} {o})"
+        rows = [f"{row} IS NULL" for row in (date_row, other_row) if row]
+        if rows:
+            whens.append(f"WHEN {' OR '.join(rows)} THEN NULL")
+        whens.append(
+            f"WHEN {d} IS NULL AND {o} IS NULL THEN {_bool_sql(_EMPTY_VS_EMPTY[sql_op])}"
+        )
+        whens.append(f"WHEN {d} IS NULL THEN {_bool_sql(_EMPTY_VS_DATE[sql_op])}")
+        whens.append(f"WHEN {o} IS NULL THEN {_bool_sql(_DATE_VS_EMPTY[sql_op])}")
+        return f"(CASE {' '.join(whens)} ELSE {d} {sql_op} {o} END)"
+    if other_kind == "null" and not equal_op:
+        return "NULL"  # v < NULL
+    missing: bool | None
+    if other_kind in {"empty", "null"}:
+        # ``null`` is an empty identifier for ``=``/``!=`` (filter.go l.395):
+        # (v = '' OR v IS NULL) / (v IS NOT '' AND v IS NOT NULL).
+        missing = {"=": True, "!=": False}.get(sql_op)
+        empty: bool | None = _EMPTY_VS_EMPTY[sql_op]
+        value: bool | None = _DATE_VS_EMPTY[sql_op]
+    else:
+        # A known value: v = 'x' / v IS NOT 'x' / v < 'x'...
+        missing = True if sql_op == "!=" else None
+        empty = _EMPTY_VS_DATE[sql_op]
+        value = None
+    if date_row is not None:
+        whens.append(f"WHEN {date_row} IS NULL THEN {_bool_sql(missing)}")
+    whens.append(f"WHEN {d} IS NULL THEN {_bool_sql(empty)}")
+    if value is None:
+        compare = "<>" if sql_op == "!=" else sql_op
+        return f"(CASE {' '.join(whens)} ELSE {d} {compare} {o} END)"
+    return f"(CASE {' '.join(whens)} ELSE {_bool_sql(value)} END)"
+
+
+def _empty_date_condition(
+    parser: _FilterTransformer,
+    left: Any,
+    left_sql: str,
+    op: str,
+    right: Any,
+    right_sql: str,
+    *,
+    exact: bool = False,
+) -> str | None:
+    """SQL of ``left op right`` when one operand is a nullable date column.
+
+    Returns ``None`` for any other comparison, which keeps its usual SQL.
+    ``exact`` gives PocketBase's exact three-valued result (multi-match).
+    """
+    left_kind = _date_operand_kind(parser, left, left_sql)
+    right_kind = _date_operand_kind(parser, right, right_sql)
+    if "date" not in (left_kind, right_kind):
+        return None
+    left_row, right_row = _date_row_sql(left), _date_row_sql(right)
+    if op in _LIKE_OPS:
+        if left_kind == "date":
+            left_sql = _pb_date_text_sql(left_sql, left_row)
+        if right_kind == "date":
+            right_sql = _pb_date_text_sql(right_sql, right_row)
+            right = ("sql_ref", right_sql)
+        return parser._like_comparison_sql(left_sql, right, right_sql, _LIKE_OPS[op])
+    if op not in _STANDARD_OPS:
+        return None
+    sql_op = _STANDARD_OPS[op]
+    if left_kind != "date":
+        # ``value op date`` is ``date flipped(op) value``.
+        left_sql, right_sql, right_kind = right_sql, left_sql, left_kind
+        left_row, right_row = right_row, left_row
+        sql_op = _FLIPPED_STANDARD_OPS[sql_op]
+    if exact:
+        return _exact_date_sql(left_sql, sql_op, right_sql, right_kind, left_row, right_row)
+    return _empty_date_sql(left_sql, sql_op, right_sql, right_kind, left_row, right_row)

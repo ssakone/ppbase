@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Empty dates served, filtered and sorted like PocketBase
+
+See `docs/empty-dates.md`.
+
+- An empty date is served `""` (never `null`); view records omit empty
+  `created`/`updated`.
+- Filters and sorts give the stored `NULL` the semantics of PocketBase's
+  `''` (before every date), including relation and `@collection` leaves,
+  where a missing target stays SQL `NULL`, and multi-match subqueries.
+
 ### Relation paths: PocketBase LEFT JOIN and multi-match
 
 See `docs/filter-paths-multi-match.md`.
