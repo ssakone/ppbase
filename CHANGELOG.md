@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Security follow-up: qualified paths, modifiers, realtime payload, expand
+
+See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
+`docs/error-envelope.md`.
+
+- A dotted filter path must start with a relation, a back relation or a JSON
+  field: `users.password_hash~"$2b$"` (table-qualified self reference) used to
+  read the hidden column, and `other.col` produced a 500; both are now an
+  opaque 400 like in PocketBase 0.22.34.
+- A system field never takes a modifier: `email:lower`, `email:length`,
+  `email:isset`, `email:each`, `id:length`... are a 400 (they used to drop the
+  email visibility guard, a masked-email oracle).
+- Every list filter/sort error answers PocketBase's opaque message.
+- Realtime payloads no longer send a hidden email to every subscriber: only
+  the owner whose `manageRule` check passes receives it, like PocketBase
+  0.22.34 (admins do not).
+- Expand applies the related collection's `viewRule` (nil: admins only).
+- `emailVisibility`/`verified` are parsed like Go's `cast.ToBool` on create
+  and update: the multipart/JSON string `"false"` is false.
+- `username` resolves in a filter/sort only when the auth collection has a
+  `username` column (400 instead of a 500 otherwise).
+- A present `@request.*` value compared with a literal, `true`/`false` or
+  another request value is folded with SQLite's comparison (`1 = true`,
+  `"true" != true`) instead of being bound against a boolean (500); an absent
+  value is SQL NULL, so `<`, `>`, `~` never match it.
+- `totalPages` is `ceil(totalItems / perPage)` (0 when empty) for the
+  collections, admins and logs lists too.
+- JSON error bodies carry PocketBase 0.22's `code` next to `status`.
+
 ### Absent @request.* values no longer 500; totalPages and expand key
 
 See `docs/request-static-fields.md`.
