@@ -217,16 +217,16 @@ async def request_password_reset(
     session: AsyncSession,
     email: str,
     settings: Any,
-    *,
-    base_url: str = "",
 ) -> bool:
     """E-mail a password reset link to the admin with exactly ``email``.
 
     PocketBase 0.22.34 forms/admin_password_reset_request.go:63-89: unknown
     e-mail, or a link sent less than 120 seconds ago, sends nothing; the send
-    time is stored only once the message is accepted.  Returns whether a
-    message was sent.
+    time is stored only once the message is accepted.  The link is built on
+    the stored ``meta.appURL`` only (mails/admin.go:22-26), never on request
+    headers.  Returns whether a message was sent.
     """
+    from ppbase.services.app_url import app_url_from_settings
     from ppbase.services.mail_service import send_admin_password_reset_email
 
     admin = await get_admin_by_email(session, email)
@@ -253,7 +253,7 @@ async def request_password_reset(
         admin.email,
         token,
         settings,
-        base_url=base_url,
+        base_url=app_url_from_settings(settings_row),
         app_name=app_name,
     )
     if not sent:

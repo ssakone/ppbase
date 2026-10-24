@@ -24,6 +24,7 @@ from ppbase.core.id_generator import generate_id
 from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import ParamRecord
 from ppbase.models.field_types import _EMAIL_RE
+from ppbase.services.app_url import DEFAULT_APP_URL
 from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
 from ppbase.services.secret_redaction import (
     redact_settings,
@@ -41,7 +42,7 @@ router = APIRouter()
 _DEFAULT_SETTINGS: dict[str, Any] = {
     "meta": {
         "appName": "PPBase",
-        "appURL": "http://localhost:8090",
+        "appURL": DEFAULT_APP_URL,
         "senderName": "Support",
         "senderAddress": "support@example.com",
         "hideControls": False,

@@ -30,7 +30,7 @@ from ppbase.api.deps import (
     get_settings,
     require_admin,
 )
-from ppbase.db.engine import get_async_session, get_engine
+from ppbase.db.engine import get_async_session
 from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services import admin_service
 
@@ -252,13 +252,11 @@ def _string_fields(body: dict[str, Any], *names: str) -> dict[str, str]:
     return values
 
 
-async def _send_admin_password_reset(email: str, settings: Any, base_url: str) -> None:
+async def _send_admin_password_reset(email: str, settings: Any) -> None:
     """Background part of the reset request: errors are never shown to the client."""
     try:
         async for session in get_async_session():
-            await admin_service.request_password_reset(
-                session, email, settings, base_url=base_url
-            )
+            await admin_service.request_password_reset(session, email, settings)
     except Exception as exc:  # pragma: no cover - logged, like PocketBase's FireAndForget
         logger.error("Failed to send admin password reset request: %s", type(exc).__name__)
 
@@ -272,7 +270,9 @@ async def request_password_reset(
     """PocketBase 0.22 admin password reset request (apis/admin.go:21, :111-154).
 
     Answers 204 for any valid e-mail, known or not, before anything is sent
-    (protection against admin enumeration); the link is sent in the background.
+    (protection against admin enumeration); the link is sent in the background,
+    built on the stored application URL only (services/app_url.py), never on
+    the request headers.
     """
     body = await _json_object_or_error(request)
     email = _string_fields(body, "email")["email"]
@@ -284,10 +284,7 @@ async def request_password_reset(
             {"email": {"code": "validation_is_email", "message": "Must be a valid email address."}},
         )
 
-    from ppbase.api.record_auth import _resolve_public_base_url
-
-    base_url = await _resolve_public_base_url(request, get_engine())
-    background_tasks.add_task(_send_admin_password_reset, email, settings, base_url)
+    background_tasks.add_task(_send_admin_password_reset, email, settings)
     return Response(status_code=204)
 
 
