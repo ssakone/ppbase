@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.db.system_tables import CollectionRecord
 from ppbase.models.field_multiplicity import (
+    field_options,
     prepare_relation_value,
     relation_is_multiple,
     to_unique_string_list,
@@ -176,7 +177,8 @@ async def _expand_path(
     if rel_field is None:
         return
 
-    opts = rel_field.get("options", {})
+    # Nested (0.22) or flat (current) definition, merged like everywhere else.
+    opts = field_options(rel_field)
     target_coll_id = opts.get("collectionId", "")
     # PocketBase 0.22.34 daos/record_expand.go l.257-261: a list unless
     # maxSelect is a number <= 1 (so maxSelect: null expands to a list).

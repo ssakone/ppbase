@@ -422,15 +422,23 @@ def test_request_value_any_match_does_not_use_untyped_to_jsonb() -> None:
     assert "user_1" in params.values()
 
 
-def test_list_request_value_any_match_unnests_a_text_array() -> None:
+def test_list_request_value_is_bound_as_its_json_text_like_pocketbase() -> None:
+    # v0.22.34 resolvers/record_field_resolver.go l.203-215: a non-plain
+    # @request.* value is json.Marshal-ed, so ?= never multi-matches it.
     sql, params = parse_filter(
         '@request.body.tags ?= "b"',
         request_context={"data": {"tags": ["a", "b", 3]}},
         current_table="owners",
     )
     assert "to_jsonb(:" not in sql
-    assert "unnest(CAST(:" in sql
-    assert ["a", "b", "3"] in params.values()
+    assert "unnest(" not in sql
+    assert '["a","b",3]' in params.values()
+    sql, params = parse_filter(
+        "@request.data.meta = '{}'",
+        request_context={"data": {"meta": {"z": 1, "a": "<&>"}}},
+        current_table="owners",
+    )
+    assert '{"a":"\\u003c\\u0026\\u003e","z":1}' in params.values()
 
 
 def test_direct_multi_value_ordering_operators_compare_json_text() -> None:
@@ -439,3 +447,184 @@ def test_direct_multi_value_ordering_operators_compare_json_text() -> None:
         'rels ?> "a"', relation_resolver=index, current_table="owners"
     )
     assert sql.startswith('array_to_json("owners"."rels")::text > :')
+
+
+def _path_collections():
+    """targets <- customers.pdv (maxSelect null) <- sales.customer (single)."""
+    targets, owners = _collections()
+    customers = _Collection(
+        "customer_coll01",
+        "customers",
+        [
+            {
+                "name": "pdv",
+                "type": "relation",
+                "options": {"collectionId": "target_coll_id1", "maxSelect": None},
+            },
+            {
+                "name": "one",
+                "type": "relation",
+                "options": {"collectionId": "target_coll_id1", "maxSelect": 1},
+            },
+            {"name": "label", "type": "text"},
+        ],
+    )
+    sales = _Collection(
+        "sales_coll_id01",
+        "sales",
+        [
+            {
+                "name": "customer",
+                "type": "relation",
+                "options": {"collectionId": "customer_coll01", "maxSelect": 1},
+            }
+        ],
+    )
+    return [targets, owners, customers, sales]
+
+
+def test_relation_path_ending_on_a_multi_value_field_uses_its_json_text() -> None:
+    # PocketBase resolves the last segment like a direct field (v0.22.34
+    # resolvers/record_field_resolve_runner.go l.454-476): the JSON text.
+    index = _build_relation_index_from_collections(_path_collections())
+    for expression in (
+        'customer.pdv = "x"',
+        'customer.pdv ?= "x"',
+        'customer.pdv ~ "x"',
+        "customer.pdv = '[\"x\"]'",
+    ):
+        sql, _params = parse_filter(
+            expression, relation_resolver=index, current_table="sales"
+        )
+        assert 'array_to_json("customers"."pdv")::text' in sql, expression
+        assert "jsonb_array_elements_text" not in sql, expression
+    # A scalar leaf keeps its column.
+    sql, _params = parse_filter(
+        'customer.label = "x"', relation_resolver=index, current_table="sales"
+    )
+    assert '"customers"."label" = :' in sql
+
+
+def test_relation_path_modifiers_apply_to_the_leaf() -> None:
+    index = _build_relation_index_from_collections(_path_collections())
+    sql, _params = parse_filter(
+        "customer.pdv:length = 2", relation_resolver=index, current_table="sales"
+    )
+    assert 'COALESCE(cardinality("customers"."pdv"), 0) = 2' in sql
+    sql, _params = parse_filter(
+        "customer.one:length = 1", relation_resolver=index, current_table="sales"
+    )
+    assert "CASE WHEN COALESCE(\"customers\".\"one\"::text, '') = '' THEN 0" in sql
+    sql, _params = parse_filter(
+        'customer.pdv:each ?= "x"', relation_resolver=index, current_table="sales"
+    )
+    assert (
+        'unnest(CASE WHEN COALESCE(cardinality(COALESCE(CAST("customers"."pdv"' in sql
+    )
+    assert "NOT EXISTS" not in sql  # ? operators are any-match
+    sql, _params = parse_filter(
+        'customer.pdv:each = "x"', relation_resolver=index, current_table="sales"
+    )
+    assert "AND NOT EXISTS (SELECT 1 FROM unnest(" in sql  # every item must match
+
+
+def test_collection_reference_leaf_and_modifiers() -> None:
+    index = _build_relation_index_from_collections(_path_collections())
+    sql, _params = parse_filter(
+        '@collection.customers.pdv ?~ "x"',
+        relation_resolver=index,
+        collection_resolver=index,
+        current_table="sales",
+    )
+    assert 'array_to_json("customers"."pdv")::text' in sql
+    sql, _params = parse_filter(
+        "@collection.customers.pdv:length ?= 2",
+        relation_resolver=index,
+        collection_resolver=index,
+        current_table="sales",
+    )
+    assert 'cardinality("customers"."pdv")' in sql
+    sql, _params = parse_filter(
+        '@collection.sales.customer.pdv ~ "x"',
+        relation_resolver=index,
+        collection_resolver=index,
+        current_table="owners",
+    )
+    assert 'array_to_json("customers"."pdv")::text' in sql
+    with pytest.raises(ValueError):
+        parse_filter(
+            "@collection.customers.pdv:unknown = 1",
+            relation_resolver=index,
+            collection_resolver=index,
+            current_table="sales",
+        )
+
+
+def test_direct_each_and_length_use_the_shared_rule() -> None:
+    index = _build_relation_index_from_collections(_path_collections())
+    sql, _params = parse_filter(
+        "one:length = 0", relation_resolver=index, current_table="customers"
+    )
+    assert "char_length" not in sql  # a single relation counts 0 or 1 item
+    sql, _params = parse_filter(
+        "pdv:length = 0", relation_resolver=index, current_table="customers"
+    )
+    assert 'COALESCE(cardinality("customers"."pdv"), 0) = 0' in sql
+    sql, _params = parse_filter(
+        'one:each = "x"', relation_resolver=index, current_table="customers"
+    )
+    assert 'ARRAY[CAST("customers"."one" AS text)]' in sql
+    assert "NOT EXISTS" not in sql  # a single value has no multi-match
+    sql, _params = parse_filter(
+        'pdv:each = ""', relation_resolver=index, current_table="customers"
+    )
+    assert "_elem.value = '' OR _elem.value IS NULL" in sql
+    sql, _params = parse_filter(
+        'pdv:each != "x"', relation_resolver=index, current_table="customers"
+    )
+    assert "_elem.value IS DISTINCT FROM CAST(:" in sql
+    assert "OR _elem.value IS NULL" in sql
+
+
+def test_request_data_length_and_each_follow_pocketbase() -> None:
+    index = _build_relation_index_from_collections(_path_collections())
+    # Arrayable schema field: len(list.ToUniqueStringSlice(value)).
+    _sql, params = parse_filter(
+        "@request.data.pdv:length = 1",
+        request_context={"data": {"pdv": "abc"}},
+        relation_resolver=index,
+        current_table="customers",
+    )
+    assert 1 in params.values()
+    _sql, params = parse_filter(
+        "@request.data.pdv:length = 2",
+        request_context={"data": {"pdv": ["a", "a", "", "b"]}},
+        relation_resolver=index,
+        current_table="customers",
+    )
+    assert 2 in params.values()
+    # Other fields keep PPBase's value length.
+    _sql, params = parse_filter(
+        "@request.data.label:length = 3",
+        request_context={"data": {"label": "abc"}},
+        relation_resolver=index,
+        current_table="customers",
+    )
+    assert 3 in params.values()
+    _sql, params = parse_filter(
+        '@request.data.pdv:each ?= "a"',
+        request_context={"data": {"pdv": ["a", "a", "b"]}},
+        relation_resolver=index,
+        current_table="customers",
+    )
+    assert ["a", "b"] in params.values()
+
+
+def test_go_json_text_matches_go_json_marshal() -> None:
+    from ppbase.models.field_multiplicity import go_json_text
+
+    assert go_json_text(["a", "b"]) == '["a","b"]'
+    assert go_json_text([]) == "[]"
+    assert go_json_text({"b": 1, "a": [1.0, 2.5]}) == '{"a":[1,2.5],"b":1}'
+    assert go_json_text(["<a&b>"]) == '["\\u003ca\\u0026b\\u003e"]'
+    assert go_json_text(["é"]) == '["é"]'

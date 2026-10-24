@@ -50,6 +50,18 @@ normalized on input), so the rule is expressed on the normalized options:
 * ``select``/``file`` with ``maxSelect: null`` -> single, exactly like the
   0.22 ``int`` decoding.
 
+Two deliberate differences follow from storing one normalized shape for both
+PocketBase formats (no BUMA field is affected: the 191 relation fields of the
+BUMA export all carry the key, 188 with ``1`` and 3 with ``null``):
+
+* a hand-written 0.22 relation *without* the ``maxSelect`` key is single in
+  PPBase, while PocketBase 0.22.34 decodes it as a ``nil`` pointer (multiple)
+  and the v0.23.0 upgrade turns it into ``2147483647``;
+* a *flat* (current format) relation sent with ``maxSelect: null`` is multiple
+  in PPBase (it is the round trip of the 0.22 ``null`` that PPBase exposes in
+  the flat ``fields`` list too), while PocketBase v0.40.6 decodes ``null`` into
+  its ``int`` as ``0``, i.e. single.
+
 The stored schema is never rewritten: the API keeps returning
 ``maxSelect: null`` as PocketBase 0.22 does.
 """
@@ -271,10 +283,59 @@ def prepare_relation_value(value: Any, *, multiple: bool) -> str | list[str]:
     return ids
 
 
+# Go's encoding/json escapes these characters by default (HTMLEscape).
+_GO_JSON_ESCAPES = {
+    "<": "\\u003c",
+    ">": "\\u003e",
+    "&": "\\u0026",
+    " ": "\\u2028",
+    " ": "\\u2029",
+}
+
+
+def _go_json_compatible(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _go_json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_go_json_compatible(item) for item in value]
+    if isinstance(value, Decimal):
+        value = float(value)
+    if (
+        isinstance(value, float)
+        and math.isfinite(value)
+        and value.is_integer()
+        and abs(value) < 1e21
+    ):
+        # Go formats float64(1) as 1, not 1.0.
+        return int(value)
+    return value
+
+
+def go_json_text(value: Any) -> str:
+    """Encode ``value`` like Go ``json.Marshal`` (compact, sorted map keys).
+
+    PocketBase binds a non-plain ``@request.*`` value (a list or an object) as
+    its JSON text (v0.22.34 ``resolvers/record_field_resolver.go``
+    ``resolveStaticRequestField``: ``cast.ToStringE`` fails, then
+    ``json.Marshal``), and a multi-value column holds the same compact JSON.
+    """
+    encoded = json.dumps(
+        _go_json_compatible(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    for char, escaped in _GO_JSON_ESCAPES.items():
+        encoded = encoded.replace(char, escaped)
+    return encoded
+
+
 __all__ = [
     "MAX_SELECT_KEY",
     "field_is_multiple",
     "field_options",
+    "go_json_text",
     "is_multiple",
     "prepare_relation_value",
     "relation_is_multiple",

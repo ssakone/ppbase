@@ -14,8 +14,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lark import Lark, Transformer, v_args
+from lark.exceptions import VisitError
 
-from ppbase.models.field_multiplicity import is_multiple
+from ppbase.models.field_multiplicity import (
+    go_json_text,
+    is_multiple,
+    to_unique_string_list,
+)
 
 # ---------------------------------------------------------------------------
 # Lark grammar for PocketBase filter syntax
@@ -109,6 +114,10 @@ _ANY_LIKE_OPS = {
 }
 
 _DATETIME_FIELD_TYPES = {"date", "autodate"}
+# PocketBase "arrayable" field types: the only ones whose ``:length`` and
+# ``:each`` modifiers iterate values (v0.22.34 ``schema.ArraybleFieldTypes``,
+# v0.40.6 ``MultiValuer`` fields).
+_ARRAYABLE_FIELD_TYPES = {"select", "file", "relation"}
 _SYSTEM_FIELD_TYPES = {
     "id": "text",
     "created": "autodate",
@@ -136,10 +145,6 @@ class _CollectionCondition:
         self.table_name = table_name
         self.group_key = group_key
         self.inner_sql = inner_sql
-
-
-# Marker returned by ``_bound_param_values`` for a scalar bound value.
-_SCALAR_BOUND = object()
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,22 @@ class _ResolvedPath:
     sql: str
     is_json: bool = False
     field_type: str = ""
+    # Whether the last segment is a multi-value field (shared rule).
+    leaf_multiple: bool = False
+
+
+@dataclass(frozen=True)
+class _LeafOperand:
+    """The last segment of a relation or ``@collection`` path.
+
+    ``sql`` is the raw column; ``modifier`` is the optional ``:length``,
+    ``:each`` or ``:lower`` suffix of the last segment.
+    """
+
+    sql: str
+    field_type: str = ""
+    multiple: bool = False
+    modifier: str | None = None
 
 
 class _CollectionRef:
@@ -184,6 +205,8 @@ class _CollectionRef:
         "leaf_sql",
         "leaf_is_json",
         "leaf_type",
+        "leaf_multiple",
+        "modifier",
     )
 
     def __init__(
@@ -196,6 +219,8 @@ class _CollectionRef:
         leaf_sql: str | None = None,
         leaf_is_json: bool = False,
         leaf_type: str = "",
+        leaf_multiple: bool = False,
+        modifier: str | None = None,
     ) -> None:
         self.table_name = table_name
         self.group_key = group_key
@@ -204,6 +229,8 @@ class _CollectionRef:
         self.leaf_sql = leaf_sql
         self.leaf_is_json = leaf_is_json
         self.leaf_type = leaf_type
+        self.leaf_multiple = leaf_multiple
+        self.modifier = modifier
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +368,17 @@ class _FilterTransformer(Transformer):
             else:
                 coll_name = _sanitize_ident(coll_ref)
                 group_key = coll_name
-            field_path = tuple(_sanitize_ident(part) for part in parts[2:] if part)
+            raw_path = [part for part in parts[2:] if part]
+            modifier: str | None = None
+            if raw_path:
+                raw_path[-1], modifier = self._split_modifier(raw_path[-1])
+            field_path = tuple(_sanitize_ident(part) for part in raw_path)
             if not field_path:
                 raise ValueError(
                     f"Invalid @collection reference: @{stripped}. "
                     "Expected format: @collection.collectionName.fieldName"
                 )
-            return ("collection_ref", coll_name, field_path, group_key)
+            return ("collection_ref", coll_name, field_path, group_key, modifier)
 
         return ("macro", name)
 
@@ -426,11 +457,7 @@ class _FilterTransformer(Transformer):
 
     def _is_multi_value_field(self, table_name: str | None, field_name: str) -> bool:
         """Return whether a current-collection field stores an array."""
-        info = self._field_info_for_table(table_name, field_name)
-        if info is None:
-            return False
-        options = info.get("options")
-        return is_multiple(info.get("type"), options if isinstance(options, dict) else {})
+        return self._info_is_multiple(self._field_info_for_table(table_name, field_name))
 
     def _field_type_for_table(self, table_name: str | None, field_name: str) -> str:
         safe_field = _sanitize_ident(str(field_name))
@@ -451,14 +478,12 @@ class _FilterTransformer(Transformer):
             return str(field_info.get("type") or "")
         return ""
 
-    def _field_type_for_collection_resolver(
+    def _collection_resolver_field_info(
         self,
         table_name: str,
         field_name: str,
-    ) -> str:
+    ) -> dict[str, Any] | None:
         safe_field = _sanitize_ident(str(field_name))
-        if safe_field in _SYSTEM_FIELD_TYPES:
-            return _SYSTEM_FIELD_TYPES[safe_field]
         safe_table = _sanitize_ident(str(table_name))
         if self._is_flat_resolver(self._collection_resolver):
             field_info = self._flat_fields(self._collection_resolver, safe_table).get(
@@ -468,9 +493,31 @@ class _FilterTransformer(Transformer):
             coll_info = self._collection_resolver.get(safe_table)
             fields = coll_info.get("fields", {}) if isinstance(coll_info, dict) else {}
             field_info = fields.get(safe_field) if isinstance(fields, dict) else None
+        return field_info if isinstance(field_info, dict) else None
+
+    def _field_type_for_collection_resolver(
+        self,
+        table_name: str,
+        field_name: str,
+    ) -> str:
+        safe_field = _sanitize_ident(str(field_name))
+        if safe_field in _SYSTEM_FIELD_TYPES:
+            return _SYSTEM_FIELD_TYPES[safe_field]
+        field_info = self._collection_resolver_field_info(table_name, safe_field)
         if isinstance(field_info, dict):
             return str(field_info.get("type") or "")
         return ""
+
+    @staticmethod
+    def _info_is_multiple(field_info: dict[str, Any] | None) -> bool:
+        """Apply the shared multiplicity rule to resolver field metadata."""
+        if not isinstance(field_info, dict):
+            return False
+        options = field_info.get("options")
+        return is_multiple(
+            field_info.get("type"),
+            options if isinstance(options, dict) else {},
+        )
 
     def _literal_for_field_type(
         self,
@@ -617,6 +664,7 @@ class _FilterTransformer(Transformer):
                     steps,
                     self._column_expr_for_table(current_table, part),
                     field_type=field_type,
+                    leaf_multiple=self._info_is_multiple(field_info),
                 )
 
             field_info = current_fields.get(part) if isinstance(current_fields, dict) else None
@@ -716,6 +764,12 @@ class _FilterTransformer(Transformer):
                     resolved.sql,
                     resolved.is_json,
                     resolved.field_type,
+                    _LeafOperand(
+                        resolved.sql,
+                        field_type=resolved.field_type,
+                        multiple=resolved.leaf_multiple,
+                        modifier=None if resolved.is_json else modifier,
+                    ),
                 )
             if resolved is not None and resolved.is_json:
                 return ("sql_ref", resolved.sql, resolved.is_json, resolved.field_type)
@@ -762,12 +816,12 @@ class _FilterTransformer(Transformer):
         # ── @collection references → generate _CollectionCondition ──────
         left_is_coll = (
             isinstance(left, tuple)
-            and len(left) == 4
+            and len(left) >= 4
             and left[0] == "collection_ref"
         )
         right_is_coll = (
             isinstance(right, tuple)
-            and len(right) == 4
+            and len(right) >= 4
             and right[0] == "collection_ref"
         )
         if left_is_coll or right_is_coll:
@@ -857,24 +911,19 @@ class _FilterTransformer(Transformer):
             f"{self._like_pattern_sql(pattern_node, pattern_sql)}"
         )
 
-    def _bound_param_values(self, sql_expr: str) -> Any:
-        """Classify a bound ``:param`` operand by its Python value.
+    def _is_bound_param(self, sql_expr: str) -> bool:
+        """Return whether ``sql_expr`` is a bare ``:param`` bound while parsing.
 
-        Returns ``None`` when ``sql_expr`` is not a bare parameter, the
-        ``_SCALAR_BOUND`` marker for a scalar value, or the parameter name of
-        a list-like value (rebound as a list of strings).
+        Literals and ``@request.*`` values are plain scalars (PocketBase binds
+        a list or an object as its JSON text, see ``_request_value``), so they
+        are compared directly: ``to_jsonb()`` on an untyped parameter cannot
+        be resolved by PostgreSQL.
         """
-        if not (sql_expr.startswith(":") and sql_expr[1:].isidentifier()):
-            return None
-        name = sql_expr[1:]
-        if name not in self._params:
-            return None
-        value = self._params[name]
-        if isinstance(value, (list, tuple, set)):
-            # Rebind as text items so CAST(:name AS text[]) is well typed.
-            self._params[name] = ["" if item is None else str(item) for item in value]
-            return name
-        return _SCALAR_BOUND
+        return (
+            sql_expr.startswith(":")
+            and sql_expr[1:].isidentifier()
+            and sql_expr[1:] in self._params
+        )
 
     def _scalar_or_array_any_sql(
         self,
@@ -900,17 +949,8 @@ class _FilterTransformer(Transformer):
 
         container_text = self._text_cast_sql(container_sql)
         value_text = self._text_cast_sql(value_sql)
-        bound = self._bound_param_values(container_sql)
-        if bound is not None:
-            # A literal or request value is known while parsing: comparing it
-            # needs no to_jsonb() on an untyped parameter (which PostgreSQL
-            # cannot resolve).
-            if bound is _SCALAR_BOUND:
-                return f"{value_text} {sql_op} {container_text}"
-            return (
-                f"EXISTS (SELECT 1 FROM unnest(CAST(:{bound} AS text[])) "
-                f"AS _elem(value) WHERE {value_text} {sql_op} _elem.value)"
-            )
+        if self._is_bound_param(container_sql):
+            return f"{value_text} {sql_op} {container_text}"
         return (
             "(CASE "
             f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
@@ -930,14 +970,8 @@ class _FilterTransformer(Transformer):
         container_text = self._text_cast_sql(container_sql)
         if container_sql in self._json_text_operands:
             return f"{container_text} {sql_op} {pattern_sql}"
-        bound = self._bound_param_values(container_sql)
-        if bound is not None:
-            if bound is _SCALAR_BOUND:
-                return f"{container_text} {sql_op} {pattern_sql}"
-            return (
-                f"EXISTS (SELECT 1 FROM unnest(CAST(:{bound} AS text[])) "
-                f"AS _elem(value) WHERE _elem.value {sql_op} {pattern_sql})"
-            )
+        if self._is_bound_param(container_sql):
+            return f"{container_text} {sql_op} {pattern_sql}"
         return (
             "(CASE "
             f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
@@ -951,6 +985,7 @@ class _FilterTransformer(Transformer):
         coll_name = _sanitize_ident(str(node[1]))
         field_path = tuple(_sanitize_ident(str(part)) for part in node[2])
         group_key = str(node[3])
+        modifier = node[4] if len(node) > 4 else None
 
         if len(field_path) == 1:
             field_type = self._field_type_for_collection_resolver(
@@ -962,6 +997,10 @@ class _FilterTransformer(Transformer):
                 group_key,
                 column_sql=self._qualified_column(coll_name, field_path[0]),
                 leaf_type=field_type,
+                leaf_multiple=self._info_is_multiple(
+                    self._collection_resolver_field_info(coll_name, field_path[0])
+                ),
+                modifier=modifier,
             )
 
         if self._is_flat_resolver(self._collection_resolver):
@@ -986,12 +1025,15 @@ class _FilterTransformer(Transformer):
                 f"@collection.{coll_name}.{'.'.join(field_path)}."
             )
 
+        leaf_modifier = None if resolved.is_json else modifier
         if not resolved.steps:
             return _CollectionRef(
                 coll_name,
                 group_key,
                 column_sql=resolved.sql,
                 leaf_type=resolved.field_type,
+                leaf_multiple=resolved.leaf_multiple,
+                modifier=leaf_modifier,
             )
 
         return _CollectionRef(
@@ -1001,6 +1043,8 @@ class _FilterTransformer(Transformer):
             leaf_sql=resolved.sql,
             leaf_is_json=resolved.is_json,
             leaf_type=resolved.field_type,
+            leaf_multiple=resolved.leaf_multiple,
+            modifier=leaf_modifier,
         )
 
     def _collection_relation_leaf_sql(self, ref: _CollectionRef) -> str:
@@ -1046,6 +1090,93 @@ class _FilterTransformer(Transformer):
             )
         return wrapped
 
+    def _collection_ref_leaf(self, ref: _CollectionRef) -> _LeafOperand:
+        sql = (
+            ref.column_sql
+            if ref.column_sql is not None
+            else self._collection_relation_leaf_sql(ref)
+        )
+        return _LeafOperand(
+            sql,
+            field_type=ref.leaf_type,
+            multiple=ref.leaf_multiple,
+            modifier=ref.modifier,
+        )
+
+    def _operator_condition_sql(
+        self,
+        ref_sql: str,
+        op: str,
+        other: tuple,
+        other_sql: str,
+        *,
+        ref_is_left: bool,
+    ) -> str:
+        """Compare a resolved path leaf with the other operand."""
+        if op in _STANDARD_OPS:
+            sql_op = _STANDARD_OPS[op]
+            if other[0] == "null":
+                if sql_op == "=":
+                    return f"{ref_sql} IS NULL"
+                if sql_op == "!=":
+                    return f"{ref_sql} IS NOT NULL"
+                return f"{ref_sql} {sql_op} NULL"
+            if ref_is_left:
+                return f"{ref_sql} {sql_op} {other_sql}"
+            return f"{other_sql} {sql_op} {ref_sql}"
+        if op in _LIKE_OPS:
+            sql_op = _LIKE_OPS[op]
+            if ref_is_left:
+                return self._like_comparison_sql(ref_sql, other, other_sql, sql_op)
+            return self._like_comparison_sql(
+                other_sql,
+                ("sql_ref", ref_sql),
+                ref_sql,
+                sql_op,
+            )
+        if op in _ANY_STANDARD_OPS:
+            sql_op = _ANY_STANDARD_OPS[op]
+            if ref_is_left:
+                return self._scalar_or_array_any_sql(ref_sql, other_sql, sql_op)
+            return self._scalar_or_array_any_sql(other_sql, ref_sql, sql_op)
+        if op in _ANY_LIKE_OPS:
+            sql_op = _ANY_LIKE_OPS[op]
+            if ref_is_left:
+                pattern_sql = self._like_pattern_sql(other, other_sql)
+                return self._scalar_or_array_like_sql(ref_sql, pattern_sql, sql_op)
+            pattern_sql = self._like_pattern_sql(("sql_ref", ref_sql), ref_sql)
+            return self._scalar_or_array_like_sql(other_sql, pattern_sql, sql_op)
+        if ref_is_left:
+            return f"{ref_sql} = {other_sql}"
+        return f"{other_sql} = {ref_sql}"
+
+    def _leaf_condition_sql(
+        self,
+        leaf: _LeafOperand,
+        op: str,
+        other: tuple,
+        *,
+        leaf_is_left: bool,
+    ) -> str:
+        """Compare the last segment of a relation/``@collection`` path."""
+        if leaf.modifier == "each" and leaf.field_type in _ARRAYABLE_FIELD_TYPES:
+            return self._each_condition_sql(
+                self._each_elements_sql(leaf.sql, multiple=leaf.multiple),
+                op,
+                other,
+                each_is_left=leaf_is_left,
+                multiple=leaf.multiple,
+            )
+        leaf_sql = self._leaf_value_sql(leaf)
+        other_sql = self._operand_to_sql(other)
+        return self._operator_condition_sql(
+            leaf_sql,
+            op,
+            other,
+            other_sql,
+            ref_is_left=leaf_is_left,
+        )
+
     def _collection_ref_condition(
         self,
         ref: _CollectionRef,
@@ -1054,60 +1185,14 @@ class _FilterTransformer(Transformer):
         *,
         ref_is_left: bool,
     ) -> str:
-        ref_sql = (
-            ref.column_sql
-            if ref.column_sql is not None
-            else self._collection_relation_leaf_sql(ref)
-        )
         if ref.leaf_type in _DATETIME_FIELD_TYPES:
             other = self._literal_for_field_type(other, ref.leaf_type)
-        other_sql = self._operand_to_sql(other)
-
-        if op in _STANDARD_OPS:
-            sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
-                if sql_op == "=":
-                    condition = f"{ref_sql} IS NULL"
-                elif sql_op == "!=":
-                    condition = f"{ref_sql} IS NOT NULL"
-                else:
-                    condition = f"{ref_sql} {sql_op} NULL"
-            elif ref_is_left:
-                condition = f"{ref_sql} {sql_op} {other_sql}"
-            else:
-                condition = f"{other_sql} {sql_op} {ref_sql}"
-        elif op in _LIKE_OPS:
-            sql_op = _LIKE_OPS[op]
-            if ref_is_left:
-                condition = self._like_comparison_sql(ref_sql, other, other_sql, sql_op)
-            else:
-                condition = self._like_comparison_sql(
-                    other_sql,
-                    ("sql_ref", ref_sql),
-                    ref_sql,
-                    sql_op,
-                )
-        elif op in _ANY_STANDARD_OPS:
-            sql_op = _ANY_STANDARD_OPS[op]
-            if ref_is_left:
-                condition = self._scalar_or_array_any_sql(ref_sql, other_sql, sql_op)
-            else:
-                condition = self._scalar_or_array_any_sql(other_sql, ref_sql, sql_op)
-        elif op in _ANY_LIKE_OPS:
-            sql_op = _ANY_LIKE_OPS[op]
-            if ref_is_left:
-                pattern_sql = self._like_pattern_sql(other, other_sql)
-                condition = self._scalar_or_array_like_sql(ref_sql, pattern_sql, sql_op)
-            else:
-                pattern_sql = self._like_pattern_sql(("sql_ref", ref_sql), ref_sql)
-                condition = self._scalar_or_array_like_sql(other_sql, pattern_sql, sql_op)
-        else:
-            condition = (
-                f"{ref_sql} = {other_sql}"
-                if ref_is_left
-                else f"{other_sql} = {ref_sql}"
-            )
-
+        condition = self._leaf_condition_sql(
+            self._collection_ref_leaf(ref),
+            op,
+            other,
+            leaf_is_left=ref_is_left,
+        )
         if ref.column_sql is not None:
             return condition
         return self._wrap_collection_relation_exists(ref, condition)
@@ -1126,16 +1211,12 @@ class _FilterTransformer(Transformer):
         if left_is_coll and right_is_coll:
             l_ref = self._resolve_collection_ref(left)
             r_ref = self._resolve_collection_ref(right)
-            l_col = (
-                l_ref.column_sql
-                if l_ref.column_sql is not None
-                else self._collection_relation_leaf_sql(l_ref)
-            )
-            r_col = (
-                r_ref.column_sql
-                if r_ref.column_sql is not None
-                else self._collection_relation_leaf_sql(r_ref)
-            )
+            if "each" in (l_ref.modifier, r_ref.modifier):
+                raise ValueError(
+                    "Comparisons between two @collection references cannot use :each."
+                )
+            l_col = self._leaf_value_sql(self._collection_ref_leaf(l_ref))
+            r_col = self._leaf_value_sql(self._collection_ref_leaf(r_ref))
             sql_op = _STANDARD_OPS.get(op, "=")
             inner = f"{l_col} {sql_op} {r_col}"
             if l_ref.column_sql is None:
@@ -1222,14 +1303,28 @@ class _FilterTransformer(Transformer):
                 where_cond,
             )
 
+        def _leaf_of(node: tuple) -> _LeafOperand:
+            if len(node) >= 6 and isinstance(node[5], _LeafOperand):
+                return node[5]
+            return _LeafOperand(
+                str(node[2]),
+                field_type=str(node[4]) if len(node) >= 5 else "",
+            )
+
         # Both sides are relation refs (rare) --------------------------------
         if left_is_rel and right_is_rel:
-            l_steps, l_col = left[1], left[2]
-            r_steps, r_col = right[1], right[2]
+            l_steps, r_steps = left[1], right[1]
             if len(l_steps) > 1 or len(r_steps) > 1:
                 raise ValueError(
                     "Comparisons between two nested relation traversals are not supported."
                 )
+            l_leaf, r_leaf = _leaf_of(left), _leaf_of(right)
+            if "each" in (l_leaf.modifier, r_leaf.modifier):
+                raise ValueError(
+                    "Comparisons between two relation traversals cannot use :each."
+                )
+            l_col = self._leaf_value_sql(l_leaf)
+            r_col = self._leaf_value_sql(r_leaf)
 
             l_step = l_steps[0]
             r_step = r_steps[0]
@@ -1243,70 +1338,24 @@ class _FilterTransformer(Transformer):
 
         # One side is a relation ref -----------------------------------------
         if left_is_rel:
-            rel_steps, rel_col = left[1], left[2]
+            rel_steps, leaf = left[1], _leaf_of(left)
             other = right
             rel_is_left = True
         else:
-            rel_steps, rel_col = right[1], right[2]
+            rel_steps, leaf = right[1], _leaf_of(right)
             other = left
             rel_is_left = False
 
-        other_sql = self._operand_to_sql(other)
-
-        # WHERE condition — mirrors operator handling of _collection_comparison
-        where_cond: str
-
-        if op in _STANDARD_OPS:
-            sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
-                if sql_op == "=":
-                    where_cond = f"{rel_col} IS NULL"
-                elif sql_op == "!=":
-                    where_cond = f"{rel_col} IS NOT NULL"
-                else:
-                    where_cond = f"{rel_col} {sql_op} NULL"
-            elif rel_is_left:
-                where_cond = f"{rel_col} {sql_op} {other_sql}"
-            else:
-                where_cond = f"{other_sql} {sql_op} {rel_col}"
-            return _relation_condition_for_steps(rel_steps, where_cond)
-
-        if op in _LIKE_OPS:
-            sql_op = _LIKE_OPS[op]
-            if rel_is_left:
-                where_cond = self._like_comparison_sql(rel_col, other, other_sql, sql_op)
-            else:
-                where_cond = self._like_comparison_sql(
-                    other_sql,
-                    ("sql_ref", rel_col),
-                    rel_col,
-                    sql_op,
-                )
-            return _relation_condition_for_steps(rel_steps, where_cond)
-
-        if op in _ANY_STANDARD_OPS:
-            sql_op = _ANY_STANDARD_OPS[op]
-            if rel_is_left:
-                where_cond = self._scalar_or_array_any_sql(rel_col, other_sql, sql_op)
-            else:
-                where_cond = self._scalar_or_array_any_sql(other_sql, rel_col, sql_op)
-            return _relation_condition_for_steps(rel_steps, where_cond)
-
-        if op in _ANY_LIKE_OPS:
-            sql_op = _ANY_LIKE_OPS[op]
-            if rel_is_left:
-                pattern_sql = self._like_pattern_sql(other, other_sql)
-                where_cond = self._scalar_or_array_like_sql(rel_col, pattern_sql, sql_op)
-            else:
-                pattern_sql = self._like_pattern_sql(("sql_ref", rel_col), rel_col)
-                where_cond = self._scalar_or_array_like_sql(other_sql, pattern_sql, sql_op)
-            return _relation_condition_for_steps(rel_steps, where_cond)
-
-        # Fallback
-        if rel_is_left:
-            where_cond = f"{rel_col} = {other_sql}"
-        else:
-            where_cond = f"{other_sql} = {rel_col}"
+        # PocketBase resolves the last segment like a direct field: a
+        # multi-value leaf is its JSON text, ``:length``/``:each`` iterate it
+        # (v0.22.34 resolvers/record_field_resolve_runner.go l.356-477,
+        # v0.40.6 core/record_field_resolver_runner.go l.758-852).
+        where_cond = self._leaf_condition_sql(
+            leaf,
+            op,
+            other,
+            leaf_is_left=rel_is_left,
+        )
         return _relation_condition_for_steps(rel_steps, where_cond)
 
     # -- :each modifier helpers ---------------------------------------------
@@ -1328,15 +1377,37 @@ class _FilterTransformer(Transformer):
             return (True, data.get(leaf))
         return (False, None)
 
-    def _extract_each_operand(self, node: tuple[str, Any]) -> tuple[str, str] | None:
-        """Extract SQL array expression for ``:each`` from an operand."""
+    def _request_data_field_is_multiple(self, field_name: str) -> bool:
+        """Multiplicity of a ``@request.data.<field>`` schema field.
+
+        PocketBase applies its all-items multi-match to ``:each`` only when the
+        schema field is multiple (v0.22.34 resolvers/record_field_resolve_runner.go
+        l.243-286).  Unknown fields keep PPBase's historical all-items reading.
+        """
+        info = self._field_info_for_table(self._current_table, field_name)
+        if info is None:
+            return True
+        return self._info_is_multiple(info)
+
+    def _extract_each_operand(self, node: tuple[str, Any]) -> tuple[str, bool] | None:
+        """Return ``(text[] SQL, multiple)`` for an ``:each`` operand."""
         if not isinstance(node, tuple) or len(node) < 2:
             return None
 
         # Collection field modifier: field:each
         if node[0] == "field_modifier" and len(node) >= 3 and node[2] == "each":
-            field_sql = self._field_expr(node[1])
-            return ("field", f"COALESCE({field_sql}::text[], ARRAY[]::text[])")
+            field_name = str(node[1])
+            field_sql = self._field_expr(field_name)
+            info = (
+                self._field_info_for_table(self._current_table, field_name)
+                if "." not in field_name
+                else None
+            )
+            if info is not None and info.get("type") in _ARRAYABLE_FIELD_TYPES:
+                multiple = self._info_is_multiple(info)
+                return (self._each_elements_sql(field_sql, multiple=multiple), multiple)
+            # Unknown metadata: historical text[] reading.
+            return (f"COALESCE({field_sql}::text[], ARRAY[]::text[])", True)
 
         # Request body/data modifier: @request.body.field:each
         if node[0] == "macro":
@@ -1349,20 +1420,24 @@ class _FilterTransformer(Transformer):
                     return None
 
                 has_field, raw_val = self._extract_request_data_field_value(field_name)
-                values: list[str]
-                if not has_field or raw_val is None:
-                    values = []
-                elif isinstance(raw_val, (list, tuple, set)):
-                    values = [str(v) for v in raw_val]
-                else:
-                    values = [str(raw_val)]
-
+                # PocketBase iterates list.ToUniqueStringSlice(data[field]).
+                values = to_unique_string_list(raw_val) if has_field else []
                 pname = self._next_param(values)
-                return ("request", f"COALESCE(CAST(:{pname} AS text[]), ARRAY[]::text[])")
+                return (
+                    f"COALESCE(CAST(:{pname} AS text[]), ARRAY[]::text[])",
+                    self._request_data_field_is_multiple(field_name),
+                )
 
         return None
 
-    def _build_each_item_condition(
+    def _bound_value_is_empty(self, sql_expr: str) -> bool:
+        """Return whether a bare ``:param`` operand is bound to ``''``/``None``."""
+        if not (sql_expr.startswith(":") and sql_expr[1:].isidentifier()):
+            return False
+        name = sql_expr[1:]
+        return name in self._params and self._params[name] in (None, "")
+
+    def _each_item_condition(
         self,
         item_sql: str,
         op: str,
@@ -1370,23 +1445,34 @@ class _FilterTransformer(Transformer):
         *,
         each_is_left: bool,
     ) -> str:
-        """Build per-item comparison SQL for an ``:each`` operand."""
+        """Compare one ``:each`` element like PocketBase compares a value.
+
+        ``=``/``!=`` follow ``tools/search/filter.go`` ``resolveEqualExpr``
+        (v0.22.34 l.290-368): an empty operand also matches NULL, ``!=`` is
+        NULL-safe (``IS NOT``).  The ``?`` prefix only selects any-match.
+        """
+        base_op = op.removeprefix("?")
         other_sql = self._operand_to_sql(other)
 
-        if op in _STANDARD_OPS:
-            sql_op = _STANDARD_OPS[op]
+        if base_op in _STANDARD_OPS:
+            sql_op = _STANDARD_OPS[base_op]
+            empty = other[0] == "null" or self._bound_value_is_empty(other_sql)
+            if sql_op == "=":
+                if empty:
+                    return f"({item_sql} = '' OR {item_sql} IS NULL)"
+                return f"{item_sql} = {self._text_cast_sql(other_sql)}"
+            if sql_op == "!=":
+                if empty:
+                    return f"({item_sql} IS DISTINCT FROM '' AND {item_sql} IS NOT NULL)"
+                return f"{item_sql} IS DISTINCT FROM {self._text_cast_sql(other_sql)}"
             if other[0] == "null":
-                if sql_op == "=":
-                    return f"{item_sql} IS NULL"
-                if sql_op == "!=":
-                    return f"{item_sql} IS NOT NULL"
                 return f"{item_sql} {sql_op} NULL"
             if each_is_left:
                 return f"{item_sql} {sql_op} {other_sql}"
             return f"{other_sql} {sql_op} {item_sql}"
 
-        if op in _LIKE_OPS:
-            sql_op = _LIKE_OPS[op]
+        if base_op in _LIKE_OPS:
+            sql_op = _LIKE_OPS[base_op]
             if each_is_left:
                 return self._like_comparison_sql(item_sql, other, other_sql, sql_op)
             return self._like_comparison_sql(
@@ -1401,34 +1487,114 @@ class _FilterTransformer(Transformer):
             return f"{item_sql} = {other_sql}"
         return f"{other_sql} = {item_sql}"
 
+    def _each_condition_sql(
+        self,
+        elements_sql: str,
+        op: str,
+        other: tuple[str, Any],
+        *,
+        each_is_left: bool,
+        multiple: bool,
+    ) -> str:
+        """Build PocketBase ``:each`` semantics over a ``text[]`` expression.
+
+        PocketBase LEFT JOINs ``json_each(field)`` (an empty array yields one
+        NULL row) and, for a multiple field with a non-``?`` operator, adds a
+        multi-match subquery that no element may fail (v0.22.34
+        resolvers/record_field_resolve_runner.go l.418-452 and
+        tools/search/filter.go l.183-215, l.630-706; v0.40.6
+        core/record_field_resolver_runner.go l.776-809).  Result: ``?``
+        operators match when any element matches; other operators need a
+        non-empty array whose every element matches.
+        """
+        elements = (
+            f"unnest(CASE WHEN COALESCE(cardinality({elements_sql}), 0) > 0 "
+            f"THEN {elements_sql} ELSE ARRAY[NULL]::text[] END) AS _elem(value)"
+        )
+        item_sql = "_elem.value"
+        condition = self._each_item_condition(
+            item_sql,
+            op,
+            other,
+            each_is_left=each_is_left,
+        )
+        any_match = f"EXISTS (SELECT 1 FROM {elements} WHERE {condition})"
+        if op.startswith("?") or not multiple:
+            return any_match
+        if op == "=":
+            failing = f"NOT ({condition})"
+        else:
+            failing = f"(NOT ({condition}) OR {item_sql} IS NULL)"
+        return f"({any_match} AND NOT EXISTS (SELECT 1 FROM {elements} WHERE {failing}))"
+
     def _each_comparison(
         self,
         left: tuple[str, Any],
         op: str,
         right: tuple[str, Any],
-        left_each: tuple[str, str] | None,
-        right_each: tuple[str, str] | None,
+        left_each: tuple[str, bool] | None,
+        right_each: tuple[str, bool] | None,
     ) -> str:
         """Handle comparisons where at least one side uses ``:each``."""
         if left_each and right_each:
             raise ValueError("Comparisons with :each on both sides are not supported.")
 
         if left_each:
-            array_sql = left_each[1]
-            condition = self._build_each_item_condition(
-                "_elem", op, right, each_is_left=True,
+            return self._each_condition_sql(
+                left_each[0],
+                op,
+                right,
+                each_is_left=True,
+                multiple=left_each[1],
             )
-        else:
-            array_sql = right_each[1] if right_each else "ARRAY[]::text[]"
-            condition = self._build_each_item_condition(
-                "_elem", op, left, each_is_left=False,
-            )
-
-        # "All items match" semantics; empty arrays evaluate to true.
-        return (
-            f"NOT EXISTS (SELECT 1 FROM unnest({array_sql}) AS _elem "
-            f"WHERE NOT COALESCE(({condition}), FALSE))"
+        assert right_each is not None
+        return self._each_condition_sql(
+            right_each[0],
+            op,
+            left,
+            each_is_left=False,
+            multiple=right_each[1],
         )
+
+    # -- Path leaves -----------------------------------------------------------
+
+    def _json_text_sql(self, column_sql: str) -> str:
+        """JSON text of a multi-value column, compared like a plain scalar.
+
+        PocketBase stores the compact JSON array and compares that text
+        (``array_to_json`` renders the same compact JSON for text arrays).
+        """
+        json_text = f"array_to_json({column_sql})::text"
+        self._json_text_operands.add(json_text)
+        return json_text
+
+    @staticmethod
+    def _array_length_sql(column_sql: str, *, multiple: bool) -> str:
+        """``:length`` of a select/file/relation value.
+
+        PocketBase counts the JSON array items and counts a single value as one
+        item (``''``/NULL as zero): v0.22.34 tools/dbutils/json.go l.17-28,
+        v0.40.6 tools/dbutils/json.go l.19-32.
+        """
+        if multiple:
+            return f"COALESCE(cardinality({column_sql}), 0)"
+        return f"(CASE WHEN COALESCE({column_sql}::text, '') = '' THEN 0 ELSE 1 END)"
+
+    @staticmethod
+    def _each_elements_sql(column_sql: str, *, multiple: bool) -> str:
+        """``text[]`` iterated by ``:each``: the array, or the single value."""
+        if multiple:
+            return f"COALESCE(CAST({column_sql} AS text[]), ARRAY[]::text[])"
+        return f"ARRAY[CAST({column_sql} AS text)]"
+
+    def _leaf_value_sql(self, leaf: _LeafOperand) -> str:
+        """Render a path leaf (default, ``:length`` or ``:lower``) as SQL."""
+        if leaf.modifier == "length" and leaf.field_type in _ARRAYABLE_FIELD_TYPES:
+            return self._array_length_sql(leaf.sql, multiple=leaf.multiple)
+        sql = self._json_text_sql(leaf.sql) if leaf.multiple else leaf.sql
+        if leaf.modifier == "lower":
+            return f"LOWER(COALESCE({sql}::text, ''))"
+        return sql
 
     # -- Logical operators ---------------------------------------------------
 
@@ -1512,12 +1678,9 @@ class _FilterTransformer(Transformer):
             ):
                 # PocketBase compares a direct multi-value field through its
                 # stored JSON text (no json_each multi-match, v0.22.34
-                # resolvers/record_field_resolve_runner.go l.454-463, v0.40.6
-                # core/record_field_resolver_runner.go l.811-820).
-                # array_to_json renders the same compact JSON.
-                json_text = f"array_to_json({column_sql})::text"
-                self._json_text_operands.add(json_text)
-                return json_text
+                # resolvers/record_field_resolve_runner.go l.454-476, v0.40.6
+                # core/record_field_resolver_runner.go l.811-852).
+                return self._json_text_sql(column_sql)
             return column_sql
         if kind == "field_modifier":
             field_name = value
@@ -1550,6 +1713,20 @@ class _FilterTransformer(Transformer):
             return self._qualified_column(self._current_table, safe)
         return f'"{safe}"'
 
+    @staticmethod
+    def _request_value(value: Any) -> Any:
+        """Bind a ``@request.*`` value like PocketBase.
+
+        Plain values (strings, numbers, booleans, ``None``) are bound as they
+        are; a list or an object is bound as its JSON text, so it compares
+        like the stored JSON of a multi-value field and never multi-matches
+        (v0.22.34 resolvers/record_field_resolver.go l.203-215, v0.40.6
+        core/record_field_resolver.go l.350-361).
+        """
+        if isinstance(value, (list, tuple, set, frozenset, dict)):
+            return go_json_text(value)
+        return value
+
     def _value_length(self, value: Any) -> int:
         """Compute a PocketBase-like length for request payload values."""
         if value is None:
@@ -1561,8 +1738,24 @@ class _FilterTransformer(Transformer):
     def _resolve_field_modifier(self, field_name: str, modifier: str) -> str:
         """Resolve a ``field:modifier`` operand to SQL."""
         field_sql = self._field_expr(field_name)
+        info = (
+            self._field_info_for_table(self._current_table, field_name)
+            if "." not in field_name
+            else None
+        )
         if modifier == "isset":
             return f"({field_sql} IS NOT NULL)"
+        if (
+            modifier == "length"
+            and info is not None
+            and info.get("type") in _ARRAYABLE_FIELD_TYPES
+        ):
+            return self._array_length_sql(
+                field_sql,
+                multiple=self._info_is_multiple(info),
+            )
+        if modifier == "lower" and self._info_is_multiple(info):
+            return f"LOWER({self._json_text_sql(field_sql)})"
         if modifier == "length":
             return (
                 f"(CASE "
@@ -1679,7 +1872,7 @@ class _FilterTransformer(Transformer):
                 val = auth.get("collectionName", "")
             else:
                 val = auth.get(field, "")
-            pname = self._next_param(val)
+            pname = self._next_param(self._request_value(val))
             return f":{pname}"
         if name.startswith("request.data.") or name.startswith("request.body."):
             # PocketBase v0.22: @request.data.*  /  v0.23+: @request.body.*
@@ -1694,7 +1887,15 @@ class _FilterTransformer(Transformer):
                 pname = self._next_param(has_field)
                 return f":{pname}"
             if modifier == "length":
-                pname = self._next_param(self._value_length(val) if has_field else 0)
+                info = self._field_info_for_table(self._current_table, field)
+                if info is not None and info.get("type") in _ARRAYABLE_FIELD_TYPES:
+                    # PocketBase: len(list.ToUniqueStringSlice(data[field]))
+                    # (v0.22.34 resolvers/record_field_resolve_runner.go
+                    # l.233-241).
+                    length = len(to_unique_string_list(val)) if has_field else 0
+                else:
+                    length = self._value_length(val) if has_field else 0
+                pname = self._next_param(length)
                 return f":{pname}"
             if modifier == "changed":
                 if not has_field:
@@ -1707,13 +1908,7 @@ class _FilterTransformer(Transformer):
                     f"<> COALESCE(CAST(:{pname} AS TEXT), ''))"
                 )
             if modifier == "each":
-                values: list[str]
-                if has_field and isinstance(val, (list, tuple, set)):
-                    values = [str(v) for v in val]
-                elif has_field and val is not None:
-                    values = [str(val)]
-                else:
-                    values = []
+                values = to_unique_string_list(val) if has_field else []
                 pname = self._next_param(values)
                 return f"CAST(:{pname} AS text[])"
             if modifier == "lower":
@@ -1723,7 +1918,7 @@ class _FilterTransformer(Transformer):
                 pname = self._next_param(lowered)
                 return f":{pname}"
 
-            pname = self._next_param(val if has_field else "")
+            pname = self._next_param(self._request_value(val) if has_field else "")
             return f":{pname}"
         if name.startswith("request.query."):
             field = name[len("request.query."):]
@@ -1786,7 +1981,14 @@ def parse_filter(
         collection_resolver,
         current_table,
     )
-    where_sql = transformer.transform(tree)
+    try:
+        where_sql = transformer.transform(tree)
+    except VisitError as exc:
+        # Invalid identifiers, modifiers or paths are client errors (400),
+        # not server errors.
+        if isinstance(exc.orig_exc, ValueError):
+            raise exc.orig_exc from exc
+        raise
     return (str(where_sql), transformer._params)
 
 
