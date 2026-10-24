@@ -785,7 +785,11 @@ async def _apply_batch_create(
 
         try:
             record = await create_record(
-                engine, collection, payload, files=payload_files
+                engine,
+                collection,
+                payload,
+                files=payload_files,
+                validate_relations=True,
             )
         except _ValidationErrors as exc:
             return _error_response(
@@ -972,6 +976,7 @@ async def _apply_batch_update(
                 target_record_id,
                 payload,
                 files=payload_files,
+                validate_relations=True,
             )
         except _ValidationErrors as exc:
             return _error_response(
@@ -1402,7 +1407,11 @@ async def api_create_record(
 
         try:
             record = await create_record(
-                active_engine, collection, payload, files=payload_files
+                active_engine,
+                collection,
+                payload,
+                files=payload_files,
+                validate_relations=True,
             )
         except _ValidationErrors as exc:
             return _error_response(
@@ -1687,6 +1696,7 @@ async def api_update_record(
                 target_record_id,
                 payload,
                 files=payload_files,
+                validate_relations=True,
             )
         except _ValidationErrors as exc:
             return _error_response(

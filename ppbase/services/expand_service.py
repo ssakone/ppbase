@@ -14,6 +14,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.db.system_tables import CollectionRecord
+from ppbase.models.field_multiplicity import (
+    prepare_relation_value,
+    relation_is_multiple,
+    to_unique_string_list,
+)
 from ppbase.models.record import build_record_response, format_datetime
 
 # Maximum nesting depth for relation expansion (PocketBase limit).
@@ -173,23 +178,23 @@ async def _expand_path(
 
     opts = rel_field.get("options", {})
     target_coll_id = opts.get("collectionId", "")
-    max_select = opts.get("maxSelect", 1) or 1
-    is_multi = max_select > 1
+    # PocketBase 0.22.34 daos/record_expand.go l.257-261: a list unless
+    # maxSelect is a number <= 1 (so maxSelect: null expands to a list).
+    is_multi = relation_is_multiple(opts)
 
     target_coll = _find_collection_by_id(target_coll_id, all_collections)
     if target_coll is None:
         return
 
-    # Collect all relation IDs from the records
+    def _relation_ids(value: Any) -> list[str]:
+        # Record.GetStringSlice(PrepareValue(value)): a single relation keeps
+        # only its last id even if a list was stored.
+        return to_unique_string_list(prepare_relation_value(value, multiple=is_multi))
+
+    # Collect all relation IDs from the records.
     all_ids: set[str] = set()
     for record in records:
-        value = record.get(field_name)
-        if value is None:
-            continue
-        if isinstance(value, list):
-            all_ids.update(str(v) for v in value if v)
-        elif value:
-            all_ids.add(str(value))
+        all_ids.update(_relation_ids(record.get(field_name)))
 
     if not all_ids:
         return
@@ -238,18 +243,18 @@ async def _expand_path(
         if value is None:
             continue
 
-        if is_multi and isinstance(value, list):
-            expanded_list = [
-                related_responses[str(v)]
-                for v in value
-                if str(v) in related_responses
-            ]
-            if expanded_list:
-                record["expand"][field_name] = expanded_list
-        elif not is_multi:
-            rid = str(value) if value else ""
-            if rid in related_responses:
-                record["expand"][field_name] = related_responses[rid]
+        # Keep the field order and skip missing targets, like PocketBase.
+        expanded_list = [
+            related_responses[rid]
+            for rid in _relation_ids(value)
+            if rid in related_responses
+        ]
+        if not expanded_list:
+            continue
+        if is_multi:
+            record["expand"][field_name] = expanded_list
+        else:
+            record["expand"][field_name] = expanded_list[0]
 
     # If there are remaining segments, recurse into the expanded records
     if remaining:

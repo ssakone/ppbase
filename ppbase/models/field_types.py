@@ -25,6 +25,13 @@ from ppbase.core.storage_safety import (
     is_remote_file_reference,
     validate_file_reference,
 )
+from ppbase.models.field_multiplicity import (
+    prepare_relation_value,
+    relation_is_multiple,
+    relation_max_select,
+    select_or_file_is_multiple,
+    select_or_file_max_select,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +349,9 @@ def _validate_autodate(field: FieldDefinition, value: Any) -> str:
 def _validate_select(field: FieldDefinition, value: Any) -> str | list[str]:
     opts = field.options
     allowed: list[str] = opts.get("values", []) or []
-    max_select: int = opts.get("maxSelect", 1) or 1
-    is_multi = max_select > 1
+    # select maxSelect is an int in every PocketBase release: null -> single.
+    is_multi = select_or_file_is_multiple(opts)
+    max_select = select_or_file_max_select(opts)
 
     if is_multi:
         if value is None:
@@ -403,8 +411,9 @@ def _validate_file(field: FieldDefinition, value: Any) -> str | list[str]:
     validate the stored filename references.
     """
     opts = field.options
-    max_select: int = opts.get("maxSelect", 1) or 1
-    is_multi = max_select > 1
+    # file maxSelect is an int in every PocketBase release: null -> single.
+    is_multi = select_or_file_is_multiple(opts)
+    max_select = select_or_file_max_select(opts)
 
     def file_list(raw: Any) -> list[str]:
         if raw is None:
@@ -454,38 +463,31 @@ def _validate_file(field: FieldDefinition, value: Any) -> str | list[str]:
 def _validate_relation(field: FieldDefinition, value: Any) -> str | list[str]:
     """Validate relation references (record IDs).
 
+    The value is normalized like PocketBase relation ``PrepareValue``
+    (v0.22.34 ``models/schema/schema_field.go`` l.375-386): ids are
+    de-duplicated, a JSON array string is decoded, a single relation keeps the
+    last id and a multiple relation keeps the ordered list.  ``maxSelect: null``
+    is an unlimited multiple relation (see ``field_multiplicity``).
+
     Existence checks against the target collection happen at the service layer.
     """
     opts = field.options
-    max_select: int = opts.get("maxSelect", 1) or 1
-    is_multi = max_select > 1
+    is_multi = relation_is_multiple(opts)
+    prepared = prepare_relation_value(value, multiple=is_multi)
 
+    if field.required and not prepared:
+        raise FieldValidationError(
+            field.name, "validation_required", "Cannot be blank."
+        )
     if is_multi:
-        if value is None:
-            val_list: list[str] = []
-        elif isinstance(value, list):
-            val_list = [str(v) for v in value if v]
-        else:
-            val_list = [str(value)] if value else []
-
-        if field.required and not val_list:
-            raise FieldValidationError(
-                field.name, "validation_required", "Cannot be blank."
-            )
-        if len(val_list) > max_select:
+        max_select = relation_max_select(opts)
+        if max_select is not None and len(prepared) > max_select:
             raise FieldValidationError(
                 field.name,
                 "validation_max_select_constraint",
                 f"Must select at most {max_select} relation(s).",
             )
-        return val_list
-    else:
-        val = str(value) if value is not None else ""
-        if field.required and not val:
-            raise FieldValidationError(
-                field.name, "validation_required", "Cannot be blank."
-            )
-        return val
+    return prepared
 
 
 def _validate_json(field: FieldDefinition, value: Any) -> Any:

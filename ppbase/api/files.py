@@ -26,6 +26,7 @@ from ppbase.core.storage_safety import StorageSafetyError
 from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import CollectionRecord, SuperuserRecord
 from ppbase.ext.events import FileDownloadRequestEvent, FileTokenRequestEvent
+from ppbase.models.field_multiplicity import select_or_file_is_multiple
 from ppbase.ext.registry import (
     HOOK_FILE_DOWNLOAD_REQUEST,
     HOOK_FILE_TOKEN_REQUEST,
@@ -647,10 +648,9 @@ async def _resolve_view_file_storage_context(
                 continue
 
             options = _normalize_file_options(field_def)
-            max_select = options.get("maxSelect", 1) or 1
             table_name = _quote_ident(candidate.name)
             column_name = _quote_ident(field_name)
-            if max_select > 1:
+            if select_or_file_is_multiple(options):
                 query = text(
                     f"SELECT id FROM {table_name} "
                     f"WHERE :filename = ANY({column_name}) LIMIT 1"

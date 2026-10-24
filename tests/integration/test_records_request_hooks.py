@@ -130,7 +130,7 @@ async def test_record_create_hook_can_mutate_payload(monkeypatch) -> None:
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         created_payloads.append(dict(payload))
         return {
             "id": "rec1",
@@ -175,7 +175,7 @@ async def test_record_create_route_decodes_multipart_json_payload(monkeypatch) -
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         created_payloads.append(dict(payload))
         created_files.append(dict(files or {}))
         return {
@@ -232,7 +232,9 @@ async def test_record_update_route_decodes_multipart_json_payload(monkeypatch) -
             options={},
         )
 
-    async def _fake_update_record(_engine, _collection, record_id, payload, files=None):
+    async def _fake_update_record(
+        _engine, _collection, record_id, payload, files=None, **_kwargs
+    ):
         updated_payloads.append(dict(payload))
         updated_files.append(dict(files or {}))
         return {
@@ -297,7 +299,7 @@ async def test_record_create_hook_exception_rolls_back(
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         nonlocal writes
         writes += 1
         saved = file_storage.save_files(
@@ -357,7 +359,7 @@ async def test_record_create_hook_can_apply_builtin_auth_middleware(
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         return {
             "id": "rec_auth",
             "collectionId": "templates_id",
@@ -407,7 +409,7 @@ async def test_record_create_hook_supports_multiple_middlewares(monkeypatch) -> 
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         calls.append("default")
         return {
             "id": "rec_multi",
@@ -468,7 +470,7 @@ async def test_batch_create_triggers_record_create_hook(monkeypatch) -> None:
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         created_payloads.append(dict(payload))
         return {
             "id": "rec_batch",
@@ -551,7 +553,7 @@ async def test_batch_create_exposes_subrequest_headers_and_context(
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         created_payloads.append(dict(payload))
         return {
             "id": "rec_batch",
@@ -653,7 +655,7 @@ async def test_batch_upsert_rewrites_subrequest_for_record_hooks(
             return {"id": record_id, "title": "existing"}
         return None
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         return {
             "id": payload.get("id"),
             "collectionId": "posts_id",
@@ -661,7 +663,9 @@ async def test_batch_upsert_rewrites_subrequest_for_record_hooks(
             "title": payload.get("title"),
         }
 
-    async def _fake_update_record(_engine, _collection, record_id, payload, files=None):
+    async def _fake_update_record(
+        _engine, _collection, record_id, payload, files=None, **_kwargs
+    ):
         return {
             "id": record_id,
             "collectionId": "posts_id",
@@ -735,7 +739,7 @@ async def test_batch_create_hook_rejection_rolls_back_transaction(monkeypatch) -
             options={},
         )
 
-    async def _fake_create_record(_engine, _collection, payload, files=None):
+    async def _fake_create_record(_engine, _collection, payload, files=None, **_kwargs):
         nonlocal writes
         writes += 1
         return {"id": "should_not_commit"}
@@ -800,7 +804,9 @@ async def test_batch_update_and_delete_trigger_record_hooks(monkeypatch) -> None
             options={},
         )
 
-    async def _fake_update_record(_engine, _collection, record_id, payload, files=None):
+    async def _fake_update_record(
+        _engine, _collection, record_id, payload, files=None, **_kwargs
+    ):
         updated_payloads.append(dict(payload))
         return {
             "id": record_id,

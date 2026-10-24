@@ -20,6 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from ppbase.core.id_generator import generate_id
 from ppbase.core.storage_safety import StorageSafetyError, validate_record_id
 from ppbase.db.system_tables import CollectionRecord
+from ppbase.models.field_multiplicity import (
+    relation_is_multiple,
+    relation_max_select,
+    select_or_file_is_multiple,
+    to_unique_string_list,
+)
 from ppbase.models.field_types import (
     _EMAIL_RE,
     FieldDefinition,
@@ -106,6 +112,20 @@ def _normalize_file_options(field_def: FieldDefinition) -> dict[str, Any]:
         if hasattr(field_def, key) and key not in opts:  # defensive fallback
             opts[key] = getattr(field_def, key)
     return opts
+
+
+def _file_upload_limit(field_def: FieldDefinition) -> int:
+    """Return the upload count passed to ``save_files`` for a multiple file.
+
+    ``save_files`` only distinguishes a single upload (``1``) from several, so
+    any value above one keeps the historical behavior of storing every file.
+    """
+    raw = (field_def.options or {}).get("maxSelect")
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        limit = 2
+    return limit if limit > 1 else 2
 
 
 def _matches_mime_pattern(mime_type: str, pattern: str) -> bool:
@@ -287,11 +307,22 @@ def _collection_field_metadata(collection: CollectionRecord) -> dict[str, dict[s
     return fields
 
 
+# PocketBase's own representation of an unlimited relation once upgraded from
+# 0.22 (v0.23.0 migrations/1717233556_v0.23_migrate.go l.844-848).
+_UNLIMITED_MAX_SELECT = 2147483647
+
+
 def _relation_targets(
     collection: CollectionRecord,
     by_id: dict[str, CollectionRecord],
     by_name: dict[str, CollectionRecord],
 ) -> list[tuple[str, CollectionRecord, int]]:
+    """Return ``(field, target, max_select)`` for relation fields.
+
+    ``max_select > 1`` exactly when the shared relation rule says multiple:
+    ``maxSelect: null`` (an unlimited 0.22 relation) is reported as
+    ``2147483647``, the value PocketBase's v0.23 upgrade gives it.
+    """
     targets: list[tuple[str, CollectionRecord, int]] = []
     schema: list[dict[str, Any]] = collection.schema or []
     for raw in schema:
@@ -304,8 +335,62 @@ def _relation_targets(
         target = by_id.get(str(target_ref)) or by_name.get(str(target_ref))
         if not field_name or target is None:
             continue
-        targets.append((field_name, target, int(opts.get("maxSelect", 1) or 1)))
+        if relation_is_multiple(opts):
+            max_select = relation_max_select(opts) or _UNLIMITED_MAX_SELECT
+        else:
+            max_select = 1
+        targets.append((field_name, target, max_select))
     return targets
+
+
+_MISSING_REL_COLLECTION_ERROR = {
+    "code": "validation_missing_rel_collection",
+    "message": "Relation connection is missing or cannot be accessed.",
+}
+_MISSING_REL_RECORDS_ERROR = {
+    "code": "validation_missing_rel_records",
+    "message": "Failed to find all relation records with the provided ids.",
+}
+
+
+async def _relation_target_errors(
+    engine: AsyncEngine,
+    schema_fields: list[FieldDefinition],
+    values: dict[str, Any],
+    *,
+    skip: set[str],
+) -> dict[str, dict[str, str]]:
+    """Return errors for relation ids that do not exist in their target.
+
+    Mirrors PocketBase 0.22.34 ``forms/validators/record_data.go``
+    ``checkRelationValue`` (l.361-398; v0.40.6 ``core/field_relation.go``
+    l.198-237): every id must exist in the target collection, otherwise the
+    field fails with ``validation_missing_rel_records``.  Orphan ids are
+    reported, never removed or rewritten.
+    """
+    errors: dict[str, dict[str, str]] = {}
+    for field_def in schema_fields:
+        if field_def.type != FieldType.RELATION or field_def.name in skip:
+            continue
+        ids = to_unique_string_list(values.get(field_def.name))
+        if not ids:
+            continue
+        target_ref = (field_def.options or {}).get("collectionId")
+        target = (
+            await resolve_collection(engine, str(target_ref)) if target_ref else None
+        )
+        if target is None:
+            errors[field_def.name] = dict(_MISSING_REL_COLLECTION_ERROR)
+            continue
+        count_sql = text(
+            f'SELECT COUNT(*) FROM "{_table_name(target)}" '
+            'WHERE "id" = ANY(CAST(:ids AS text[]))'
+        )
+        async with engine.connect() as conn:
+            total = (await conn.execute(count_sql, {"ids": ids})).scalar_one()
+        if int(total) != len(ids):
+            errors[field_def.name] = dict(_MISSING_REL_RECORDS_ERROR)
+    return errors
 
 
 def _relation_index_signature(
@@ -359,12 +444,14 @@ def _build_relation_index_from_collections(
         table = _table_name(coll)
         relations = collections_meta[table]["relations"]
         for field_name, target, max_select in _relation_targets(coll, by_id, by_name):
+            multiple = max_select > 1
             target_table = _table_name(target)
             relations[field_name] = {
                 "kind": "forward",
                 "field": field_name,
                 "table": target_table,
                 "max_select": max_select,
+                "multiple": multiple,
             }
 
             back_key = f"{table}_via_{field_name}"
@@ -373,6 +460,7 @@ def _build_relation_index_from_collections(
                 "table": table,
                 "back_field": field_name,
                 "max_select": max_select,
+                "multiple": multiple,
             }
 
     return result
@@ -680,11 +768,17 @@ async def create_record(
     collection: CollectionRecord,
     data: dict[str, Any],
     files: dict[str, list[tuple[str, bytes]]] | None = None,
+    *,
+    validate_relations: bool = False,
 ) -> dict[str, Any]:
     """Create a new record in the collection.
 
     Validates all fields, generates an ID, and sets timestamps.
     Handles file uploads if files dict is provided.
+
+    ``validate_relations`` additionally requires every referenced relation
+    record to exist, like PocketBase's record API form.  Internal callers
+    (the equivalent of PocketBase ``dao.SaveRecord``) leave it disabled.
 
     For auth collections, handles password hashing, token_key generation,
     and auth system column defaults.
@@ -835,14 +929,14 @@ async def create_record(
                     upload_has_error = True
             if upload_has_error:
                 continue
-            max_select = field_def.options.get("maxSelect", 1) or 1
+            file_multiple = select_or_file_is_multiple(field_def.options)
             try:
                 saved_names = save_files(
                     collection.id,
                     record_id,
                     field_name,
                     file_list,
-                    max_select,
+                    _file_upload_limit(field_def) if file_multiple else 1,
                     lease=require_mutation_write_barrier(),
                 )
             except Exception:
@@ -853,7 +947,7 @@ async def create_record(
                 )
                 raise
             saved_upload_names.extend(saved_names)
-            if max_select == 1:
+            if not file_multiple:
                 data[field_name] = saved_names[0] if saved_names else ""
             else:
                 data[field_name] = saved_names
@@ -879,6 +973,16 @@ async def create_record(
                     "code": exc.code,
                     "message": exc.message,
                 }
+
+        if validate_relations:
+            errors.update(
+                await _relation_target_errors(
+                    engine,
+                    schema_fields,
+                    columns,
+                    skip=set(errors),
+                )
+            )
     except BaseException:
         _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         raise
@@ -962,12 +1066,18 @@ async def update_record(
     record_id: str,
     data: dict[str, Any],
     files: dict[str, list[tuple[str, bytes]]] | None = None,
+    *,
+    validate_relations: bool = False,
 ) -> dict[str, Any] | None:
     """Update an existing record.
 
     Supports ``field+`` (append) and ``field-`` (remove) modifiers for
     multi-value fields (select, relation, file).
     Handles file uploads if files dict is provided.
+
+    ``validate_relations`` requires every relation id of the resulting record
+    (changed or not) to exist, like PocketBase's record API form, which
+    validates the whole record data on update.
 
     Returns the updated record dict, or None if not found.
     """
@@ -1111,8 +1221,7 @@ async def update_record(
     def _coerce_file_value(
         field_def: FieldDefinition, values: list[str]
     ) -> str | list[str]:
-        max_select = field_def.options.get("maxSelect", 1) or 1
-        if max_select > 1:
+        if select_or_file_is_multiple(field_def.options):
             return values
         return values[-1] if values else ""
 
@@ -1173,14 +1282,14 @@ async def update_record(
             if upload_has_error:
                 continue
 
-            max_select = field_def.options.get("maxSelect", 1) or 1
+            file_multiple = select_or_file_is_multiple(field_def.options)
             try:
                 saved_names = save_files(
                     collection.id,
                     record_id,
                     field_name,
                     file_list,
-                    max_select,
+                    _file_upload_limit(field_def) if file_multiple else 1,
                     lease=require_mutation_write_barrier(),
                 )
             except Exception:
@@ -1245,6 +1354,20 @@ async def update_record(
                     "code": exc.code,
                     "message": exc.message,
                 }
+
+        if validate_relations:
+            final_values = {
+                name: updates[name] if name in updates else raw_row.get(name)
+                for name in field_map
+            }
+            errors.update(
+                await _relation_target_errors(
+                    engine,
+                    schema_fields,
+                    final_values,
+                    skip=set(errors),
+                )
+            )
     except BaseException:
         _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
         raise
@@ -1343,7 +1466,11 @@ def _apply_append(
         inc = float(new_values) if new_values is not None else 0.0
         return cur + inc
 
-    # Multi-value fields (select, relation, file)
+    if field_def.type == FieldType.RELATION:
+        # PrepareValueWithModifier: ToUniqueStringSlice(base) + ToUniqueStringSlice(new)
+        return to_unique_string_list(current) + to_unique_string_list(new_values)
+
+    # Multi-value fields (select, file)
     cur_list = _coerce_modifier_values(current)
     if isinstance(new_values, list):
         cur_list.extend(new_values)
@@ -1362,6 +1489,9 @@ def _apply_prepend(
         cur = float(current) if current is not None else 0.0
         inc = float(new_values) if new_values is not None else 0.0
         return cur + inc
+
+    if field_def.type == FieldType.RELATION:
+        return to_unique_string_list(new_values) + to_unique_string_list(current)
 
     cur_list = _coerce_modifier_values(current)
     prepend_values: list[Any]
@@ -1384,6 +1514,11 @@ def _apply_remove(
         cur = float(current) if current is not None else 0.0
         dec = float(remove_values) if remove_values is not None else 0.0
         return cur - dec
+
+    if field_def.type == FieldType.RELATION:
+        # list.SubtractSlice(ToUniqueStringSlice(base), ToUniqueStringSlice(value))
+        removed = set(to_unique_string_list(remove_values))
+        return [v for v in to_unique_string_list(current) if v not in removed]
 
     cur_list = _coerce_modifier_values(current)
     if isinstance(remove_values, list):
@@ -1503,9 +1638,8 @@ async def _cascade_delete(
                 continue
 
             other_table = _table_name(other_coll)
-            max_select = opts.get("maxSelect", 1) or 1
 
-            if max_select > 1:
+            if relation_is_multiple(opts):
                 # Array column: find records where array contains this ID
                 find_sql = (
                     f'SELECT "id" FROM "{other_table}" WHERE :rid = ANY("{field_name}")'

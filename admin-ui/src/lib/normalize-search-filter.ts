@@ -8,6 +8,7 @@
  */
 
 import type { Collection } from '@/api/types'
+import { isMultiValueField } from './field-multiplicity.ts'
 
 /** Scalar field types: use ~ (ILIKE) */
 const SCALAR_SEARCHABLE = new Set(['text', 'editor', 'email', 'url'])
@@ -28,12 +29,12 @@ export function getSearchableFields(collection: Collection): SearchableField[] {
     if ((f as { hidden?: boolean }).hidden) continue
     if (f.type === 'password') continue
     if (f.type === 'json') continue // JSONB — ?~ uses unnest, not suitable
-    const maxSelect = f.maxSelect ?? (f as { options?: { maxSelect?: number } }).options?.maxSelect ?? 1
+    const multiple = isMultiValueField(f)
 
     if (f.type === 'select') {
-      result.push({ name: f.name, op: maxSelect > 1 ? '?~' : '~' })
+      result.push({ name: f.name, op: multiple ? '?~' : '~' })
     } else if (f.type === 'file' || f.type === 'relation') {
-      result.push({ name: f.name, op: maxSelect > 1 ? '?~' : '~' })
+      result.push({ name: f.name, op: multiple ? '?~' : '~' })
     } else if (SCALAR_SEARCHABLE.has(f.type)) {
       result.push({ name: f.name, op: '~' })
     }

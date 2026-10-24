@@ -15,6 +15,8 @@ from typing import Any
 
 from lark import Lark, Transformer, v_args
 
+from ppbase.models.field_multiplicity import is_multiple
+
 # ---------------------------------------------------------------------------
 # Lark grammar for PocketBase filter syntax
 # ---------------------------------------------------------------------------
@@ -136,6 +138,10 @@ class _CollectionCondition:
         self.inner_sql = inner_sql
 
 
+# Marker returned by ``_bound_param_values`` for a scalar bound value.
+_SCALAR_BOUND = object()
+
+
 @dataclass(frozen=True)
 class _TraversalStep:
     """One relation or back-relation hop in a dotted filter path."""
@@ -146,6 +152,15 @@ class _TraversalStep:
     kind: str = "forward"
     source_field: str | None = None
     back_field: str | None = None
+    # Explicit multiplicity from the relation index (``maxSelect: null`` is a
+    # multiple relation); older metadata only carries ``max_select``.
+    multiple: bool | None = None
+
+    @property
+    def is_multiple(self) -> bool:
+        if self.multiple is not None:
+            return self.multiple
+        return self.max_select > 1
 
 
 @dataclass(frozen=True)
@@ -265,6 +280,9 @@ class _FilterTransformer(Transformer):
         # Maps collection name → {"table": name, "relations": RelationResolver}.
         self._collection_resolver = collection_resolver or {}
         self._current_table = _sanitize_ident(current_table) if current_table else None
+        # SQL of direct multi-value fields rendered as their JSON text: they
+        # are plain scalars for every operator, like in PocketBase.
+        self._json_text_operands: set[str] = set()
 
     def _next_param(self, value: Any) -> str:
         self._param_counter += 1
@@ -388,6 +406,32 @@ class _FilterTransformer(Transformer):
                     return info
         return None
 
+    def _field_info_for_table(
+        self,
+        table_name: str | None,
+        field_name: str,
+    ) -> dict[str, Any] | None:
+        """Return the schema metadata (type/options) of a field, if known."""
+        safe_field = _sanitize_ident(str(field_name))
+        safe_table = _sanitize_ident(str(table_name)) if table_name else ""
+        if safe_table and self._is_flat_resolver(self._relation_resolver):
+            field_info = self._flat_fields(self._relation_resolver, safe_table).get(
+                safe_field,
+            )
+            if isinstance(field_info, dict):
+                return field_info
+        fields = self._resolver_fields(self._relation_resolver)
+        field_info = fields.get(safe_field) if isinstance(fields, dict) else None
+        return field_info if isinstance(field_info, dict) else None
+
+    def _is_multi_value_field(self, table_name: str | None, field_name: str) -> bool:
+        """Return whether a current-collection field stores an array."""
+        info = self._field_info_for_table(table_name, field_name)
+        if info is None:
+            return False
+        options = info.get("options")
+        return is_multiple(info.get("type"), options if isinstance(options, dict) else {})
+
     def _field_type_for_table(self, table_name: str | None, field_name: str) -> str:
         safe_field = _sanitize_ident(str(field_name))
         if safe_field in _SYSTEM_FIELD_TYPES:
@@ -492,6 +536,8 @@ class _FilterTransformer(Transformer):
         kind = str(info.get("kind", "forward") or "forward")
         target_table = _sanitize_ident(str(info["table"]))
         max_select = int(info.get("max_select", 1) or 1)
+        raw_multiple = info.get("multiple")
+        multiple = bool(raw_multiple) if raw_multiple is not None else None
         source_field = _sanitize_ident(str(info.get("field") or segment))
         back_field_raw = info.get("back_field")
         back_field = (
@@ -508,6 +554,7 @@ class _FilterTransformer(Transformer):
             kind=kind,
             source_field=source_field,
             back_field=back_field,
+            multiple=multiple,
         )
 
     def _json_extract_sql(self, column_sql: str, path_parts: list[str] | tuple[str, ...]) -> str:
@@ -598,7 +645,7 @@ class _FilterTransformer(Transformer):
                 if (
                     optimize_relation_id
                     and step.kind == "forward"
-                    and step.max_select <= 1
+                    and not step.is_multiple
                     and idx == len(safe_parts) - 2
                     and safe_parts[idx + 1] == "id"
                 ):
@@ -810,6 +857,25 @@ class _FilterTransformer(Transformer):
             f"{self._like_pattern_sql(pattern_node, pattern_sql)}"
         )
 
+    def _bound_param_values(self, sql_expr: str) -> Any:
+        """Classify a bound ``:param`` operand by its Python value.
+
+        Returns ``None`` when ``sql_expr`` is not a bare parameter, the
+        ``_SCALAR_BOUND`` marker for a scalar value, or the parameter name of
+        a list-like value (rebound as a list of strings).
+        """
+        if not (sql_expr.startswith(":") and sql_expr[1:].isidentifier()):
+            return None
+        name = sql_expr[1:]
+        if name not in self._params:
+            return None
+        value = self._params[name]
+        if isinstance(value, (list, tuple, set)):
+            # Rebind as text items so CAST(:name AS text[]) is well typed.
+            self._params[name] = ["" if item is None else str(item) for item in value]
+            return name
+        return _SCALAR_BOUND
+
     def _scalar_or_array_any_sql(
         self,
         container_sql: str,
@@ -823,11 +889,28 @@ class _FilterTransformer(Transformer):
         operators use a JSONB shape check that works for scalar and array
         columns.
         """
+        if container_sql in self._json_text_operands:
+            # Direct multi-value field: plain comparison of its JSON text.
+            if sql_op in {"=", "!="}:
+                return f"{self._text_cast_sql(value_sql)} {sql_op} {container_sql}"
+            return f"{container_sql} {sql_op} {value_sql}"
+
         if sql_op not in {"=", "!="}:
             return f"{value_sql} {sql_op} ANY({container_sql})"
 
         container_text = self._text_cast_sql(container_sql)
         value_text = self._text_cast_sql(value_sql)
+        bound = self._bound_param_values(container_sql)
+        if bound is not None:
+            # A literal or request value is known while parsing: comparing it
+            # needs no to_jsonb() on an untyped parameter (which PostgreSQL
+            # cannot resolve).
+            if bound is _SCALAR_BOUND:
+                return f"{value_text} {sql_op} {container_text}"
+            return (
+                f"EXISTS (SELECT 1 FROM unnest(CAST(:{bound} AS text[])) "
+                f"AS _elem(value) WHERE {value_text} {sql_op} _elem.value)"
+            )
         return (
             "(CASE "
             f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
@@ -845,6 +928,16 @@ class _FilterTransformer(Transformer):
     ) -> str:
         """Build scalar-safe ``?~``/``?!~`` SQL."""
         container_text = self._text_cast_sql(container_sql)
+        if container_sql in self._json_text_operands:
+            return f"{container_text} {sql_op} {pattern_sql}"
+        bound = self._bound_param_values(container_sql)
+        if bound is not None:
+            if bound is _SCALAR_BOUND:
+                return f"{container_text} {sql_op} {pattern_sql}"
+            return (
+                f"EXISTS (SELECT 1 FROM unnest(CAST(:{bound} AS text[])) "
+                f"AS _elem(value) WHERE _elem.value {sql_op} {pattern_sql})"
+            )
         return (
             "(CASE "
             f"WHEN jsonb_typeof(to_jsonb({container_sql})) = 'array' THEN "
@@ -926,14 +1019,14 @@ class _FilterTransformer(Transformer):
             back_field = step.back_field or ""
             target_expr = self._qualified_column(step.target_table, back_field)
             parent_id = self._column_expr_for_table(parent_table, "id")
-            if step.max_select > 1:
+            if step.is_multiple:
                 return self._scalar_or_array_any_sql(target_expr, parent_id, "=")
             return f"{target_expr} = {parent_id}"
 
         source_field = step.source_field or step.relation_key
         source_expr = self._column_expr_for_table(parent_table, source_field)
         target_id = self._qualified_column(step.target_table, "id")
-        if step.max_select > 1:
+        if step.is_multiple:
             return self._scalar_or_array_any_sql(source_expr, target_id, "=")
         return f"{target_id} = {source_expr}"
 
@@ -1412,7 +1505,20 @@ class _FilterTransformer(Transformer):
         if kind == "null":
             return "NULL"
         if kind == "field":
-            return self._field_expr(value)
+            column_sql = self._field_expr(value)
+            if "." not in str(value) and self._is_multi_value_field(
+                self._current_table,
+                str(value),
+            ):
+                # PocketBase compares a direct multi-value field through its
+                # stored JSON text (no json_each multi-match, v0.22.34
+                # resolvers/record_field_resolve_runner.go l.454-463, v0.40.6
+                # core/record_field_resolver_runner.go l.811-820).
+                # array_to_json renders the same compact JSON.
+                json_text = f"array_to_json({column_sql})::text"
+                self._json_text_operands.add(json_text)
+                return json_text
+            return column_sql
         if kind == "field_modifier":
             field_name = value
             modifier = node[2]

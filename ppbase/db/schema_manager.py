@@ -9,7 +9,7 @@ operations that are not expressible through the standard DDL API.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
@@ -20,6 +20,11 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
+from ppbase.models.field_multiplicity import (
+    field_is_multiple,
+    relation_is_multiple,
+    select_or_file_is_multiple,
+)
 from ppbase.models.field_types import FieldDefinition, FieldType
 
 
@@ -100,23 +105,19 @@ def _col_ddl(field: FieldDefinition) -> str:
     if ft == FieldType.AUTODATE:
         return f'"{field.name}" TIMESTAMPTZ NOT NULL DEFAULT NOW()'
 
-    if ft == FieldType.SELECT:
-        max_select = opts.get("maxSelect", 1) or 1
-        if max_select > 1:
-            return f'"{field.name}" TEXT[] NOT NULL DEFAULT \'{{}}\''
-        return f'"{field.name}" TEXT NOT NULL DEFAULT \'\''
-
-    if ft == FieldType.FILE:
-        max_select = opts.get("maxSelect", 1) or 1
-        if max_select > 1:
+    if ft in (FieldType.SELECT, FieldType.FILE):
+        if select_or_file_is_multiple(opts):
             return f'"{field.name}" TEXT[] NOT NULL DEFAULT \'{{}}\''
         return f'"{field.name}" TEXT NOT NULL DEFAULT \'\''
 
     if ft == FieldType.RELATION:
-        max_select = opts.get("maxSelect", 1) or 1
-        if max_select > 1:
-            return f'"{field.name}" VARCHAR(15)[] NOT NULL DEFAULT \'{{}}\''
-        return f'"{field.name}" VARCHAR(15) NOT NULL DEFAULT \'\''
+        # PocketBase stores relation ids without a length limit (TEXT/JSON,
+        # v0.22.34 models/schema/schema_field.go l.150-165). Columns created
+        # before this rule may still be VARCHAR(15)/VARCHAR(15)[]; they keep
+        # working unchanged (see docs/relation-multiplicity.md).
+        if relation_is_multiple(opts):
+            return f'"{field.name}" TEXT[] NOT NULL DEFAULT \'{{}}\''
+        return f'"{field.name}" TEXT NOT NULL DEFAULT \'\''
 
     if ft == FieldType.JSON:
         return f'"{field.name}" JSONB NOT NULL DEFAULT \'null\'::jsonb'
@@ -136,13 +137,7 @@ def _col_ddl(field: FieldDefinition) -> str:
 
 def _is_array_field(field: FieldDefinition) -> bool:
     """Check if a field maps to a PostgreSQL array column."""
-    opts = field.options
-    max_select = opts.get("maxSelect", 1) or 1
-    return field.type in (
-        FieldType.SELECT,
-        FieldType.FILE,
-        FieldType.RELATION,
-    ) and max_select > 1
+    return field_is_multiple(field)
 
 
 def _is_jsonb_field(field: FieldDefinition) -> bool:
@@ -1366,6 +1361,7 @@ async def update_collection_table(
         )
 
     # Handle changed fields (rename or type change)
+    multiplicity_changes: list[tuple[FieldDefinition, FieldDefinition]] = []
     for key in sorted(common_keys):
         old_f = old_fields[key]
         new_f = new_fields[key]
@@ -1377,8 +1373,12 @@ async def update_collection_table(
                 f'RENAME COLUMN "{old_f.name}" TO "{new_f.name}"'
             )
 
-        # If the type or relevant options changed, drop and re-add
-        if old_f.type != new_f.type or _type_options_changed(old_f, new_f):
+        if _multiplicity_changed(old_f, new_f):
+            # Like PocketBase, keep the stored values: single -> multiple wraps
+            # the id, multiple -> single keeps the last one.
+            multiplicity_changes.append((old_f, new_f))
+        elif old_f.type != new_f.type or _type_options_changed(old_f, new_f):
+            # Other type changes keep the historical drop and re-add.
             col_ddl = _col_ddl(new_f)
             # Use the new name (after rename)
             stmts.append(
@@ -1392,8 +1392,36 @@ async def update_collection_table(
         for stmt in stmts:
             await conn.execute(text(stmt))
 
+        for old_f, new_f in multiplicity_changes:
+            await _convert_field_multiplicity(
+                conn,
+                table_name=current_table,
+                old_table_name=old_name,
+                old_field=old_f,
+                new_field=new_f,
+            )
+
         # ALTER statements and index replacement are one atomic schema change.
         await _sync_collection_indexes(conn, old_collection, new_collection)
+
+
+# A JSON array of strings without escapes or control characters: values that
+# match can always be cast to jsonb. Used when converting a scalar column.
+_JSON_STRING_ARRAY_PATTERN = (
+    r'^\s*\[\s*(?:"[^"\\[:cntrl:]]*"\s*(?:,\s*"[^"\\[:cntrl:]]*"\s*)*)?\]\s*$'
+)
+# SQLAlchemy text() would read ":cntrl" as a bind parameter; DDL cannot take
+# parameters, so the colons are escaped for text().
+_SQL_JSON_STRING_ARRAY_PATTERN = _JSON_STRING_ARRAY_PATTERN.replace(":", "\\:")
+
+
+def _multiplicity_changed(old_f: FieldDefinition, new_f: FieldDefinition) -> bool:
+    """Return whether a select/file/relation field switches single/multiple."""
+    if old_f.type != new_f.type:
+        return False
+    if old_f.type not in (FieldType.SELECT, FieldType.FILE, FieldType.RELATION):
+        return False
+    return _is_array_field(old_f) != _is_array_field(new_f)
 
 
 def _type_options_changed(old_f: FieldDefinition, new_f: FieldDefinition) -> bool:
@@ -1405,11 +1433,180 @@ def _type_options_changed(old_f: FieldDefinition, new_f: FieldDefinition) -> boo
         return old_f.options.get("onlyInt") != new_f.options.get("onlyInt")
 
     if old_f.type in (FieldType.SELECT, FieldType.FILE, FieldType.RELATION):
-        old_max = old_f.options.get("maxSelect", 1) or 1
-        new_max = new_f.options.get("maxSelect", 1) or 1
-        return (old_max > 1) != (new_max > 1)
+        return _multiplicity_changed(old_f, new_f)
 
     return False
+
+
+async def _column_is_array(
+    connection: AsyncConnection,
+    table_name: str,
+    column_name: str,
+) -> bool | None:
+    """Return whether a live column is an array, ``None`` when it is missing."""
+    result = await connection.execute(
+        text(
+            "SELECT type.typcategory = 'A' "
+            "FROM pg_catalog.pg_attribute AS attribute "
+            "JOIN pg_catalog.pg_class AS relation "
+            "ON relation.oid = attribute.attrelid "
+            "JOIN pg_catalog.pg_namespace AS namespace "
+            "ON namespace.oid = relation.relnamespace "
+            "JOIN pg_catalog.pg_type AS type ON type.oid = attribute.atttypid "
+            "WHERE namespace.nspname = 'public' AND relation.relname = :table "
+            "AND attribute.attname = :column AND attribute.attnum > 0 "
+            "AND NOT attribute.attisdropped"
+        ),
+        {"table": table_name, "column": column_name},
+    )
+    value = result.scalar_one_or_none()
+    return None if value is None else bool(value)
+
+
+async def _convert_field_multiplicity(
+    connection: AsyncConnection,
+    *,
+    table_name: str,
+    old_table_name: str,
+    old_field: FieldDefinition,
+    new_field: FieldDefinition,
+) -> None:
+    """Convert a select/file/relation column between single and multiple.
+
+    Mirrors PocketBase's ``normalizeSingleVsMultipleFieldChanges`` (v0.22.34
+    ``daos/record_table_sync.go`` l.166-291, v0.40.6
+    ``core/collection_record_table_sync.go`` l.155-298): ``''`` becomes ``{}``,
+    ``'x'`` becomes ``{x}`` and a multiple value keeps its last element.  The
+    live column shape is checked first, so a column that already has the
+    target shape (for example one created before the relation multiplicity
+    rule) is left untouched instead of being rewritten.
+    """
+    table = _safe_name(table_name)
+    column = _safe_name(new_field.name)
+    to_multiple = _is_array_field(new_field)
+    is_array = await _column_is_array(connection, table, column)
+    if is_array is None or is_array == to_multiple:
+        return
+
+    # Managed indexes (GIN for arrays, partial btree for single relations)
+    # cannot survive the type change; _sync_collection_indexes recreates them.
+    expected_tables = _expected_table_names(table, _safe_name(old_table_name))
+    for index_table in sorted({table, _safe_name(old_table_name)}):
+        for index_column in sorted({column, _safe_name(old_field.name)}):
+            await _drop_index_if_owned(
+                connection,
+                _managed_index_name(index_table, index_column),
+                expected_tables=expected_tables,
+            )
+
+    quoted_table = _quote_identifier(table)
+    quoted_column = _quote_identifier(column)
+    await connection.execute(
+        text(f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} DROP DEFAULT")
+    )
+    if to_multiple:
+        value = f"{quoted_column}::text"
+        # PocketBase keeps a stored JSON array as the array (json_valid +
+        # json_type = 'array'). ALTER ... USING cannot run subqueries, so only
+        # JSON arrays of plain strings (no quote, backslash or control
+        # character inside an element) are split; anything else, including
+        # malformed JSON, becomes one element, exactly as PocketBase wraps it.
+        await connection.execute(
+            text(
+                f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} "
+                f"TYPE TEXT[] USING (CASE "
+                f"WHEN COALESCE({value}, '') = '' THEN ARRAY[]::text[] "
+                f"WHEN {value} ~ '^\\s*\\[\\s*\\]\\s*$' THEN ARRAY[]::text[] "
+                f"WHEN {value} ~ '{_SQL_JSON_STRING_ARRAY_PATTERN}' "
+                f"THEN regexp_split_to_array(regexp_replace({value}, "
+                f"'^\\s*\\[\\s*\"|\"\\s*\\]\\s*$', '', 'g'), '\"\\s*,\\s*\"') "
+                f"ELSE ARRAY[{value}] END)"
+            )
+        )
+        default = "'{}'"
+    else:
+        await connection.execute(
+            text(
+                f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} "
+                f"TYPE TEXT USING (COALESCE(({quoted_column})"
+                f"[array_upper({quoted_column}, 1)]::text, ''))"
+            )
+        )
+        default = "''"
+    await connection.execute(
+        text(
+            f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} "
+            f"SET DEFAULT {default}"
+        )
+    )
+    await connection.execute(
+        text(f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} SET NOT NULL")
+    )
+
+
+async def reconcile_multi_value_columns(
+    engine: SchemaExecutor,
+    collection: Any,
+    *,
+    field_names: Iterable[str] | None = None,
+) -> list[str]:
+    """Convert live select/file/relation columns whose shape breaks the rule.
+
+    Explicit, opt-in repair for databases created before the shared
+    multiplicity rule, e.g. a relation with ``maxSelect: null`` created as a
+    scalar ``VARCHAR(15)`` column.  Values are converted like PocketBase
+    converts a single/multiple change (``''`` -> ``{}``, ``'x'`` -> ``{x}``, a
+    stored JSON array of strings -> that array; multiple -> single keeps the
+    last element).  Columns that already have the expected shape, including
+    legacy ``VARCHAR(15)``/``VARCHAR(15)[]`` relation columns, are left
+    untouched, so a second run is a no-op.  Managed indexes of the converted
+    columns are recreated.  Nothing runs automatically: callers (migrations)
+    decide when to repair, inside their own transaction.
+
+    Returns the names of the converted fields.
+    """
+    if _collection_type(collection) == "view":
+        return []
+    table_name = _safe_name(collection.name)
+    fields = {
+        field.name: field
+        for field in _parse_physical_fields(collection)
+        if field.type in (FieldType.SELECT, FieldType.FILE, FieldType.RELATION)
+    }
+    if field_names is None:
+        selected = list(fields)
+    else:
+        selected = list(dict.fromkeys(field_names))
+        unknown = [name for name in selected if name not in fields]
+        if unknown:
+            raise ValueError(
+                f"Collection {collection.name!r} has no select/file/relation "
+                f"field named {', '.join(repr(name) for name in unknown)}."
+            )
+
+    converted: list[str] = []
+    async with _ddl_connection(engine) as conn:
+        for name in selected:
+            field = fields[name]
+            is_array = await _column_is_array(conn, table_name, field.name)
+            if is_array is None:
+                raise ValueError(
+                    f"Collection {collection.name!r} has no column for field "
+                    f"{field.name!r}."
+                )
+            if is_array == _is_array_field(field):
+                continue
+            await _convert_field_multiplicity(
+                conn,
+                table_name=table_name,
+                old_table_name=table_name,
+                old_field=field,
+                new_field=field,
+            )
+            converted.append(field.name)
+        if converted:
+            await _sync_collection_indexes(conn, collection, collection)
+    return converted
 
 
 async def _recreate_field_indexes(
@@ -1442,8 +1639,7 @@ async def _recreate_field_indexes(
                 )
             )
         elif f.type == FieldType.RELATION:
-            max_select = f.options.get("maxSelect", 1) or 1
-            if max_select <= 1:
+            if not relation_is_multiple(f.options):
                 index_stmts.append(
                     (
                         idx_name,
