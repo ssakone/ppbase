@@ -2,9 +2,12 @@
 
 PocketBase 0.22 stores such relations as JSON arrays (``RelationOptions``
 ``MaxSelect *int``, ``IsMultiple() = MaxSelect == nil || *MaxSelect > 1``,
-v0.22.34 ``models/schema/schema_field.go`` l.715-716).  Every expected value
-below was observed on the official PocketBase 0.22.34 binary with the same
-requests (synthetic data only).
+v0.22.34 ``models/schema/schema_field.go`` l.715-716).  The expected API
+values (PrepareValue shapes, orphan errors, modifiers, direct filters, back
+relation, expand order, buma_wallet rules) are the PocketBase 0.22.34 results
+of the ``direct`` scenarios of
+``tests/pocketbase_parity/relation_multiplicity_probe.py`` (synthetic data
+only); column types, conversions and legacy columns are PPBase-specific.
 """
 
 from __future__ import annotations
@@ -264,10 +267,11 @@ async def test_internal_writes_keep_orphans_and_long_elements_unchanged(
     app_client: AsyncClient,
     relation_env: dict,
 ) -> None:
-    """record_service without validate_relations mirrors dao.SaveRecord.
+    """Internal record_service writes mirror PocketBase ``dao.SaveRecord``.
 
     PocketBase 0.22 hooks save through the DAO, which never checks relation
-    targets, so historical orphans (D-0021) stay importable and writable.
+    targets, so historical orphans (D-0021) stay importable and writable; only
+    the record API validates the submitted form.
     """
     engine = get_engine()
     owners = await resolve_collection(engine, relation_env["owners"]["name"])
@@ -377,20 +381,36 @@ async def test_filters_match_pocketbase_on_direct_and_nested_paths(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Known PPBase divergence (not introduced by D-0019): traversals and "
-        ":each through a multiple relation use any-match EXISTS, while "
-        "PocketBase applies its match-all multi-match subquery."
+        "Known PPBase divergence (not introduced by D-0019): a traversal "
+        "through a multiple relation with a non-? operator is any-match "
+        "(EXISTS), while PocketBase adds its match-all multi-match subquery."
     ),
+)
+@pytest.mark.parametrize(
+    ("expression", "titles"),
+    [
+        ('rels.name = "alpha"', ["one"]),
+        ('rels.id = "{t1}"', ["one"]),
+        ('rels.name != "alpha"', ["string"]),
+    ],
 )
 async def test_match_all_traversal_semantics_like_pocketbase(
     app_client: AsyncClient,
     relation_env: dict,
+    expression: str,
+    titles: list[str],
 ) -> None:
-    t1, t2 = relation_env["t1"], relation_env["t2"]
-    for title, rels in (("dups", [t1, t2]), ("empty", []), ("one", [t1])):
+    t1, t2, t3 = relation_env["t1"], relation_env["t2"], relation_env["t3"]
+    for title, rels in (
+        ("dups", [t1, t2]),
+        ("empty", []),
+        ("one", [t1]),
+        ("string", [t3]),
+        ("two", [t2, t1]),
+    ):
         await _create(app_client, relation_env, {"title": title, "rels": rels})
-    items = await _list(app_client, relation_env, filter='rels.name = "alpha"')
-    assert [item["title"] for item in items] == ["one"]  # PocketBase 0.22.34
+    items = await _list(app_client, relation_env, filter=expression.format(t1=t1))
+    assert [item["title"] for item in items] == titles  # PocketBase 0.22.34
 
 
 async def test_expand_returns_lists_in_field_order(
