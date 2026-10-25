@@ -47,6 +47,7 @@ import hashlib
 import json
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,8 @@ CRAFTED_ATTRS = {
         b'{"user.content_type":"image/png","md5":"kAFQmDzST7DWlj99\\nKOF/cg=="}'
     ),
     "c_md5arr": b'{"user.content_type":"image/png","md5":[1,2,255]}',
+    # A number that is no byte, beyond Python's 4300-digit int() limit.
+    "c_md5huge": b'{"user.content_type":"image/png","md5":[1,' + b"9" * 5000 + b"]}",
     "c_md5bad": b'{"user.content_type":"image/png","md5":"%%%"}',
     "c_nan": b'{"x":NaN,"user.content_type":"image/png"}',
     "c_null": b"null",
@@ -117,15 +120,49 @@ NOATTRS_DIVERGENCES = {
     "A.noattrs.thumb_100x100.image": "no .attrs: thumbnail",
 }
 
+# Forms of a valid protected-file token.  v0.22.34 trims it with
+# strings.TrimSpace (apis/file.go l.221-225), v0.40.6 does not (l.115-116);
+# golang-jwt decodes each segment with base64.RawURLEncoding, which skips
+# CR/LF and refuses any other character (padding included).
+TOKEN_FORMS = {
+    "token_valid": lambda token: token,
+    "token_spaces": lambda token: f"  {token}  ",
+    "token_go_spaces": lambda token: f"\u3000\xa0\x85\t{token}\u2029\u205f\v\u2000\n",
+    # Python's str.strip() would remove U+001C; Go's TrimSpace keeps it.
+    "token_not_go_spaces": lambda token: f"{token}\x1c\x1c",
+    "token_zero_width": lambda token: f"{token}\u200b",
+    "token_lf_in_signature": lambda token: f"{token[:-10]}\n{token[-10:]}",
+    "token_padding": lambda token: f"{token}=",
+    "token_blank": lambda token: " \t\u3000 ",
+}
+
 # Protected files: both versions evaluate the viewRule as a guest without a
 # valid token (v0.22.34 apis/file.go l.118-138, v0.40.6 l.109-134) and
 # v0.22.34 refuses with a 403 (l.136-138); PPBase refuses before reading the
 # rule, with a 404 (v0.40.6 l.132-133).  Both modes, not implemented.
+# path -> (reason, PocketBase value, PPBase value).
 PROTECTED_DIVERGENCES = {
-    "C.png.protected_no_token.status": "protected: guest viewRule not evaluated",
-    "C.png.protected_bad_token.status": "protected: guest viewRule not evaluated",
-    "D.png.protected_no_token.status": "protected: 0.22.34 refuses with 403",
-    "D.png.protected_bad_token.status": "protected: 0.22.34 refuses with 403",
+    **{
+        f"C.png.{name}.status": ("protected: guest viewRule not evaluated", 200, 404)
+        for name in ("protected_no_token", "protected_bad_token", "token_blank")
+    },
+    **{
+        f"D.png.{name}.status": ("protected: 0.22.34 refuses with 403", 403, 404)
+        for name in (
+            "protected_no_token",
+            "protected_bad_token",
+            "token_blank",
+            "token_not_go_spaces",
+            "token_zero_width",
+            "token_padding",
+        )
+    },
+}
+
+# v0.40.6 verifies the token untrimmed (the default mode).
+DEFAULT_MODE_TOKEN_DIVERGENCES = {
+    f"D.png.{name}.status": ("v0.40.6: file token not trimmed", 200, 404)
+    for name in ("token_spaces", "token_go_spaces")
 }
 
 # The PocketBase v0.40.6 behavior PPBase applies outside the 0.22 mode.
@@ -158,12 +195,26 @@ def _go_quoted(name: str) -> str:
     return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _expected(entry: tuple[str, Any, Any], row: dict[str, Any]) -> str | None:
+    """The reason of ``entry`` when both sides answered the documented values."""
+    reason, pocketbase, ppbase = entry
+    if (row["pocketbase"], row["ppbase"]) == (pocketbase, ppbase):
+        return reason
+    return None
+
+
 def known_divergence(row: dict[str, Any], compat: str) -> str | None:
     """The documented reason of one difference, ``None`` if unexpected."""
     path = row["path"]
-    reason = NOATTRS_DIVERGENCES.get(path) or PROTECTED_DIVERGENCES.get(path)
-    if reason or compat == "0.22":
+    reason = NOATTRS_DIVERGENCES.get(path)
+    if reason:
         return reason
+    if path in PROTECTED_DIVERGENCES:
+        return _expected(PROTECTED_DIVERGENCES[path], row)
+    if compat == "0.22":
+        return None
+    if path in DEFAULT_MODE_TOKEN_DIVERGENCES:
+        return _expected(DEFAULT_MODE_TOKEN_DIVERGENCES[path], row)
     reason = DEFAULT_MODE_DIVERGENCES.get(path)
     if reason:
         return reason
@@ -326,6 +377,12 @@ def scenarios() -> list[dict[str, Any]]:
     add("A", "missing", "plain", kind="error")
     add("A", "missing", "thumb_100x100", params=[("thumb", "100x100")], kind="error")
     add("A", "png", "attrs_sidecar", suffix=".attrs", kind="error")
+    # A name the record references that ends in .attrs (another file's
+    # side-car): fileblob refuses the key in both versions.
+    add("A", "attrs_ref", "plain", kind="error")
+    add("A", "attrs_ref", "head", method="HEAD", kind="error")
+    add("A", "attrs_ref", "thumb_100x100", params=[("thumb", "100x100")], kind="error")
+    add("A", "attrs_ref", "download_1", params=[("download", "1")], kind="error")
     add("A", "png", "thumbs_dir", prefix="thumbs_", kind="error")
     add("A", "png", "unknown_record", record_id="zzzzzzzzzzzzzzz", kind="error")
     add("A", "png", "unknown_collection", collection="nope_collection", kind="error")
@@ -344,6 +401,9 @@ def scenarios() -> list[dict[str, Any]]:
             params=[("token", "invalid.token.value")],
             kind="error",
         )
+    for name, form in TOKEN_FORMS.items():
+        add("D", "png", name, token=form)
+    add("C", "png", "token_blank", token=TOKEN_FORMS["token_blank"])
     return rows
 
 
@@ -377,6 +437,7 @@ async def run_scenarios(
     client: httpx.AsyncClient,
     targets: dict[str, dict[str, Any]],
     storage_root: Path,
+    file_token: str,
 ) -> dict[str, Any]:
     results: dict[str, Any] = {}
     for row in scenarios():
@@ -385,10 +446,13 @@ async def run_scenarios(
         filename = f"{row.get('prefix', '')}{filename}{row.get('suffix', '')}"
         collection = row.get("collection", target["collection"])
         record_id = row.get("record_id", target["record"])
+        params = list(row.get("params") or [])
+        if "token" in row:
+            params.append(("token", row["token"](file_token)))
         response = await client.request(
             row.get("method", "GET"),
             f"/api/files/{collection}/{record_id}/{filename}",
-            params=row.get("params"),
+            params=params or None,
             headers=row.get("headers"),
         )
         kind = row.get("kind", "file")
@@ -545,6 +609,26 @@ COLLECTIONS = (
 SCENARIO_PREFIXES = tuple(f"{label}." for label, *_rest in COLLECTIONS)
 
 
+def _reference_in_pocketbase(
+    data_db: Path, table: str, record_id: str, name: str
+) -> None:
+    """Append ``name`` to a record's file list in PocketBase's SQLite.
+
+    The API only stores uploads, and fileblob refuses to write a key ending
+    in ``.attrs``: only an import or a direct edit can reference one.
+    """
+    with contextlib.closing(sqlite3.connect(data_db, timeout=30)) as connection:
+        (raw,) = connection.execute(
+            f'SELECT "docs" FROM "{table}" WHERE "id" = ?', (record_id,)
+        ).fetchone()
+        docs = [*json.loads(raw), name]
+        connection.execute(
+            f'UPDATE "{table}" SET "docs" = ? WHERE "id" = ?',
+            (json.dumps(docs), record_id),
+        )
+        connection.commit()
+
+
 def _stored_names(
     uploaded: list[str], record_files: list[str], keys: list[str]
 ) -> dict[str, str]:
@@ -610,8 +694,20 @@ async def run_pocketbase(
         (record_dir / f"{targets['A']['files']['missing']}.attrs").unlink()
         for key, payload in CRAFTED_ATTRS.items():
             (record_dir / f"{targets['A']['files'][key]}.attrs").write_bytes(payload)
+        attrs_ref = f"{targets['A']['files']['txt']}.attrs"
+        _reference_in_pocketbase(
+            work / "pocketbase" / "pb_data" / "data.db",
+            "probe_files",
+            targets["A"]["record"],
+            attrs_ref,
+        )
+        targets["A"]["files"]["attrs_ref"] = attrs_ref
         shutil.copytree(storage, work / "storage-copy", copy_function=shutil.copy2)
-        results = await run_scenarios(client, targets, storage)
+        response = await client.post("/api/files/token", headers=admin)
+        response.raise_for_status()
+        results = await run_scenarios(
+            client, targets, storage, response.json()["token"]
+        )
         results["sidecar.upload_keys"] = list(
             json.loads(
                 (record_dir / f"{targets['A']['files']['png']}.attrs").read_bytes()
@@ -718,7 +814,11 @@ async def run_ppbase(
                             "docs": list(target["files"].values()),
                         },
                     )
-            return await run_scenarios(client, targets, data_dir / "storage")
+            response = await client.post("/api/files/token", headers=admin)
+            response.raise_for_status()
+            return await run_scenarios(
+                client, targets, data_dir / "storage", response.json()["token"]
+            )
     finally:
         await close_engine()
 
