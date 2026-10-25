@@ -214,7 +214,9 @@ def go_to_bool(value: Any) -> bool:
     v1.10.0 basic.go l.16-67) keeps a bool, maps nil to false, compares a
     number to 0, parses a string with ``strconv.ParseBool`` and drops its
     error, so ``"false"``, ``"0"``, ``""`` or ``"yes"`` are false.  Any other
-    type (a JSON array or object, a repeated multipart key) is false.
+    type, such as a JSON array or object, is an error, hence false.  How a
+    repeated multipart key reaches it depends on the mode, see
+    :func:`prepare_bool_value`.
     """
     if isinstance(value, bool):
         return value
@@ -227,8 +229,43 @@ def go_to_bool(value: Any) -> bool:
     return False
 
 
+class MultipartValues(list):
+    """The text values of a repeated multipart/form-data key, in the 0.22 mode.
+
+    PocketBase 0.22.34 keeps every value only for a key named like an
+    arrayable field (select, file, relation: forms/record_upsert.go
+    l.191-193, models/schema/schema_field.go l.122-128); any other key takes
+    its first value (forms/record_upsert.go l.194-195).  The 0.22 mode of
+    the records API parser gives a repeated key this ``list`` type so that a
+    consumer can apply that rule; it behaves as a plain ``list`` everywhere
+    else.  The default mode keeps a plain ``list``, as v0.40.6 decodes a
+    repeated key as a ``[]any`` (tools/router/unmarshal_request_data.go
+    l.84-90).
+    """
+
+    __slots__ = ()
+
+
+def first_multipart_value(value: Any) -> Any:
+    """``values[0]`` of a :class:`MultipartValues` list, else ``value``."""
+    if isinstance(value, MultipartValues):
+        return value[0] if value else None
+    return value
+
+
+def prepare_bool_value(value: Any) -> bool:
+    """A written bool value, converted like PocketBase.
+
+    The 0.22 mode first takes the first value of a repeated multipart key,
+    as 0.22.34 does for every non-arrayable key (:class:`MultipartValues`),
+    then applies ``cast.ToBool`` (:func:`go_to_bool`).  In the default mode
+    a repeated key stays a plain list, false like the ``[]any`` of v0.40.6.
+    """
+    return go_to_bool(first_multipart_value(value))
+
+
 def _validate_bool(field: FieldDefinition, value: Any) -> bool:
-    val = go_to_bool(value)
+    val = prepare_bool_value(value)
     if field.required and not val:
         raise FieldValidationError(
             field.name, "validation_required", "Must be true."

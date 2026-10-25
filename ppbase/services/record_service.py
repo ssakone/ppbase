@@ -33,7 +33,7 @@ from ppbase.models.field_types import (
     FieldDefinition,
     FieldType,
     FieldValidationError,
-    go_to_bool,
+    prepare_bool_value,
     validate_field_value,
 )
 from ppbase.models.record import (
@@ -587,11 +587,16 @@ def _merged_form_value(
     current: dict[str, Any],
     data: dict[str, Any],
 ) -> Any:
-    """Current value of ``field`` with the request value and modifiers applied."""
+    """Current value of ``field`` with the request value and modifiers applied.
+
+    A bool field ignores its modifier keys, as in ``update_record``.
+    """
     value = current.get(field.name)
     for key, raw in data.items():
         if key == field.name:
             value = raw
+        elif field.type == FieldType.BOOL:
+            continue
         elif key == f"{field.name}+":
             value = _apply_append(value, raw, field)
         elif key == f"+{field.name}":
@@ -1385,13 +1390,13 @@ async def create_record(
                     "email_visibility", data.pop("emailVisibility", False)
                 )
                 data.pop("emailVisibility", None)
-                columns["email_visibility"] = go_to_bool(raw_visibility)
+                columns["email_visibility"] = prepare_bool_value(raw_visibility)
             else:
                 columns["email_visibility"] = False
             if "verified" not in data:
                 columns["verified"] = False
             else:
-                columns["verified"] = go_to_bool(data.pop("verified", False))
+                columns["verified"] = prepare_bool_value(data.pop("verified", False))
 
     # File fields: a new record references no file yet, so only uploads can
     # fill them (record_file_fields); a refused field keeps its error.
@@ -1636,11 +1641,15 @@ async def update_record(
             data.pop("verified", None)
         else:
             if "email_visibility" in data:
-                updates["email_visibility"] = go_to_bool(data.pop("email_visibility"))
+                updates["email_visibility"] = prepare_bool_value(
+                    data.pop("email_visibility")
+                )
             elif "emailVisibility" in data:
-                updates["email_visibility"] = go_to_bool(data.pop("emailVisibility"))
+                updates["email_visibility"] = prepare_bool_value(
+                    data.pop("emailVisibility")
+                )
             if "verified" in data:
-                updates["verified"] = go_to_bool(data.pop("verified"))
+                updates["verified"] = prepare_bool_value(data.pop("verified"))
 
     field_map = {f.name: f for f in schema_fields}
 
@@ -1688,6 +1697,18 @@ async def update_record(
         if field_def is None:
             continue
         if field_def.type in (FieldType.AUTODATE, FieldType.FILE):
+            continue
+        if modifier is not None and field_def.type == FieldType.BOOL:
+            # A modifier key is a no-op for a bool field, which keeps the
+            # request's own value or the current one.  PocketBase 0.22.34
+            # ReplaceModifers takes that value as base (models/record.go
+            # l.616-629) and PrepareValueWithModifier has no bool case, so it
+            # returns PrepareValue(base) (models/schema/schema_field.go
+            # l.394-429); "+name" is no 0.22.34 modifier (l.20-32), just an
+            # unknown key.  v0.40.6 BoolField has no FindSetter, so
+            # SetIfFieldExists ignores all three keys (core/record_model.go
+            # l.869-889; ReplaceModifiers l.1374-1404, RecordUpsert.Load
+            # forms/record_upsert.go l.109-115).
             continue
 
         current = field_state.get(field_name)
