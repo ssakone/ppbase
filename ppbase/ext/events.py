@@ -240,7 +240,20 @@ class HookEvent:
     ) -> RecordRepository:
         """Build a repository-style accessor for a collection."""
         active_engine = engine if engine is not None else getattr(self, "engine", None)
-        return RecordRepository(collection_id_or_name, engine=active_engine)
+        return RecordRepository(
+            collection_id_or_name,
+            engine=active_engine,
+            file_semantics=self._repository_file_semantics,
+        )
+
+    def _repository_file_semantics(self) -> str | None:
+        """File name check of ``records()`` writes: the app's mode."""
+        from ppbase.middleware.error_compat import get_error_compat
+        from ppbase.services.record_file_fields import server_semantics_for_mode
+
+        return server_semantics_for_mode(
+            get_error_compat(getattr(self, "app", None))
+        )
 
     async def get_current_user(
         self,
@@ -400,7 +413,11 @@ class RecordRequestEvent(HookEvent):
                 "Pass collection_id_or_name explicitly."
             )
         active_engine = engine if engine is not None else self.engine
-        return RecordRepository(target, engine=active_engine)
+        return RecordRepository(
+            target,
+            engine=active_engine,
+            file_semantics=self._repository_file_semantics,
+        )
 
     async def get(
         self,

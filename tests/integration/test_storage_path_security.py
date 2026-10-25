@@ -520,12 +520,18 @@ async def test_successful_batch_flushes_deferred_file_deletes(
         )
 
 
-async def test_batch_reconciliation_preserves_file_readded_before_commit(
+async def test_batch_refuses_readding_a_removed_file_and_keeps_it(
     app_client: AsyncClient,
     admin_token: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """A name removed earlier in the batch is no longer the record's.
+
+    PocketBase checks submitted names against the latest saved value, inside
+    the batch transaction (v0.40.6 core/field_file.go l.250-269, l.405-414):
+    the second request is refused, the batch rolls back and the file stays.
+    """
     data_dir = tmp_path / "data"
     monkeypatch.setattr(
         file_storage,
@@ -563,7 +569,11 @@ async def test_batch_reconciliation_preserves_file_readded_before_commit(
             },
         )
 
-        assert response.status_code == 200, response.text
+        assert response.status_code == 400, response.text
+        failed = response.json()["data"]["requests"]
+        assert list(failed) == ["1"], failed
+        nested = failed["1"]["response"]["data"]["document"]
+        assert nested["code"] == "validation_invalid_file", nested
         fetched = await app_client.get(
             f"/api/collections/{collection['name']}/records/{record_id}"
         )

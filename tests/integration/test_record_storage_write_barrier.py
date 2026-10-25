@@ -192,7 +192,9 @@ async def test_hook_repository_reuses_outer_pid_with_pool_size_one(
     async def _resolve(_engine, _target):
         return collection
 
-    async def _create(active_engine, _collection, data, files=None):
+    async def _create(
+        active_engine, _collection, data, files=None, file_semantics=None
+    ):
         async with active_engine.connect() as connection:
             pid_result = await connection.execute(text("SELECT pg_backend_pid()"))
             pids.append(int(pid_result.scalar_one()))

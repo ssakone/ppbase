@@ -448,6 +448,51 @@ def get_provider_credentials(
     )
 
 
+def _oauth2_record_data(
+    collection: CollectionRecord,
+    oauth_data: dict[str, Any],
+    create_data: Any,
+    file_semantics: str | None,
+) -> tuple[dict[str, Any], frozenset[str]]:
+    """Merge the provider's mapped fields and the client's ``createData``.
+
+    ``createData`` comes from the client, so its file names are checked like
+    a record create: a new record references no file yet.  v0.40.6 creates
+    the record by an internal ``POST /records`` request
+    (apis/record_auth_with_oauth2.go l.319, l.403-425), where
+    ``FileField.ValidateValue`` refuses them (core/field_file.go l.250-269);
+    0.22.34 loads ``createData`` with ``LoadData`` and ignores its error
+    (forms/record_oauth2_login.go l.227), so the refused file field and the
+    schema fields after it are not loaded
+    (:func:`~ppbase.services.record_file_fields.load_022_create_data`).
+
+    A mapped file field (PPBase stores the provider avatar URL there) is a
+    value of the server: it is not checked, unless ``createData`` addresses
+    the same field, which then replaces it entirely.  Returns the record
+    data and the mapped file fields to leave unchecked.
+    """
+    from ppbase.services.record_file_fields import (
+        POCKETBASE_022,
+        field_keys,
+        load_022_create_data,
+    )
+    from ppbase.services.record_service import _get_schema_fields
+
+    if not isinstance(create_data, dict):
+        return {**oauth_data, **create_data}, frozenset()
+    fields = _get_schema_fields(collection)
+    file_fields = {field.name for field in fields if field.type == "file"}
+    mapped = {
+        name: value
+        for name, value in oauth_data.items()
+        if name not in file_fields or not field_keys(name, create_data)
+    }
+    if file_semantics == POCKETBASE_022:
+        create_data = load_022_create_data(fields, create_data)
+    unchecked = frozenset(name for name in mapped if name in file_fields)
+    return {**mapped, **create_data}, unchecked
+
+
 async def link_or_create_oauth_user(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -455,6 +500,8 @@ async def link_or_create_oauth_user(
     provider_user_info: dict[str, Any],
     token_data: dict[str, Any],
     create_data: dict[str, Any],
+    *,
+    file_semantics: str | None = None,
 ) -> dict[str, Any]:
     """Link or create user record for OAuth2 authentication.
 
@@ -465,6 +512,9 @@ async def link_or_create_oauth_user(
         provider_user_info: User info from provider
         token_data: Token response from provider (access_token, refresh_token, etc.)
         create_data: Additional data to merge when creating new user
+        file_semantics: File field semantics of the client's ``createData``
+            (``record_file_fields.CURRENT`` or ``POCKETBASE_022``, see
+            :func:`_oauth2_record_data`); ``None`` accepts its file names.
 
     Returns:
         Dict with keys: record, isNew, meta (OAuth2Meta)
@@ -521,7 +571,9 @@ async def link_or_create_oauth_user(
                         oauth_data[collection_field] = provider_user_info[provider_field]
 
                 # Merge createData with OAuth data (createData takes precedence)
-                record_data = {**oauth_data, **create_data}
+                record_data, server_file_fields = _oauth2_record_data(
+                    collection, oauth_data, create_data, file_semantics
+                )
 
                 # OAuth providers usually return email; use it as fallback for auth collections.
                 if not record_data.get("email") and provider_user_info.get("email"):
@@ -540,7 +592,13 @@ async def link_or_create_oauth_user(
                     record_data["emailVisibility"] = False
 
                 # Create user record
-                record = await create_record(engine, collection, record_data)
+                record = await create_record(
+                    engine,
+                    collection,
+                    record_data,
+                    file_semantics=file_semantics,
+                    unchecked_file_fields=server_file_fields,
+                )
 
             # Create external auth link for newly linked/created records.
             if record is not None:

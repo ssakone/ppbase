@@ -47,6 +47,11 @@ export function buildRecordFormData(
   for (const field of fields) {
     if (resetPrimaryKey && (field.primaryKey || field.name === 'id')) {
       data[field.name] = null
+    } else if (resetPrimaryKey && field.type === 'file') {
+      // A new record cannot reference the files of another one: PocketBase's
+      // dashboard drops them from a duplicate (ui/src/fields/file/
+      // onrecordduplicate.js l.7-9, v0.40.6) and its API refuses them.
+      continue
     } else if (source) {
       data[field.name] = source[field.name] ?? null
     } else {

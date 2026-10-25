@@ -93,6 +93,10 @@ record = await pb.records("posts").create(
 )
 ```
 
+A file field only takes uploaded files, plus names the record already has:
+in the default mode `create` and `update` refuse any other name, like
+PocketBase's `app.Save` (see [File fields](./file-fields.md)).
+
 ---
 
 ## `update` — partial update

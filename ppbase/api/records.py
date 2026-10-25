@@ -34,21 +34,30 @@ from ppbase.ext.registry import (
     HOOK_RECORD_VIEW_REQUEST,
     get_extension_registry,
 )
-from ppbase.middleware.error_compat import compat_record_errors, mark_error
+from ppbase.middleware.error_compat import (
+    POCKETBASE_022,
+    compat_record_errors,
+    get_error_compat,
+    mark_error,
+)
 from ppbase.services.expand_service import expand_records
+from ppbase.services.record_file_fields import MultipartText, semantics_for_mode
 from ppbase.services.record_service import (
+    FileNamesLoadError,
     RecordReferenceError,
     _ValidationErrors,
     auth_email_visible_ids,
     check_record_rule,
     create_record,
     delete_record,
+    file_name_load_errors,
     get_all_collections,
     get_record,
     has_relation_fields,
     list_records,
     relation_target_errors,
     resolve_collection,
+    touched_file_fields,
     update_record,
 )
 from ppbase.services.record_storage_coordinator import (
@@ -522,6 +531,63 @@ async def _relation_errors_before_hooks(
     return await relation_target_errors(engine, collection, data, record_id=record_id)
 
 
+def _file_semantics(request: Any) -> str:
+    """File field semantics of the app: PocketBase 0.22.34 in the 0.22 mode."""
+    return semantics_for_mode(get_error_compat(getattr(request, "app", None)))
+
+
+# apis/record_crud.go l.227, l.270, l.362 (v0.22.34).
+_LOAD_ERROR_MESSAGE = "Failed to load the submitted data due to invalid formatting."
+
+
+def _file_load_error(errors: dict[str, Any]) -> JSONResponse:
+    """PocketBase 0.22.34 answer to an unknown file name (``LoadRequest``)."""
+    return _error_response(400, _LOAD_ERROR_MESSAGE, errors)
+
+
+async def _file_load_errors_before_hooks(
+    request: Request,
+    engine: Any,
+    collection: Any,
+    data: Any,
+    files: dict[str, list[tuple[str, bytes]]],
+    *,
+    rule: str | None,
+    auth: dict[str, Any] | None,
+    record_id: str | None = None,
+) -> dict[str, Any]:
+    """The 0.22 mode refusal of unknown file names, in PocketBase's order.
+
+    PocketBase 0.22.34 answers 403 for a superuser-only rule and 404 for a
+    missing or inaccessible record (apis/record_crud.go l.207-209, l.323-355)
+    before it loads the request, then refuses a file name the record does
+    not have while loading it (l.226-227, l.269-270, l.361-362), before the
+    form validation and the ``OnRecordBefore*Request`` hooks.  The access
+    checks are only replayed here to keep that order; the default handlers
+    still enforce them, and ``create_record`` / ``update_record`` check the
+    names again after the hooks.
+    """
+    if get_error_compat(request.app) != POCKETBASE_022:
+        return {}
+    if not touched_file_fields(collection, data, files):
+        return {}
+    auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
+    rule_result = check_rule(rule, auth_ctx)
+    if rule_result is False:
+        return {}
+    if (
+        record_id is not None
+        and isinstance(rule_result, str)
+        and not await check_record_rule(
+            engine, collection, record_id, rule_result, request_context
+        )
+    ):
+        return {}
+    return await file_name_load_errors(
+        engine, collection, data, files, record_id=record_id
+    )
+
+
 def _response_json_body(response: JSONResponse) -> dict[str, Any]:
     """Decode a JSONResponse payload to dict."""
     try:
@@ -622,6 +688,13 @@ async def _parse_record_request_body(
     if "multipart/form-data" in content_type:
         form = await request.form()
         json_payloads: list[str] = []
+        # 0.22.34 keeps a file field's text values as raw strings
+        # (record_file_fields.MultipartText); a plain str everywhere else.
+        text_type = (
+            MultipartText
+            if get_error_compat(getattr(request, "app", None)) == POCKETBASE_022
+            else str
+        )
 
         for key in form.keys():
             values = form.getlist(key)
@@ -643,7 +716,7 @@ async def _parse_record_request_body(
             if file_values:
                 files[key] = file_values
             if len(str_values) == 1:
-                data[key] = str_values[0]
+                data[key] = text_type(str_values[0])
             elif str_values:
                 data[key] = str_values
 
@@ -990,7 +1063,11 @@ async def _apply_batch_create(
 
         try:
             record = await create_record(
-                engine, collection, payload, files=payload_files
+                engine,
+                collection,
+                payload,
+                files=payload_files,
+                file_semantics=_file_semantics(request),
             )
         except _ValidationErrors as exc:
             return _error_response(
@@ -1199,6 +1276,7 @@ async def _apply_batch_update(
                 target_record_id,
                 payload,
                 files=payload_files,
+                file_semantics=_file_semantics(request),
             )
         except _ValidationErrors as exc:
             return _error_response(
@@ -1650,8 +1728,14 @@ async def api_create_record(
 
         try:
             record = await create_record(
-                active_engine, collection, payload, files=payload_files
+                active_engine,
+                collection,
+                payload,
+                files=payload_files,
+                file_semantics=_file_semantics(request),
             )
+        except FileNamesLoadError as exc:
+            return _file_load_error(exc.errors)
         except _ValidationErrors as exc:
             return _create_validation_error(request, e.auth, collection, exc.errors)
         except Exception:
@@ -1724,6 +1808,17 @@ async def api_create_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
+        file_errors = await _file_load_errors_before_hooks(
+            request,
+            active_engine,
+            collection,
+            data,
+            files,
+            rule=collection.create_rule,
+            auth=auth,
+        )
+        if file_errors:
+            return _file_load_error(file_errors)
         if has_relation_fields(collection):
             auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
             relation_errors = await _relation_errors_before_hooks(
@@ -1958,7 +2053,10 @@ async def api_update_record(
                 target_record_id,
                 payload,
                 files=payload_files,
+                file_semantics=_file_semantics(request),
             )
+        except FileNamesLoadError as exc:
+            return _file_load_error(exc.errors)
         except _ValidationErrors as exc:
             return _update_validation_error(request, collection, exc.errors)
         except Exception:
@@ -1992,6 +2090,18 @@ async def api_update_record(
         collection = await resolve_collection(active_engine, collectionIdOrName)
         if collection is None:
             return _error_response(404, "Missing collection context.")
+        file_errors = await _file_load_errors_before_hooks(
+            request,
+            active_engine,
+            collection,
+            data,
+            files,
+            rule=collection.update_rule,
+            auth=auth,
+            record_id=recordId,
+        )
+        if file_errors:
+            return _file_load_error(file_errors)
         if has_relation_fields(collection):
             auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
             relation_errors = await _relation_errors_before_hooks(

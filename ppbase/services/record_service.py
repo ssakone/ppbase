@@ -10,6 +10,7 @@ import json as _json
 import logging
 import mimetypes
 import re
+from collections.abc import Collection
 from datetime import UTC, datetime, timezone
 from typing import Any
 
@@ -24,7 +25,6 @@ from ppbase.models.field_multiplicity import (
     prepare_relation_value,
     relation_is_multiple,
     relation_max_select,
-    select_or_file_is_multiple,
     select_or_file_max_select,
     to_unique_string_list,
 )
@@ -163,6 +163,96 @@ def _validate_uploaded_file_constraints(
                 "validation_invalid_mime_type",
                 f"Unsupported file type: {mime_type}.",
             )
+
+
+def _resolve_file_fields(
+    semantics: str | None,
+    collection: CollectionRecord,
+    record_id: str,
+    schema_fields: list[FieldDefinition],
+    old_row: dict[str, Any],
+    data: dict[str, Any],
+    files: dict[str, list[tuple[str, bytes]]] | None,
+    errors: dict[str, dict[str, Any]],
+    saved_upload_names: list[str],
+    *,
+    only_touched: bool,
+    unchecked: frozenset[str] = frozenset(),
+) -> dict[str, str | list[str]]:
+    """Resolve, check and save the file fields of a record write.
+
+    See :mod:`ppbase.services.record_file_fields`.  A field refused there
+    (or by its upload constraints) goes to ``errors`` and saves nothing; the
+    others get their uploads saved and are returned with their final value.
+    With the 0.22 semantics a submitted name the record does not have raises
+    :class:`FileNamesLoadError` for the first such field, before anything is
+    saved (v0.22.34 forms/record_upsert.go l.415-439).  The ``unchecked``
+    fields hold a value set by the server itself: no name check.
+    """
+    from ppbase.services.file_storage import save_files
+    from ppbase.services.record_file_fields import (
+        file_value,
+        is_touched,
+        plan_file_field,
+        upload_counts,
+    )
+
+    counts = upload_counts(files)
+    plans = []
+    for field_def in schema_fields:
+        if field_def.type != FieldType.FILE:
+            continue
+        if only_touched and not is_touched(field_def.name, data, counts):
+            continue
+        plan = plan_file_field(
+            None if field_def.name in unchecked else semantics,
+            field_def,
+            old_row.get(field_def.name),
+            data,
+            counts,
+        )
+        if plan.load_error:
+            raise FileNamesLoadError({plan.name: dict(plan.error or {})})
+        plans.append((field_def, plan))
+
+    values: dict[str, str | list[str]] = {}
+    for field_def, plan in plans:
+        if plan.error is not None:
+            errors[plan.name] = plan.error
+            continue
+        uploaded = files or {}
+        selected = [
+            (upload, uploaded[upload.key][upload.index]) for upload in plan.uploads
+        ]
+        upload_has_error = False
+        for _upload, (uploaded_name, uploaded_content) in selected:
+            try:
+                _validate_uploaded_file_constraints(
+                    field_def, uploaded_name, uploaded_content
+                )
+            except FieldValidationError as exc:
+                errors[exc.field_name] = {"code": exc.code, "message": exc.message}
+                upload_has_error = True
+        if upload_has_error:
+            continue
+        saved: dict[Any, str] = {}
+        if selected:
+            try:
+                saved_names = save_files(
+                    collection.id,
+                    record_id,
+                    field_def.name,
+                    [upload_file for _upload, upload_file in selected],
+                    select_or_file_max_select(field_def.options),
+                    lease=require_mutation_write_barrier(),
+                )
+            except Exception:
+                _cleanup_new_storage_files(collection.id, record_id, saved_upload_names)
+                raise
+            saved_upload_names.extend(saved_names)
+            saved = dict(zip((upload for upload, _file in selected), saved_names))
+        values[plan.name] = file_value(plan, saved)
+    return values
 
 
 def _get_schema_fields(collection: CollectionRecord) -> list[FieldDefinition]:
@@ -422,6 +512,73 @@ def _relation_field_definitions(collection: Any) -> list[FieldDefinition]:
 def has_relation_fields(collection: Any) -> bool:
     """Return whether a collection defines at least one relation field."""
     return bool(_relation_field_definitions(collection))
+
+
+def touched_file_fields(
+    collection: Any,
+    data: Any,
+    files: dict[str, list[tuple[str, bytes]]] | None,
+) -> list[FieldDefinition]:
+    """The file fields a record write addresses (no database access)."""
+    from ppbase.services.record_file_fields import is_touched, upload_counts
+
+    if not isinstance(data, dict):
+        return []
+    counts = upload_counts(files)
+    return [
+        field
+        for field in _get_schema_fields(collection)
+        if field.type == FieldType.FILE and is_touched(field.name, data, counts)
+    ]
+
+
+async def file_name_load_errors(
+    engine: AsyncEngine,
+    collection: Any,
+    data: Any,
+    files: dict[str, list[tuple[str, bytes]]] | None,
+    *,
+    record_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """The PocketBase 0.22.34 refusal of unknown file names, before hooks.
+
+    ``LoadData`` checks the file fields in schema order while the request is
+    loaded and stops at the first one that names a file the record does not
+    have (forms/record_upsert.go l.415-439), before the form validation and
+    the ``OnRecordBefore*Request`` hooks.  Returns ``{field: error}`` for
+    that field, else ``{}`` (also when the record does not exist: the caller
+    answers 404).
+    """
+    from ppbase.services.record_file_fields import (
+        POCKETBASE_022,
+        plan_file_field,
+        upload_counts,
+    )
+
+    touched = touched_file_fields(collection, data, files)
+    if not touched:
+        return {}
+    counts = upload_counts(files)
+    old_row: dict[str, Any] = {}
+    if record_id is not None:
+        try:
+            safe_id = validate_record_id(record_id)
+        except StorageSafetyError:
+            return {}
+        columns = ", ".join(f'"{field.name}"' for field in touched)
+        sql = f'SELECT {columns} FROM "{_table_name(collection)}" WHERE "id" = :id'
+        async with engine.connect() as conn:
+            row = (await conn.execute(text(sql), {"id": safe_id})).mappings().first()
+        if row is None:
+            return {}
+        old_row = dict(row)
+    for field in touched:
+        plan = plan_file_field(
+            POCKETBASE_022, field, old_row.get(field.name), data, counts
+        )
+        if plan.load_error:
+            return {plan.name: dict(plan.error or {})}
+    return {}
 
 
 def _merged_form_value(
@@ -1113,11 +1270,21 @@ async def create_record(
     collection: CollectionRecord,
     data: dict[str, Any],
     files: dict[str, list[tuple[str, bytes]]] | None = None,
+    *,
+    file_semantics: str | None = None,
+    unchecked_file_fields: Collection[str] = (),
 ) -> dict[str, Any]:
     """Create a new record in the collection.
 
     Validates all fields, generates an ID, and sets timestamps.
     Handles file uploads if files dict is provided.
+
+    ``file_semantics`` (``record_file_fields.CURRENT`` or ``POCKETBASE_022``,
+    passed by the record API and ``pb.records()``) refuses submitted file
+    names like PocketBase: a new record has no file yet.  ``None``
+    (server-side callers) accepts them, as before; so do the
+    ``unchecked_file_fields`` (a value the server sets itself, like the
+    OAuth2 avatar URL mapping).
 
     Relation targets are not looked up here, like PocketBase
     ``dao.SaveRecord``; the record API checks them first with
@@ -1129,8 +1296,6 @@ async def create_record(
     Raises:
         FieldValidationError: If any field fails validation.
     """
-    from ppbase.services.file_storage import save_files
-
     table = _table_name(collection)
     schema_fields = _get_schema_fields(collection)
     hidden = _get_hidden_fields(schema_fields)
@@ -1251,53 +1416,21 @@ async def create_record(
             else:
                 columns["verified"] = _go_to_bool(data.pop("verified", False))
 
-    # Build field map for file handling
-    field_map = {f.name: f for f in schema_fields}
-
-    # Process uploaded files
-    if files:
-        for field_name, file_list in files.items():
-            field_def = field_map.get(field_name)
-            if field_def is None or field_def.type != FieldType.FILE:
-                continue
-            upload_has_error = False
-            for uploaded_name, uploaded_content in file_list:
-                try:
-                    _validate_uploaded_file_constraints(
-                        field_def,
-                        uploaded_name,
-                        uploaded_content,
-                    )
-                except FieldValidationError as exc:
-                    errors[exc.field_name] = {
-                        "code": exc.code,
-                        "message": exc.message,
-                    }
-                    upload_has_error = True
-            if upload_has_error:
-                continue
-            file_multiple = select_or_file_is_multiple(field_def.options)
-            try:
-                saved_names = save_files(
-                    collection.id,
-                    record_id,
-                    field_name,
-                    file_list,
-                    select_or_file_max_select(field_def.options),
-                    lease=require_mutation_write_barrier(),
-                )
-            except Exception:
-                _cleanup_new_storage_files(
-                    collection.id,
-                    record_id,
-                    saved_upload_names,
-                )
-                raise
-            saved_upload_names.extend(saved_names)
-            if not file_multiple:
-                data[field_name] = saved_names[0] if saved_names else ""
-            else:
-                data[field_name] = saved_names
+    # File fields: a new record references no file yet, so only uploads can
+    # fill them (record_file_fields); a refused field keeps its error.
+    file_values = _resolve_file_fields(
+        file_semantics,
+        collection,
+        record_id,
+        schema_fields,
+        {},
+        data,
+        files,
+        errors,
+        saved_upload_names,
+        only_touched=False,
+        unchecked=frozenset(unchecked_file_fields),
+    )
 
     try:
         for field_def in schema_fields:
@@ -1309,6 +1442,10 @@ async def create_record(
                 and field_def.name in _AUTH_COLUMNS_HANDLED_SEPARATELY
             ):
                 continue
+            if field_def.type == FieldType.FILE:
+                if field_def.name not in file_values:
+                    continue
+                data[field_def.name] = file_values[field_def.name]
 
             value = data.get(field_def.name)
 
@@ -1403,6 +1540,8 @@ async def update_record(
     record_id: str,
     data: dict[str, Any],
     files: dict[str, list[tuple[str, bytes]]] | None = None,
+    *,
+    file_semantics: str | None = None,
 ) -> dict[str, Any] | None:
     """Update an existing record.
 
@@ -1410,9 +1549,13 @@ async def update_record(
     multi-value fields (select, relation, file).
     Handles file uploads if files dict is provided.
 
+    File fields follow :mod:`ppbase.services.record_file_fields`; with a
+    ``file_semantics`` (passed by the record API) only names the record
+    already has can be kept, like PocketBase.
+
     Returns the updated record dict, or None if not found.
     """
-    from ppbase.services.file_storage import delete_files, save_files
+    from ppbase.services.file_storage import delete_files
 
     record_id = validate_record_id(record_id)
     table = _table_name(collection)
@@ -1549,13 +1692,6 @@ async def update_record(
             return [str(value)]
         return []
 
-    def _coerce_file_value(
-        field_def: FieldDefinition, values: list[str]
-    ) -> str | list[str]:
-        if select_or_file_is_multiple(field_def.options):
-            return values
-        return values[-1] if values else ""
-
     # Build a mutable field state from the current DB row so mixed multipart
     # operations like images + images- are applied against a single source of
     # truth and DB/storage stay in sync.
@@ -1574,7 +1710,7 @@ async def update_record(
         field_def = field_map.get(field_name)
         if field_def is None:
             continue
-        if field_def.type == FieldType.AUTODATE:
+        if field_def.type in (FieldType.AUTODATE, FieldType.FILE):
             continue
 
         current = field_state.get(field_name)
@@ -1588,71 +1724,21 @@ async def update_record(
         else:
             field_state[field_name] = value
 
-    # Apply uploaded files using the same modifier semantics as body fields.
-    if files:
-        for raw_key, file_list in files.items():
-            field_name, modifier = _parse_modifier_key(raw_key)
-            field_def = field_map.get(field_name)
-            if field_def is None or field_def.type != FieldType.FILE:
-                continue
-
-            upload_has_error = False
-            for uploaded_name, uploaded_content in file_list:
-                try:
-                    _validate_uploaded_file_constraints(
-                        field_def,
-                        uploaded_name,
-                        uploaded_content,
-                    )
-                except FieldValidationError as exc:
-                    errors[exc.field_name] = {
-                        "code": exc.code,
-                        "message": exc.message,
-                    }
-                    upload_has_error = True
-            if upload_has_error:
-                continue
-
-            try:
-                saved_names = save_files(
-                    collection.id,
-                    record_id,
-                    field_name,
-                    file_list,
-                    select_or_file_max_select(field_def.options),
-                    lease=require_mutation_write_barrier(),
-                )
-            except Exception:
-                _cleanup_new_storage_files(
-                    collection.id,
-                    record_id,
-                    saved_upload_names,
-                )
-                raise
-            saved_upload_names.extend(saved_names)
-
-            try:
-                current = field_state.get(field_name)
-                if modifier == "+":
-                    field_state[field_name] = _apply_append(
-                        current, saved_names, field_def
-                    )
-                elif modifier == "prepend":
-                    field_state[field_name] = _apply_prepend(
-                        current, saved_names, field_def
-                    )
-                else:
-                    field_state[field_name] = _coerce_file_value(
-                        field_def,
-                        saved_names,
-                    )
-            except BaseException:
-                _cleanup_new_storage_files(
-                    collection.id,
-                    record_id,
-                    saved_upload_names,
-                )
-                raise
+    # File fields: names the record has, plus uploads (record_file_fields).
+    field_state.update(
+        _resolve_file_fields(
+            file_semantics,
+            collection,
+            record_id,
+            schema_fields,
+            raw_row,
+            data,
+            files,
+            errors,
+            saved_upload_names,
+            only_touched=True,
+        )
+    )
 
     # Validate final field state and derive removed physical files from the
     # final DB value instead of from intermediate mutations.
@@ -2207,3 +2293,13 @@ class _ValidationErrors(Exception):
     def __init__(self, errors: dict[str, dict[str, str]]) -> None:
         self.errors = errors
         super().__init__(f"Validation failed: {errors}")
+
+
+class FileNamesLoadError(_ValidationErrors):
+    """A submitted file name the record does not have, in the 0.22 semantics.
+
+    PocketBase 0.22.34 refuses it while loading the request
+    (forms/record_upsert.go l.428-439), so the record API answers "Failed to
+    load the submitted data due to invalid formatting." (apis/record_crud.go
+    l.226-227, l.269-270, l.361-362) with only this field in ``data``.
+    """

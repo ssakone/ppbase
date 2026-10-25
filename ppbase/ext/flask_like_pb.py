@@ -1049,7 +1049,22 @@ class FlaskLikePB:
         engine: Any | None = None,
     ) -> RecordRepository:
         """Return a repository-like accessor for record CRUD operations."""
-        return RecordRepository(collection_id_or_name, engine=engine)
+        return RecordRepository(
+            collection_id_or_name,
+            engine=engine,
+            file_semantics=self._repository_file_semantics,
+        )
+
+    def _repository_file_semantics(self) -> str | None:
+        """File name check of ``records()`` writes: the app's mode."""
+        from ppbase.middleware.error_compat import get_error_compat
+        from ppbase.services.record_file_fields import server_semantics_for_mode
+
+        if self._app is not None:
+            mode = get_error_compat(self._app)
+        else:
+            mode = str(getattr(self.settings, "error_compat", "") or "")
+        return server_semantics_for_mode(mode)
 
     def optional_auth(self):
         """FastAPI dependency returning auth payload or ``None``."""

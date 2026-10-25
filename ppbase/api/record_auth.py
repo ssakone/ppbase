@@ -1039,11 +1039,13 @@ async def api_auth_with_oauth2(
             )
 
         settings = request.app.state.settings
+        from ppbase.middleware.error_compat import get_error_compat
         from ppbase.services.oauth2_service import (
             get_provider_class,
             get_provider_credentials,
             link_or_create_oauth_user,
         )
+        from ppbase.services.record_file_fields import semantics_for_mode
 
         try:
             client_id, client_secret = get_provider_credentials(provider, settings, opts)
@@ -1064,6 +1066,7 @@ async def api_auth_with_oauth2(
                 user_info,
                 token_data,
                 create_data,
+                file_semantics=semantics_for_mode(get_error_compat(request.app)),
             )
 
             rule_request_context = _build_rule_request_context(
