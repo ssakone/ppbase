@@ -112,7 +112,8 @@ PocketBase 0.22.34 binary; the PocketBase results are pinned in
   `NULL` of a missing row, so both tie in a sort where SQLite puts `NULL`
   before `''` (`empty-dates.md`).
 - Json comparisons with a non-null value (`meta = 5`, `meta ?= "x"`) keep
-  PPBase's jsonb reading, not `JSON_EXTRACT`'s.
+  PPBase's jsonb reading, and non-null json values keep the jsonb sort order,
+  not `JSON_EXTRACT`'s SQLite values.
 - A stored JSON `null` of a base record is `jsonb 'null'` in PPBase and SQL
   `NULL` in PocketBase: same served `null` and, since WS-A11, the same
   `= null`/`!= null` filters and sort (BUMA D-0029).
