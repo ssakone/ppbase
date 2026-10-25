@@ -167,6 +167,14 @@ _JSON_NULL = """("v"."meta" IS NULL OR jsonb_typeof(to_jsonb("v"."meta")) = 'nul
             "txt ~ meta",
             """"v"."txt"::text ILIKE ('%' || NULLIF("v"."meta"::text, 'null')::text || '%')""",
         ),
+        # json and a known non-empty value: IS NOT keeps the NULL row; the
+        # value comparison itself is unchanged (open divergence).
+        ('meta = "x"', '"v"."meta" = :_fp1'),
+        ('meta != "x"', '"v"."meta" IS DISTINCT FROM :_fp1'),
+        (
+            '"x" ?!= meta',
+            """("v"."meta" IS NULL OR "v"."meta"::text != CAST(:_fp1 AS text))""",
+        ),
         # json and another column: NULL-safe, without COALESCE (IS / IS NOT).
         (
             "meta = meta",
@@ -279,3 +287,10 @@ def test_multi_match_fails_a_json_null() -> None:
         assert """"."v"), 'null'::jsonb) IS NULL""" in sql, expression
     # ``=`` has no NULL clause.
     assert "IS NULL" not in _sql('rels.tj = ""')
+
+
+def test_json_any_not_equal_keeps_a_null_row() -> None:
+    sql = _sql('meta ?!= "x"')
+    assert sql.startswith('("v"."meta" IS NULL OR (CASE WHEN'), sql
+    # ?= is unchanged: a NULL never equals a known non-empty value.
+    assert _sql('meta ?= "x"').startswith("(CASE WHEN")

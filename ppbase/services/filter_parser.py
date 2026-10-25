@@ -1079,7 +1079,11 @@ class _FilterTransformer(Transformer):
                 )
                 if json_null is not None:
                     return _guarded(json_null)
-            return _guarded(self._scalar_or_array_any_sql(left_sql, right_sql, sql_op))
+            sql = self._scalar_or_array_any_sql(left_sql, right_sql, sql_op)
+            for node, node_sql in ((left, left_sql), (right, right_sql)):
+                if self._is_json_operand(node):
+                    sql = self._json_null_safe_any_sql(node_sql, sql, sql_op)
+            return _guarded(sql)
 
         # ANY LIKE operators
         if op in _ANY_LIKE_OPS:
@@ -1248,9 +1252,12 @@ class _FilterTransformer(Transformer):
         if self._is_json_operand(left) or self._is_json_operand(right):
             if left_side.kind == "column" and right_side.kind == "column":
                 return self._json_columns_equal_sql(left_sql, right_sql, equal=equal)
-            # A json operand and a non-null value: unchanged SQL (open
-            # divergence, docs/null-values.md).
-            return f"{left_sql} {'=' if equal else '!='} {right_sql}"
+            # A json operand and a known non-empty value: ``x IS [NOT] v``,
+            # so ``!=`` keeps a NULL row (NoCoalesce, filter.go l.308-316).
+            # The value comparison itself is unchanged: PPBase compares the
+            # stored value, PocketBase JSON_EXTRACT's (open divergence,
+            # docs/null-values.md).
+            return f"{left_sql} {'=' if equal else 'IS DISTINCT FROM'} {right_sql}"
         if left_side.kind == "column" and right_side.kind == "column":
             return self._columns_equal_sql(left_sql, right_sql, equal=equal)
         return self._pb_equal_sql(left_side, right_side, equal=equal)
@@ -1264,6 +1271,19 @@ class _FilterTransformer(Transformer):
         l.30-47); PPBase stores it as ``jsonb 'null'``.
         """
         return f"NULLIF(to_jsonb({sql}), 'null'::jsonb)"
+
+    @staticmethod
+    def _json_null_safe_any_sql(json_sql: str, sql: str, sql_op: str) -> str:
+        """``json ?!= v`` (PPBase's array-any reading) keeps a SQL NULL row.
+
+        PocketBase builds ``?!=`` like ``!=``: ``JSON_EXTRACT(x) IS NOT v``,
+        TRUE for a NULL (filter.go l.150-154 and l.308-316); a JSON ``null``
+        already differs from ``v`` in ``sql``.  ``?=`` is unchanged: a NULL
+        never equals a known non-empty value.
+        """
+        if sql_op != "!=":
+            return sql
+        return f"({json_sql} IS NULL OR {sql})"
 
     @staticmethod
     def _json_like_text_sql(sql: str) -> str:
@@ -2113,6 +2133,9 @@ class _FilterTransformer(Transformer):
                 if sql_op == "!=":
                     return f"{ref_sql} IS NOT NULL"
                 return f"{ref_sql} {sql_op} NULL"
+            if sql_op == "!=":
+                # NULL-safe like PocketBase's ``IS NOT`` (filter.go l.308-316).
+                sql_op = "IS DISTINCT FROM"
             if ref_is_left:
                 return f"{ref_sql} {sql_op} {other_sql}"
             return f"{other_sql} {sql_op} {ref_sql}"
@@ -2131,8 +2154,10 @@ class _FilterTransformer(Transformer):
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
             if ref_is_left:
-                return self._scalar_or_array_any_sql(ref_sql, other_sql, sql_op)
-            return self._scalar_or_array_any_sql(other_sql, ref_sql, sql_op)
+                sql = self._scalar_or_array_any_sql(ref_sql, other_sql, sql_op)
+            else:
+                sql = self._scalar_or_array_any_sql(other_sql, ref_sql, sql_op)
+            return self._json_null_safe_any_sql(ref_sql, sql, sql_op)
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
             if ref_is_left:
