@@ -31,6 +31,28 @@ See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
   collections, admins and logs lists too.
 - JSON error bodies carry PocketBase 0.22's `code` next to `status`.
 
+### File downloads like PocketBase
+
+See `docs/file-serving.md`.
+
+- `GET`/`HEAD /api/files/...` take the content type from the `.attrs`
+  side-car of a PocketBase storage (an undecodable one is a 404), always send
+  `Content-Disposition` (`inline` for PocketBase's safe types, `attachment`
+  otherwise: `text/*` is now an attachment), PocketBase's
+  `Content-Security-Policy`, `Cache-Control`, `X-Content-Type-Options` and
+  `X-XSS-Protection`, and answer `HEAD`.
+- `?download` is a Go boolean (`1`, `t`, `true`...): `?download=<name>` no
+  longer renames the download.
+- `?thumb` serves a stored `thumbs_<file>/<size>_<file>` as is, or generates
+  it like `CreateThumb` (only `100x100` and the field's sizes, otherwise the
+  original), one generation per thumbnail at a time.
+- Where PocketBase 0.22.34 and 0.40.6 differ (file name quoting, `.js` and
+  Office overrides, `Cross-Origin-Opener-Policy`, webp thumbnails, thumbnail
+  format, `.attrs` JSON decoding), PPBase follows 0.40.6 by default and
+  0.22.34 when `app.state.error_compat` is `"0.22"` (the PocketBase 0.22
+  mode).
+- A protected file's token is the first `?token` value, untrimmed.
+
 ### Absent @request.* values no longer 500; totalPages and expand key
 
 See `docs/request-static-fields.md`.
