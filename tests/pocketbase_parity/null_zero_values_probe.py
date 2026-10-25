@@ -364,6 +364,7 @@ async def setup(client: httpx.AsyncClient, admin: dict[str, str]) -> dict[str, A
     return {
         "labels": labels,
         "sources": sources,
+        "refs_id": refs["id"],
         "schema": {
             coll["name"]: {
                 field["name"]: [
@@ -958,6 +959,246 @@ async def review_scenarios(
     return out
 
 
+# Equalities between operands of different types (review of WS-A11).  A
+# current-record ``?=``/``?!=`` is ``=``/``!=`` in PocketBase; SQLite
+# compares a column with a value through the column affinity (a filter
+# number is a REAL, the text '1.0' for a TEXT column; a numeric text is a
+# number for a NUMERIC/BOOLEAN/JSON column) and two columns through
+# ``COALESCE(x, '')``, without affinity.  Rows a to i hold the texts and
+# numbers that make each conversion visible; row f keeps every default and
+# the view row n (no target) holds the LEFT JOIN NULLs.
+TYPE_DAY = "2024-01-02 03:04:05.000Z"
+TYPE_ROWS: tuple[tuple[str, dict[str, Any]], ...] = (
+    (
+        "a",
+        {
+            "txt": "1",
+            "num": 1,
+            "flag": True,
+            "day": TYPE_DAY,
+            "sel": "x",
+            "sels": ["x"],
+            "rel": "ra",
+            "rels": ["ra"],
+        },
+    ),
+    (
+        "b",
+        {
+            "txt": "1.0",
+            "num": 4.5,
+            "sel": "y",
+            "sels": ["x", "y"],
+            "rels": ["ra", "rb"],
+        },
+    ),
+    ("c", {"txt": "4.5", "flag": True}),
+    ("d", {"txt": "true", "num": 2}),
+    ("e", {"txt": "0.1", "num": 0.1}),
+    ("f", {}),
+    ("g", {"txt": TYPE_DAY, "day": TYPE_DAY}),
+    ("h", {"txt": "0.0", "num": -1, "flag": True}),
+    ("i", {"txt": "0", "num": 1}),
+)
+TYPE_FIELDS = ("txt", "num", "flag", "day", "sel", "sels", "rel", "rels")
+TYPE_VALUES = (
+    "0",
+    "1",
+    "4.5",
+    "0.1",
+    "-1",
+    "true",
+    "false",
+    '"1"',
+    '"1.0"',
+    '"4.5"',
+    '"0.1"',
+    '"true"',
+    '"x"',
+    '" 1 "',
+    '"1e0"',
+    '"+1"',
+    f'"{TYPE_DAY}"',
+)
+TYPE_COLUMNS = ("txt", "num", "flag", "day", "sel", "sels", "title")
+TYPE_OPS = ("=", "!=", "?=", "?!=")
+# ``@request.query.q`` (a text) compared with each field (admin only: a
+# filter with ``@request.*`` is forbidden to other callers).
+TYPE_QUERIES = ("1", "1.0", "x")
+# ``:length`` (an integer without affinity) and ``@now`` (a date text).
+TYPE_OTHER_FILTERS = (
+    'sels:length = "1"',
+    'sels:length ?= "1"',
+    'sels:length != "1"',
+    "sels:length = 1",
+    'rels:length ?!= "2"',
+    "sels:length = txt",
+    "sels:length ?!= txt",
+    "sels:length = num",
+    "sels:length = flag",
+    'num = "2."',
+    'num = ".1"',
+    'num = "1e"',
+    'num = "0x2"',
+    '@now ?= "x"',
+    '@now != "x"',
+    "@now = txt",
+    "@now ?!= txt",
+    "@now = num",
+    "@now != flag",
+)
+# A json operand compared with a column (finding of the review of WS-A11):
+# ``?=``/``?!=`` are ``=``/``!=``, NULL-safe without COALESCE.
+JSON_COLUMNS = (*TARGET_FIELDS, "title", "tid")
+# A date compared with a json operand is its PocketBase text ('' when
+# empty): right for a base record (``json_base``) and a matched view row, but
+# PPBase cannot tell the LEFT JOIN NULL of view row c from the empty date of
+# row b (D-0032), which PocketBase compares as NULL.
+_VIEW_DATE_JSON = "view date vs json: LEFT JOIN NULL read as an empty date (D-0032)"
+JSON_DATE_FILTERS = (
+    "meta = day",
+    "meta != day",
+    "meta ?= day",
+    "meta ?!= day",
+    "day ?= meta",
+    "day ?!= meta",
+)
+KNOWN_DIVERGENCES.update(
+    {
+        f"types.json_columns.{expression}": _VIEW_DATE_JSON
+        for expression in JSON_DATE_FILTERS
+    }
+)
+# ``?~``/``?!~`` on a view date are ``~``/``!~``: the LEFT JOIN NULL of row c
+# reads as the empty date of row b (D-0032, docs/empty-dates.md).
+_VIEW_DATE_LIKE = "view date: LEFT JOIN NULL read as an empty date by ~/!~ (D-0032)"
+VIEW_DATE_LIKE_FILTERS = ('day ~ ""', 'day ?~ ""', 'day !~ "tx"', 'day ?!~ "tx"')
+KNOWN_DIVERGENCES.update(
+    {
+        f"types.view_date_like.{expression}": _VIEW_DATE_LIKE
+        for expression in VIEW_DATE_LIKE_FILTERS
+    }
+)
+
+
+def type_filter_expressions() -> list[str]:
+    expressions = [
+        f"{field} {op} {operand}"
+        for field in TYPE_FIELDS
+        for op in TYPE_OPS
+        for operand in (*TYPE_VALUES, *TYPE_COLUMNS)
+    ]
+    expressions += [
+        f"{value} {op} {field}"
+        for value in ("1", '"1"', "true")
+        for field in TYPE_FIELDS
+        for op in TYPE_OPS
+    ]
+    return [*expressions, *TYPE_OTHER_FILTERS]
+
+
+async def type_scenarios(
+    client: httpx.AsyncClient, admin: dict[str, str], env: dict[str, Any]
+) -> dict[str, Any]:
+    labels: Labels = env["labels"]
+    refs = {label: record_id for record_id, label in labels.by_id.items()}
+    refs_id = env["refs_id"]
+    types = await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_types",
+            "schema": [
+                text_field("title"),
+                text_field("txt"),
+                _base("num", "number", {"min": None, "max": None, "noDecimal": False}),
+                _base("flag", "bool", {}),
+                _base("day", "date", {"min": "", "max": ""}),
+                _base("sel", "select", {"maxSelect": 1, "values": ["x", "y"]}),
+                _base("sels", "select", {"maxSelect": 2, "values": ["x", "y"]}),
+                relation_field("rel", refs_id, 1),
+                relation_field("rels", refs_id, 5),
+            ],
+        },
+    )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_tlink",
+            "schema": [text_field("title"), relation_field("target", types["id"], 1)],
+        },
+    )
+    for title, values in TYPE_ROWS:
+        payload: dict[str, Any] = {"title": title, **values}
+        if "rel" in payload:
+            payload["rel"] = refs[payload["rel"]]
+        if "rels" in payload:
+            payload["rels"] = [refs[label] for label in payload["rels"]]
+        created = await _create(client, "zv_types", payload)
+        await _create(client, "zv_tlink", {"title": title, "target": created["id"]})
+    await _create(client, "zv_tlink", {"title": "n", "target": ""})
+    view_fields = [
+        field for field in types["schema"] if field["name"] in {"title", *TYPE_FIELDS}
+    ]
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_tview",
+            "type": "view",
+            "schema": view_fields,
+            "options": {
+                "query": (
+                    "SELECT l.id, l.title, "
+                    + ", ".join(f"t.{name}" for name in TYPE_FIELDS)
+                    + " FROM zv_tlink l LEFT JOIN zv_types t ON t.id = l.target"
+                )
+            },
+        },
+    )
+    out: dict[str, Any] = {"base": {}, "view": {}, "query_base": {}, "query_view": {}}
+    for key, name in (("base", "zv_types"), ("view", "zv_tview")):
+        for expression in type_filter_expressions():
+            out[key][expression] = await _titles(
+                client, name, sort="title", filter=expression
+            )
+        for q in TYPE_QUERIES:
+            for field in TYPE_FIELDS:
+                for op in TYPE_OPS:
+                    expression = f"@request.query.q {op} {field}"
+                    out[f"query_{key}"][f"q={q}: {expression}"] = await _titles(
+                        client, name, admin, sort="title", filter=expression, q=q
+                    )
+    out["json_columns"] = {}
+    for column in JSON_COLUMNS:
+        for expression in (
+            f"meta = {column}",
+            f"meta != {column}",
+            f"meta ?= {column}",
+            f"meta ?!= {column}",
+            f"{column} ?= meta",
+            f"{column} ?!= meta",
+        ):
+            out["json_columns"][expression] = await _titles(
+                client, "zv_view", sort="title", filter=expression
+            )
+    out["json_base"] = {}
+    for expression in JSON_DATE_FILTERS:
+        body = await _list(client, "zv_targets", sort="txt", filter=expression)
+        out["json_base"][expression] = (
+            [labels.by_id.get(item["id"], item["id"]) for item in body["items"]]
+            if "items" in body
+            else body
+        )
+    out["view_date_like"] = {}
+    for expression in VIEW_DATE_LIKE_FILTERS:
+        out["view_date_like"][expression] = await _titles(
+            client, "zv_view", sort="title", filter=expression
+        )
+    return out
+
+
 async def auth_scenarios(client: httpx.AsyncClient, env: dict[str, Any]) -> Any:
     name = env["people"]
     email = "zvperson@example.invalid"
@@ -987,6 +1228,7 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any
     return {
         "read": await read_scenarios(client, env),
         "null": await null_scenarios(client, admin, env),
+        "types": await type_scenarios(client, admin, env),
         "auth": await auth_scenarios(client, env),
     }
 
