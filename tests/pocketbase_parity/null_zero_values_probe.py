@@ -69,26 +69,26 @@ AUTH_OPTIONS = {
 }
 FILE_MARK = "<file>"
 
-# Filters and sorts on a view column that a LEFT JOIN leaves NULL: SQLite
-# PocketBase compares that NULL like the zero value for ``= ""``/``= null``
-# and sorts it first in ascending order, PostgreSQL PPBase keeps the SQL
-# NULL semantics.  Measured identical with and without the NULL
-# serialization fix (the fix only changes served values); open item for a
-# filter/sort decision, outside this probe's serialization scope.
-_FILTER_SORT_NULL = "view LEFT JOIN NULL in filters/sorts (open, not serialization)"
+# Filters and sorts on a NULL column (a view column that a LEFT JOIN leaves
+# NULL) and on a json null follow PocketBase since WS-A11 (empty operands
+# match NULL, ``!=`` is NULL-safe, NULL sorts first in ascending order); see
+# ``docs/null-values.md``.  What remains differs for non-NULL values or
+# cannot be told apart in a view:
+# - PocketBase sorts a multi-value field by its stored JSON text ('[]' after
+#   '["x"]'), PPBase by its array ('{}' first); the NULL row is placed like
+#   PocketBase, the order of the non-NULL values is unchanged (open).
+_MULTI_VALUE_SORT = "multi-value sort: JSON text vs array order of non-NULL values"
+# - PPBase stores the empty date '' as NULL (D-0032): in a view, the empty
+#   date of a matched row and the NULL of a missing row are both NULL and
+#   tie, SQLite sorts NULL before ''.
+_VIEW_EMPTY_DATE_SORT = "view date: empty date and LEFT JOIN NULL tie (D-0032)"
 KNOWN_DIVERGENCES: dict[str, str] = {
-    "read.filters.txt_eq_empty": _FILTER_SORT_NULL,
-    "read.filters.rel_eq_empty": _FILTER_SORT_NULL,
-    "read.filters.tid_eq_empty": _FILTER_SORT_NULL,
-    # Also the stored json null of a base record: PocketBase keeps SQL NULL
-    # (``JSON DEFAULT NULL``), PPBase stores jsonb 'null'.
-    "read.filters.meta_eq_null": _FILTER_SORT_NULL,
-    "read.sort.txt_asc": _FILTER_SORT_NULL,
-    "read.sort.num_desc": _FILTER_SORT_NULL,
-    # BUMA D-0029: a json NULL is stored as jsonb 'null' by PPBase, so the
-    # ``= null``/``!= null`` filters of a base collection differ too.
-    "read.base_filters.meta_eq_null": "json null filters (BUMA D-0029)",
-    "read.base_filters.meta_neq_null": "json null filters (BUMA D-0029)",
+    **{
+        f"null.view_sorts.{sign}{field},title": _MULTI_VALUE_SORT
+        for field in ("sels", "docs", "rels", "relnull")
+        for sign in ("", "-")
+    },
+    "null.view_sorts.day,title": _VIEW_EMPTY_DATE_SORT,
 }
 
 # The joined target fields: one of each PocketBase 0.22 type.  ``relnull`` is
@@ -367,6 +367,7 @@ async def setup(client: httpx.AsyncClient, admin: dict[str, str]) -> dict[str, A
             for coll in (view, view_ref)
         },
         "people": people["name"],
+        "people_id": people["id"],
     }
 
 
@@ -445,6 +446,219 @@ async def read_scenarios(client: httpx.AsyncClient, env: dict[str, Any]) -> Any:
     return out
 
 
+# Filters and sorts on the NULL columns of an unmatched LEFT JOIN row
+# (rows a: full target, b: empty target, c: no target).  For each joined
+# field: the empty operands ``""``/``null`` and a non-empty value that no row
+# holds, with every equality operator, both operand orders and both sort
+# directions.
+NULL_VALUES: dict[str, str | None] = {
+    "txt": '"zz"',
+    "mail": '"zz@example.invalid"',
+    "link": '"https://zz.invalid"',
+    "rich": '"zz"',
+    "num": "7",
+    "flag": "true",
+    # A json field compared with a non-null value is not a NULL case (json
+    # scalar comparisons are outside this probe).
+    "meta": None,
+    "sel": '"y"',
+    "sels": '"y"',
+    "doc": '"zz.txt"',
+    "docs": '"zz.txt"',
+    "rel": '"zzzzzzzzzzzzzzz"',
+    "rels": '"zzzzzzzzzzzzzzz"',
+    "relnull": '"zzzzzzzzzzzzzzz"',
+    "day": '"2030-01-01 00:00:00.000Z"',
+    "tid": '"zzzzzzzzzzzzzzz"',
+}
+NULL_OTHER_FILTERS = (
+    'txt !~ "zz"',
+    'txt ~ ""',
+    'txt > ""',
+    'txt < "zz"',
+    "num > 1",
+    "num < 9",
+    "num <= 0",
+    'sels !~ "zz"',
+    'rel !~ "zz"',
+    "txt = sel",
+    "txt != title",
+    "rel = tid",
+    "sel != txt",
+    "txt ?= sel",
+    "meta.k = null",
+    "meta.k != null",
+)
+
+
+def null_filter_expressions(field: str, value: str | None) -> list[str]:
+    expressions = [
+        f"{field} {op} {rhs}"
+        for rhs in ('""', "null")
+        for op in ("=", "!=", "?=", "?!=")
+    ]
+    expressions += [f'"" = {field}', f"null != {field}"]
+    if value is not None:
+        expressions += [
+            f"{field} = {value}",
+            f"{field} != {value}",
+            f"{field} ?!= {value}",
+            f"{value} != {field}",
+        ]
+    return expressions
+
+
+async def _titles(
+    client: httpx.AsyncClient,
+    name: str,
+    headers: dict[str, str] | None = None,
+    **params: Any,
+) -> Any:
+    params.setdefault("perPage", 200)
+    response = await client.get(
+        f"/api/collections/{name}/records", params=params, headers=headers
+    )
+    body = _json(response)
+    if response.status_code != 200:
+        body = {"status": response.status_code, "body": body}
+    if "items" not in body:
+        return body
+    return [body["totalItems"], [item.get("title") for item in body["items"]]]
+
+
+async def null_scenarios(
+    client: httpx.AsyncClient, admin: dict[str, str], env: dict[str, Any]
+) -> Any:
+    labels: Labels = env["labels"]
+    out: dict[str, Any] = {"view_filters": {}, "view_sorts": {}}
+    for field, value in NULL_VALUES.items():
+        for expression in null_filter_expressions(field, value):
+            out["view_filters"][expression] = await _titles(
+                client, "zv_view", sort="title", filter=expression
+            )
+        if field == "tid":
+            # Two generated ids: their order is arbitrary.
+            continue
+        for sort in (f"{field},title", f"-{field},title"):
+            out["view_sorts"][sort] = await _titles(client, "zv_view", sort=sort)
+    for expression in NULL_OTHER_FILTERS:
+        out["view_filters"][expression] = await _titles(
+            client, "zv_view", sort="title", filter=expression
+        )
+
+    # Relation paths into the view (zv_view_ref.vref -> zv_view) and
+    # ``@collection`` reads of the view (admin only), whose row c holds the
+    # NULLs.
+    out["path_filters"] = {}
+    for expression in (
+        'vref.txt = ""',
+        'vref.txt != "zz"',
+        "vref.num != 7",
+        'vref.rel = ""',
+        'vref.sel ?= ""',
+        'vref.sels ?= ""',
+        "vref.flag != true",
+        "vref.meta = null",
+        "vref.meta != null",
+        "vref.meta.k = null",
+        'vref.tid = ""',
+    ):
+        out["path_filters"][expression] = await _titles(
+            client, "zv_view_ref", sort="title", filter=expression
+        )
+    for expression in (
+        # ``?`` operators: one joined view row must match both conditions
+        # (without ``?`` every row of the collection must match).
+        '@collection.zv_view.id ?= id && @collection.zv_view.txt ?= ""',
+        '@collection.zv_view.id ?= id && @collection.zv_view.txt ?!= "zz"',
+        "@collection.zv_view.id ?= id && @collection.zv_view.num ?!= 7",
+        "@collection.zv_view.id ?= id && @collection.zv_view.meta ?= null",
+        "@collection.zv_view.id ?= id && @collection.zv_view.meta ?!= null",
+        '@collection.zv_view.id ?= id && @collection.zv_view.rels ?= ""',
+        '@collection.zv_view.id ?= id && @collection.zv_view.sel = ""',
+    ):
+        out["path_filters"][expression] = await _titles(
+            client, "zv_src", admin, sort="title", filter=expression
+        )
+
+    # Auth records through a LEFT JOIN: users with an email (rows a and b;
+    # PPBase requires an email even with ``requireEmail: false``, which is
+    # outside this probe), no user (row c).
+    people = env["people"]
+    for nick in ("a", "b"):
+        await _create(
+            client,
+            people,
+            {
+                "username": f"zvnull{nick}",
+                "email": f"zvnull{nick}@example.invalid",
+                "nick": nick,
+                "score": 3,
+                "password": USER_PASSWORD,
+                "passwordConfirm": USER_PASSWORD,
+            },
+        )
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_uview",
+            "type": "view",
+            "schema": [
+                text_field("title"),
+                relation_field("uid", env["people_id"], 1),
+                _base("uemail", "email", {"exceptDomains": None, "onlyDomains": None}),
+                _base("uver", "bool", {}),
+                _base(
+                    "uscore", "number", {"min": None, "max": None, "noDecimal": False}
+                ),
+                _base("utags", "select", {"maxSelect": 2, "values": ["x", "y"]}),
+            ],
+            "options": {
+                "query": (
+                    "SELECT s.id, s.title, u.id AS uid, u.email AS uemail, "
+                    "u.verified AS uver, u.score AS uscore, "
+                    f"u.tags AS utags FROM zv_src s LEFT JOIN {people} u "
+                    "ON u.nick = s.title"
+                )
+            },
+        },
+    )
+    out["auth_view_filters"] = {}
+    for expression in (
+        'uemail = ""',
+        'uemail != ""',
+        'uemail != "zz@example.invalid"',
+        "uver = false",
+        "uver != true",
+        'uid = ""',
+        "uscore != 1",
+        'utags = ""',
+        'utags ?= ""',
+    ):
+        out["auth_view_filters"][expression] = await _titles(
+            client, "zv_uview", sort="title", filter=expression
+        )
+    out["auth_view_sorts"] = {}
+    for sort in ("uemail,title", "-uemail,title", "uver,title", "-uscore,title"):
+        out["auth_view_sorts"][sort] = await _titles(client, "zv_uview", sort=sort)
+
+    # A base record whose json holds a null key (stored value, not SQL NULL).
+    labels.add(
+        (await _create(client, "zv_targets", {"txt": "jn", "meta": {"k": None}}))["id"],
+        "t_jnull",
+    )
+    out["base_filters"] = {}
+    for expression in ("meta.k = null", "meta.k != null", "meta = null"):
+        body = await _list(client, "zv_targets", sort="txt", filter=expression)
+        out["base_filters"][expression] = (
+            [labels.by_id.get(item["id"], item["id"]) for item in body["items"]]
+            if "items" in body
+            else body
+        )
+    return out
+
+
 async def auth_scenarios(client: httpx.AsyncClient, env: dict[str, Any]) -> Any:
     name = env["people"]
     email = "zvperson@example.invalid"
@@ -473,6 +687,7 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any
     env = await setup(client, admin)
     return {
         "read": await read_scenarios(client, env),
+        "null": await null_scenarios(client, admin, env),
         "auth": await auth_scenarios(client, env),
     }
 
