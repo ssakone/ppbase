@@ -2,7 +2,7 @@
 
 PocketBase 0.22.34 prepares a bool field value with ``cast.ToBool``
 (``models/schema/schema_field.go`` l.346-347, called by ``LoadData`` in
-``forms/record_upsert.go`` l.415-417 after a JSON round trip, l.400-411), as
+``forms/record_upsert.go`` l.415-417 after a JSON round trip, l.406-413), as
 v0.40.6 does (``core/field_bool.go`` l.103-106).  ``cast.ToBool`` (spf13/cast
 v1.7.1 ``caste.go`` l.103-148 and ``cast.go`` l.12-15; v1.10.0 ``basic.go``
 l.16-67) keeps a bool, gives false for nil, compares a number to 0, parses a
