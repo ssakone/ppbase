@@ -1,0 +1,188 @@
+"""Bool field values are converted like PocketBase's ``cast.ToBool``.
+
+PocketBase 0.22.34 prepares a bool field value with ``cast.ToBool``
+(``models/schema/schema_field.go`` l.346-347, called by ``LoadData`` in
+``forms/record_upsert.go`` l.415-417 after a JSON round trip, l.406-413), as
+v0.40.6 does (``core/field_bool.go`` l.103-106).  ``cast.ToBool`` (spf13/cast
+v1.7.1 ``caste.go`` l.103-148 and ``cast.go`` l.12-15; v1.10.0 ``basic.go``
+l.16-67) keeps a bool, gives false for nil, compares a number to 0, parses a
+string with Go's ``strconv.ParseBool`` (go1.23.7 ``strconv/atob.go`` l.10-18:
+exact spellings, no trimming) and gives false for an error or any other type.
+Python's ``bool()`` made the multipart/form-data string ``"false"`` true.
+
+In the 0.22 mode a repeated multipart key keeps its first value, as 0.22.34
+does for every non-arrayable key (``forms/record_upsert.go`` l.191-196); the
+default mode keeps the list, false like the ``[]any`` of v0.40.6
+(``tools/router/unmarshal_request_data.go`` l.84-90).  A modifier key
+(``flag+``, ``flag-``, ``+flag``) never changes a bool field: 0.22.34
+``PrepareValueWithModifier`` has no bool case (``models/schema/schema_field.go``
+l.394-429) and v0.40.6 ``BoolField`` has no ``FindSetter``.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from ppbase.models.field_types import (
+    FieldDefinition,
+    FieldType,
+    FieldValidationError,
+    MultipartValues,
+    validate_field_value,
+)
+from ppbase.services.record_file_fields import MultipartText
+from ppbase.services.record_service import _merged_form_value
+
+GO_TRUE = ("1", "t", "T", "TRUE", "true", "True")
+GO_FALSE = ("0", "f", "F", "FALSE", "false", "False")
+# strconv.ParseBool errors: cast.ToBool returns false.
+GO_ERRORS = (
+    "",
+    " ",
+    " true",
+    "true ",
+    "\ttrue",
+    "tRUE",
+    "yes",
+    "on",
+    "no",
+    "off",
+    "null",
+    "2",
+    "-1",
+    "0.5",
+    "1.0",
+    "01",
+    "-0",
+)
+
+
+def _bool_field(*, required: bool = False) -> FieldDefinition:
+    return FieldDefinition(name="flag", type=FieldType.BOOL, required=required)
+
+
+@pytest.mark.parametrize("raw", GO_TRUE)
+def test_parse_bool_true_spellings_are_true(raw: str) -> None:
+    assert validate_field_value(_bool_field(), raw) is True
+
+
+@pytest.mark.parametrize("raw", GO_FALSE)
+def test_parse_bool_false_spellings_are_false(raw: str) -> None:
+    assert validate_field_value(_bool_field(), raw) is False
+
+
+@pytest.mark.parametrize("raw", GO_ERRORS)
+def test_unparsable_strings_are_false(raw: str) -> None:
+    assert validate_field_value(_bool_field(), raw) is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (None, False),
+        (0, False),
+        (1, True),
+        (-1, True),
+        (2, True),
+        (0.0, False),
+        (-0.0, False),
+        (0.5, True),
+        (1e-300, True),
+        (10**30, True),
+    ],
+)
+def test_native_json_values_keep_their_go_meaning(raw: object, expected: bool) -> None:
+    assert validate_field_value(_bool_field(), raw) is expected
+
+
+@pytest.mark.parametrize("raw", [[], [True], ["true"], {}, {"a": True}])
+def test_lists_and_objects_are_false(raw: object) -> None:
+    # cast.ToBool default branch: unsupported type, false.  A JSON array or
+    # object, or a repeated multipart key of the default mode, is never true.
+    assert validate_field_value(_bool_field(), raw) is False
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("false", False), ("true", True)])
+def test_multipart_text_of_the_022_mode_is_parsed_too(raw: str, expected: bool) -> None:
+    assert validate_field_value(_bool_field(), MultipartText(raw)) is expected
+
+
+@pytest.mark.parametrize("raw", ["false", "0", "", "yes", [True], None, False, 0])
+def test_required_rejects_every_false_value(raw: object) -> None:
+    with pytest.raises(FieldValidationError) as exc:
+        validate_field_value(_bool_field(required=True), raw)
+    assert exc.value.field_name == "flag"
+    assert exc.value.code == "validation_required"
+    assert exc.value.message == "Must be true."
+
+
+@pytest.mark.parametrize("raw", ["true", "1", "T", True, 1, 0.5])
+def test_required_accepts_every_true_value(raw: object) -> None:
+    assert validate_field_value(_bool_field(required=True), raw) is True
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (["true", "false"], True),
+        (["false", "true"], False),
+        (["true", "true"], True),
+        (["false", "false"], False),
+        (["T", ""], True),
+        (["", "true"], False),
+        (["1", "0"], True),
+        (["yes", "true"], False),
+        ([], False),
+    ],
+)
+def test_022_repeated_multipart_key_keeps_its_first_value(
+    values: list[str], expected: bool
+) -> None:
+    # 0.22.34 extractMultipartFormData: values[0] for a non-arrayable key.
+    assert validate_field_value(_bool_field(), MultipartValues(values)) is expected
+    # Default mode: the same values as a plain list are false (v0.40.6).
+    assert validate_field_value(_bool_field(), list(values)) is False
+
+
+def test_022_repeated_multipart_key_and_the_required_rule() -> None:
+    field = _bool_field(required=True)
+    assert validate_field_value(field, MultipartValues(["true", "false"])) is True
+    with pytest.raises(FieldValidationError) as exc:
+        validate_field_value(field, MultipartValues(["false", "true"]))
+    assert exc.value.code == "validation_required"
+
+
+MODIFIER_KEYS = ("flag+", "flag-", "+flag")
+MODIFIER_VALUES = ("x", "true", "false", "1", True, False, ["true"], None)
+
+
+@pytest.mark.parametrize("current", [True, False, None])
+@pytest.mark.parametrize("key", MODIFIER_KEYS)
+@pytest.mark.parametrize("raw", MODIFIER_VALUES)
+def test_bool_modifier_keys_keep_the_current_value(
+    current: bool | None, key: str, raw: object
+) -> None:
+    field = _bool_field()
+    merged = _merged_form_value(field, {"flag": current}, {key: raw})
+    assert merged is current
+    assert validate_field_value(field, merged) is bool(current)
+
+
+@pytest.mark.parametrize("current", [True, False])
+@pytest.mark.parametrize("key", MODIFIER_KEYS)
+@pytest.mark.parametrize(("explicit", "expected"), [("true", True), ("false", False)])
+def test_bool_modifier_keys_keep_the_request_value(
+    current: bool, key: str, explicit: str, expected: bool
+) -> None:
+    field = _bool_field()
+    for data in ({"flag": explicit, key: "x"}, {key: "x", "flag": explicit}):
+        merged = _merged_form_value(field, {"flag": current}, data)
+        assert validate_field_value(field, merged) is expected, data
+
+
+def test_number_modifiers_are_still_applied() -> None:
+    field = FieldDefinition(name="n", type=FieldType.NUMBER)
+    assert _merged_form_value(field, {"n": 2}, {"n+": 3}) == 5
+    assert _merged_form_value(field, {"n": 2}, {"n-": 3}) == -1

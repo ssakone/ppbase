@@ -197,8 +197,75 @@ def _validate_number(field: FieldDefinition, value: Any) -> int | float:
     return int(val) if only_int else val
 
 
+# Go's ``strconv.ParseBool`` true spellings (go1.23.7 strconv/atob.go
+# l.10-18): exact, case-sensitive, never trimmed.
+_GO_TRUE_STRINGS = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+
+
+def go_to_bool(value: Any) -> bool:
+    """Return PocketBase's ``cast.ToBool(value)`` for a decoded request value.
+
+    PocketBase 0.22.34 prepares bool fields with ``cast.ToBool``
+    (models/schema/schema_field.go l.346-347, called for every schema field
+    by ``LoadData`` after a JSON round trip, forms/record_upsert.go
+    l.400-417) and so do ``emailVisibility``/``verified`` (l.380-385);
+    v0.40.6 is identical (core/field_bool.go l.103-106).  spf13/cast v1.7.1
+    (caste.go l.103-148, cast.go l.12-15; unchanged for these types in
+    v1.10.0 basic.go l.16-67) keeps a bool, maps nil to false, compares a
+    number to 0, parses a string with ``strconv.ParseBool`` and drops its
+    error, so ``"false"``, ``"0"``, ``""`` or ``"yes"`` are false.  Any other
+    type, such as a JSON array or object, is an error, hence false.  How a
+    repeated multipart key reaches it depends on the mode, see
+    :func:`prepare_bool_value`.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value in _GO_TRUE_STRINGS
+    return False
+
+
+class MultipartValues(list):
+    """The text values of a repeated multipart/form-data key, in the 0.22 mode.
+
+    PocketBase 0.22.34 keeps every value only for a key named like an
+    arrayable field (select, file, relation: forms/record_upsert.go
+    l.191-193, models/schema/schema_field.go l.122-128); any other key takes
+    its first value (forms/record_upsert.go l.194-195).  The 0.22 mode of
+    the records API parser gives a repeated key this ``list`` type so that a
+    consumer can apply that rule; it behaves as a plain ``list`` everywhere
+    else.  The default mode keeps a plain ``list``, as v0.40.6 decodes a
+    repeated key as a ``[]any`` (tools/router/unmarshal_request_data.go
+    l.84-90).
+    """
+
+    __slots__ = ()
+
+
+def first_multipart_value(value: Any) -> Any:
+    """``values[0]`` of a :class:`MultipartValues` list, else ``value``."""
+    if isinstance(value, MultipartValues):
+        return value[0] if value else None
+    return value
+
+
+def prepare_bool_value(value: Any) -> bool:
+    """A written bool value, converted like PocketBase.
+
+    The 0.22 mode first takes the first value of a repeated multipart key,
+    as 0.22.34 does for every non-arrayable key (:class:`MultipartValues`),
+    then applies ``cast.ToBool`` (:func:`go_to_bool`).  In the default mode
+    a repeated key stays a plain list, false like the ``[]any`` of v0.40.6.
+    """
+    return go_to_bool(first_multipart_value(value))
+
+
 def _validate_bool(field: FieldDefinition, value: Any) -> bool:
-    val = bool(value) if value is not None else False
+    val = prepare_bool_value(value)
     if field.required and not val:
         raise FieldValidationError(
             field.name, "validation_required", "Must be true."

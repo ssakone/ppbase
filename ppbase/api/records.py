@@ -40,6 +40,7 @@ from ppbase.middleware.error_compat import (
     get_error_compat,
     mark_error,
 )
+from ppbase.models.field_types import MultipartValues
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_file_fields import MultipartText, semantics_for_mode
 from ppbase.services.record_service import (
@@ -688,13 +689,13 @@ async def _parse_record_request_body(
     if "multipart/form-data" in content_type:
         form = await request.form()
         json_payloads: list[str] = []
-        # 0.22.34 keeps a file field's text values as raw strings
-        # (record_file_fields.MultipartText); a plain str everywhere else.
-        text_type = (
-            MultipartText
-            if get_error_compat(getattr(request, "app", None)) == POCKETBASE_022
-            else str
-        )
+        # In the 0.22 mode, a file field's text values stay raw strings
+        # (record_file_fields.MultipartText) and a repeated key is marked so
+        # that a non-arrayable field keeps its first value, like 0.22.34
+        # (field_types.MultipartValues).  The default mode uses str and list.
+        compat_022 = get_error_compat(getattr(request, "app", None)) == POCKETBASE_022
+        text_type = MultipartText if compat_022 else str
+        list_type = MultipartValues if compat_022 else list
 
         for key in form.keys():
             values = form.getlist(key)
@@ -718,7 +719,7 @@ async def _parse_record_request_body(
             if len(str_values) == 1:
                 data[key] = text_type(str_values[0])
             elif str_values:
-                data[key] = str_values
+                data[key] = list_type(str_values)
 
         for raw_payload in json_payloads:
             try:
