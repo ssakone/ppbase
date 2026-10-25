@@ -1005,3 +1005,372 @@ async def test_json_null_filters_of_a_base_collection(
             f"/api/collections/{tn}/records/{jnull['id']}",
             headers={"Authorization": admin_token},
         )
+
+
+async def _title_list(
+    client: AsyncClient, name: str, headers: dict | None = None, **params: Any
+) -> list[str]:
+    params.setdefault("perPage", 200)
+    response = await client.get(
+        f"/api/collections/{name}/records", params=params, headers=headers
+    )
+    assert response.status_code == 200, (params, response.text)
+    body = response.json()
+    titles = [item["title"] for item in body["items"]]
+    assert body["totalItems"] == len(titles), params
+    return titles
+
+
+# PocketBase 0.22.34 (probe ``null.constants``, rows a to c): a comparison
+# without any column is '' = v or v = w compared by SQLite without affinity.
+_PB_CONSTANTS = {
+    "1 = null": "",
+    "1 != null": "abc",
+    "0 != null": "abc",
+    "null = 0": "",
+    "true = null": "",
+    "true != null": "abc",
+    "false != null": "abc",
+    '1 = ""': "",
+    '1 != ""': "abc",
+    '"" = 0': "",
+    'true = ""': "",
+    'true != ""': "abc",
+    "null = null": "abc",
+    '"" != null': "",
+    '"x" = null': "",
+    '"x" != ""': "abc",
+    "1 = 1": "abc",
+    '1 = "1"': "",
+    "true = 1": "abc",
+    '"a" = "b"': "",
+    "1 ?= null": "",
+    "1 ?!= null": "abc",
+    "null ?= null": "abc",
+    '"a" ?= "a"': "abc",
+    'title = "a" || 1 = null': "a",
+    'title = "a" && 1 != null': "a",
+}
+
+
+async def test_comparisons_without_a_column_follow_pocketbase(
+    app_client: AsyncClient, zv_env: dict
+) -> None:
+    """``1 = null`` and the like are folded (they were HTTP 500 in 8fc3e9c)."""
+    mismatches = {}
+    for expression, expected in _PB_CONSTANTS.items():
+        got = await _titles(app_client, zv_env["src"], sort="title", filter=expression)
+        if got != expected:
+            mismatches[expression] = {"pocketbase": expected, "ppbase": got}
+    assert mismatches == {}
+
+
+async def test_a_null_operand_matches_a_stored_empty_value(
+    app_client: AsyncClient, zv_env: dict
+) -> None:
+    """``x = null`` is ``(x = '' OR x IS NULL)``: a stored '' matches.
+
+    Rule-visible since WS-A11 (before: ``x IS NULL``, never true on a NOT NULL
+    base column); PocketBase 0.22.34 probe ``null.base_filters``.
+    """
+    labels = {zv_env["full"]: "t_full", zv_env["empty"]: "t_empty"}
+    for expression, expected in (
+        ("txt = null", ["t_empty"]),
+        ("null = txt", ["t_empty"]),
+        ("txt != null", ["t_full"]),
+    ):
+        items = await _items(
+            app_client, zv_env["targets"], sort="txt", filter=expression
+        )
+        assert [labels[item["id"]] for item in items] == expected, expression
+
+
+_JSON_ROWS: tuple[tuple[str, Any], ...] = (
+    ("n", None),
+    ("kn", {"k": None}),
+    ("knu", {"k": "nu"}),
+    ("k1", {"k": 1}),
+    ("sx", "x"),
+    ("es", ""),
+    ("num5", 5),
+    ("tr", True),
+    ("arr", ["nu", "x"]),
+    ("o", {"a": 1}),
+)
+# PocketBase 0.22.34 (probe ``null.json_like``): JSON_EXTRACT reads a JSON
+# null as NULL, which matches neither ~ nor !~.
+_PB_JSON_LIKE = {
+    'meta ~ "nu"': ["arr", "kn", "knu"],
+    'meta ~ "x"': ["arr", "sx"],
+    'meta !~ "x"': ["es", "k1", "kn", "knu", "num5", "o", "tr"],
+    'meta !~ "zz"': ["arr", "es", "k1", "kn", "knu", "num5", "o", "sx", "tr"],
+    'meta.k ~ "nu"': ["knu"],
+    'meta.k !~ "x"': ["k1", "knu"],
+    'meta.k !~ "zz"': ["k1", "knu"],
+    'meta ?~ "nu"': ["arr", "kn", "knu"],
+    'meta ?!~ "zz"': ["arr", "es", "k1", "kn", "knu", "num5", "o", "sx", "tr"],
+}
+_MULTI_ROWS: tuple[tuple[str, tuple[str, ...], Any], ...] = (
+    ("ma", ("kn", "knu"), {"k": 1}),
+    ("mb", ("n",), None),
+    ("mc", (), None),
+    ("md", ("sx",), "x"),
+    ("me", ("knu",), {"k": "nu"}),
+    ("mf", ("n", "knu"), None),
+)
+_ALL_MULTI = ["ma", "mb", "mc", "md", "me", "mf"]
+# PocketBase 0.22.34 (probe ``null.multi_json``): the multi-match value of a
+# json leaf is JSON_EXTRACT(...), NULL for a JSON null, which fails the
+# "IS NULL" clause of every operator but ``=``.
+_PB_MULTI_JSON = {
+    'ts.meta != ""': ["ma", "md", "me"],
+    'ts.meta = ""': [],
+    "ts.meta = null": ["mb", "mc"],
+    "ts.meta != null": ["ma", "md", "me"],
+    'ts.meta ~ "nu"': ["ma", "me"],
+    'ts.meta !~ "zz"': ["ma", "md", "me"],
+    "ts.meta.k = null": ["mb", "mc", "md"],
+    "ts.meta.k != null": ["me"],
+    'ts.meta.k ~ "nu"': ["me"],
+    'ts.meta.k !~ "zz"': ["me"],
+    'ts.meta ?!= ""': _ALL_MULTI,
+    'ts.meta ?~ "nu"': ["ma", "me", "mf"],
+    "ts.meta = meta": ["mb", "mc", "md", "me"],
+    "ts.meta != meta": ["ma"],
+    "ts.meta ?= meta": ["mb", "mc", "md", "me", "mf"],
+    '@collection.{json}.meta != ""': [],
+    '@collection.{targets}.meta != ""': [],
+    '@collection.{json}.meta !~ "zz"': [],
+    "@collection.{json}.meta ?= null": _ALL_MULTI,
+}
+
+
+async def test_json_nulls_in_like_and_multi_match_follow_pocketbase(
+    app_client: AsyncClient, admin_token: str, zv_env: dict
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    headers = {"Authorization": admin_token}
+    json_coll = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zv_json_{suffix}",
+            "schema": [_f("title", "text"), _f("meta", "json")],
+        },
+    )
+    multi = None
+    try:
+        ids = {}
+        for title, meta in _JSON_ROWS:
+            payload: dict[str, Any] = {"title": title}
+            if title != "n":
+                payload["meta"] = meta
+            ids[title] = (await _create(app_client, json_coll["name"], payload))["id"]
+        for expression, expected in _PB_JSON_LIKE.items():
+            got = await _title_list(
+                app_client, json_coll["name"], sort="title", filter=expression
+            )
+            assert got == expected, expression
+
+        multi = await _post_collection(
+            app_client,
+            admin_token,
+            {
+                "name": f"zv_multi_{suffix}",
+                "schema": [
+                    _f("title", "text"),
+                    _f("meta", "json"),
+                    _f("ts", "relation", collectionId=json_coll["id"], maxSelect=5),
+                ],
+            },
+        )
+        for title, targets, meta in _MULTI_ROWS:
+            payload = {"title": title, "ts": [ids[t] for t in targets]}
+            if meta is not None:
+                payload["meta"] = meta
+            await _create(app_client, multi["name"], payload)
+        mismatches = {}
+        for template, expected in _PB_MULTI_JSON.items():
+            expression = template.format(
+                json=json_coll["name"], targets=zv_env["targets"]
+            )
+            got = await _title_list(
+                app_client, multi["name"], headers, sort="title", filter=expression
+            )
+            if got != expected:
+                mismatches[template] = {"pocketbase": expected, "ppbase": got}
+        assert mismatches == {}
+    finally:
+        if multi is not None:
+            await app_client.delete(f"/api/collections/{multi['id']}", headers=headers)
+        await app_client.delete(f"/api/collections/{json_coll['id']}", headers=headers)
+
+
+# PocketBase 0.22.34 (probe ``null.jview_*``): json columns computed by a
+# view (PocketBase infers ``json`` for an expression), NULL for row c.
+_PB_JVIEW_FILTERS = {
+    'jtxt = ""': "b",
+    'jtxt != ""': "ac",
+    "jtxt = null": "c",
+    "jtxt != null": "ab",
+    'jtxt = "tx"': "a",
+    'jtxt != "tx"': "bc",
+    '"tx" != jtxt': "bc",
+    'jtxt ?= "tx"': "a",
+    'jtxt ?!= "tx"': "bc",
+    'jtxt ~ "t"': "a",
+    'jtxt !~ "zz"': "ab",
+    "jnum = 0": "b",
+    "jnum != 0": "ac",
+    "jnum != 4.5": "bc",
+    "jnum > 1": "a",
+    "jnum = null": "c",
+    "jtxt = txt": "abc",
+    "jtxt != txt": "",
+}
+_PB_JVIEW_SORTS = {
+    "jtxt,title": "cba",
+    "-jtxt,title": "abc",
+    "jnum,title": "cba",
+    "-jnum,title": "abc",
+}
+
+
+async def test_view_json_columns_compare_null_like_pocketbase(
+    app_client: AsyncClient, admin_token: str, zv_env: dict
+) -> None:
+    """``json != value`` keeps the NULL row (``IS NOT``), as in BUMA views."""
+    suffix = uuid.uuid4().hex[:8]
+    jview = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zv_jview_{suffix}",
+            "type": "view",
+            "schema": [
+                _f("title", "text"),
+                _f("jtxt", "json"),
+                _f("jnum", "json"),
+                _f("txt", "text"),
+            ],
+            "options": {
+                "query": (
+                    "SELECT s.id, s.title, (t.txt || '') AS jtxt, "
+                    f"(t.num + 0) AS jnum, t.txt FROM {zv_env['src']} s "
+                    f"LEFT JOIN {zv_env['targets']} t ON t.id = s.target"
+                )
+            },
+        },
+    )
+    try:
+        mismatches = {}
+        for expression, expected in _PB_JVIEW_FILTERS.items():
+            got = await _titles(
+                app_client, jview["name"], sort="title", filter=expression
+            )
+            if got != expected:
+                mismatches[expression] = {"pocketbase": expected, "ppbase": got}
+        for sort, expected in _PB_JVIEW_SORTS.items():
+            got = await _titles(app_client, jview["name"], sort=sort)
+            if got != expected:
+                mismatches[sort] = {"pocketbase": expected, "ppbase": got}
+        assert mismatches == {}
+    finally:
+        await app_client.delete(
+            f"/api/collections/{jview['id']}",
+            headers={"Authorization": admin_token},
+        )
+
+
+# PocketBase 0.22.34 (probe ``null.rules_*``): records ``oa`` (owned by the
+# user) and ``ob`` (no owner).  An anonymous ``@request.auth.id`` is NULL: it
+# equals an empty owner, and a ``?op`` without multi-match is ``op``.
+_PB_RULES = {
+    "@request.auth.id ?= owner": (["ob"], ["oa"]),
+    "@request.auth.id = owner": (["ob"], ["oa"]),
+    "owner ?= @request.auth.id": (["ob"], ["oa"]),
+    "@request.auth.id ?!= owner": (["oa"], ["ob"]),
+    "@request.auth.id != owner": (["oa"], ["ob"]),
+    '@request.auth.id ?= ""': (["oa", "ob"], []),
+    '@request.auth.id ?!= ""': ([], ["oa", "ob"]),
+    "@request.auth.id ?= null": (["oa", "ob"], []),
+}
+
+
+async def test_any_equal_rules_on_an_empty_owner_follow_pocketbase(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """An anonymous caller lists the records without owner under
+    ``@request.auth.id ?= owner`` (none before WS-A11), like PocketBase."""
+    suffix = uuid.uuid4().hex[:8]
+    headers = {"Authorization": admin_token}
+    people = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zv_owners_{suffix}",
+            "type": "auth",
+            "schema": [],
+            "options": {
+                "allowEmailAuth": True,
+                "allowUsernameAuth": True,
+                "allowOAuth2Auth": False,
+                "minPasswordLength": 8,
+                "requireEmail": False,
+            },
+        },
+    )
+    owned = None
+    try:
+        password = "probe-User-Password-1"
+        email = f"zvowner{suffix}@example.invalid"
+        user = await _create(
+            app_client,
+            people["name"],
+            {
+                "username": f"zvowner{suffix}",
+                "email": email,
+                "password": password,
+                "passwordConfirm": password,
+            },
+        )
+        response = await app_client.post(
+            f"/api/collections/{people['name']}/auth-with-password",
+            json={"identity": email, "password": password},
+        )
+        assert response.status_code == 200, response.text
+        user_headers = {"Authorization": response.json()["token"]}
+        owned = await _post_collection(
+            app_client,
+            admin_token,
+            {
+                "name": f"zv_owned_{suffix}",
+                "schema": [
+                    _f("title", "text"),
+                    _f("owner", "relation", collectionId=people["id"], maxSelect=1),
+                ],
+            },
+        )
+        await _create(app_client, owned["name"], {"title": "oa", "owner": user["id"]})
+        await _create(app_client, owned["name"], {"title": "ob", "owner": ""})
+        mismatches = {}
+        for rule, (anonymous, owner) in _PB_RULES.items():
+            response = await app_client.patch(
+                f"/api/collections/{owned['id']}",
+                headers=headers,
+                json={"listRule": rule},
+            )
+            assert response.status_code == 200, response.text
+            got = (
+                await _title_list(app_client, owned["name"], sort="title"),
+                await _title_list(
+                    app_client, owned["name"], user_headers, sort="title"
+                ),
+            )
+            if got != (anonymous, owner):
+                mismatches[rule] = {"pocketbase": (anonymous, owner), "ppbase": got}
+        assert mismatches == {}
+    finally:
+        if owned is not None:
+            await app_client.delete(f"/api/collections/{owned['id']}", headers=headers)
+        await app_client.delete(f"/api/collections/{people['id']}", headers=headers)
