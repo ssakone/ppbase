@@ -656,3 +656,39 @@ async def test_repeated_auth_bool_keys_follow_the_mode(
         ):
             assert response.json()[name] is expected, name
             assert await _stored(collection, record_id, column) is expected, column
+
+
+async def test_batch_ignores_bool_modifier_keys(
+    app_client: AsyncClient, bool_env: dict
+) -> None:
+    # Batch exists from v0.23 on, where BoolField has no setter for these
+    # keys (core/record_model.go l.869-889): the field keeps its value.
+    collection = bool_env["flags"]
+    records_url = f"/api/collections/{collection}/records"
+    created = await app_client.post(records_url, json={"flag": True})
+    assert created.status_code == 200, created.text
+    record_id = created.json()["id"]
+    response = await app_client.post(
+        "/api/batch",
+        headers=bool_env["admin"],
+        json={
+            "requests": [
+                {
+                    "method": "PATCH",
+                    "url": f"{records_url}/{record_id}",
+                    "body": {"flag+": "x", "+flag": "false"},
+                },
+                {"method": "POST", "url": records_url, "body": {"flag-": "true"}},
+                {
+                    "method": "POST",
+                    "url": records_url,
+                    "body": {"flag": "true", "flag+": "false"},
+                },
+            ]
+        },
+    )
+    assert response.status_code == 200, response.text
+    bodies = [item["body"] for item in response.json()]
+    assert bodies[0]["id"] == record_id
+    stored = [await _check(app_client, collection, body) for body in bodies]
+    assert stored == [True, False, True]
