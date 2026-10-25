@@ -2,10 +2,66 @@
 
 ## Unreleased
 
+### totalItems counts distinct ids, like PocketBase
+
+See `docs/request-static-fields.md`.
+
+- A records list answers `totalItems` = the number of distinct ids of the
+  filtered query, like both PocketBase versions (`COUNT(DISTINCT
+  [[<table>.id]])`, v0.22.34 `tools/search/provider.go` l.236-256, v0.40.6
+  l.298-327); it counted rows. `totalPages` follows; `skipTotal` still
+  answers `-1`/`-1`. Base and auth collections are unchanged (unique ids). A
+  view that repeats an id now answers its number of ids while its pages keep
+  serving every row: BUMA's `buma_article_stockage_list_view` answers 42
+  instead of 989 (989 rows).
+- Open divergence: a joining filter or rule makes PocketBase collapse the
+  identical rows of a view (`SELECT DISTINCT`); PPBase serves them all (no
+  BUMA view has identical rows).
+
+### Security: file names a record write may keep
+
+See `docs/file-fields.md`.
+
+- A record write may only keep, remove, reorder or de-duplicate the file
+  names that the record already has; new files must be uploaded. Before,
+  PPBase stored any well-formed name, and the files API served it. A client
+  allowed by the `updateRule` could thus reference, then download, a `.attrs`
+  side-car, an unreferenced object of the record directory or another
+  record's file.
+- The check covers create, JSON update, multipart text and `@jsonPayload`,
+  batch, names written by request hooks, the `createData` of
+  `auth-with-oauth2`, and `pb.records()` / `e.records()` in the default mode.
+- Default mode, like v0.40.6: 400 `validation_invalid_file` `Invalid new
+  files: [x].`. Files uploaded under `f` now keep the names sent under `f`
+  with them; before, the uploads replaced them.
+- 0.22 mode, like 0.22.34: 400 `Failed to load the submitted data due to
+  invalid formatting.` with `validation_unknown_filenames`.
+  - Uploads under `f` are appended, and uploads under `f+` are ignored.
+  - A single multipart text value of a file field is one raw name.
+  - `createData` file names are not loaded, and neither are the schema
+    fields after them.
+  - Server-side writes are not checked, like `dao.SaveRecord`.
+  - A batch, which 0.22.34 does not have, uses these 0.22 rules.
+- Server-side writes now normalize file values like a request.
+- A record duplicated in the dashboard no longer copies its file fields.
+
+### Error envelope: current PocketBase by default, 0.22 on demand
+
+See `docs/error-envelope.md` and `docs/error-compat.md`.
+
+- The default error envelope is exactly current PocketBase's `{status,
+  message, data}` (v0.40.6 `tools/router/error.go` l.36-42). The interim
+  `code` key next to `status` (never released) is removed again: it matched
+  neither version and hid PPBase's envelope from the 0.22 mode.
+- The opt-in PocketBase 0.22 mode (`pb.set_error_compat("0.22")`,
+  `PPBASE_ERROR_COMPAT=0.22`, `Settings(error_compat="0.22")`) is the API
+  for clients written against PocketBase 0.22: exactly `{code, message,
+  data}` with the 0.22.34 messages. One outermost middleware is the only
+  error post-processing.
+
 ### Security follow-up: qualified paths, modifiers, realtime payload, expand
 
-See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
-`docs/error-envelope.md`.
+See `docs/hidden-auth-fields.md` and `docs/request-static-fields.md`.
 
 - A dotted filter path must start with a relation, a back relation or a JSON
   field: `users.password_hash~"$2b$"` (table-qualified self reference) used to
@@ -18,7 +74,6 @@ See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
 - Realtime payloads no longer send a hidden email to every subscriber: only
   the owner whose `manageRule` check passes receives it, like PocketBase
   0.22.34 (admins do not).
-- Expand applies the related collection's `viewRule` (nil: admins only).
 - `emailVisibility`/`verified` are parsed like Go's `cast.ToBool` on create
   and update: the multipart/JSON string `"false"` is false.
 - `username` resolves in a filter/sort only when the auth collection has a
@@ -29,7 +84,100 @@ See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
   value is SQL NULL, so `<`, `>`, `~` never match it.
 - `totalPages` is `ceil(totalItems / perPage)` (0 when empty) for the
   collections, admins and logs lists too.
-- JSON error bodies carry PocketBase 0.22's `code` next to `status`.
+
+### Security: expand applies the related viewRule
+
+See `docs/expand-view-rules.md`.
+
+- Every expanded record must satisfy the `viewRule` of its collection for the
+  current request (PocketBase 0.22.34 `expandFetch`): admins see everything,
+  a `null` rule fails the path, any other rule is evaluated by the list
+  filter parser with the same `@request.*` context. An anonymous caller or a
+  role without the permission no longer reads protected records through a
+  public relation (BUMA: `buma_sale.customer`, `users.employee`,
+  `buma_payment.caisse_transaction`, ...).
+- Paths are normalized like PocketBase, a failing path is skipped, a failing
+  nested level drops the whole path, refused or missing targets are skipped
+  in field order; `<collection>_via_<field>` back relations are supported.
+- Expanded auth records show their email only to an admin, the owner or a
+  `manageRule` match.
+- Create/update, auth responses (as the authenticated record), realtime and
+  `pb.apis.enrich_records`/`record_auth_response` use the same rules; one
+  query per path and level, in a savepoint inside write transactions.
+- `pb.set_auth_record_rule_context(loader)` extends `@request.auth` for the
+  authenticated record of an auth response (BUMA's role permissions);
+  `ppbase.api.record_auth.auth_response_rule_context` builds that context for
+  host login routes. `pb.apis.enrich_records` passes a JSON body as
+  `@request.data`.
+- Behavior change: `pb.apis.enrich_record(s)` expands `default_expand` and
+  appends the request's `?expand` paths (PocketBase `EnrichRecords`); it used
+  to apply `default_expand` only when the request had no `?expand`.
+- Realtime delete events still carry only `{id}` and reach only admins and
+  public-rule subscriptions without a filter (0.22.34 sends the whole
+  record to every matching subscriber): a documented open divergence.
+
+### Security: emails of listed, viewed and written auth records
+
+- The main auth records of a list, a view, a create, an update and a batch
+  write show a hidden email (`emailVisibility` false) only to an admin, the
+  owner and a `manageRule` match, like PocketBase's `EnrichRecords`. Create
+  and update responses used to always show it: a caller allowed to update an
+  auth record read its hidden email. A guest signup response now hides the
+  new email unless `emailVisibility`.
+
+### PocketBase 0.22 error compatibility (opt-in)
+
+See `docs/error-compat.md`.
+
+- `pb.set_error_compat("0.22")` or `PPBASE_ERROR_COMPAT=0.22` makes every
+  PPBase JSON error answer `{code, message, data}` with the PocketBase
+  0.22.34 messages ("Only admins can perform this action.", ...). Disabled by
+  default; status codes and non-PPBase bodies are never changed.
+- Form validation errors take the 0.22.34 message per case (record update
+  and an admin's create unwrapped, a user's create "Failed to create
+  record.", login forms with only the failing fields), required schema
+  fields "Missing required value.", and the `pb.apis` guards, the
+  `pb.require_auth()`/`pb.require_record_auth()` dependencies and the
+  `event.require_*()` helpers the messages of their 0.22.34 middlewares;
+  handlers tag these cases with a private header the middleware strips.
+- A body that cannot be bound (invalid JSON, not an object) answers the
+  `c.Bind` message of its 0.22.34 route.
+- `event.require_superuser()` answers 401 without auth (was 403), like
+  `pb.apis.require_superuser_auth()` and both PocketBase versions.
+- `PATCH /api/settings` and `POST /api/settings/test/email` answer their 400
+  load error to an invalid JSON body (was a plain 500).
+
+### File downloads like PocketBase
+
+See `docs/file-serving.md`.
+
+- `GET`/`HEAD /api/files/...` take the content type from the `.attrs`
+  side-car of a PocketBase storage (an undecodable one is a 404), always send
+  `Content-Disposition` (`inline` for PocketBase's safe types, `attachment`
+  otherwise: `text/*` is now an attachment), PocketBase's
+  `Content-Security-Policy`, `Cache-Control`, `X-Content-Type-Options` and
+  `X-XSS-Protection`, and answer `HEAD`.
+- `?download` is a Go boolean (`1`, `t`, `true`...): `?download=<name>` no
+  longer renames the download.
+- `?thumb` serves a stored `thumbs_<file>/<size>_<file>` as is, or generates
+  it like `CreateThumb` (only `100x100` and the field's sizes, otherwise the
+  original), one generation per thumbnail at a time.
+- Where PocketBase 0.22.34 and 0.40.6 differ (file name quoting, `.js` and
+  Office overrides, `Cross-Origin-Opener-Policy`, webp thumbnails, thumbnail
+  format, `.attrs` JSON decoding, file token trimming), PPBase follows 0.40.6
+  by default and 0.22.34 when `app.state.error_compat` is `"0.22"` (the
+  PocketBase 0.22 mode).
+- A protected file's token is the first `?token` value, trimmed like Go's
+  `strings.TrimSpace` in the 0.22 mode (as PocketBase 0.22.34: Go's Unicode
+  spaces, not Python's `str.strip()` set; an empty result is no token) and
+  verified as received by default (as 0.40.6).
+  It must decode like golang-jwt: a padded token or one with any other
+  character than the URL-safe alphabet is refused (PyJWT accepted
+  `token=`), CR/LF in its signature segment are skipped.
+- On local storage a name ending in `.attrs` is a `404`, even when a record
+  references it (it was served as a JSON attachment).
+- In the 0.22 mode an `.attrs` md5 array element that is not a byte is a
+  `404` whatever its length (a 5000-digit one was a `500`).
 
 ### Absent @request.* values no longer 500; totalPages and expand key
 
@@ -64,6 +212,17 @@ See `docs/hidden-auth-fields.md`.
   filter without hidden-field access.
 - Auth record create now accepts PocketBase's `emailVisibility` wire name (it
   previously ignored it, leaving visibility always off).
+
+### NULL values served as PocketBase zero values
+
+See `docs/null-values.md`.
+
+- A `NULL` value (a view `LEFT JOIN` without match, an absent column) is
+  served as the zero value of its field type, like PocketBase 0.22.34 and
+  v0.40.6: `""` for text, email, url, editor and single select/file/relation,
+  `0` for number, `false` for bool, `[]` for multiple select/file/relation
+  (a 0.22 `maxSelect: null` relation included), `null` for json. A `NULL` id
+  is `""`. Stored values, filters, sorts and totals are unchanged.
 
 ### Empty dates served, filtered and sorted like PocketBase
 

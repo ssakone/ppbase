@@ -74,6 +74,10 @@ After upload, file fields store only the generated filename. Build file URLs usi
 /api/files/{collectionIdOrName}/{recordId}/{filename}
 ```
 
+Downloads follow PocketBase (stored content type, `Content-Disposition`,
+thumbnails, cache and security headers, `HEAD`): see
+[File downloads like PocketBase](./file-serving.md).
+
 Protected file fields require a file token:
 
 1. `POST /api/files/token` with auth

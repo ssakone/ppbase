@@ -391,7 +391,12 @@ async def update_settings(
     # ``require_admin`` used this cached session for token verification. Return
     # its read transaction before reserving the one barrier connection.
     await session.rollback()
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ValueError:
+        # Invalid JSON is a load error like a non-object body, never a 500
+        # (0.22.34 c.Bind failure, apis/settings.go l.52-54).
+        body = None
     if not isinstance(body, dict):
         raise HTTPException(
             status_code=400,
@@ -486,7 +491,12 @@ async def send_test_email(
     session: AsyncSession = Depends(get_session),
 ):
     """Send a test email using the currently persisted SMTP settings."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ValueError:
+        # Invalid JSON: the same load error as a non-object body, never a 500
+        # (0.22.34 c.Bind failure, apis/settings.go l.112-115).
+        body = None
     if not isinstance(body, dict):
         raise _error_response(
             400,

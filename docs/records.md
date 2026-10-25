@@ -37,6 +37,10 @@ result = await pb.records("posts").list(
 # }
 ```
 
+`totalItems` is the number of distinct ids matching the filter, like
+PocketBase (a view may serve more rows than ids); with `skip_total=True`
+both `totalItems` and `totalPages` are `-1`.
+
 ### Filter syntax (PocketBase compatible)
 
 ```
@@ -88,6 +92,10 @@ record = await pb.records("posts").create(
     files={"cover": [("cover.jpg", data)]},
 )
 ```
+
+A file field only takes uploaded files, plus names the record already has:
+in the default mode `create` and `update` refuse any other name, like
+PocketBase's `app.Save` (see [File fields](./file-fields.md)).
 
 ---
 

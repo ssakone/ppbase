@@ -259,9 +259,10 @@ relation in a path, formerly listed here, now follow PocketBase 0.22.34: see
   hook that reproduces another form check (BUMA's 15-character id check):
   with both errors, PPBase reports the relation and PocketBase the id.
 - `+field` (prepend) is applied; PocketBase 0.22.34 ignores the key.
-- Back-relation expand (`x_via_rels`) is not supported. (A record with
-  nothing expanded no longer serves `expand: {}`: the key is omitted like in
-  PocketBase, see `docs/request-static-fields.md`.)
+- Back-relation expand (`x_via_rels`) is supported and every expanded record
+  must satisfy its `viewRule` (`docs/expand-view-rules.md`); a record with
+  nothing expanded has no `expand` key, as in PocketBase (see
+  `docs/request-static-fields.md`).
 - Sorting on a multi-value field uses PostgreSQL array order, not the JSON
   text order; JSON text uses `array_to_json`, which does not apply Go's HTML
   escaping of `<`, `>` and `&` (relation ids never contain them).

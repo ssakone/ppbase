@@ -259,7 +259,10 @@ class _BuiltinRouteMiddlewares:
             if hasattr(event, "load_auth"):
                 await event.load_auth()
             if getattr(event, "has_auth")():
-                raise event._http_error(403, "The request is allowed only for guest clients.")
+                # 0.22.34 RequireGuestOnly (apis/middlewares.go l.37, with 400).
+                raise event._http_error(
+                    403, "The request is allowed only for guest clients.", kind="guest_only"
+                )
             return await event.next()
 
         return _middleware
@@ -267,9 +270,22 @@ class _BuiltinRouteMiddlewares:
     def require_auth(self, *collections: str) -> MiddlewareHandler:
         allowed_collections = self._normalize_collections(collections)
 
+        # PocketBase 0.22.34 counterpart (only for the 0.22 error mode):
+        # RequireAdminOrRecordAuth without collections or with _superusers
+        # allowed, RequireRecordAuth otherwise (apis/middlewares.go l.72-86,
+        # l.158-173).
+        admins_allowed = not allowed_collections or "_superusers" in allowed_collections
+        missing_kind = (
+            "admin_or_record_auth_required" if admins_allowed else "record_auth_required"
+        )
+
         async def _middleware(event: Any):
             if hasattr(event, "load_auth"):
                 await event.load_auth()
+            if not event.has_auth():
+                raise event._http_error(
+                    401, "The request requires authentication.", kind=missing_kind
+                )
             auth = getattr(event, "require_auth")()
             if not allowed_collections:
                 return await event.next()
@@ -278,7 +294,8 @@ class _BuiltinRouteMiddlewares:
                 str(auth.get("collectionName", "")).strip(),
                 str(auth.get("collectionId", "")).strip(),
             }
-            if str(auth.get("type", "")).strip() == "admin":
+            is_admin = str(auth.get("type", "")).strip() == "admin"
+            if is_admin:
                 auth_collections.add("_superusers")
             auth_collections.discard("")
 
@@ -286,6 +303,10 @@ class _BuiltinRouteMiddlewares:
                 raise event._http_error(
                     403,
                     "The authorized auth model is not allowed to perform this action.",
+                    # RequireRecordAuth answers an admin token l.77 (with 401).
+                    kind="record_auth_required"
+                    if is_admin
+                    else "record_collection_forbidden",
                 )
             return await event.next()
 
@@ -295,10 +316,19 @@ class _BuiltinRouteMiddlewares:
         async def _middleware(event: Any):
             if hasattr(event, "load_auth"):
                 await event.load_auth()
+            # 0.22.34 RequireAdminAuth (apis/middlewares.go l.119, always 401).
             if not getattr(event, "has_auth")():
-                raise event._http_error(401, "The request requires authentication.")
+                raise event._http_error(
+                    401,
+                    "The request requires authentication.",
+                    kind="admin_auth_required",
+                )
             if not getattr(event, "is_superuser")():
-                raise event._http_error(403, "Only superusers can perform this action.")
+                raise event._http_error(
+                    403,
+                    "Only superusers can perform this action.",
+                    kind="admin_auth_required",
+                )
             return await event.next()
 
         return _middleware
@@ -315,6 +345,13 @@ class _BuiltinRouteMiddlewares:
             if getattr(event, "is_superuser")():
                 return await event.next()
 
+            # 0.22.34 RequireAdminOrOwnerAuth (apis/middlewares.go l.183-209).
+            if not event.has_auth():
+                raise event._http_error(
+                    401,
+                    "The request requires authentication.",
+                    kind="admin_or_record_auth_required",
+                )
             auth = getattr(event, "require_auth_record")()
             auth_id = str(auth.get("id", "")).strip()
             target_id = str(getattr(event, "path_params", {}).get(owner_key, "")).strip()
@@ -322,6 +359,7 @@ class _BuiltinRouteMiddlewares:
                 raise event._http_error(
                     403,
                     "The authorized auth model is not allowed to perform this action.",
+                    kind="owner_forbidden",
                 )
             return await event.next()
 
@@ -407,7 +445,21 @@ class _BuiltinRouteMiddlewares:
         *,
         collection: Any | None = None,
         default_expand: str | None = None,
+        auth_record: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        """``apis.EnrichRecords``: ``?expand`` (and ``?fields``) of the request.
+
+        The hidden email of an auth record is removed unless the requester
+        is an admin, its owner or a ``manageRule`` match (l.153-158). The
+        ``?expand`` paths are appended to ``default_expand`` (v0.22.34
+        apis/record_helpers.go l.160-163). Every expanded record must satisfy
+        its collection ``viewRule`` for this request (admins excepted), with
+        the same rule context as the records API and a JSON request body as
+        ``@request.data`` (``RequestInfo``). ``auth_record`` evaluates the
+        rules as that auth record instead of the request auth, like
+        PocketBase's ``RecordAuthResponse`` (l.105-116), host extension of
+        ``set_auth_record_rule_context`` included.
+        """
         if not records:
             return []
 
@@ -418,13 +470,37 @@ class _BuiltinRouteMiddlewares:
         engine = get_engine()
         collection_ref = await self._resolve_collection_ref(engine, collection, records[0])
 
-        result_records = [dict(item) for item in records]
-        auth_payload = await self._resolve_request_auth(request)
-        request_context = self._build_request_context(request, auth_payload)
+        from ppbase.api import records as records_api
 
-        expand_value = str(request.query_params.get("expand", "") or "").strip()
-        if not expand_value:
-            expand_value = str(default_expand or "").strip()
+        result_records = [dict(item) for item in records]
+        body_data = await self._request_body_data(request)
+        if auth_record is not None:
+            from ppbase.api.record_auth import auth_response_rule_context
+
+            request_context = await auth_response_rule_context(
+                request, collection_ref, auth_record, body_data
+            )
+            auth_payload = request_context.get("auth")
+        else:
+            # Looked up at call time: host applications may extend the rule
+            # context of the records API (BUMA flattens role permissions).
+            auth_payload = await self._resolve_request_auth(request)
+            _auth_ctx, request_context = records_api._prepare_rule_context(
+                request, auth_payload, data=body_data
+            )
+        # The main auth records' email visibility (EnrichRecords l.156).
+        result_records = await records_api.hide_unmanaged_auth_emails(
+            engine, collection_ref, result_records, auth_payload, request_context
+        )
+
+        expand_value = ",".join(
+            part
+            for part in (
+                str(default_expand or "").strip(),
+                str(request.query_params.get("expand", "") or "").strip(),
+            )
+            if part
+        )
         if expand_value:
             all_collections = await get_all_collections(engine)
             await expand_records(
@@ -445,6 +521,22 @@ class _BuiltinRouteMiddlewares:
 
         return result_records
 
+    @staticmethod
+    async def _request_body_data(request: Request) -> dict[str, Any]:
+        """``RequestInfo.Data`` of a JSON request body (``{}`` otherwise).
+
+        Multipart and urlencoded bodies are not read here (``{}``).
+        """
+        if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+            return {}
+        if "application/json" not in request.headers.get("content-type", "").lower():
+            return {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - an unreadable body is no data
+            return {}
+        return body if isinstance(body, dict) else {}
+
     async def enrich_record(
         self,
         request: Request,
@@ -452,6 +544,7 @@ class _BuiltinRouteMiddlewares:
         *,
         collection: Any | None = None,
         default_expand: str | None = None,
+        auth_record: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if record is None:
             return None
@@ -460,6 +553,7 @@ class _BuiltinRouteMiddlewares:
             [record],
             collection=collection,
             default_expand=default_expand,
+            auth_record=auth_record,
         )
         return records[0] if records else None
 
@@ -493,6 +587,7 @@ class _BuiltinRouteMiddlewares:
             dict(record),
             collection=collection_ref,
             default_expand=default_expand,
+            auth_record=record,
         )
         if enriched_record is None:
             raise ValueError("record is required.")
@@ -564,6 +659,7 @@ class FlaskLikePB:
         self._extensions = ExtensionRegistry()
         self._pending_hook_targets: list[str] = []
         self._extensions_loaded = False
+        self._auth_record_rule_context: Any | None = None
         self.apis = _BuiltinRouteMiddlewares(self)
 
     def configure(self, **settings_overrides: object) -> FlaskLikePB:
@@ -573,6 +669,57 @@ class FlaskLikePB:
         self._settings_kwargs.update(settings_overrides)
         self.settings = Settings(**self._settings_kwargs)  # type: ignore[arg-type]
         return self
+
+    def set_error_compat(self, mode: str | None) -> FlaskLikePB:
+        """Select the error compatibility mode of the app.
+
+        ``"0.22"`` makes every PPBase JSON error answer exactly like
+        PocketBase 0.22.34 (``{"code", "message", "data"}`` and the 0.22.34
+        messages, see ``docs/error-compat.md``); ``""``/``None`` restores
+        PPBase's own envelope (the default). Callable before the app is built
+        and from a hooks ``register(pb)`` function at startup. Equivalent to
+        ``PPBASE_ERROR_COMPAT``.
+        """
+        from ppbase.middleware.error_compat import (
+            normalize_error_compat,
+            set_error_compat,
+        )
+
+        normalized = normalize_error_compat(mode)
+        self._settings_kwargs["error_compat"] = normalized
+        self.settings.error_compat = normalized
+        if self._app is not None:
+            set_error_compat(self._app, normalized)
+        return self
+
+    def set_auth_record_rule_context(self, loader: Any | None) -> FlaskLikePB:
+        """Extend the rule context of auth-response expands.
+
+        ``loader(engine, auth)`` (sync or async) receives the
+        ``@request.auth`` payload of the authenticated record of an auth
+        response and returns extra ``@request.auth.*`` keys (flattened dotted
+        keys allowed), merged before the expanded records are filtered by
+        their ``viewRule`` (``ppbase.api.record_auth.set_auth_record_rule_context``).
+        ``None`` removes it. Callable before the app is built and from a
+        hooks ``register(pb)`` function at startup.
+        """
+        from ppbase.api.record_auth import set_auth_record_rule_context
+
+        if loader is not None and not callable(loader):
+            raise TypeError("The auth record rule context loader must be callable.")
+        self._auth_record_rule_context = loader
+        if self._app is not None:
+            set_auth_record_rule_context(self._app, loader)
+        return self
+
+    @property
+    def error_compat(self) -> str:
+        """The active error compatibility mode (``""`` or ``"0.22"``)."""
+        if self._app is not None:
+            from ppbase.middleware.error_compat import get_error_compat
+
+            return get_error_compat(self._app)
+        return str(getattr(self.settings, "error_compat", "") or "")
 
     def get_app(self):
         """Build and return the FastAPI app instance."""
@@ -604,6 +751,10 @@ class FlaskLikePB:
                 # marker-without-journal case that cannot be detected locally.
                 deferred_extension_loader=load_pending_extensions,
             )
+            if self._auth_record_rule_context is not None:
+                from ppbase.api.record_auth import set_auth_record_rule_context
+
+                set_auth_record_rule_context(self._app, self._auth_record_rule_context)
         return self._app
 
     def start(self, host: str | None = None, port: int | None = None) -> None:
@@ -898,7 +1049,22 @@ class FlaskLikePB:
         engine: Any | None = None,
     ) -> RecordRepository:
         """Return a repository-like accessor for record CRUD operations."""
-        return RecordRepository(collection_id_or_name, engine=engine)
+        return RecordRepository(
+            collection_id_or_name,
+            engine=engine,
+            file_semantics=self._repository_file_semantics,
+        )
+
+    def _repository_file_semantics(self) -> str | None:
+        """File name check of ``records()`` writes: the app's mode."""
+        from ppbase.middleware.error_compat import get_error_compat
+        from ppbase.services.record_file_fields import server_semantics_for_mode
+
+        if self._app is not None:
+            mode = get_error_compat(self._app)
+        else:
+            mode = str(getattr(self.settings, "error_compat", "") or "")
+        return server_semantics_for_mode(mode)
 
     def optional_auth(self):
         """FastAPI dependency returning auth payload or ``None``."""
@@ -1197,6 +1363,7 @@ class FlaskLikePB:
     def _reset_for_tests(self) -> None:
         """Reset singleton state between tests."""
         self._app = None
+        self._auth_record_rule_context = None
         self._settings_kwargs = {}
         self.settings = Settings()
         self._extensions = ExtensionRegistry()

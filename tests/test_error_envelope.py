@@ -1,112 +1,62 @@
-"""PPBase error bodies carry PocketBase 0.22's ``code`` next to ``status``.
+"""One error post-processing: current PocketBase envelope, or 0.22's on demand.
 
-PocketBase 0.22.34 serializes ``{"code", "message", "data"}``
-(apis/api_error.go l.12-15), the current PocketBase ``{"status", ...}``.
-See ppbase/middleware/error_envelope.py.
+PPBase answers the exact error envelope of current PocketBase versions,
+``{"status", "message", "data"}`` (v0.40.6 tools/router/error.go l.36-42).
+PocketBase 0.22.34 answers ``{"code", "message", "data"}`` (apis/api_error.go
+l.11-15, ``NewApiError`` l.67-75); clients written for it select the opt-in
+0.22 mode (docs/error-compat.md), whose single outermost middleware rewrites
+PPBase's envelope.  An earlier additive ``code`` next to ``status`` (a second
+middleware) matched neither version and hid PPBase's envelope from the 0.22
+mode; it is gone.
 """
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
 from httpx import ASGITransport, AsyncClient
 
 from ppbase.app import create_app
 from ppbase.config import Settings
-from ppbase.middleware.error_envelope import ErrorEnvelopeCodeMiddleware
+from ppbase.middleware.error_compat import ErrorCompatMiddleware
+
+_MAINTENANCE = (
+    "PPBase is temporarily read-only while a destructive backup restore is running."
+)
 
 
-def _app() -> FastAPI:
-    app = FastAPI()
-
-    @app.get("/native")
-    async def native() -> JSONResponse:
-        return JSONResponse(
-            status_code=403,
-            content={"status": 403, "message": "Only admins.", "data": {}},
-        )
-
-    @app.get("/legacy")
-    async def legacy() -> JSONResponse:
-        # BUMA's ported routes already answer in the 0.22 shape.
-        return JSONResponse(
-            status_code=401,
-            content={"code": 401, "message": "Unauthorized.", "data": {}},
-        )
-
-    @app.get("/custom")
-    async def custom() -> JSONResponse:
-        return JSONResponse(status_code=400, content={"status": "error", "x": 1})
-
-    @app.get("/mismatch")
-    async def mismatch() -> JSONResponse:
-        return JSONResponse(
-            status_code=400, content={"status": 404, "message": "m", "data": {}}
-        )
-
-    @app.get("/ok")
-    async def ok() -> JSONResponse:
-        return JSONResponse(content={"status": 200, "message": "m", "data": {}})
-
-    @app.get("/text")
-    async def text() -> PlainTextResponse:
-        return PlainTextResponse('{"status": 500}', status_code=500)
-
-    @app.get("/raised")
-    async def raised() -> None:
-        raise HTTPException(status_code=404, detail="missing")
-
-    @app.exception_handler(HTTPException)
-    async def handler(_request, exc: HTTPException) -> JSONResponse:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"status": exc.status_code, "message": exc.detail, "data": {}},
-        )
-
-    app.add_middleware(ErrorEnvelopeCodeMiddleware)
-    return app
-
-
-@pytest.mark.asyncio
-async def test_native_error_bodies_gain_the_legacy_code_key() -> None:
-    async with AsyncClient(
-        transport=ASGITransport(app=_app()), base_url="http://testserver"
-    ) as client:
-        native = await client.get("/native")
-        assert native.status_code == 403
-        assert native.json() == {
-            "code": 403,
-            "status": 403,
-            "message": "Only admins.",
-            "data": {},
-        }
-        assert int(native.headers["content-length"]) == len(native.content)
-        raised = await client.get("/raised")
-        assert raised.json() == {
-            "code": 404,
-            "status": 404,
-            "message": "missing",
-            "data": {},
-        }
-        # Anything else is passed through byte for byte.
-        legacy = await client.get("/legacy")
-        assert legacy.json() == {"code": 401, "message": "Unauthorized.", "data": {}}
-        assert (await client.get("/custom")).json() == {"status": "error", "x": 1}
-        assert "code" not in (await client.get("/mismatch")).json()
-        assert "code" not in (await client.get("/ok")).json()
-        assert (await client.get("/text")).text == '{"status": 500}'
-
-
-@pytest.mark.asyncio
-async def test_the_app_emits_code_and_status() -> None:
-    app = create_app(Settings())
+async def _maintenance_error(mode: str) -> tuple[int, dict]:
+    app = create_app(Settings(error_compat=mode))
     app.state.backup_maintenance = True
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://testserver"
     ) as client:
         response = await client.post("/api/health")
-    assert response.status_code == 503
-    body = response.json()
-    assert body["code"] == body["status"] == 503
-    assert set(body) == {"code", "status", "message", "data"}
+    assert int(response.headers["content-length"]) == len(response.content)
+    return response.status_code, response.json()
+
+
+def test_a_single_error_middleware_is_installed() -> None:
+    app = create_app(Settings())
+    classes = [middleware.cls for middleware in app.user_middleware]
+    assert classes.count(ErrorCompatMiddleware) == 1
+    # Outermost: every PPBase error body passes through it last.
+    assert classes[0] is ErrorCompatMiddleware
+    assert importlib.util.find_spec("ppbase.middleware.error_envelope") is None
+
+
+@pytest.mark.asyncio
+async def test_the_default_envelope_is_the_current_pocketbase_one() -> None:
+    status, body = await _maintenance_error("")
+    assert status == 503
+    assert body == {"status": 503, "message": _MAINTENANCE, "data": {}}
+    assert list(body) == ["status", "message", "data"]
+
+
+@pytest.mark.asyncio
+async def test_the_022_mode_envelope_is_the_pocketbase_022_one() -> None:
+    status, body = await _maintenance_error("0.22")
+    assert status == 503
+    assert body == {"code": 503, "message": _MAINTENANCE, "data": {}}
+    assert list(body) == ["code", "message", "data"]

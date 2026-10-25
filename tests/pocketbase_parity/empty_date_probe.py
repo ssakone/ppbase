@@ -8,6 +8,8 @@ scenarios (writes, reads, expand, auth records, views, filters and sorts)
 against an official PocketBase 0.22 binary and against PPBase, then writes
 ``pocketbase.json``, ``ppbase.json`` and ``diff.json`` in ``--out``.  It
 backs the expected values of ``tests/integration/test_empty_dates.py``.
+Its ``totals`` group pairs the list totals of a base collection and of
+views that repeat an id (``tests/integration/test_list_total_items.py``).
 
 Differences listed in ``KNOWN_DIVERGENCES`` are reported separately: they
 are documented in ``docs/empty-dates.md`` and are not regressions.
@@ -76,6 +78,12 @@ KNOWN_DIVERGENCES = {
     # ''; PPBase rejects it with a validation error.  Out of this probe's
     # empty-value scope, recorded for the decision log.
     "write.invalid_string": "unparseable date: PocketBase stores '', PPBase 400",
+    # A joining filter makes PocketBase SELECT DISTINCT (identical view rows
+    # collapse); PPBase renders joins as EXISTS and serves every row.  Open,
+    # documented in docs/request-static-fields.md; totalItems is equal.
+    "totals.repeated_same_join.rows": (
+        "join filter: PocketBase collapses identical view rows, PPBase does not"
+    ),
 }
 
 
@@ -536,6 +544,110 @@ async def view_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> An
     return out
 
 
+async def _page(
+    client: httpx.AsyncClient,
+    name: str,
+    headers: dict[str, str] | None = None,
+    **params: Any,
+) -> Any:
+    response = await client.get(
+        f"/api/collections/{name}/records", params=params, headers=headers
+    )
+    if response.status_code != 200:
+        return {"status": response.status_code}
+    body = response.json()
+    return {
+        "page": body["page"],
+        "perPage": body["perPage"],
+        "totalItems": body["totalItems"],
+        "totalPages": body["totalPages"],
+        "rows": [[item.get("name"), item.get("title")] for item in body["items"]],
+    }
+
+
+async def total_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any:
+    """totalItems/totalPages of a base collection and of views repeating ids.
+
+    PocketBase counts ``COUNT(DISTINCT [[<table>.id]])`` (v0.22.34
+    ``tools/search/provider.go`` l.236-256) and serves every row of a page.
+    ``pd_repeated``: 6 rows for the 2 targets (distinct titles);
+    ``pd_repeated_same``: the same 6 rows without the title, so identical in
+    threes.  A ``@collection`` filter adds a join, hence PocketBase's
+    ``SELECT DISTINCT`` (resolvers/record_field_resolver.go l.121-138).
+    """
+    join = "FROM pd_targets t JOIN pd_dates p ON p.other = t.id"
+    for name, columns, schema in (
+        ("pd_repeated", "t.id, t.name, p.title", ["name", "title"]),
+        ("pd_repeated_same", "t.id, t.name", ["name"]),
+    ):
+        await _collection(
+            client,
+            admin,
+            {
+                "name": name,
+                "type": "view",
+                "schema": [text_field(field) for field in schema],
+                "options": {"query": f"SELECT {columns} {join}"},
+            },
+        )
+    out: dict[str, Any] = {
+        "base": {
+            str(page): await _page(
+                client, "pd_dates", perPage=3, page=page, sort="title"
+            )
+            for page in (1, 2, 3, 4)
+        },
+        "base_skip_total": await _page(
+            client, "pd_dates", perPage=3, sort="title", skipTotal=1
+        ),
+        "repeated": {
+            str(page): await _page(
+                client, "pd_repeated", perPage=4, page=page, sort="title"
+            )
+            for page in (1, 2, 3)
+        },
+        "repeated_per_page_1": await _page(
+            client, "pd_repeated", perPage=1, sort="title"
+        ),
+        "repeated_filter": {
+            str(page): await _page(
+                client,
+                "pd_repeated",
+                perPage=2,
+                page=page,
+                sort="title",
+                filter='name = "t_empty"',
+            )
+            for page in (1, 2)
+        },
+        "repeated_skip_total": await _page(
+            client, "pd_repeated", perPage=4, sort="title", skipTotal="true"
+        ),
+        "repeated_same": await _page(
+            client, "pd_repeated_same", perPage=10, sort="name"
+        ),
+        # @collection filters are admin-only for a client filter
+        # (apis/record_crud.go checkForAdminOnlyRuleFields).
+        "repeated_same_join": await _page(
+            client,
+            "pd_repeated_same",
+            admin,
+            perPage=10,
+            sort="name",
+            filter='@collection.pd_targets.name ?= "t_empty"',
+        ),
+        "repeated_join": await _page(
+            client,
+            "pd_repeated",
+            admin,
+            perPage=4,
+            sort="title",
+            filter='@collection.pd_targets.name ?= "t_empty"',
+        ),
+    }
+    return out
+
+
 async def auth_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any:
     out: dict[str, Any] = {}
     await _collection(
@@ -603,6 +715,7 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> Any
     out["read"] = await read_scenarios(client, ids)
     out.update(await filter_scenarios(client, admin))
     out["views"] = await view_scenarios(client, admin)
+    out["totals"] = await total_scenarios(client, admin)
     out["auth"] = await auth_scenarios(client, admin)
     return out
 

@@ -77,7 +77,7 @@ def test_null_date_is_served_as_empty_string() -> None:
     record = build_record_response(row, "cid", "cname", _SCHEMA)
     assert record["d"] == ""
     assert record["a"] == ""  # absent autodate column
-    assert record["title"] is None  # only date types are DateTime values
+    assert record["title"] == ""  # a NULL text is "" too (test_null_zero_values)
     row["d"] = stamp
     assert build_record_response(row, "cid", "cname", _SCHEMA)["d"] == (
         "2024-02-03 04:05:06.789Z"

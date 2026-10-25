@@ -192,7 +192,9 @@ async def test_hook_repository_reuses_outer_pid_with_pool_size_one(
     async def _resolve(_engine, _target):
         return collection
 
-    async def _create(active_engine, _collection, data, files=None):
+    async def _create(
+        active_engine, _collection, data, files=None, file_semantics=None
+    ):
         async with active_engine.connect() as connection:
             pid_result = await connection.execute(text("SELECT pg_backend_pid()"))
             pids.append(int(pid_result.scalar_one()))
@@ -392,37 +394,25 @@ async def test_thumbnail_cache_miss_reopens_current_backend_after_switch(
     cache_miss_observed = asyncio.Event()
     resume_cache_miss = asyncio.Event()
     resolve_calls: list[tuple[str, bool]] = []
-    original_resolve_thumb = files_api._resolve_thumb_bytes
+    original_resolve_thumb = files_api._resolve_thumbnail
 
-    async def _pause_after_first_cache_miss(
-        collection_id_arg,
-        record_id_arg,
-        filename_arg,
-        field_def,
-        thumb_option,
-        source_loader,
-        storage_config,
-        lease,
-    ):
-        result = await original_resolve_thumb(
-            collection_id_arg,
-            record_id_arg,
-            filename_arg,
-            field_def,
-            thumb_option,
-            source_loader,
-            storage_config,
-            lease,
-        )
+    async def _pause_after_first_cache_miss(*args, **kwargs):
+        result = await original_resolve_thumb(*args, **kwargs)
+        storage_config = args[5]
+        lease = args[6]
         resolve_calls.append((storage_config.backend, lease is None))
-        if lease is None and result is None and not cache_miss_observed.is_set():
+        if (
+            lease is None
+            and result is files_api._THUMBNAIL_CACHE_MISS
+            and not cache_miss_observed.is_set()
+        ):
             cache_miss_observed.set()
             await resume_cache_miss.wait()
         return result
 
     monkeypatch.setattr(
         files_api,
-        "_resolve_thumb_bytes",
+        "_resolve_thumbnail",
         _pause_after_first_cache_miss,
     )
 

@@ -205,18 +205,35 @@ async def require_admin(
     )
 
 
+def _guard_error(status: int, message: str, kind: str) -> HTTPException:
+    """A guard error tagged with its PocketBase 0.22.34 counterpart.
+
+    The tag is only read by the opt-in 0.22 error mode: the app's exception
+    handler forwards it while that mode is on and drops it otherwise
+    (``ppbase.middleware.error_compat``, ``docs/error-compat.md``).
+    """
+    from ppbase.middleware.error_compat import ERROR_KIND_HEADER
+
+    return HTTPException(
+        status_code=status,
+        detail={"status": status, "message": message, "data": {}},
+        headers={ERROR_KIND_HEADER: kind},
+    )
+
+
 async def require_auth(
     auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> dict[str, Any]:
-    """Require that the request has any valid auth token."""
+    """Require that the request has any valid auth token.
+
+    0.22.34 counterpart: ``RequireAdminOrRecordAuth()``
+    (apis/middlewares.go l.158-175).
+    """
     if auth is None:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "status": 401,
-                "message": "The request requires authentication.",
-                "data": {},
-            },
+        raise _guard_error(
+            401,
+            "The request requires authentication.",
+            "admin_or_record_auth_required",
         )
     return auth
 
@@ -224,24 +241,21 @@ async def require_auth(
 async def require_record_auth(
     auth: dict[str, Any] | None = Depends(get_optional_auth),
 ) -> dict[str, Any]:
-    """Require that the request has an auth-record token."""
+    """Require that the request has an auth-record token.
+
+    0.22.34 counterpart: ``RequireRecordAuth()`` (apis/middlewares.go
+    l.72-88), which answers an admin token 401 with the message of a missing
+    record (PPBase: 403, same message in the 0.22 mode).
+    """
     if auth is None:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "status": 401,
-                "message": "The request requires authentication.",
-                "data": {},
-            },
+        raise _guard_error(
+            401, "The request requires authentication.", "record_auth_required"
         )
     if auth.get("type") not in {"auth", "authRecord"}:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "status": 403,
-                "message": "The authorized auth model is not allowed to perform this action.",
-                "data": {},
-            },
+        raise _guard_error(
+            403,
+            "The authorized auth model is not allowed to perform this action.",
+            "record_auth_required",
         )
     return auth
 

@@ -39,7 +39,27 @@ class HookEvent:
         return await self._next_handler()
 
     @staticmethod
-    def _http_error(status: int, message: str, data: dict[str, Any] | None = None) -> HTTPException:
+    def _http_error(
+        status: int,
+        message: str,
+        data: dict[str, Any] | None = None,
+        *,
+        kind: str | None = None,
+    ) -> HTTPException:
+        """A PPBase error; ``kind`` names its PocketBase 0.22.34 counterpart.
+
+        ``kind`` (``ppbase.middleware.error_compat.error_kinds()``) is only
+        used by the opt-in 0.22 error mode: the app's exception handler
+        forwards it as a private header while that mode is on and drops it
+        otherwise, so the default response is unchanged.
+        """
+        headers = None
+        if kind is not None:
+            from ppbase.middleware.error_compat import ERROR_KIND_HEADER, error_kinds
+
+            if kind not in error_kinds():
+                raise ValueError(f"Unknown error compatibility kind {kind!r}.")
+            headers = {ERROR_KIND_HEADER: kind}
         return HTTPException(
             status_code=status,
             detail={
@@ -47,6 +67,7 @@ class HookEvent:
                 "message": message,
                 "data": data or {},
             },
+            headers=headers,
         )
 
     def current_auth(self) -> dict[str, Any] | None:
@@ -105,28 +126,50 @@ class HookEvent:
     def require_auth(self) -> dict[str, Any]:
         auth = self.current_auth()
         if auth is None:
+            # 0.22.34 RequireAdminOrRecordAuth (apis/middlewares.go l.165).
             raise self._http_error(
                 401,
                 "The request requires authentication.",
+                kind="admin_or_record_auth_required",
             )
         return auth
 
     def require_auth_record(self) -> dict[str, Any]:
+        if self.current_auth() is None:
+            # 0.22.34 RequireRecordAuth (apis/middlewares.go l.77).
+            raise self._http_error(
+                401,
+                "The request requires authentication.",
+                kind="record_auth_required",
+            )
         auth = self.require_auth()
         if not self.has_record_auth():
+            # An admin token: RequireRecordAuth answers l.77 too (with 401).
             raise self._http_error(
                 403,
                 "The authorized auth model is not allowed to perform this action.",
+                kind="record_auth_required",
             )
         return auth
 
     def require_superuser(self) -> dict[str, Any]:
         auth = self.current_auth()
-        if auth is not None and self.has_superuser_auth():
+        if auth is None:
+            # Without auth, 401 like pb.apis.require_superuser_auth(), 0.22.34
+            # RequireAdminAuth (apis/middlewares.go l.114-124) and v0.40.6
+            # RequireSuperuserAuth (apis/middlewares.go l.91-95, l.108).
+            raise self._http_error(
+                401,
+                "The request requires authentication.",
+                kind="admin_auth_required",
+            )
+        if self.has_superuser_auth():
             return auth
+        # 0.22.34 RequireAdminAuth answers a record token l.119 (with 401).
         raise self._http_error(
             403,
             "Only superusers can perform this action.",
+            kind="admin_auth_required",
         )
 
     def is_auth_collection(self, collection_id_or_name: str) -> bool:
@@ -170,9 +213,11 @@ class HookEvent:
     ) -> dict[str, Any]:
         auth = self.require_auth_record()
         if not self.is_same_auth_record(record_id, collection_id_or_name):
+            # 0.22.34 RequireAdminOrOwnerAuth (apis/middlewares.go l.204).
             raise self._http_error(
                 403,
                 "The authorized auth model is not allowed to perform this action.",
+                kind="owner_forbidden",
             )
         return auth
 
@@ -195,7 +240,20 @@ class HookEvent:
     ) -> RecordRepository:
         """Build a repository-style accessor for a collection."""
         active_engine = engine if engine is not None else getattr(self, "engine", None)
-        return RecordRepository(collection_id_or_name, engine=active_engine)
+        return RecordRepository(
+            collection_id_or_name,
+            engine=active_engine,
+            file_semantics=self._repository_file_semantics,
+        )
+
+    def _repository_file_semantics(self) -> str | None:
+        """File name check of ``records()`` writes: the app's mode."""
+        from ppbase.middleware.error_compat import get_error_compat
+        from ppbase.services.record_file_fields import server_semantics_for_mode
+
+        return server_semantics_for_mode(
+            get_error_compat(getattr(self, "app", None))
+        )
 
     async def get_current_user(
         self,
@@ -355,7 +413,11 @@ class RecordRequestEvent(HookEvent):
                 "Pass collection_id_or_name explicitly."
             )
         active_engine = engine if engine is not None else self.engine
-        return RecordRepository(target, engine=active_engine)
+        return RecordRepository(
+            target,
+            engine=active_engine,
+            file_semantics=self._repository_file_semantics,
+        )
 
     async def get(
         self,

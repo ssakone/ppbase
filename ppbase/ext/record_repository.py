@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ppbase.db.engine import get_engine
+from ppbase.services.record_file_fields import CURRENT
 from ppbase.services.record_service import (
     create_record,
     delete_record,
@@ -21,18 +23,42 @@ from ppbase.services.record_storage_coordinator import (
 
 
 class RecordRepository:
-    """Small async repository for one collection."""
+    """Small async repository for one collection.
 
-    def __init__(self, collection_id_or_name: str, *, engine: Any | None = None) -> None:
+    ``create`` and ``update`` check file names like PocketBase's
+    ``app.Save``: a write may keep, remove or reorder the names the record
+    already has, new files come only from ``files``
+    (``ppbase.services.record_file_fields``, ``docs/file-fields.md``).
+    ``file_semantics`` is ``CURRENT`` (v0.40.6, the default) or ``None`` (no
+    name check, like 0.22.34 ``dao.SaveRecord``), or a callable returning
+    one when the write runs; ``pb.records()`` and ``e.records()`` pass the
+    app's mode.
+    """
+
+    def __init__(
+        self,
+        collection_id_or_name: str,
+        *,
+        engine: Any | None = None,
+        file_semantics: str | None | Callable[[], str | None] = CURRENT,
+    ) -> None:
         target = str(collection_id_or_name or "").strip()
         if not target:
             raise ValueError("collection_id_or_name cannot be empty.")
         self.collection_id_or_name = target
         self._engine = engine
+        self._file_semantics = file_semantics
 
     @property
     def engine(self) -> Any:
         return self._engine or get_engine()
+
+    @property
+    def file_semantics(self) -> str | None:
+        """The file name semantics of the next write."""
+        if callable(self._file_semantics):
+            return self._file_semantics()
+        return self._file_semantics
 
     async def resolve_collection(self):
         collection = await resolve_collection(self.engine, self.collection_id_or_name)
@@ -91,6 +117,7 @@ class RecordRepository:
                 collection,
                 dict(data),
                 files=files,
+                file_semantics=self.file_semantics,
             )
 
         return await run_record_storage_transaction(self.engine, _create)
@@ -118,6 +145,7 @@ class RecordRepository:
                 str(record_id),
                 dict(data),
                 files=files,
+                file_semantics=self.file_semantics,
             )
 
         return await run_record_storage_transaction(self.engine, _update)

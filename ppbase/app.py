@@ -354,6 +354,11 @@ def create_app(
     app.state.extension_routes_mounted = 0
     app.state.rate_limit_settings_version = 0
     app.state.backup_maintenance = False
+    from ppbase.middleware.error_compat import normalize_error_compat
+
+    app.state.error_compat = normalize_error_compat(
+        getattr(settings, "error_compat", "")
+    )
 
     @app.middleware("http")
     async def _backup_restore_maintenance(request: Request, call_next):
@@ -422,11 +427,6 @@ def create_app(
 
     app.add_middleware(RateLimitMiddleware)
     app.add_middleware(RequestLoggerMiddleware)
-
-    # Outermost: PocketBase 0.22's error key ``code`` next to ``status``.
-    from ppbase.middleware.error_envelope import ErrorEnvelopeCodeMiddleware
-
-    app.add_middleware(ErrorEnvelopeCodeMiddleware)
 
     # API routes
     from ppbase.api.router import (
@@ -533,16 +533,29 @@ def create_app(
 
     # Custom exception handler: PocketBase returns flat error objects, not
     # FastAPI's default {"detail": ...} wrapper.
+    from ppbase.middleware.error_compat import (
+        ERROR_KIND_HEADER,
+        error_kind_headers,
+        error_kinds,
+    )
+
     @app.exception_handler(HTTPException)
     async def _pocketbase_error_handler(
         request: Request, exc: HTTPException
     ) -> JSONResponse:
         detail = exc.detail
+        # Only the 0.22 error-kind tag of a guard is forwarded (and only
+        # while that mode is on): other exception headers stay dropped.
+        kind = (getattr(exc, "headers", None) or {}).get(ERROR_KIND_HEADER)
+        headers = (
+            error_kind_headers(request.app, kind) if kind in error_kinds() else None
+        )
         if isinstance(detail, dict) and "status" in detail:
             # Already a PocketBase-format error dict
             return JSONResponse(
                 content=detail,
                 status_code=exc.status_code,
+                headers=headers,
             )
         # Fallback: wrap plain string errors
         return JSONResponse(
@@ -552,6 +565,7 @@ def create_app(
                 "data": {},
             },
             status_code=exc.status_code,
+            headers=headers,
         )
 
     # Handle Pydantic request validation errors in PocketBase format.
@@ -560,14 +574,27 @@ def create_app(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         data: dict = {}
+        query_only = True
+        body_unbound = False
         for err in exc.errors():
             loc = err.get("loc", ())
+            if not loc or loc[0] not in ("query", "path"):
+                query_only = False
+            # The JSON itself, or a body that is not an object: what the
+            # 0.22.34 c.Bind fails on (a missing body binds an empty form).
+            if err.get("type") == "json_invalid" or (
+                tuple(loc) in {(), ("body",)} and err.get("type") != "missing"
+            ):
+                body_unbound = True
             # Field name is typically the last element after "body"
             field_name = str(loc[-1]) if loc else "unknown"
             data[field_name] = {
                 "code": "validation_required",
                 "message": err.get("msg", "Invalid value."),
             }
+        # PocketBase 0.22.34: a bad page/perPage/skipTotal is a search
+        # provider parse error, an unparsable body a c.Bind error, a bad
+        # body a form validation error.
         return JSONResponse(
             content={
                 "status": 400,
@@ -575,6 +602,19 @@ def create_app(
                 "data": data,
             },
             status_code=400,
+            headers=error_kind_headers(
+                request.app,
+                "body_load" if body_unbound else "query" if query_only else "form",
+            ),
         )
+
+    # Outermost, and the only error post-processing: PPBase answers the exact
+    # envelope of current PocketBase, {status, message, data} (v0.40.6
+    # tools/router/error.go l.36-42); the opt-in 0.22 mode
+    # (app.state.error_compat) answers 0.22.34's {code, message, data} and
+    # messages (docs/error-compat.md).  A pass-through otherwise.
+    from ppbase.middleware.error_compat import ErrorCompatMiddleware
+
+    app.add_middleware(ErrorCompatMiddleware)
 
     return app

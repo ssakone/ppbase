@@ -319,7 +319,7 @@ describe('Field Type Validation', () => {
     }
   });
 
-  it('should store file field reference', async () => {
+  it('should refuse a file name that was not uploaded', async () => {
     const { collection, cleanup } = await createTestCollection(adminPb, {
       schema: [
         {
@@ -332,11 +332,14 @@ describe('Field Type Validation', () => {
     });
 
     try {
-      // File field stores filename string (actual upload is separate)
-      const record = await adminPb.collection(collection.name).create({
-        avatar: 'avatar123.png',
+      // Like PocketBase (core/field_file.go l.250-269, v0.40.6): a record
+      // only keeps the names it already has; new files must be uploaded.
+      await expect(
+        adminPb.collection(collection.name).create({ avatar: 'avatar123.png' }),
+      ).rejects.toMatchObject({
+        status: 400,
+        response: { data: { avatar: { code: 'validation_invalid_file' } } },
       });
-      expect(record.avatar).toBe('avatar123.png');
     } finally {
       await cleanup();
     }

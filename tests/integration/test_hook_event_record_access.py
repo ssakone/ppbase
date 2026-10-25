@@ -20,8 +20,10 @@ async def test_record_request_event_crud_helpers_use_event_defaults(monkeypatch)
         calls["resolve"] = (engine, id_or_name)
         return fake_collection
 
-    async def _create_record(engine, collection, data, files=None):
-        calls["create"] = (engine, collection.name, dict(data), files)
+    async def _create_record(
+        engine, collection, data, files=None, file_semantics=None
+    ):
+        calls["create"] = (engine, collection.name, dict(data), files, file_semantics)
         return {"id": "rec_created", **data}
 
     async def _get_record(engine, collection, record_id, fields=None):
@@ -53,8 +55,17 @@ async def test_record_request_event_crud_helpers_use_event_defaults(monkeypatch)
         )
         return {"items": []}
 
-    async def _update_record(engine, collection, record_id, data, files=None):
-        calls["update"] = (engine, collection.name, record_id, dict(data), files)
+    async def _update_record(
+        engine, collection, record_id, data, files=None, file_semantics=None
+    ):
+        calls["update"] = (
+            engine,
+            collection.name,
+            record_id,
+            dict(data),
+            files,
+            file_semantics,
+        )
         return {"id": record_id, **data}
 
     async def _get_all_collections(engine):
@@ -106,7 +117,14 @@ async def test_record_request_event_crud_helpers_use_event_defaults(monkeypatch)
     assert deleted is True
 
     assert calls["resolve"] == (fake_engine, "posts")
-    assert calls["create"] == (fake_engine, "posts", {"title": "hello"}, None)
+    # No app: the default mode checks file names like app.Save (v0.40.6).
+    assert calls["create"] == (
+        fake_engine,
+        "posts",
+        {"title": "hello"},
+        None,
+        "current",
+    )
     assert calls["get"] == (fake_engine, "posts", "rec1", "id,title")
     assert calls["list"] == (
         fake_engine,
@@ -119,7 +137,14 @@ async def test_record_request_event_crud_helpers_use_event_defaults(monkeypatch)
         True,
         None,
     )
-    assert calls["update"] == (fake_engine, "posts", "rec1", {"title": "changed"}, None)
+    assert calls["update"] == (
+        fake_engine,
+        "posts",
+        "rec1",
+        {"title": "changed"},
+        None,
+        "current",
+    )
     assert calls["get_all_collections"] == fake_engine
     assert calls["delete"][0:3] == (fake_engine, "posts", "rec1")
 
@@ -256,6 +281,12 @@ def test_hook_event_require_superuser_checks_both_admin_and_superusers_collectio
     with pytest.raises(HTTPException) as user_exc:
         user.require_superuser()
     assert user_exc.value.status_code == 403
+
+    # Without auth: 401 like pb.apis.require_superuser_auth(), 0.22.34
+    # RequireAdminAuth and v0.40.6 RequireSuperuserAuth (it used to be 403).
+    with pytest.raises(HTTPException) as missing_exc:
+        RecordRequestEvent(auth=None).require_superuser()
+    assert missing_exc.value.status_code == 401
 
 
 def test_hook_event_require_same_auth_record_rejects_different_identity() -> None:

@@ -1,4 +1,4 @@
-# @request.* static fields, totalPages and the expand key
+# @request.* static fields, list totals and the expand key
 
 ## Absent and present @request.* values (no 500)
 
@@ -80,6 +80,48 @@ and logs; all four now return `0`. (The collections list still ignores
 admin-only APIs that BUMA clients do not call. PPBase's own
 `/api/migrations` list is not a PocketBase route and keeps its minimum of
 one page.)
+
+## totalItems counts distinct ids
+
+PocketBase counts a records list with `COUNT(DISTINCT [[<table>.id]])`, the
+ORDER BY reset and the same filter (v0.22.34 `tools/search/provider.go`
+l.236-256, v0.40.6 l.298-327: `countQuery.Distinct(false).Select("COUNT(DISTINCT
+[[" + countCol + "]])")`), and computes `totalPages` from that number. PPBase
+counted rows (`COUNT(*)`); it now counts the distinct ids of a view, so
+`totalItems`, `totalPages` (`ceil(totalItems / perPage)`) and `skipTotal`
+(`-1`/`-1`, no count query) follow both PocketBase versions. A base or auth
+table keeps `COUNT(*)`: `id` is its primary key and PPBase renders joins as
+`EXISTS`, so no row is repeated and both counts are the same number
+(`COUNT(DISTINCT id)` measured about 20 times slower than `COUNT(*)` for a
+filtered count of 500,000 of 1,000,000 rows on PostgreSQL 16). A view may
+repeat an id: its pages
+still serve every row of the query, while `totalItems` counts the ids (NULL
+ids are not counted, as in SQLite). On the real BUMA backup the public
+`buma_article_stockage_list_view` serves 989 rows for 42 ids: `totalItems`
+was 989 and `totalPages` 33 at `perPage` 30, PocketBase and now PPBase answer
+42 and 2, and pages 3 to 33 still serve rows. It is the only one of the 42
+BUMA views that repeats an id. Paired with the 0.22.34 binary by the `totals`
+group of `tests/pocketbase_parity/empty_date_probe.py`; tested by
+`tests/integration/test_list_total_items.py`.
+
+The relation existence check of a create or update keeps PocketBase's
+`count(*)` (v0.22.34 `forms/validators/record_data.go` l.387-394, v0.40.6
+`core/field_relation.go` l.225-233): its ids are deduplicated first and only
+a view may target a view, which cannot be written. The collections, admins
+and logs lists count primary-keyed tables, where both counts are equal.
+
+Open divergence: a filter or rule that joins another table (`@collection`, a
+relation or back-relation path, or, for an authenticated request,
+`@request.auth.<field>` other than the plain auth fields: v0.22.34
+`resolvers/record_field_resolve_runner.go` l.184-211 and
+`resolvers/record_field_resolver.go` l.26-36) makes PocketBase select
+`DISTINCT` rows (`resolvers/record_field_resolver.go` l.121-138), so the
+identical rows of a view collapse into one. PPBase renders these joins as
+correlated `EXISTS` and keeps serving every row; `totalItems` is the same.
+Client impact: none on the real BUMA backup, where no view has two identical
+rows (42 views checked read-only); a view that later repeats identical rows
+and is listed through such a filter or rule would serve more items on PPBase.
+Pinned by `test_identical_view_rows_under_a_join_filter_are_not_collapsed`.
 
 ## Omitted `expand` key
 

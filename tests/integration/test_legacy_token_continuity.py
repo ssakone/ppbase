@@ -74,7 +74,12 @@ async def _create_user(app_client: AsyncClient, collection: str = "users", **fie
         json={"email": email, "password": PASSWORD, "passwordConfirm": PASSWORD, **fields},
     )
     assert resp.status_code == 200, resp.text
-    return resp.json()
+    record = resp.json()
+    # A guest signup response hides the new email unless emailVisibility, like
+    # PocketBase 0.22.34 EnrichRecords (apis/record_crud.go l.289,
+    # apis/record_helpers.go l.153-158): keep the address the test signed up.
+    assert "email" not in record, record
+    return {**record, "email": email}
 
 
 async def _create_auth_collection(app_client: AsyncClient, admin_token: str) -> str:
