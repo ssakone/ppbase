@@ -33,6 +33,7 @@ from ppbase.models.field_types import (
     FieldDefinition,
     FieldType,
     FieldValidationError,
+    go_to_bool,
     validate_field_value,
 )
 from ppbase.models.record import (
@@ -918,30 +919,6 @@ def _filter_needs_relation_index(filter_expression: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-# strconv.ParseBool true spellings (Go standard library).
-_GO_TRUE_STRINGS = frozenset({"1", "t", "T", "TRUE", "true", "True"})
-
-
-def _go_to_bool(value: Any) -> bool:
-    """``cast.ToBool`` of PocketBase's record upsert form.
-
-    PocketBase 0.22.34 loads ``emailVisibility``/``verified`` with
-    ``cast.ToBool`` (forms/record_upsert.go l.380-384; spf13/cast v1.7.1):
-    a string goes through ``strconv.ParseBool`` and anything unparsable is
-    false, so the multipart/JSON strings ``"false"``/``"0"`` are false, not
-    Python-truthy.
-    """
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value in _GO_TRUE_STRINGS
-    return False
-
-
 async def auth_email_visible_ids(
     engine: AsyncEngine,
     collection: CollectionRecord,
@@ -1408,13 +1385,13 @@ async def create_record(
                     "email_visibility", data.pop("emailVisibility", False)
                 )
                 data.pop("emailVisibility", None)
-                columns["email_visibility"] = _go_to_bool(raw_visibility)
+                columns["email_visibility"] = go_to_bool(raw_visibility)
             else:
                 columns["email_visibility"] = False
             if "verified" not in data:
                 columns["verified"] = False
             else:
-                columns["verified"] = _go_to_bool(data.pop("verified", False))
+                columns["verified"] = go_to_bool(data.pop("verified", False))
 
     # File fields: a new record references no file yet, so only uploads can
     # fill them (record_file_fields); a refused field keeps its error.
@@ -1659,11 +1636,11 @@ async def update_record(
             data.pop("verified", None)
         else:
             if "email_visibility" in data:
-                updates["email_visibility"] = _go_to_bool(data.pop("email_visibility"))
+                updates["email_visibility"] = go_to_bool(data.pop("email_visibility"))
             elif "emailVisibility" in data:
-                updates["email_visibility"] = _go_to_bool(data.pop("emailVisibility"))
+                updates["email_visibility"] = go_to_bool(data.pop("emailVisibility"))
             if "verified" in data:
-                updates["verified"] = _go_to_bool(data.pop("verified"))
+                updates["verified"] = go_to_bool(data.pop("verified"))
 
     field_map = {f.name: f for f in schema_fields}
 

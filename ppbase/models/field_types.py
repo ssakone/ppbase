@@ -197,8 +197,38 @@ def _validate_number(field: FieldDefinition, value: Any) -> int | float:
     return int(val) if only_int else val
 
 
+# Go's ``strconv.ParseBool`` true spellings (go1.23.7 strconv/atob.go
+# l.10-18): exact, case-sensitive, never trimmed.
+_GO_TRUE_STRINGS = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+
+
+def go_to_bool(value: Any) -> bool:
+    """Return PocketBase's ``cast.ToBool(value)`` for a decoded request value.
+
+    PocketBase 0.22.34 prepares bool fields with ``cast.ToBool``
+    (models/schema/schema_field.go l.346-347, called for every schema field
+    by ``LoadData`` after a JSON round trip, forms/record_upsert.go
+    l.400-417) and so do ``emailVisibility``/``verified`` (l.380-385);
+    v0.40.6 is identical (core/field_bool.go l.103-106).  spf13/cast v1.7.1
+    (caste.go l.103-148, cast.go l.12-15; unchanged for these types in
+    v1.10.0 basic.go l.16-67) keeps a bool, maps nil to false, compares a
+    number to 0, parses a string with ``strconv.ParseBool`` and drops its
+    error, so ``"false"``, ``"0"``, ``""`` or ``"yes"`` are false.  Any other
+    type (a JSON array or object, a repeated multipart key) is false.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value in _GO_TRUE_STRINGS
+    return False
+
+
 def _validate_bool(field: FieldDefinition, value: Any) -> bool:
-    val = bool(value) if value is not None else False
+    val = go_to_bool(value)
     if field.required and not val:
         raise FieldValidationError(
             field.name, "validation_required", "Must be true."
