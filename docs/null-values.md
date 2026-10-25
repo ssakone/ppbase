@@ -32,9 +32,12 @@ Only `NULL` values change: stored values (including `""`, `0`, `false`, `[]`
 and a stored JSON `null`) are served as before, and filters, sorts and
 `totalItems` are untouched.
 
-Base and auth tables cannot hold `NULL` outside `date` columns: every other
-column is `NOT NULL` with the zero value as `DEFAULT`, including columns added
-to a collection that already has records. The rule still applies to them, for
+The tables PPBase creates for base and auth collections cannot hold `NULL`
+in a served column outside `date` fields: every other field column, `id`,
+`created`, `updated` and the auth columns are `NOT NULL` (fields with their
+zero value as `DEFAULT`), including columns added to a collection that already
+has records (`ppbase/db/schema_manager.py` `_col_ddl` and
+`_AUTH_SYSTEM_COLUMN_DEFINITIONS`). The rule still applies to them, for
 example to a column made nullable by hand.
 
 ## Not applied, and known differences
