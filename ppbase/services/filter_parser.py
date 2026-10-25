@@ -1314,8 +1314,11 @@ class _FilterTransformer(Transformer):
         v0.40.6 l.334-422): ``!=`` is NULL-safe (``IS NOT``), an empty operand
         (``""``, ``null``) also matches NULL, two columns are compared with
         ``COALESCE(x, '')`` and a json operand without COALESCE.  Only NULL
-        values change: two non-NULL values keep their typed comparison, and
-        a comparison without any column is folded (``_pb_equal_sql``).
+        values change: two non-NULL values of one type keep their typed
+        comparison, and a comparison without any column is folded
+        (``_pb_equal_sql``).  Operands of different types never get here
+        (``_sqlite_equal_sql``), nor a json operand and another column
+        (``_json_column_equal_sql``).
         """
         json_null = self._json_null_equal_sql(
             left, left_sql, right, right_sql, equal=equal
