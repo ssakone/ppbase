@@ -65,15 +65,20 @@ async def test_serve_file_download_query_param_controls_content_disposition(
         last_modified = inline_response.headers.get("last-modified", "")
         assert etag.startswith('"') and etag.endswith('"')
         assert last_modified
+        # PocketBase serves text/plain as an attachment, whatever ``download``
+        # says (v0.22.34 tools/filesystem/filesystem.go l.405-418); the name
+        # is quoted like v0.40.6 (l.587) outside the 0.22 mode.
         inline_cd = inline_response.headers.get("content-disposition", "")
-        assert "attachment" not in inline_cd.lower()
+        assert inline_cd == f'attachment; filename="{stored_filename}"'
+        assert inline_response.headers["content-type"] == "text/plain; charset=utf-8"
 
         download_response = await app_client.get(file_path, params={"download": "1"})
         assert download_response.status_code == 200, download_response.text
         download_cd = download_response.headers.get("content-disposition", "")
-        assert "attachment" in download_cd.lower()
-        assert stored_filename in download_cd
+        assert download_cd == f'attachment; filename="{stored_filename}"'
 
+        # ``download`` is a Go boolean: a custom name is a parse error, ignored
+        # like by PocketBase (the served name stays the stored one).
         named_download_response = await app_client.get(
             file_path, params={"download": "custom-name.txt"}
         )
@@ -81,8 +86,8 @@ async def test_serve_file_download_query_param_controls_content_disposition(
         named_download_cd = named_download_response.headers.get(
             "content-disposition", ""
         )
-        assert "attachment" in named_download_cd.lower()
-        assert "custom-name.txt" in named_download_cd
+        assert named_download_cd == f'attachment; filename="{stored_filename}"'
+        assert "custom-name.txt" not in named_download_cd
 
         explicit_inline_response = await app_client.get(
             file_path, params={"download": "0"}
@@ -93,7 +98,7 @@ async def test_serve_file_download_query_param_controls_content_disposition(
         explicit_inline_cd = explicit_inline_response.headers.get(
             "content-disposition", ""
         )
-        assert "attachment" not in explicit_inline_cd.lower()
+        assert explicit_inline_cd == f'attachment; filename="{stored_filename}"'
 
         range_response = await app_client.get(
             file_path,
@@ -389,6 +394,17 @@ async def test_protected_files_require_valid_file_token(
         )
         assert with_token_response.status_code == 200, with_token_response.text
         assert with_token_response.content == b"top secret"
+
+        # A repeated token: the first value, like ``c.QueryParam`` (v0.22.34
+        # apis/file.go l.119) and ``URL.Query().Get`` (v0.40.6 l.115).
+        first_valid = await app_client.get(
+            file_path, params=[("token", file_token), ("token", "invalid.token.value")]
+        )
+        assert first_valid.status_code == 200, first_valid.text
+        first_invalid = await app_client.get(
+            file_path, params=[("token", "invalid.token.value"), ("token", file_token)]
+        )
+        assert first_invalid.status_code == 404, first_invalid.text
     finally:
         await app_client.delete(
             f"/api/collections/{collection['id']}",
