@@ -25,9 +25,11 @@ from ppbase.storage.serving import (
     disposition_type,
     encode_attrs,
     file_security_headers,
+    file_token_to_verify,
     force_attachment,
     go_parse_bool,
     go_quote,
+    go_trim_space,
     latin1_header_value,
     parse_attrs,
     pocketbase_compat,
@@ -432,6 +434,9 @@ def test_parse_attrs_json_v1_and_v2(payload: bytes, v1: str, v2: str | None) -> 
         b'{"md5": [256]}',
         b'{"md5": [-1]}',
         b'{"md5": [1.0]}',
+        # json v1 ParseUint range error, beyond Python's int() digit limit.
+        b'{"md5": [1, ' + b"9" * 5000 + b"]}",
+        b'{"md5": [1000]}',
         b'{"md5": {}}',
         b'{"x": NaN, "user.content_type": "a"}',
         b'{"x": Infinity}',
@@ -479,3 +484,49 @@ def test_constant_headers() -> None:
         "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; sandbox"
     )
     assert CACHE_CONTROL == "max-age=2592000, stale-while-revalidate=86400"
+
+
+def test_go_trim_space_removes_the_go_unicode_spaces_only() -> None:
+    """Go ``strings.TrimSpace`` trims ``unicode.IsSpace`` (White_Space).
+
+    Python's ``str.isspace`` adds U+001C-U+001F (bidirectional class B/S),
+    which Go keeps: everything else matches, for every code point.
+    """
+    python_only = {0x1C, 0x1D, 0x1E, 0x1F}
+    for code in range(0x110000):
+        char = chr(code)
+        expected = char.isspace() and code not in python_only
+        assert (go_trim_space(f"{char}a{char}") == "a") is expected, hex(code)
+    assert go_trim_space("\u3000\xa0 a b\t\n\u2029") == "a b"
+    assert go_trim_space("\x1ca\u200b") == "\x1ca\u200b"
+
+
+@pytest.mark.parametrize(
+    ("raw", "compat", "expected"),
+    [
+        (None, "", ""),
+        (None, POCKETBASE_022, ""),
+        ("aa.bb.cc", "", "aa.bb.cc"),
+        # v0.22.34 trims (apis/file.go l.222), v0.40.6 does not (l.115).
+        (" aa.bb.cc\t", "", ""),
+        (" aa.bb.cc\t", POCKETBASE_022, "aa.bb.cc"),
+        ("\u3000aa.bb.cc\x85", POCKETBASE_022, "aa.bb.cc"),
+        ("  \u2000 ", POCKETBASE_022, ""),
+        ("aa.bb.cc\x1c", POCKETBASE_022, ""),
+        # RawURLEncoding: the URL-safe alphabet without padding.
+        ("aa.bb.cc=", "", ""),
+        ("aa.b+b.cc", "", ""),
+        ("aa.b/b.cc", "", ""),
+        ("aa.bb.c\u200bc", POCKETBASE_022, ""),
+        ("aa.bb", "", ""),
+        ("aa.bb.cc.dd", "", ""),
+        ("", "", ""),
+        # Go's base64 skips CR and LF: harmless in the signature segment.
+        ("aa.bb.c\nc\r", "", "aa.bb.cc"),
+        ("aa.bb.cc\n", "", "aa.bb.cc"),
+        # In the signed segments they stay (the signature then fails).
+        ("a\na.bb.cc", "", "a\na.bb.cc"),
+    ],
+)
+def test_file_token_to_verify(raw: str | None, compat: str, expected: str) -> None:
+    assert file_token_to_verify(raw, compat=compat) == expected

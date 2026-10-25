@@ -657,3 +657,186 @@ async def test_concurrent_requests_generate_a_missing_thumbnail_once(
         assert not any(files_api._thumb_generation_pending.values())
     finally:
         await _delete(app_client, admin_token, collection)
+
+
+async def _protected_record(
+    app_client: AsyncClient, admin_token: str, content: bytes
+) -> tuple[str, str]:
+    """A protected file in a collection whose ``viewRule`` is ``null``."""
+    name = f"pbprot_{uuid.uuid4().hex[:8]}"
+    created = await app_client.post(
+        "/api/collections",
+        headers={"Authorization": admin_token},
+        json={
+            "name": name,
+            "type": "base",
+            "schema": [
+                {
+                    "name": "docs",
+                    "type": "file",
+                    "required": False,
+                    "options": {"maxSelect": 1, "protected": True},
+                }
+            ],
+        },
+    )
+    assert created.status_code == 200, created.text
+    collection = created.json()
+    record = await app_client.post(
+        f"/api/collections/{name}/records",
+        headers={"Authorization": admin_token},
+        files={"docs": ("secret.png", content, "image/png")},
+    )
+    assert record.status_code == 200, record.text
+    return collection["id"], _url(collection, record.json(), record.json()["docs"])
+
+
+async def test_file_token_is_trimmed_like_go_only_in_the_0_22_mode(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """v0.22.34 ``strings.TrimSpace``s the token (``apis/file.go`` l.222),
+    v0.40.6 does not (l.115-116); golang-jwt decodes each segment with
+    ``base64.RawURLEncoding``, which skips CR and LF and refuses any other
+    character (PyJWT would discard it)."""
+    content = _png((20, 10))
+    collection_id, url = await _protected_record(app_client, admin_token, content)
+    try:
+        response = await app_client.post(
+            "/api/files/token", headers={"Authorization": admin_token}
+        )
+        assert response.status_code == 200, response.text
+        token = response.json()["token"]
+        cut = len(token) - 10  # inside the signature segment
+
+        def status(value: str) -> Any:
+            return app_client.get(url, params={"token": value})
+
+        # label: (value, status by default, status in the 0.22 mode)
+        cases = {
+            "as issued": (token, 200, 200),
+            "spaces around": (f"  {token}  ", 404, 200),
+            "Go unicode spaces": (
+                f"\u3000\xa0\x85\t{token}\u2029\u205f\v\u2000",
+                404,
+                200,
+            ),
+            "only spaces": ("  \u3000\t ", 404, 404),
+            # Python's str.strip() removes U+001C-U+001F, Go keeps them.
+            "U+001C is no Go space": (f"{token}\x1c\x1c", 404, 404),
+            "U+200B is no Go space": (f"{token}\u200b\u200b", 404, 404),
+            "two trailing spaces": (f"{token}  ", 404, 200),
+            "LF inside the signature": (f"{token[:cut]}\n{token[cut:]}", 200, 200),
+            "trailing LF": (f"{token}\n", 200, 200),
+            "padding": (f"{token}=", 404, 404),
+            "four segments": (f"{token}.x", 404, 404),
+        }
+        for label, (value, expected, _) in cases.items():
+            assert (await status(value)).status_code == expected, label
+        with _pocketbase_022(app_client):
+            for label, (value, _, expected) in cases.items():
+                assert (await status(value)).status_code == expected, label
+    finally:
+        await app_client.delete(
+            f"/api/collections/{collection_id}",
+            headers={"Authorization": admin_token},
+        )
+
+
+async def test_a_name_ending_in_attrs_is_never_served_from_local_storage(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """``fileblob`` reserves the ``.attrs`` suffix for its side-cars and
+    refuses such a key (v0.40.6 ``internal/fileblob/fileblob.go``
+    l.185-187), which both versions answer with a 404 (v0.22.34
+    ``apis/file.go`` l.166-168 and l.213-215, v0.40.6 l.168-170 and
+    l.209-212), even when a record references the name."""
+    photo = _png((120, 80))
+    collection, record, stored = await _record_with_files(
+        app_client, admin_token, [("photo.png", photo, "image/png")], thumbs=["50x50"]
+    )
+    try:
+        name = stored["photo.png"]
+        record_dir = get_storage_path(collection["id"], record["id"])
+        (record_dir / f"{name}.attrs").write_bytes(
+            _pocketbase_attrs(photo, "image/png", "photo.png")
+        )
+        # The record references the side-car itself, and a regular file
+        # whose name ends in .attrs (with a side-car of its own).
+        async with get_engine().begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{collection["name"]}" '
+                    'SET "docs" = array_append("docs", :name) WHERE "id" = :id'
+                ),
+                {"name": f"{name}.attrs", "id": record["id"]},
+            )
+        await _import_file(
+            collection, record, "notes_k3j2h1g0f9.attrs", b"{}", "image/png"
+        )
+        requests = [
+            ("GET", {}),
+            ("HEAD", {}),
+            ("GET", {"thumb": "100x100"}),
+            ("GET", {"thumb": "50x50"}),
+            ("GET", {"download": "1"}),
+        ]
+        for compat in ("", "0.22"):
+            with _pocketbase_022(app_client) if compat else contextlib.nullcontext():
+                assert (
+                    await app_client.get(_url(collection, record, name))
+                ).status_code == 200
+                for filename in (f"{name}.attrs", "notes_k3j2h1g0f9.attrs"):
+                    for method, params in requests:
+                        response = await app_client.request(
+                            method, _url(collection, record, filename), params=params
+                        )
+                        assert response.status_code == 404, (compat, filename, params)
+        assert not (record_dir / f"thumbs_{name}.attrs").exists()
+    finally:
+        await _delete(app_client, admin_token, collection)
+
+
+async def test_an_out_of_range_md5_byte_is_an_undecodable_side_car(
+    app_client: AsyncClient, admin_token: str
+) -> None:
+    """json v1 decodes an ``md5`` array into ``[]byte``: a number that is not
+    a byte, however long, is an error (404), never a 500."""
+    photo = _png((120, 80))
+    huge = b"9" * 5000  # beyond Python's 4300-digit int() limit
+    crafted = b'{"user.content_type":"image/png","md5":[1,' + huge + b"]}"
+    collection, record, stored = await _record_with_files(
+        app_client, admin_token, [("photo.png", photo, "image/png")], thumbs=["50x50"]
+    )
+    try:
+        name = stored["photo.png"]
+        record_dir = get_storage_path(collection["id"], record["id"])
+        (record_dir / f"{name}.attrs").write_bytes(
+            _pocketbase_attrs(photo, "image/png", "photo.png")
+        )
+        await _import_file(
+            collection, record, "huge_k3j2h1g0f9.png", photo, attrs=crafted
+        )
+        # A stored thumbnail whose side-car is crafted the same way does not
+        # exist for fileblob: it is generated again.
+        thumb_dir = record_dir / f"thumbs_{name}"
+        thumb_dir.mkdir()
+        (thumb_dir / f"50x50_{name}").write_bytes(_png((50, 50), (255, 0, 0)))
+        (thumb_dir / f"50x50_{name}.attrs").write_bytes(crafted)
+
+        huge_url = _url(collection, record, "huge_k3j2h1g0f9.png")
+        assert (await app_client.get(huge_url)).status_code == 404
+        with _pocketbase_022(app_client):
+            assert (await app_client.get(huge_url)).status_code == 404
+            assert (
+                await app_client.get(huge_url, params={"thumb": "100x100"})
+            ).status_code == 404
+            response = await app_client.get(
+                _url(collection, record, name), params={"thumb": "50x50"}
+            )
+            assert response.status_code == 200, response.text
+            assert _image_info(response.content) == ("PNG", (50, 50))
+            assert response.content != _png((50, 50), (255, 0, 0))
+            decoded = json.loads((thumb_dir / f"50x50_{name}.attrs").read_bytes())
+            assert isinstance(decoded["md5"], str)
+    finally:
+        await _delete(app_client, admin_token, collection)

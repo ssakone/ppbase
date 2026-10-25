@@ -73,6 +73,7 @@ from ppbase.storage.serving import (
     disposition_type,
     encode_attrs,
     file_security_headers,
+    file_token_to_verify,
     force_attachment,
     latin1_header_value,
     parse_attrs,
@@ -1059,10 +1060,13 @@ async def _serve_file(
     compat = pocketbase_compat(request.app)
 
     if is_protected:
-        # The first value, untrimmed, like ``c.QueryParam("token")``
-        # (v0.22.34 apis/file.go l.119) and ``URL.Query().Get`` (v0.40.6
-        # l.115).
-        file_token = _first_query_value(request, "token") or ""
+        # The first ``?token`` value (``c.QueryParam``, v0.22.34
+        # apis/file.go l.119; ``URL.Query().Get``, v0.40.6 l.115), trimmed
+        # like ``strings.TrimSpace`` in the 0.22 mode only (v0.22.34
+        # l.221-225) and decoded like golang-jwt (``file_token_to_verify``).
+        file_token = file_token_to_verify(
+            _first_query_value(request, "token"), compat=compat
+        )
         if not file_token:
             raise _not_found_error()
         token_auth = await _verify_file_token(session, file_token)
@@ -1085,6 +1089,14 @@ async def _serve_file(
     )
     if view_storage_context is not None:
         storage_collection_id, storage_record_id = view_storage_context
+
+    if initial_storage_config.backend != "s3" and filename.endswith(ATTRS_SUFFIX):
+        # ``fileblob`` reserves the suffix of its side-cars: any key ending
+        # in ``.attrs`` is refused (gocloud v0.40.0 ``fileblob`` in v0.22.34;
+        # v0.40.6 ``internal/fileblob/fileblob.go`` l.185-187), and PocketBase
+        # answers 404 (v0.22.34 apis/file.go l.166-168, l.213-215; v0.40.6
+        # l.168-170, l.209-212), even for a name a record references.
+        raise _not_found_error()
 
     try:
         opened_stream = await asyncio.to_thread(

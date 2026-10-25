@@ -190,6 +190,64 @@ def force_attachment(raw: str | None) -> bool:
     return go_parse_bool(raw) is True
 
 
+#: Go's ``unicode.IsSpace`` (the Unicode White_Space property), the runes
+#: ``strings.TrimSpace`` removes: ``\t``, ``\n``, ``\v``, ``\f``, ``\r``,
+#: space, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+#: U+205F and U+3000.  Python's ``str.strip()`` also removes U+001C-U+001F.
+GO_UNICODE_SPACES = "".join(
+    map(
+        chr,
+        (
+            *range(0x09, 0x0E),
+            0x20,
+            0x85,
+            0xA0,
+            0x1680,
+            *range(0x2000, 0x200B),
+            0x2028,
+            0x2029,
+            0x202F,
+            0x205F,
+            0x3000,
+        ),
+    )
+)
+
+# A JWT segment as golang-jwt decodes it (``base64.RawURLEncoding``): the
+# URL-safe alphabet, no padding; Go's base64 decoder skips CR and LF.
+_JWT_SEGMENT_RE = re.compile(r"[A-Za-z0-9_\-\r\n]*")
+
+
+def go_trim_space(value: str) -> str:
+    """Go's ``strings.TrimSpace``: :data:`GO_UNICODE_SPACES` at both ends."""
+    return value.strip(GO_UNICODE_SPACES)
+
+
+def file_token_to_verify(raw: str | None, *, compat: str = "") -> str:
+    """The protected-file token to verify, ``""`` when PocketBase has none.
+
+    ``raw`` is the first ``?token`` value.  v0.22.34 trims it with
+    ``strings.TrimSpace`` and treats an empty result as no token
+    (``apis/file.go`` l.119, l.221-225); v0.40.6 passes it as is
+    (``URL.Query().Get``, l.115-116).  golang-jwt then splits exactly three
+    segments (v4 ``strings.Split``, v5 ``splitToken``) and decodes each with
+    ``base64.RawURLEncoding``: any other character than the URL-safe
+    alphabet, padding included, makes the token invalid, while CR and LF
+    are skipped.  PyJWT accepts padding and refuses CR/LF, so a token Go
+    could not decode is no token here, and CR/LF are taken out of the
+    signature segment (in the two signed segments they stay, and the
+    signature fails in both).
+    """
+    token = raw or ""
+    if compat == POCKETBASE_022:
+        token = go_trim_space(token)
+    parts = token.split(".")
+    if len(parts) != 3 or not all(_JWT_SEGMENT_RE.fullmatch(part) for part in parts):
+        return ""
+    signature = parts[2].replace("\r", "").replace("\n", "")
+    return f"{parts[0]}.{parts[1]}.{signature}"
+
+
 def disposition_type(real_content_type: str, *, forced: bool) -> str:
     """``inline`` for the safe types, ``attachment`` otherwise.
 
@@ -487,13 +545,19 @@ def parse_attrs(payload: bytes, *, compat: str = "") -> FileAttributes:
     if not isinstance(decoded, _Pairs):
         raise InvalidFileAttributes("The .attrs side-car is not a JSON object.")
     values: dict[str, Any] = {}
-    for name, value in decoded:
-        target = name if name in _XATTRS_FIELDS else None
-        if target is None and v1:
-            target = _XATTRS_FOLDED.get(_go_fold(name))
-        if target is None:
-            continue  # unknown members are ignored by both decoders
-        _store_member(values, target, value, v1=v1)
+    try:
+        for name, value in decoded:
+            target = name if name in _XATTRS_FIELDS else None
+            if target is None and v1:
+                target = _XATTRS_FOLDED.get(_go_fold(name))
+            if target is None:
+                continue  # unknown members are ignored by both decoders
+            _store_member(values, target, value, v1=v1)
+    except InvalidFileAttributes:
+        raise
+    except ValueError as exc:
+        # Any conversion failure is a decoding error for Go too (404).
+        raise InvalidFileAttributes("The .attrs side-car cannot be decoded.") from exc
     metadata = values.get("user.metadata") or {}
     return FileAttributes(
         content_type=values.get("user.content_type", ""), metadata=dict(metadata)
@@ -559,13 +623,19 @@ def _check_md5(value: Any, *, v1: bool) -> None:
             raise InvalidFileAttributes("Invalid md5 in the .attrs side-car.") from exc
         return
     if v1 and type(value) is list:
-        # encoding/json v1 also decodes a []byte from an array of numbers.
+        # encoding/json v1 also decodes a []byte from an array of numbers,
+        # each parsed as a uint8 (``strconv.ParseUint``, a range error
+        # otherwise).  A JSON integer has no leading zero: more than three
+        # digits is out of range, and never reaches int() (which refuses
+        # more than 4300 digits).
         for item in value:
             if item is None:
                 continue
             if not (
                 isinstance(item, _IntLiteral)
-                and not item.text.startswith("-")
+                and item.text.isascii()
+                and item.text.isdigit()
+                and len(item.text) <= 3
                 and int(item.text) <= 0xFF
             ):
                 raise InvalidFileAttributes("Invalid md5 in the .attrs side-car.")
