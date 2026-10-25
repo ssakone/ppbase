@@ -7,10 +7,13 @@ helpers to build response dicts from raw database rows.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
+
+from ppbase.models.field_multiplicity import field_is_multiple
 
 
 def format_datetime(dt: datetime | str | None) -> str:
@@ -32,6 +35,54 @@ def format_datetime(dt: datetime | str | None) -> str:
 # marshals as "" (v0.22.34 tools/types/datetime.go l.47-58, v0.40.6
 # l.100-111), so NULL is served "" and never null.
 _DATETIME_FIELD_TYPES = frozenset({"date", "autodate"})
+
+# PocketBase reads a SQL NULL as ``nil`` (v0.22.34 models/record.go l.48-58,
+# v0.40.6 core/record_model.go l.491-500) and serves every schema field
+# through its type's ``PrepareValue`` (v0.22.34 models/record.go l.328-359
+# and l.528-531, models/schema/schema_field.go l.304-390; v0.40.6
+# core/record_model.go l.496-499 and l.1274-1289).  For ``nil`` this gives
+# the zero value of the type, identical in both releases:
+#
+# * text, email, url, editor: ``cast.ToString(nil)`` = "" (v0.22.34 l.310-311;
+#   v0.40.6 core/field_text.go l.174-176, field_email.go l.117-119,
+#   field_url.go l.117-119, field_editor.go l.121-123);
+# * number: ``cast.ToFloat64(nil)`` = 0 (l.344-345; field_number.go l.134-136);
+# * bool: ``cast.ToBool(nil)`` = false (l.346-347; field_bool.go l.104-106);
+# * select, file, relation: ``list.ToUniqueStringSlice(nil)`` is an empty,
+#   non-nil slice (v0.22.34 tools/list/list.go l.90-108 and l.111-140): ""
+#   for a single field, [] for a multiple one (l.351-386; field_select.go
+#   l.156-167, field_file.go l.714-726 and l.764-777, field_relation.go
+#   l.169-180); multiplicity is ``field_is_multiple`` (D-0019 rule);
+# * json: ``ParseJsonRaw(nil)`` is an empty ``JsonRaw`` that marshals as
+#   ``null`` (l.312-343, tools/types/json_raw.go l.26-32 and l.56-83;
+#   field_json.go l.121-150): a NULL json stays null.
+#
+# ``geoPoint`` only exists in current PocketBase (v0.40.6
+# core/field_geo_point.go l.114-118 serves {"lon":0,"lat":0}) and unknown
+# types are left unmodified by 0.22.34 (l.387-388): both keep ``None``.
+_EMPTY_STRING_FIELD_TYPES = frozenset({"text", "email", "url", "editor"})
+_MULTI_VALUE_FIELD_TYPES = frozenset({"select", "file", "relation"})
+
+
+def null_field_value(field_def: Mapping[str, Any]) -> Any:
+    """Return the value PocketBase serves for a NULL value of ``field_def``.
+
+    ``field_def`` is a stored schema field (nested 0.22 ``options`` or flat
+    v0.23+ keys).  Returns ``None`` when PocketBase serves ``null`` (json,
+    geoPoint, unknown types).
+    """
+    raw_type = field_def.get("type")
+    field_type = str(getattr(raw_type, "value", raw_type) or "")
+    if field_type in _DATETIME_FIELD_TYPES or field_type in _EMPTY_STRING_FIELD_TYPES:
+        return ""
+    if field_type == "number":
+        return 0
+    if field_type == "bool":
+        return False
+    if field_type in _MULTI_VALUE_FIELD_TYPES:
+        return [] if field_is_multiple(field_def) else ""
+    return None
+
 
 # Auth collection columns that must NEVER appear in API responses
 _AUTH_HIDDEN_COLUMNS = frozenset({
@@ -59,6 +110,9 @@ def build_record_response(
 ) -> dict[str, Any]:
     """Build a record response dict from a raw database row.
 
+    A NULL (or absent) schema column is served as the PocketBase zero value
+    of its field type (``null_field_value``, ``docs/null-values.md``).
+
     Args:
         row: Dict of column_name -> value from the DB query.
         collection_id: The parent collection's ID.
@@ -77,8 +131,12 @@ def build_record_response(
     """
     hidden = hidden_fields or set()
 
+    # A NULL id (e.g. a view row without one) is served "" like any other
+    # NULL text: v0.22.34 models/record.go l.294-295 and l.544
+    # (``cast.ToString``), v0.40.6 core/record_model.go l.488-512.
+    record_id = row.get("id")
     result: dict[str, Any] = {
-        "id": row.get("id", ""),
+        "id": "" if record_id is None else record_id,
         "collectionId": collection_id,
         "collectionName": collection_name,
         "created": format_datetime(row.get("created")),
@@ -113,11 +171,19 @@ def build_record_response(
         return auth_coll_id == collection_id or auth_coll_name == collection_name
 
     # Auth collection: add system auth columns (camelCase)
+    # A NULL auth value is served as its zero value: v0.22.34
+    # models/record.go l.346-354 and l.534-541 (``cast.ToString`` /
+    # ``cast.ToBool``), v0.40.6 email and bool fields (see above).
     if is_auth_collection:
         if _can_view_auth_email():
-            result["email"] = row.get("email", "")
-        result["emailVisibility"] = row.get("email_visibility", False)
-        result["verified"] = row.get("verified", False)
+            email = row.get("email")
+            result["email"] = "" if email is None else email
+        email_visibility = row.get("email_visibility")
+        result["emailVisibility"] = (
+            False if email_visibility is None else email_visibility
+        )
+        verified = row.get("verified")
+        result["verified"] = False if verified is None else verified
 
     # Add schema-defined fields
     if schema:
@@ -144,9 +210,11 @@ def build_record_response(
                 continue
 
             val = row.get(fname)
-            if isinstance(val, datetime) or (
-                val is None and field_def.get("type") in _DATETIME_FIELD_TYPES
-            ):
+            if val is None:
+                # NULL (or absent column): the PocketBase zero value of the
+                # field type, see ``null_field_value``.
+                val = null_field_value(field_def)
+            elif isinstance(val, datetime):
                 val = format_datetime(val)
             # Return integers for whole-number floats (PocketBase compat)
             if isinstance(val, float) and val == int(val):
