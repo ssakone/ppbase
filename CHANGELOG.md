@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Security: file names a record write may keep
+
+See `docs/file-fields.md`.
+
+- A record write may only keep, remove, reorder or de-duplicate the file
+  names that the record already has; new files must be uploaded. Before,
+  PPBase stored any well-formed name, and the files API served it. A client
+  allowed by the `updateRule` could thus reference, then download, a `.attrs`
+  side-car, an unreferenced object of the record directory or another
+  record's file.
+- The check covers create, JSON update, multipart text and `@jsonPayload`,
+  batch, names written by request hooks, the `createData` of
+  `auth-with-oauth2`, and `pb.records()` / `e.records()` in the default mode.
+- Default mode, like v0.40.6: 400 `validation_invalid_file` `Invalid new
+  files: [x].`. Files uploaded under `f` now keep the names sent under `f`
+  with them; before, the uploads replaced them.
+- 0.22 mode, like 0.22.34: 400 `Failed to load the submitted data due to
+  invalid formatting.` with `validation_unknown_filenames`.
+  - Uploads under `f` are appended, and uploads under `f+` are ignored.
+  - A single multipart text value of a file field is one raw name.
+  - `createData` file names are not loaded, and neither are the schema
+    fields after them.
+  - Server-side writes are not checked, like `dao.SaveRecord`.
+  - A batch, which 0.22.34 does not have, uses these 0.22 rules.
+- Server-side writes now normalize file values like a request.
+- A record duplicated in the dashboard no longer copies its file fields.
+
 ### Error envelope: current PocketBase by default, 0.22 on demand
 
 See `docs/error-envelope.md` and `docs/error-compat.md`.
