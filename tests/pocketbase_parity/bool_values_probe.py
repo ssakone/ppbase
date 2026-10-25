@@ -9,12 +9,16 @@ once a file is attached), ``@jsonPayload``, repeated-key, update and
 required-field writes to an official PocketBase 0.22 binary and to PPBase,
 then reads each written value three times: in the write response, through
 ``GET`` and in the stored column (SQLite ``data.db`` for PocketBase,
-PostgreSQL for PPBase).  It writes ``pocketbase.json``, ``ppbase.json`` and
-``diff.json`` in ``--out`` and backs ``tests/test_bool_field_cast.py`` and
+PostgreSQL for PPBase).  It also sends the modifier keys ``flag+``, ``flag-``
+and ``+flag`` (no-ops for a bool field), with and without a relation target
+error, and repeated ``emailVisibility``/``verified`` keys of an auth record.
+It writes ``pocketbase.json``, ``ppbase.json`` and ``diff.json`` in
+``--out`` and backs ``tests/test_bool_field_cast.py`` and
 ``tests/integration/test_bool_field_writes.py``.  Batch writes do not exist
 in 0.22 and are covered by the integration test only.
 
-Differences matched by ``known_divergence`` are reported separately.
+Differences matched by ``known_divergence`` are reported separately; the
+0.22 mode has none.
 
 Only synthetic records are created.  PocketBase runs in a temporary data
 directory on a random loopback port and is always stopped; PPBase runs
@@ -60,6 +64,9 @@ PUBLIC = {
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 FLAGS = "probe_flags"
 REQUIRED = "probe_required"
+RELATED = "probe_related"
+USERS = "probe_users"
+MISSING_ID = "missingrecord01"
 
 GO_TRUE = ("1", "t", "T", "TRUE", "true", "True")
 GO_FALSE = ("0", "f", "F", "FALSE", "false", "False")
@@ -99,7 +106,15 @@ JSON_VALUES: tuple[Any, ...] = (
     {},
     {"a": True},
 )
-REPEATED = (("true", "false"), ("false", "true"), ("true", "true"), ("false", "false"))
+REPEATED = (
+    ("true", "false"),
+    ("false", "true"),
+    ("true", "true"),
+    ("false", "false"),
+    ("T", ""),
+    ("", "true"),
+    ("1", "0"),
+)
 PAYLOAD_VALUES: tuple[Any, ...] = (
     "false",
     "0",
@@ -134,6 +149,53 @@ UPDATES: tuple[tuple[bool, str, Any], ...] = (
     (False, "payload", True),
     (False, "untouched", None),
 )
+# (initial value, write kind, body): JSON object or multipart (key, value)
+# pairs.  A modifier key never changes a bool field: 0.22.34
+# PrepareValueWithModifier has no bool case (models/schema/schema_field.go
+# l.394-429) and "+flag" is no 0.22.34 modifier (l.20-32).
+MODIFIER_KEYS = ("flag+", "flag-", "+flag")
+MODIFIER_UPDATES: tuple[tuple[bool, str, Any], ...] = tuple(
+    (initial, kind, body)
+    for initial in (True, False)
+    for key in MODIFIER_KEYS
+    for kind, body in (
+        ("json", {key: "x"}),
+        ("json", {key: True}),
+        ("json", {key: "false"}),
+        ("form", [[key, "true"]]),
+        ("form", [[key, "false"]]),
+        ("json", {"flag": not initial, key: "x"}),
+        ("json", {key: initial, "flag": str(not initial).lower()}),
+        ("form", [["flag", str(not initial).lower()], [key, "x"]]),
+        ("form_file", [[key, "true"], ["flag", str(not initial).lower()]]),
+    )
+)
+MODIFIER_CREATES: tuple[tuple[str, Any], ...] = tuple(
+    (kind, body)
+    for key in MODIFIER_KEYS
+    for kind, body in (
+        ("json", {key: "true"}),
+        ("json", {"flag": "true", key: "false"}),
+        ("form", [[key, "1"]]),
+        ("form_file", [["flag", "true"], [key, "x"]]),
+    )
+)
+# Written to RELATED (required ``req``, relation ``rel``) with a missing
+# relation id: every other field of the merged form is validated too.
+RELATED_KEYS = ("req+", "req-", "+req")
+RELATED_UPDATES: tuple[dict[str, Any], ...] = (
+    *({"rel": MISSING_ID, key: "x"} for key in RELATED_KEYS),
+    {"rel": MISSING_ID, "req": "false"},
+    {"rel": MISSING_ID, "req": "true", "req-": "x"},
+)
+RELATED_CREATES: tuple[dict[str, Any], ...] = (
+    *({"rel": MISSING_ID, "req": "true", key: "false"} for key in RELATED_KEYS),
+    {"rel": MISSING_ID, "req+": "true"},
+    {"rel": MISSING_ID},
+)
+# Repeated auth flags (no 0.22.34 schema fields: values[0], then cast.ToBool).
+AUTH_FLAGS = ("emailVisibility", "verified")
+AUTH_REPEATED = (("true", "false"), ("false", "true"), ("1", ""), ("T", "0"))
 REQUIRED_WRITES: tuple[tuple[str, Any], ...] = (
     ("json", "false"),
     ("json", "0"),
@@ -154,13 +216,17 @@ StoredReader = Callable[[str, str, str], Awaitable[Any]]
 
 def known_divergence(path: str, compat: str) -> str | None:
     """Return why a difference is expected, ``None`` when it is not."""
+    if compat == "0.22":
+        return None
     if ".repeated:" in path:
         # 0.22.34 keeps the first value of a non-arrayable key
-        # (forms/record_upsert.go l.191-196); PPBase keeps every value and a
-        # list is false, as in v0.40.6 (tools/router/unmarshal_request_data.go
-        # l.84-90, core/field_bool.go l.103-106).
-        return "repeated multipart key: 0.22.34 reads the first value (D-XXXX)"
-    if compat != "0.22" and path.startswith("required.") and path.endswith(".message"):
+        # (forms/record_upsert.go l.191-196), as the 0.22 mode does; the
+        # default mode keeps every value and a list is false, as in v0.40.6
+        # (tools/router/unmarshal_request_data.go l.84-90).
+        return "default mode: a repeated multipart key is a list, as in v0.40.6"
+    if path.startswith("required.") and path.endswith(".message"):
+        return "default mode wording of a required bool (0.22 mode: 0.22.34 wording)"
+    if path.startswith("related.") and path.endswith(".req.message"):
         return "default mode wording of a required bool (0.22 mode: 0.22.34 wording)"
     return None
 
@@ -232,6 +298,23 @@ async def _write(
     return await client.request(method, url, files=_parts(kind, column, raw))
 
 
+async def _send(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    kind: str,
+    body: Any,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """A JSON object, or multipart (key, value) pairs, with a file for form_file."""
+    if kind == "json":
+        return await client.request(method, url, json=body, headers=headers)
+    parts: list[tuple[str, Any]] = [(key, (None, value)) for key, value in body]
+    if kind == "form_file":
+        parts.append(("doc", ("pixel.png", PNG, "image/png")))
+    return await client.request(method, url, files=parts, headers=headers)
+
+
 async def _observe(
     client: httpx.AsyncClient,
     stored: StoredReader,
@@ -253,25 +336,113 @@ async def _observe(
     }
 
 
+async def _observe_all(
+    client: httpx.AsyncClient,
+    stored: StoredReader,
+    collection: str,
+    response: httpx.Response,
+    columns: tuple[str, ...],
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Every error of a refused write, or each column of the written record."""
+    body = _json(response)
+    if response.status_code != 200:
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        return {"status": response.status_code, "error": data}
+    record_id = body["id"]
+    read = _json(
+        await client.get(
+            f"/api/collections/{collection}/records/{record_id}", headers=headers
+        )
+    )
+    result: dict[str, Any] = {"status": 200}
+    for column in columns:
+        result[column] = {
+            "response": body.get(column),
+            "read": read.get(column),
+            "stored": await stored(collection, record_id, column),
+        }
+    return result
+
+
+async def _create_collection(
+    client: httpx.AsyncClient, admin: dict[str, str], payload: dict[str, Any]
+) -> str:
+    response = await client.post("/api/collections", headers=admin, json=payload)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"collection {payload['name']} failed: {response.text[:400]}"
+        )
+    return str(response.json()["id"])
+
+
 async def run_scenarios(
     client: httpx.AsyncClient, admin: dict[str, str], stored: StoredReader
 ) -> dict[str, Any]:
+    ids: dict[str, str] = {}
     for name, flag, required in ((FLAGS, "flag", False), (REQUIRED, "req", True)):
-        response = await client.post(
-            "/api/collections",
-            headers=admin,
-            json={
+        ids[name] = await _create_collection(
+            client,
+            admin,
+            {
                 "name": name,
                 "type": "base",
                 "schema": _schema(flag, required=required),
                 **PUBLIC,
             },
         )
-        if response.status_code != 200:
-            raise RuntimeError(f"collection {name} failed: {response.text[:400]}")
+    relation_options = {
+        "collectionId": ids[FLAGS],
+        "cascadeDelete": False,
+        "minSelect": None,
+        "maxSelect": 1,
+        "displayFields": None,
+    }
+    await _create_collection(
+        client,
+        admin,
+        {
+            "name": RELATED,
+            "type": "base",
+            "schema": [
+                _field("label", "text", {"min": None, "max": None, "pattern": ""}),
+                _field("req", "bool", {}, required=True),
+                _field("rel", "relation", relation_options),
+            ],
+            **PUBLIC,
+        },
+    )
+    await _create_collection(
+        client,
+        admin,
+        {
+            "name": USERS,
+            "type": "auth",
+            "schema": [],
+            "options": {
+                "allowEmailAuth": True,
+                "allowOAuth2Auth": False,
+                "allowUsernameAuth": False,
+                "exceptEmailDomains": None,
+                "manageRule": None,
+                "minPasswordLength": 8,
+                "onlyEmailDomains": None,
+                "onlyVerified": False,
+                "requireEmail": False,
+            },
+            **PUBLIC,
+        },
+    )
 
     flags_url = f"/api/collections/{FLAGS}/records"
-    results: dict[str, Any] = {"create": {}, "update": {}, "required": {}}
+    results: dict[str, Any] = {
+        "create": {},
+        "update": {},
+        "required": {},
+        "modifier": {},
+        "related": {},
+        "auth": {},
+    }
     create = results["create"]
     for raw in JSON_VALUES:
         response = await _write(client, "POST", flags_url, "json", "flag", raw)
@@ -285,6 +456,10 @@ async def run_scenarios(
     for values in REPEATED:
         response = await _write(client, "POST", flags_url, "repeated", "flag", values)
         key = f"form_file.repeated:{json.dumps(list(values))}"
+        create[key] = await _observe(client, stored, FLAGS, response, "flag")
+        pairs = [["flag", value] for value in values]
+        response = await _send(client, "POST", flags_url, "form", pairs)
+        key = f"form.repeated:{json.dumps(list(values))}"
         create[key] = await _observe(client, stored, FLAGS, response, "flag")
     for raw in PAYLOAD_VALUES:
         response = await _write(client, "POST", flags_url, "payload", "flag", raw)
@@ -300,12 +475,88 @@ async def run_scenarios(
         key = f"{json.dumps(initial)}->{kind}:{json.dumps(raw)}"
         results["update"][key] = await _observe(client, stored, FLAGS, response, "flag")
 
+    for values in REPEATED:
+        # The seed differs from what 0.22.34 stores (its first value).
+        initial = values[0] not in GO_TRUE
+        created = await client.post(flags_url, json={"flag": initial})
+        if created.status_code != 200:
+            raise RuntimeError(f"update seed failed: {created.text[:300]}")
+        url = f"{flags_url}/{created.json()['id']}"
+        pairs = [["flag", value] for value in values]
+        response = await _send(client, "PATCH", url, "form", pairs)
+        key = f"{json.dumps(initial)}->form.repeated:{json.dumps(list(values))}"
+        results["update"][key] = await _observe(client, stored, FLAGS, response, "flag")
+
     required_url = f"/api/collections/{REQUIRED}/records"
     for kind, raw in REQUIRED_WRITES:
         response = await _write(client, "POST", required_url, kind, "req", raw)
         key = f"{kind}:{json.dumps(raw)}"
         results["required"][key] = await _observe(
             client, stored, REQUIRED, response, "req"
+        )
+
+    modifier = results["modifier"]
+    for initial, kind, body in MODIFIER_UPDATES:
+        created = await client.post(flags_url, json={"flag": initial})
+        if created.status_code != 200:
+            raise RuntimeError(f"modifier seed failed: {created.text[:300]}")
+        url = f"{flags_url}/{created.json()['id']}"
+        response = await _send(client, "PATCH", url, kind, body)
+        key = f"update.{json.dumps(initial)}.{kind}:{json.dumps(body)}"
+        modifier[key] = await _observe(client, stored, FLAGS, response, "flag")
+    for kind, body in MODIFIER_CREATES:
+        response = await _send(client, "POST", flags_url, kind, body)
+        key = f"create.{kind}:{json.dumps(body)}"
+        modifier[key] = await _observe(client, stored, FLAGS, response, "flag")
+
+    related_url = f"/api/collections/{RELATED}/records"
+    related = results["related"]
+    for body in RELATED_UPDATES:
+        created = await client.post(related_url, json={"req": True})
+        if created.status_code != 200:
+            raise RuntimeError(f"related seed failed: {created.text[:300]}")
+        record_id = created.json()["id"]
+        response = await _send(
+            client, "PATCH", f"{related_url}/{record_id}", "json", body
+        )
+        observed = await _observe_all(client, stored, RELATED, response, ("req",))
+        observed["seed_stored"] = await stored(RELATED, record_id, "req")
+        related[f"update:{json.dumps(body)}"] = observed
+    for body in RELATED_CREATES:
+        response = await _send(client, "POST", related_url, "json", body)
+        related[f"create:{json.dumps(body)}"] = await _observe_all(
+            client, stored, RELATED, response, ("req",)
+        )
+
+    users_url = f"/api/collections/{USERS}/records"
+    password = "probe-User-Password-1"
+    for index, values in enumerate(AUTH_REPEATED):
+        credentials = [
+            ["email", f"probe-user-{index}@example.invalid"],
+            ["password", password],
+            ["passwordConfirm", password],
+        ]
+        pairs = credentials + [[flag, value] for flag in AUTH_FLAGS for value in values]
+        response = await _send(client, "POST", users_url, "form", pairs, admin)
+        key = f"create.form.repeated:{json.dumps(list(values))}"
+        results["auth"][key] = await _observe_all(
+            client, stored, USERS, response, AUTH_FLAGS, admin
+        )
+        if response.status_code != 200:
+            continue
+        record_url = f"{users_url}/{response.json()['id']}"
+        # The seed differs from what 0.22.34 stores (its first value).
+        initial = values[0] not in GO_TRUE
+        reset = await client.patch(
+            record_url, headers=admin, json=dict.fromkeys(AUTH_FLAGS, initial)
+        )
+        if reset.status_code != 200:
+            raise RuntimeError(f"auth reset failed: {reset.text[:300]}")
+        pairs = [[flag, value] for flag in AUTH_FLAGS for value in values]
+        response = await _send(client, "PATCH", record_url, "form", pairs, admin)
+        key = f"update.{json.dumps(initial)}.form.repeated:{json.dumps(list(values))}"
+        results["auth"][key] = await _observe_all(
+            client, stored, USERS, response, AUTH_FLAGS, admin
         )
     return results
 
@@ -469,6 +720,8 @@ async def run_ppbase(database_url: str, compat: str) -> dict[str, Any]:
             )
 
             async def stored(collection: str, record_id: str, column: str) -> Any:
+                # PPBase stores the 0.22 ``emailVisibility`` as email_visibility.
+                column = {"emailVisibility": "email_visibility"}.get(column, column)
                 async with engine.connect() as conn:
                     return (
                         await conn.execute(
