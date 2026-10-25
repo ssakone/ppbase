@@ -37,6 +37,10 @@ result = await pb.records("posts").list(
 # }
 ```
 
+`totalItems` is the number of distinct ids matching the filter, like
+PocketBase (a view may serve more rows than ids); with `skip_total=True`
+both `totalItems` and `totalPages` are `-1`.
+
 ### Filter syntax (PocketBase compatible)
 
 ```

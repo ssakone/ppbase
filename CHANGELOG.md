@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### totalItems counts distinct ids, like PocketBase
+
+See `docs/request-static-fields.md`.
+
+- A records list answers `totalItems` = the number of distinct ids of the
+  filtered query, like both PocketBase versions (`COUNT(DISTINCT
+  [[<table>.id]])`, v0.22.34 `tools/search/provider.go` l.236-256, v0.40.6
+  l.298-327); it counted rows. `totalPages` follows; `skipTotal` still
+  answers `-1`/`-1`. Base and auth collections are unchanged (unique ids). A
+  view that repeats an id now answers its number of ids while its pages keep
+  serving every row: BUMA's `buma_article_stockage_list_view` answers 42
+  instead of 989 (989 rows).
+- Open divergence: a joining filter or rule makes PocketBase collapse the
+  identical rows of a view (`SELECT DISTINCT`); PPBase serves them all (no
+  BUMA view has identical rows).
+
 ### Error envelope: current PocketBase by default, 0.22 on demand
 
 See `docs/error-envelope.md` and `docs/error-compat.md`.

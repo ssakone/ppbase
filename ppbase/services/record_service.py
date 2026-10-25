@@ -953,10 +953,20 @@ async def list_records(
     page = max(1, page)
     offset = (page - 1) * per_page
 
-    # Total count (unless skipped)
+    # Total count (unless skipped).  PocketBase counts the distinct ids of the
+    # filtered query, not its rows: ``COUNT(DISTINCT [[<table>.id]])`` with
+    # the ORDER BY reset (v0.22.34 tools/search/provider.go l.236-256, v0.40.6
+    # l.298-327).  A view may repeat an id: totalItems and totalPages count
+    # the ids while the pages keep serving every row
+    # (docs/request-static-fields.md).  A base or auth table has "id" as its
+    # primary key and the WHERE never multiplies rows (joins are EXISTS), so
+    # COUNT(*) is the same number without the cost of a DISTINCT.
     total_items = -1
     if not skip_total:
-        count_sql = f'SELECT COUNT(*) AS cnt FROM "{table}" WHERE {where_sql}'
+        count_expr = (
+            f'COUNT(DISTINCT "{table}"."id")' if col_type == "view" else "COUNT(*)"
+        )
+        count_sql = f'SELECT {count_expr} AS cnt FROM "{table}" WHERE {where_sql}'
         for _attempt in range(2):
             try:
                 async with engine.connect() as conn:
