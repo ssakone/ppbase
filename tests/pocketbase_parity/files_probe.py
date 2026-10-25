@@ -15,9 +15,14 @@ Thumbnails present in the copied storage are compared byte for byte.
 Thumbnails that each server generates itself are compared on format,
 dimensions and sampled colors (Go's ``imaging`` and Pillow do not encode the
 same bytes); their ``Content-Length`` and ``Last-Modified`` are not
-compared.  Error responses are compared on their status only: the JSON
-envelope belongs to the error compatibility mode.  Differences listed in
-``KNOWN_DIVERGENCES`` are documented in ``docs/file-serving.md``.
+compared.  Error responses, and responses whose status differs, are
+compared on their status only: the JSON envelope belongs to the error
+compatibility mode.  Some side-cars are replaced by crafted ones (in both
+storages) to compare the JSON decoding of ``fileblob``.  ``--compat 0.22``
+(the default) runs PPBase in the PocketBase 0.22 compatibility mode,
+``--compat default`` in its default (PocketBase v0.40.6) mode.  Every
+difference that :func:`known_divergence` recognizes is documented in
+``docs/file-serving.md``.
 
 Only synthetic files are used.  PocketBase runs in a temporary directory on
 a random loopback port and is always stopped; PPBase runs in-process (ASGI)
@@ -29,7 +34,7 @@ Usage (from the repository root)::
     PYTHONPATH=. python tests/pocketbase_parity/files_probe.py \\
         --pocketbase /path/to/pocketbase-0.22.34 \\
         --database-url postgresql+asyncpg://user:pass@127.0.0.1:5432/probe \\
-        --out /tmp/files-probe
+        --out /tmp/files-probe [--compat default]
 """
 
 from __future__ import annotations
@@ -58,6 +63,8 @@ ADMIN_EMAIL = "probe-admin@example.invalid"
 ADMIN_PASSWORD = "probe-Password-123"
 FILES_ID = "probefiles00001"
 PLAIN_ID = "probeplain00001"
+PROTECTED_PUBLIC_ID = "probeprotpub001"
+PROTECTED_ADMIN_ID = "probeprotadm001"
 THUMBS = ["50x50", "20x0", "0x20", "30x20t", "30x20b", "30x20f", "40x40f"]
 COMPARED_HEADERS = (
     "content-type",
@@ -71,24 +78,106 @@ COMPARED_HEADERS = (
     "accept-ranges",
     "last-modified",
     "content-range",
+    "cross-origin-opener-policy",
 )
 RED = (255, 0, 0)
 BLUE = (0, 0, 255)
 
-KNOWN_DIVERGENCES = {
-    # fileblob serves a blob without side-car as application/octet-stream
-    # (an attachment, never a thumbnail); PPBase keeps its extension-based
-    # type for such files, which only its own uploads lack.
+# Side-cars replaced in both storages after the upload (``fileblob``
+# decoding: gocloud v0.40.0 json v1 in v0.22.34, json/v2 in v0.40.6).
+CRAFTED_ATTRS = {
+    "c_trailing": b'{"user.content_type":"image/png"} trailing',
+    "c_dup": b'{"user.content_type":"image/png","user.content_type":"image/gif"}',
+    "c_case": b'{"USER.CONTENT_TYPE":"image/gif"}',
+    "c_longs": '{"u\u017fer.content_type":"image/gif"}'.encode(),
+    "c_dotless": (
+        '{"user.content_d\u0131sposition":1,"user.content_type":"image/gif"}'.encode()
+    ),
+    "c_surrogate": b'{"user.content_type":"image/png\\ud800"}',
+    "c_badutf8": b'{"user.content_type":"image/png\xff"}',
+    "c_nullmeta": b'{"user.content_type":"image/png","user.metadata":{"a":null}}',
+    "c_md5nl": (
+        b'{"user.content_type":"image/png","md5":"kAFQmDzST7DWlj99\\nKOF/cg=="}'
+    ),
+    "c_md5arr": b'{"user.content_type":"image/png","md5":[1,2,255]}',
+    "c_md5bad": b'{"user.content_type":"image/png","md5":"%%%"}',
+    "c_nan": b'{"x":NaN,"user.content_type":"image/png"}',
+    "c_null": b"null",
+    "c_ctnull": b'{"user.content_type":"a/b","user.content_type":null}',
+}
+
+# fileblob serves a blob without side-car as application/octet-stream (an
+# attachment, never a thumbnail); PPBase keeps its extension-based type for
+# such files, which only its own uploads lack.  Both modes.
+NOATTRS_DIVERGENCES = {
     "A.noattrs.plain.headers.content-disposition": "no .attrs: extension type",
     "A.noattrs.plain.headers.content-type": "no .attrs: extension type",
     "A.noattrs.thumb_100x100.headers.content-disposition": "no .attrs: thumbnail",
     "A.noattrs.thumb_100x100.headers.content-type": "no .attrs: thumbnail",
     "A.noattrs.thumb_100x100.image": "no .attrs: thumbnail",
-    # PocketBase 0.22.34 makes no webp thumbnail (apis/file.go l.26); v0.40.6
-    # and PPBase do.
-    "A.webp.thumb_100x100.headers.content-disposition": "webp thumbnail",
-    "A.webp.thumb_100x100.image": "webp thumbnail",
 }
+
+# Protected files: both versions evaluate the viewRule as a guest without a
+# valid token (v0.22.34 apis/file.go l.118-138, v0.40.6 l.109-134) and
+# v0.22.34 refuses with a 403 (l.136-138); PPBase refuses before reading the
+# rule, with a 404 (v0.40.6 l.132-133).  Both modes, not implemented.
+PROTECTED_DIVERGENCES = {
+    "C.png.protected_no_token.status": "protected: guest viewRule not evaluated",
+    "C.png.protected_bad_token.status": "protected: guest viewRule not evaluated",
+    "D.png.protected_no_token.status": "protected: 0.22.34 refuses with 403",
+    "D.png.protected_bad_token.status": "protected: 0.22.34 refuses with 403",
+}
+
+# The PocketBase v0.40.6 behavior PPBase applies outside the 0.22 mode.
+DEFAULT_MODE_DIVERGENCES = {
+    "A.webp.thumb_100x100.headers.content-disposition": "v0.40.6: webp thumbnail",
+    "A.webp.thumb_100x100.headers.content-type": "v0.40.6: webp thumbnail",
+    "A.webp.thumb_100x100.image": "v0.40.6: webp thumbnail",
+    "A.fakejpg.thumb_100x100.image": "v0.40.6: format from the original type",
+    "A.js.plain.headers.content-type": "v0.40.6: .js override",
+    "A.c_case.plain.headers.content-disposition": "json/v2: case-sensitive names",
+    "A.c_case.plain.headers.content-type": "json/v2: case-sensitive names",
+    "A.c_longs.plain.headers.content-disposition": "json/v2: case-sensitive names",
+    "A.c_longs.plain.headers.content-type": "json/v2: case-sensitive names",
+    "sidecar.thumb_20x0": "v0.40.6: json.MarshalWrite side-car form",
+}
+for _key in (
+    "c_trailing",
+    "c_dup",
+    "c_surrogate",
+    "c_badutf8",
+    "c_md5nl",
+    "c_md5arr",
+    "c_ctnull",
+):
+    DEFAULT_MODE_DIVERGENCES[f"A.{_key}.plain.status"] = "json/v2: refused side-car"
+
+
+def _go_quoted(name: str) -> str:
+    """``strconv.Quote`` of the probe's ASCII names."""
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def known_divergence(row: dict[str, Any], compat: str) -> str | None:
+    """The documented reason of one difference, ``None`` if unexpected."""
+    path = row["path"]
+    reason = NOATTRS_DIVERGENCES.get(path) or PROTECTED_DIVERGENCES.get(path)
+    if reason or compat == "0.22":
+        return reason
+    reason = DEFAULT_MODE_DIVERGENCES.get(path)
+    if reason:
+        return reason
+    if (
+        path.endswith(".headers.cross-origin-opener-policy")
+        and row["pocketbase"] is None
+        and row["ppbase"] == "same-origin"
+    ):
+        return "v0.40.6: Cross-Origin-Opener-Policy"
+    if path.endswith(".headers.content-disposition"):
+        disposition, _sep, name = str(row["pocketbase"]).partition("; filename=")
+        if row["ppbase"] == f"{disposition}; filename={_go_quoted(name)}":
+            return "v0.40.6: quoted file name"
+    return None
 
 
 def _image(size: tuple[int, int], fmt: str, **save: Any) -> bytes:
@@ -134,6 +223,12 @@ def synthetic_files() -> dict[str, tuple[str, bytes]]:
         "html": ("page.html", b"<!doctype html><html><body>x</body></html>\n"),
         "noattrs": ("noattrs.png", _image((70, 50), "PNG")),
         "missing": ("gone.png", _image((30, 30), "PNG")),
+        # PocketBase keeps "=" in a stored extension (file.go l.169).
+        "eq": ("report.v=1", b"synthetic text, = in the extension\n"),
+        # PNG bytes under a .jpg name (recorded as image/png).
+        "fakejpg": ("fake.jpg", png),
+        "js": ("app.js", b"var probe = 1;\n"),
+        **{key: (f"{key}.png", _image((20, 10), "PNG")) for key in CRAFTED_ATTRS},
     }
 
 
@@ -193,6 +288,7 @@ def scenarios() -> list[dict[str, Any]]:
         ("txt", ["100x100"]),
         ("svg", ["100x100"]),
         ("noattrs", ["100x100"]),
+        ("fakejpg", ["100x100"]),
     ):
         for size in sizes:
             add("A", key, f"thumb_{size}", params=[("thumb", size)], kind="thumb")
@@ -238,6 +334,16 @@ def scenarios() -> list[dict[str, Any]]:
     add("B", "png", "thumb_100x100", params=[("thumb", "100x100")], kind="thumb")
     add("B", "png", "thumb_50x50", params=[("thumb", "50x50")])
     add("B", "jpg", "thumb_100x100", params=[("thumb", "100x100")], kind="thumb")
+    # Protected files without a valid token: C has a public viewRule, D none.
+    for label in ("C", "D"):
+        add(label, "png", "protected_no_token", kind="error")
+        add(
+            label,
+            "png",
+            "protected_bad_token",
+            params=[("token", "invalid.token.value")],
+            kind="error",
+        )
     return rows
 
 
@@ -399,7 +505,12 @@ async def pocketbase_server(
 
 
 def _collection_payload(
-    collection_id: str, name: str, thumbs: list[str]
+    collection_id: str,
+    name: str,
+    thumbs: list[str],
+    *,
+    protected: bool = False,
+    view_rule: str | None = "",
 ) -> dict[str, Any]:
     return {
         "id": collection_id,
@@ -411,17 +522,27 @@ def _collection_payload(
                 "type": "file",
                 "required": False,
                 "options": {
-                    "maxSelect": 20,
+                    "maxSelect": 50,
                     "maxSize": 5242880,
                     "mimeTypes": [],
                     "thumbs": thumbs,
-                    "protected": False,
+                    "protected": protected,
                 },
             }
         ],
-        "listRule": "",
-        "viewRule": "",
+        "listRule": view_rule,
+        "viewRule": view_rule,
     }
+
+
+# label, collection id, name, thumbs, protected, viewRule, uploaded keys.
+COLLECTIONS = (
+    ("A", FILES_ID, "probe_files", THUMBS, False, "", None),
+    ("B", PLAIN_ID, "probe_plain", [], False, "", ["png", "jpg"]),
+    ("C", PROTECTED_PUBLIC_ID, "probe_prot_public", [], True, "", ["png"]),
+    ("D", PROTECTED_ADMIN_ID, "probe_prot_admin", [], True, None, ["png"]),
+)
+SCENARIO_PREFIXES = tuple(f"{label}." for label, *_rest in COLLECTIONS)
 
 
 def _stored_names(
@@ -449,14 +570,14 @@ async def run_pocketbase(
         login.raise_for_status()
         admin = {"Authorization": login.json()["token"]}
         targets: dict[str, dict[str, Any]] = {}
-        for label, collection_id, name, thumbs, keys in (
-            ("A", FILES_ID, "probe_files", THUMBS, list(files)),
-            ("B", PLAIN_ID, "probe_plain", [], ["png", "jpg"]),
-        ):
+        for label, collection_id, name, thumbs, protected, rule, keys in COLLECTIONS:
+            keys = keys or list(files)
             response = await client.post(
                 "/api/collections",
                 headers=admin,
-                json=_collection_payload(collection_id, name, thumbs),
+                json=_collection_payload(
+                    collection_id, name, thumbs, protected=protected, view_rule=rule
+                ),
             )
             response.raise_for_status()
             upload = [("docs", (files[key][0], files[key][1])) for key in keys]
@@ -487,6 +608,8 @@ async def run_pocketbase(
         (record_dir / f"{targets['A']['files']['noattrs']}.attrs").unlink()
         (record_dir / targets["A"]["files"]["missing"]).unlink()
         (record_dir / f"{targets['A']['files']['missing']}.attrs").unlink()
+        for key, payload in CRAFTED_ATTRS.items():
+            (record_dir / f"{targets['A']['files'][key]}.attrs").write_bytes(payload)
         shutil.copytree(storage, work / "storage-copy", copy_function=shutil.copy2)
         results = await run_scenarios(client, targets, storage)
         results["sidecar.upload_keys"] = list(
@@ -498,7 +621,7 @@ async def run_pocketbase(
 
 
 async def run_ppbase(
-    database_url: str, work: Path, targets: dict[str, Any]
+    database_url: str, work: Path, targets: dict[str, Any], compat: str
 ) -> dict[str, Any]:
     from httpx import ASGITransport
     from sqlalchemy import select, text
@@ -525,6 +648,10 @@ async def run_ppbase(
         data_dir=str(data_dir),
     )
     app = create_app(settings)
+    if compat == "0.22":
+        # The PocketBase 0.22 compatibility mode (ppbase.storage.serving
+        # pocketbase_compat, the switch of the 0.22 error mode).
+        app.state.error_compat = "0.22"
     engine = await init_engine(database_url, pool_size=5, max_overflow=5)
     try:
         await create_system_tables(engine)
@@ -562,14 +689,21 @@ async def run_ppbase(
         async with httpx.AsyncClient(
             transport=transport, base_url="http://testserver", timeout=120
         ) as client:
-            for label, collection_id, name, thumbs in (
-                ("A", FILES_ID, "probe_files", THUMBS),
-                ("B", PLAIN_ID, "probe_plain", []),
-            ):
+            for (
+                label,
+                collection_id,
+                name,
+                thumbs,
+                protected,
+                rule,
+                _keys,
+            ) in COLLECTIONS:
                 response = await client.post(
                     "/api/collections",
                     headers=admin,
-                    json=_collection_payload(collection_id, name, thumbs),
+                    json=_collection_payload(
+                        collection_id, name, thumbs, protected=protected, view_rule=rule
+                    ),
                 )
                 response.raise_for_status()
                 target = targets[label]
@@ -597,7 +731,7 @@ def _compare(
     pregenerated |= {"A.png.thumb_head", "A.png.thumb_range", "A.png.thumb_download"}
     for key in sorted(set(pocketbase) | set(ppbase)):
         left, right = pocketbase.get(key), ppbase.get(key)
-        if not key.startswith(("A.", "B.")):
+        if not key.startswith(SCENARIO_PREFIXES):
             if key == "sidecar.upload_keys":
                 continue
             if left != right:
@@ -607,9 +741,11 @@ def _compare(
             rows.append({"path": key, "pocketbase": left, "ppbase": right})
             continue
         fields = ["status"]
-        if left.get("kind") == "range_error":
+        if left.get("status") != right.get("status"):
+            pass  # compared on the status only
+        elif left.get("kind") == "range_error":
             fields.append("headers.content-range")
-        elif left.get("kind") != "error":
+        elif left.get("kind") != "error" and int(left.get("status") or 0) < 400:
             generated_here = left.get("kind") == "thumb" and key not in pregenerated
             for header in COMPARED_HEADERS:
                 if generated_here and header in {"content-length", "last-modified"}:
@@ -639,15 +775,16 @@ def main() -> int:
     parser.add_argument("--pocketbase", type=Path, required=True)
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--compat", choices=("0.22", "default"), default="0.22")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ppbase-files-probe-") as root:
         work = Path(root)
         pocketbase, targets = asyncio.run(run_pocketbase(args.pocketbase, work))
-        ppbase = asyncio.run(run_ppbase(args.database_url, work, targets))
+        ppbase = asyncio.run(run_ppbase(args.database_url, work, targets, args.compat))
     differences = _compare(pocketbase, ppbase)
     for row in differences:
-        row["known"] = KNOWN_DIVERGENCES.get(row["path"])
+        row["known"] = known_divergence(row, args.compat)
     for name, payload in (
         ("pocketbase.json", pocketbase),
         ("ppbase.json", ppbase),
@@ -657,10 +794,11 @@ def main() -> int:
             json.dumps(payload, indent=1, sort_keys=True) + "\n"
         )
     unexpected = [row for row in differences if not row["known"]]
-    scenario_count = sum(1 for key in pocketbase if key.startswith(("A.", "B.")))
+    scenario_count = sum(1 for key in pocketbase if key.startswith(SCENARIO_PREFIXES))
     print(
         json.dumps(
             {
+                "compat": args.compat,
                 "scenarios": scenario_count,
                 "differences": len(differences),
                 "known": len(differences) - len(unexpected),
