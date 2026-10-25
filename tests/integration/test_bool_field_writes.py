@@ -53,7 +53,8 @@ FALSE_STRINGS = ("0", "f", "F", "FALSE", "false", "False")
 ERROR_STRINGS = ("", " true", "true ", "tRUE", "yes", "on", "no", "null", "1.0", "-0")
 # Canonical numbers of a multipart value: ParseBool error, false in 0.22.34;
 # v0.40.6 infers a number first (tools/router/unmarshal_request_data.go
-# l.310-342), true.  PPBase follows 0.22.34 (D-XXXX).
+# l.310-342), true.  PPBase follows 0.22.34 in both modes: neither has an
+# inferValue step, for any field type (D-XXXX).
 MULTIPART_NUMBERS = ("2", "-1", "0.5", "10")
 
 
@@ -450,6 +451,11 @@ async def test_022_mode_multipart_values_are_cast_too(
             with_file=True,
         )
         assert stored is expected, raw
+    # A JSON array of @jsonPayload is no repeated multipart key: false.
+    for payload in ({"flag": ["true"]}, {"flag": [True, False]}):
+        fields = [("label", "payload"), ("@jsonPayload", json.dumps(payload))]
+        stored = await _create_form(app_client, collection, fields, with_file=True)
+        assert stored is False, payload
 
     response = await app_client.post(
         f"/api/collections/{bool_env['required']}/records",
