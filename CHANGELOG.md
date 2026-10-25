@@ -154,6 +154,17 @@ See `docs/hidden-auth-fields.md`.
 - Auth record create now accepts PocketBase's `emailVisibility` wire name (it
   previously ignored it, leaving visibility always off).
 
+### NULL values served as PocketBase zero values
+
+See `docs/null-values.md`.
+
+- A `NULL` value (a view `LEFT JOIN` without match, an absent column) is
+  served as the zero value of its field type, like PocketBase 0.22.34 and
+  v0.40.6: `""` for text, email, url, editor and single select/file/relation,
+  `0` for number, `false` for bool, `[]` for multiple select/file/relation
+  (a 0.22 `maxSelect: null` relation included), `null` for json. A `NULL` id
+  is `""`. Stored values, filters, sorts and totals are unchanged.
+
 ### Empty dates served, filtered and sorted like PocketBase
 
 See `docs/empty-dates.md`.
