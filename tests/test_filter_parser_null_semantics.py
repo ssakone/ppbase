@@ -61,6 +61,11 @@ def _sql(expression: str) -> str:
                 "type": "relation",
                 "options": {"collectionId": target.id, "maxSelect": 1},
             },
+            {
+                "name": "rels",
+                "type": "relation",
+                "options": {"collectionId": target.id, "maxSelect": 5},
+            },
         ],
     )
     index = _build_relation_index_from_collections([view, target])
@@ -145,6 +150,38 @@ _JSON_NULL = """("v"."meta" IS NULL OR jsonb_typeof(to_jsonb("v"."meta")) = 'nul
         # Other operators keep their SQL (NULL never matches, as in SQLite).
         ("num > 1", '"v"."num" > 1'),
         ('txt !~ "x"', '"v"."txt"::text NOT ILIKE :_fp2'),
+        # json ~ / !~: a JSON null is NULL (JSON_EXTRACT), never matched.
+        ('meta ~ "x"', """NULLIF("v"."meta"::text, 'null')::text ILIKE :_fp2"""),
+        (
+            'meta !~ "x"',
+            """NULLIF("v"."meta"::text, 'null')::text NOT ILIKE :_fp2""",
+        ),
+        (
+            'meta.k !~ "x"',
+            (
+                """NULLIF(jsonb_extract_path("v"."meta", 'k')::text, 'null')::text """
+                """NOT ILIKE :_fp2"""
+            ),
+        ),
+        (
+            "txt ~ meta",
+            """"v"."txt"::text ILIKE ('%' || NULLIF("v"."meta"::text, 'null')::text || '%')""",
+        ),
+        # json and another column: NULL-safe, without COALESCE (IS / IS NOT).
+        (
+            "meta = meta",
+            (
+                """(NULLIF(to_jsonb("v"."meta"), 'null'::jsonb) IS NOT DISTINCT FROM """
+                """NULLIF(to_jsonb("v"."meta"), 'null'::jsonb))"""
+            ),
+        ),
+        (
+            "meta != txt",
+            (
+                """(NULLIF(to_jsonb("v"."meta"), 'null'::jsonb) IS DISTINCT FROM """
+                """NULLIF(to_jsonb("v"."txt"), 'null'::jsonb))"""
+            ),
+        ),
     ],
 )
 def test_direct_comparisons_follow_resolve_equal_expr(
@@ -190,3 +227,55 @@ def test_sort_places_null_like_sqlite(direction: str, nulls: str) -> None:
     assert _sort_term("RANDOM()", direction, set(), nullable=True) == (
         f"RANDOM() {direction}"
     )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        # No column at all: SQLite compares '' = v / v = w without affinity
+        # (filter.go l.318-338); PostgreSQL would reject 1 = '' (HTTP 500).
+        ("1 = null", "FALSE"),
+        ("1 != null", "TRUE"),
+        ("0 != null", "TRUE"),
+        ("null = 0", "FALSE"),
+        ("true = null", "FALSE"),
+        ("true != null", "TRUE"),
+        ("false != null", "TRUE"),
+        ('1 = ""', "FALSE"),
+        ('1 != ""', "TRUE"),
+        ('"" = 0', "FALSE"),
+        ('true = ""', "FALSE"),
+        ('true != ""', "TRUE"),
+        ("null = null", "TRUE"),
+        ('"" != null', "FALSE"),
+        ('"x" = null', "FALSE"),
+        ('"x" != ""', "TRUE"),
+        ("1 = 1", "TRUE"),
+        ('1 = "1"', "FALSE"),
+        ("true = 1", "TRUE"),
+        ('"a" = "b"', "FALSE"),
+        # ?op without any column is op (no multi-match).
+        ("1 ?= null", "FALSE"),
+        ("1 ?!= null", "TRUE"),
+        ("null ?= null", "TRUE"),
+        ('"a" ?= "a"', "TRUE"),
+        # A compound filter keeps its column part.
+        ('title = "a" || 1 = null', '("v"."title" = :_fp1 OR FALSE)'),
+        ('title = "a" && 1 != null', '("v"."title" = :_fp1 AND TRUE)'),
+    ],
+)
+def test_comparisons_without_a_column_are_folded(
+    expression: str, expected: str
+) -> None:
+    assert _sql(expression) == expected
+
+
+def test_multi_match_fails_a_json_null() -> None:
+    # multiMatchValue is JSON_EXTRACT(...): NULL for a JSON null too, so the
+    # "IS NULL" clause (filter.go l.680-706) fails it.
+    for expression in ('rels.tj != ""', 'rels.tj ~ "x"', "rels.tj.k != null"):
+        sql = _sql(expression)
+        assert 'NULLIF(to_jsonb("__pbsm' in sql, expression
+        assert """"."v"), 'null'::jsonb) IS NULL""" in sql, expression
+    # ``=`` has no NULL clause.
+    assert "IS NULL" not in _sql('rels.tj = ""')

@@ -1058,9 +1058,16 @@ class _FilterTransformer(Transformer):
                 )
             return _guarded(f"{left_sql} {sql_op} {right_sql}")
 
+        # A json operand of ~ / !~ is NULL for a JSON null, like PocketBase's
+        # JSON_EXTRACT (``_json_like_text_sql``).
+        if (op in _LIKE_OPS or op in _ANY_LIKE_OPS) and self._is_json_operand(right):
+            right_sql = self._json_like_text_sql(right_sql)
+
         # LIKE / NOT LIKE
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
+            if self._is_json_operand(left):
+                left_sql = self._json_like_text_sql(left_sql)
             return _guarded(self._like_comparison_sql(left_sql, right, right_sql, sql_op))
 
         # ANY standard operators (for array columns)
@@ -1078,7 +1085,11 @@ class _FilterTransformer(Transformer):
         if op in _ANY_LIKE_OPS:
             sql_op = _ANY_LIKE_OPS[op]
             pattern_sql = self._like_pattern_sql(right, right_sql)
-            return _guarded(self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op))
+            return _guarded(
+                self._scalar_or_array_like_sql(
+                    left_sql, pattern_sql, sql_op, json=self._is_json_operand(left)
+                )
+            )
 
         return _guarded(f"{left_sql} = {right_sql}")
 
@@ -1108,9 +1119,11 @@ class _FilterTransformer(Transformer):
         one case and only a relation/``@collection`` path adds the
         multi-match subquery (v0.22.34 tools/search/filter.go l.150-215,
         v0.40.6 l.188-252).  A current-record field never multi-matches; a
-        multi-value one is compared through its JSON text.  Kept as is: json
-        operands (PPBase's array-any reading), ``:each`` operands and fields
-        without metadata.
+        multi-value one is compared through its JSON text, and literals,
+        ``null`` and ``@request.*``/``@now`` values never multi-match either
+        (static values, v0.22.34 resolvers/record_field_resolver.go
+        l.162-225).  Kept as is: json operands (PPBase's array-any reading),
+        ``:each`` operands and fields without metadata.
         """
         if op not in _ANY_STANDARD_OPS and op not in _ANY_LIKE_OPS:
             return op
@@ -1119,6 +1132,11 @@ class _FilterTransformer(Transformer):
             self._is_each_node(node) or self._is_json_operand(node) for node in nodes
         ):
             return op
+        if all(
+            isinstance(node, tuple) and node and node[0] in {"literal", "null", "macro"}
+            for node in nodes
+        ):
+            return op[1:]
         for node in nodes:
             if not isinstance(node, tuple) or not node:
                 continue
@@ -1217,21 +1235,68 @@ class _FilterTransformer(Transformer):
         v0.40.6 l.334-422): ``!=`` is NULL-safe (``IS NOT``), an empty operand
         (``""``, ``null``) also matches NULL, two columns are compared with
         ``COALESCE(x, '')`` and a json operand without COALESCE.  Only NULL
-        values change: two non-NULL values keep their typed comparison.
+        values change: two non-NULL values keep their typed comparison, and
+        a comparison without any column is folded (``_pb_equal_sql``).
         """
         json_null = self._json_null_equal_sql(
             left, left_sql, right, right_sql, equal=equal
         )
         if json_null is not None:
             return json_null
-        if self._is_json_operand(left) or self._is_json_operand(right):
-            # Any other json comparison is not a NULL case: unchanged SQL.
-            return f"{left_sql} {'=' if equal else '!='} {right_sql}"
         left_side = self._side_from_sql(left, left_sql)
         right_side = self._side_from_sql(right, right_sql)
+        if self._is_json_operand(left) or self._is_json_operand(right):
+            if left_side.kind == "column" and right_side.kind == "column":
+                return self._json_columns_equal_sql(left_sql, right_sql, equal=equal)
+            # A json operand and a non-null value: unchanged SQL (open
+            # divergence, docs/null-values.md).
+            return f"{left_sql} {'=' if equal else '!='} {right_sql}"
         if left_side.kind == "column" and right_side.kind == "column":
             return self._columns_equal_sql(left_sql, right_sql, equal=equal)
         return self._pb_equal_sql(left_side, right_side, equal=equal)
+
+    @staticmethod
+    def _json_value_sql(sql: str) -> str:
+        """A json operand with a JSON ``null`` read as SQL NULL.
+
+        PocketBase reads json values through ``JSON_EXTRACT``, which yields
+        SQL NULL for a JSON ``null`` (v0.22.34 tools/dbutils/json.go
+        l.30-47); PPBase stores it as ``jsonb 'null'``.
+        """
+        return f"NULLIF(to_jsonb({sql}), 'null'::jsonb)"
+
+    @staticmethod
+    def _json_like_text_sql(sql: str) -> str:
+        """The text a ``~``/``!~`` reads from a json operand, NULL for a JSON
+        ``null``.
+
+        PocketBase matches ``JSON_EXTRACT(x, '$...') LIKE ...``: a JSON
+        ``null`` (and a SQL NULL) is NULL, so neither ``~`` nor ``!~``
+        matches it (v0.22.34 tools/search/filter.go l.155-168,
+        tools/dbutils/json.go l.30-47).  ``x::text`` is ``'null'`` only for a
+        JSON ``null`` (a text column holding ``null`` is valid JSON for
+        ``JSON_EXTRACT`` too); every other text is unchanged.
+        """
+        return f"NULLIF({sql}::text, 'null')"
+
+    def _json_columns_equal_sql(
+        self, left_sql: str, right_sql: str, *, equal: bool
+    ) -> str:
+        """``x = y``/``x != y`` of two columns, one of them json.
+
+        A json operand is compared without COALESCE and NULL-safe:
+        ``JSON_EXTRACT(x) IS [NOT] y`` (``NoCoalesce``, v0.22.34
+        tools/search/filter.go l.308-316), so two NULLs (SQL NULL or JSON
+        ``null``) are equal and a NULL differs from any value.  Two non-null
+        values are compared as jsonb (``to_jsonb``): the jsonb equality of
+        two jsonb columns is unchanged, a json and a text/number/bool column
+        no longer fail with a PostgreSQL type error.
+        """
+        distinct = "IS NOT DISTINCT FROM" if equal else "IS DISTINCT FROM"
+        return (
+            f"({self._json_value_sql(left_sql)} {distinct} "
+            f"{self._json_value_sql(right_sql)})"
+        )
 
     def _columns_equal_sql(self, left_sql: str, right_sql: str, *, equal: bool) -> str:
         """``COALESCE(a, '') = COALESCE(b, '')``, typed for non-NULL values.
@@ -1343,9 +1408,17 @@ class _FilterTransformer(Transformer):
         container_sql: str,
         pattern_sql: str,
         sql_op: str,
+        *,
+        json: bool = False,
     ) -> str:
-        """Build scalar-safe ``?~``/``?!~`` SQL."""
+        """Build scalar-safe ``?~``/``?!~`` SQL.
+
+        ``json``: the container is a json value, whose JSON ``null`` never
+        matches (``_json_like_text_sql``).
+        """
         container_text = self._text_cast_sql(container_sql)
+        if json:
+            container_text = self._json_like_text_sql(container_sql)
         if container_sql in self._json_text_operands:
             return f"{container_text} {sql_op} {pattern_sql}"
         if self._is_bound_param(container_sql):
@@ -1741,24 +1814,53 @@ class _FilterTransformer(Transformer):
         }[op]
         return "TRUE" if result else "FALSE"
 
+    def _folded_equal_sql(
+        self, left: _Side, right: _Side, *, equal: bool
+    ) -> str | None:
+        """``TRUE``/``FALSE`` of ``=``/``!=`` without any column, else ``None``.
+
+        PocketBase renders ``'' = ''`` for two empty operands, ``'' = v`` for
+        an empty operand and a known non-empty value (numbers, ``true`` and
+        ``false`` are ``1``/``0``), and ``v = w`` for two values, all compared
+        by SQLite without column affinity (v0.22.34 tools/search/filter.go
+        l.226-282 and l.318-338): ``1 = null`` is false, ``1 != null`` true,
+        ``1 = "1"`` false and ``1 = true`` true.  PostgreSQL would reject
+        ``1 = ''`` or ``TRUE = 1`` (HTTP 500), so the result is folded like
+        ``_static_equal_sql``; a value whose SQL is evaluated by PostgreSQL
+        (``@now``) is only folded against an empty operand.
+        """
+        if left.kind == "column" or right.kind == "column":
+            return None
+        if left.kind == "empty" or right.kind == "empty":
+            same = left.kind == right.kind
+        else:
+            left_known, left_value = self._static_value(left)
+            right_known, right_value = self._static_value(right)
+            if not (left_known and right_known):
+                return None
+            same = _sqlite_compare(left_value, right_value) == 0
+        return "TRUE" if same == equal else "FALSE"
+
     def _pb_equal_sql(self, left: _Side, right: _Side, *, equal: bool) -> str:
         """``=``/``!=`` like PocketBase ``resolveEqualExpr``.
 
         ``!=`` is NULL-safe (``IS NOT``); an empty operand also matches NULL;
         otherwise both sides are compared with ``COALESCE(x, '')``
-        (v0.22.34 tools/search/filter.go l.290-368).
+        (v0.22.34 tools/search/filter.go l.290-368).  Without any column the
+        result is known while parsing (``_folded_equal_sql``).
         """
         compare = "=" if equal else "IS DISTINCT FROM"
         concat = "OR" if equal else "AND"
         null_check = "IS NULL" if equal else "IS NOT NULL"
         left_empty = left.kind == "empty"
         right_empty = right.kind == "empty"
-        if left_empty and right_empty:
-            return "TRUE" if equal else "FALSE"
+        folded = self._folded_equal_sql(left, right, equal=equal)
+        if folded is not None:
+            return folded
         if left.kind == "value" or right.kind == "value":
-            left_sql = "''" if left_empty else left.sql
-            right_sql = "''" if right_empty else right.sql
-            return f"{left_sql} {compare} {right_sql}"
+            # A column and a known non-empty value (an empty operand without
+            # a column is folded above: '' is never compared with a value).
+            return f"{left.sql} {compare} {right.sql}"
         if left_empty:
             return (
                 f"({self._text_cast_sql(right.sql)} {compare} '' "
@@ -1784,6 +1886,14 @@ class _FilterTransformer(Transformer):
                     )
                     if sql is not None:
                         return sql
+            if (
+                (self._side_is_json(left) or self._side_is_json(right))
+                and left.kind == "column"
+                and right.kind == "column"
+            ):
+                return self._json_columns_equal_sql(
+                    left.sql, right.sql, equal=op.removeprefix("?") == "="
+                )
         if left.is_json or right.is_json:
             # JSON leaves keep PPBase's JSON comparison.
             ref, other, ref_is_left = (left, right, True) if left.is_json else (
@@ -1814,10 +1924,17 @@ class _FilterTransformer(Transformer):
         if base_op in {"=", "!="}:
             return self._pb_equal_sql(left, right, equal=base_op == "=")
         if base_op in _LIKE_OPS:
+            # A json leaf (no JSON sub-path): a JSON null never matches.
+            left_sql, right_sql = (
+                self._json_like_text_sql(side.sql)
+                if self._side_is_json(side)
+                else side.sql
+                for side in (left, right)
+            )
             return self._like_comparison_sql(
-                left.sql,
+                left_sql,
                 right.node,
-                right.sql,
+                right_sql,
                 _LIKE_OPS[base_op],
             )
         sql_op = _STANDARD_OPS.get(base_op, "=")
@@ -1840,12 +1957,21 @@ class _FilterTransformer(Transformer):
     def _multi_match_value(alias: str, mm: _MultiMatch, side: _Side) -> tuple[_Side, str]:
         """The subquery value of a multi-match and the SQL that is NULL when
         the joined row is missing (the value itself, or the leaf row id of a
-        nullable date leaf, whose NULL value is an empty date)."""
+        nullable date leaf, whose NULL value is an empty date).
+
+        A json leaf is ``JSON_EXTRACT(...)`` in PocketBase's subquery, NULL
+        for a JSON ``null`` too, so its ``multiMatchValue IS NULL`` clause
+        also fails a JSON ``null`` (v0.22.34 tools/search/filter.go
+        l.680-706, tools/dbutils/json.go l.30-47).
+        """
         value = f'"{alias}"."v"'
         if mm.row_id is None:
             leaf_type = side.node[3] if len(side.node) > 3 else ""
             node = ("sql_ref", value, side.is_json, leaf_type)
-            return _Side(value, "column", node, is_json=side.is_json), value
+            value_side = _Side(value, "column", node, is_json=side.is_json)
+            if _FilterTransformer._side_is_json(value_side):
+                return value_side, _FilterTransformer._json_value_sql(value)
+            return value_side, value
         row_id = f'"{alias}"."r"'
         node = ("sql_ref", value, False, side.node[3], row_id)
         return _Side(value, "column", node), row_id
@@ -1990,14 +2116,16 @@ class _FilterTransformer(Transformer):
             if ref_is_left:
                 return f"{ref_sql} {sql_op} {other_sql}"
             return f"{other_sql} {sql_op} {ref_sql}"
+        # The leaf is a JSON path: a JSON null never matches ~ / !~.
+        ref_text = self._json_like_text_sql(ref_sql)
         if op in _LIKE_OPS:
             sql_op = _LIKE_OPS[op]
             if ref_is_left:
-                return self._like_comparison_sql(ref_sql, other, other_sql, sql_op)
+                return self._like_comparison_sql(ref_text, other, other_sql, sql_op)
             return self._like_comparison_sql(
                 other_sql,
-                ("sql_ref", ref_sql),
-                ref_sql,
+                ("sql_ref", ref_text),
+                ref_text,
                 sql_op,
             )
         if op in _ANY_STANDARD_OPS:
@@ -2009,8 +2137,10 @@ class _FilterTransformer(Transformer):
             sql_op = _ANY_LIKE_OPS[op]
             if ref_is_left:
                 pattern_sql = self._like_pattern_sql(other, other_sql)
-                return self._scalar_or_array_like_sql(ref_sql, pattern_sql, sql_op)
-            pattern_sql = self._like_pattern_sql(("sql_ref", ref_sql), ref_sql)
+                return self._scalar_or_array_like_sql(
+                    ref_sql, pattern_sql, sql_op, json=True
+                )
+            pattern_sql = self._like_pattern_sql(("sql_ref", ref_text), ref_text)
             return self._scalar_or_array_like_sql(other_sql, pattern_sql, sql_op)
         if ref_is_left:
             return f"{ref_sql} = {other_sql}"
