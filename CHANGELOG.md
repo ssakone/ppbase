@@ -147,7 +147,31 @@ See `docs/null-values.md`.
   v0.40.6: `""` for text, email, url, editor and single select/file/relation,
   `0` for number, `false` for bool, `[]` for multiple select/file/relation
   (a 0.22 `maxSelect: null` relation included), `null` for json. A `NULL` id
-  is `""`. Stored values, filters, sorts and totals are unchanged.
+  is `""`. Stored values, filters, sorts and totals are unchanged (filters
+  and sorts: see the next entry).
+
+### NULL values filtered and sorted like PocketBase on SQLite
+
+See `docs/null-values.md`.
+
+- `=`/`!=` follow PocketBase's `resolveEqualExpr` (v0.22.34
+  `tools/search/filter.go` l.284-368, the same in v0.40.6): `""` and `null`
+  also match `NULL` (`txt = ""`, `sel = ""`, `rel = ""`, an auth email read
+  through a `LEFT JOIN`), `!=` is NULL-safe (`txt != "x"` keeps the `NULL`
+  rows) and two columns compare with `COALESCE(x, '')`. A current-record
+  `?op` is `op` (`num ?> 1` was a 500). Non-NULL values keep their
+  comparison. `totalItems` uses the same clause.
+- A json operand compared with `null` or `""` reads like `JSON_EXTRACT`: a
+  SQL `NULL` and a stored JSON `null` are both `null` (also for a base
+  collection, the filter part of BUMA D-0029), only the JSON string `""` is
+  `""` (`meta = ""` was a 500); relation and `@collection` json leaves too.
+- Sort: `NULL` comes first in ascending and last in descending order for
+  every view column and every json value (a JSON `null` sorts as `NULL`),
+  like dates already did. Base and auth columns other than dates are
+  `NOT NULL` and keep their term.
+- Still different (documented): a multi-value field sorts by its array in
+  PPBase and by its JSON text in PocketBase; in a view, an empty date and a
+  `LEFT JOIN` `NULL` tie.
 
 ### Empty dates served, filtered and sorted like PocketBase
 

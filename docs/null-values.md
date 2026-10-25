@@ -29,8 +29,8 @@ A `NULL` id is served `""` and a `NULL` auth `email`/`emailVisibility`/
 l.346-354 and l.534-541).
 
 Only `NULL` values change: stored values (including `""`, `0`, `false`, `[]`
-and a stored JSON `null`) are served as before, and filters, sorts and
-`totalItems` are untouched.
+and a stored JSON `null`) are served as before. Filters and sorts on `NULL`
+follow PocketBase too (next section).
 
 The tables PPBase creates for base and auth collections cannot hold `NULL`
 in a served column outside `date` fields: every other field column, `id`,
@@ -40,6 +40,63 @@ has records (`ppbase/db/schema_manager.py` `_col_ddl` and
 `_AUTH_SYSTEM_COLUMN_DEFINITIONS`). The rule still applies to them, for
 example to a column made nullable by hand.
 
+## Filters and sorts on NULL values
+
+PocketBase builds `=` and `!=` with `resolveEqualExpr` (v0.22.34
+`tools/search/filter.go` l.284-368; unchanged in v0.40.6 l.334-422, which only
+renames `NoCoalesce` to `NullFallback`) and runs them on SQLite. PPBase
+(`ppbase/services/filter_parser.py`, `_direct_equal_sql`, `_pb_equal_sql`,
+`_json_empty_sql`) builds the same result in PostgreSQL:
+
+| Filter | PocketBase SQL | Matches a `NULL` |
+| --- | --- | --- |
+| `x = ""`, `x = null`, `"" = x` | `(x = '' OR x IS NULL)` | yes |
+| `x != ""`, `x != null` | `(x IS NOT '' AND x IS NOT NULL)` | no |
+| `x = "v"` (non-empty value, `true`, `false`, numbers) | `x = 'v'` | no |
+| `x != "v"` | `x IS NOT 'v'` (NULL-safe) | yes |
+| `x = y`, `x != y` (two columns) | `COALESCE(x, '') = COALESCE(y, '')` | as `''` |
+| json `x = null` / `x != null` | `JSON_EXTRACT(x) IS [NOT] NULL` | yes / no |
+| json `x = ""` / `x != ""` | `JSON_EXTRACT(x) IS [NOT] ''` | no / yes |
+
+- The same rules apply to every column type (text, email, url, editor,
+  number, bool, select, file, relation, a multi-value field through its JSON
+  text, an auth record column read through a view `LEFT JOIN`), to relation
+  and `@collection` paths (already `_pb_equal_sql`) and to `@request.*`
+  values. Dates keep their own rules (`empty-dates.md`).
+- A current-record `?=`, `?!=`, `?>`... is the plain operator: PocketBase
+  shares one case per operator pair (filter.go l.150-176) and only adds a
+  multi-match subquery for relation/`@collection` paths (l.183-215). Json
+  operands, `:each` and fields without metadata keep PPBase's array-any
+  reading.
+- Two non-NULL columns keep PostgreSQL's typed comparison: only the `NULL`
+  cases follow `COALESCE(x, '')`.
+- Json: SQLite extracts a JSON `null` as SQL `NULL`
+  (`tools/dbutils/json.go` l.30-47), so a SQL `NULL` and a stored JSON `null`
+  (`jsonb 'null'` in PPBase) are both `null`, for a view, a base collection
+  (the filter part of BUMA D-0029) and json paths (`meta.k = null` matches
+  `{"k": null}`). Other json comparisons are unchanged.
+- `<`, `<=`, `>`, `>=`, `~`, `!~` are unchanged: a `NULL` never matches, as in
+  SQLite.
+- `totalItems` counts with the same `WHERE` clause.
+
+Sort: PocketBase sorts `ORDER BY <column> ASC|DESC` (`tools/search/sort.go`
+l.23-37) and SQLite treats `NULL` as smaller than any value, first in
+ascending and last in descending order
+(https://www.sqlite.org/lang_select.html#orderby); PostgreSQL does the
+opposite by default (https://www.postgresql.org/docs/current/queries-order.html).
+PPBase (`record_service._sort_term`) adds `NULLS FIRST`/`NULLS LAST` to every
+column of a view, to every date and to every json value, which it sorts as
+`NULLIF(to_jsonb(col), 'null'::jsonb)` (PocketBase sorts
+`JSON_EXTRACT(col, '$')`, `NULL` for a JSON `null`). The other base and auth
+columns are `NOT NULL` and keep a plain, index-friendly term. Non-`NULL`
+values keep their order.
+
+Measured by `tests/pocketbase_parity/null_zero_values_probe.py` (`null`
+section: 236 filters, 30 sorts, relation and `@collection` paths into the
+view, an auth `LEFT JOIN` view, json null keys) against the official
+PocketBase 0.22.34 binary; the PocketBase results are pinned in
+`tests/integration/test_null_zero_values.py`.
+
 ## Not applied, and known differences
 
 - `geoPoint` exists only in current PocketBase (v0.40.6
@@ -47,15 +104,15 @@ example to a column made nullable by hand.
   It is not a PocketBase 0.22 type, so a `NULL` geoPoint (only possible in a
   view) stays `null`. Unknown types stay `null` too (0.22.34 l.387-388 leaves
   the value unmodified). A view without a schema serves its raw columns.
-- Filters and sorts on such a view column keep PostgreSQL's `NULL`
-  semantics. Measured by `tests/pocketbase_parity/null_zero_values_probe.py`
-  against the official PocketBase 0.22.34 binary (`KNOWN_DIVERGENCES`): for an
-  unmatched `LEFT JOIN` row, PocketBase matches `txt = ""`, `rel = ""`,
-  `tid = ""` and `meta = null`, and sorts the `NULL` first in ascending order
-  and last in descending order; PPBase does not (dates excepted, see
-  `empty-dates.md`). `num = 0` and `flag = false` agree (neither matches the
-  `NULL`). This is an open filter/sort item, not part of the serialization
-  rule.
+- A multi-value field (select, file, relation) is sorted by its array in
+  PPBase and by its stored JSON text in PocketBase (`'[]'` after `'["x"]'`):
+  the order of non-`NULL` values differs, the `NULL` row is placed like
+  PocketBase (probe `KNOWN_DIVERGENCES`; open, not a `NULL` case).
+- In a view, the empty date of a matched row is `NULL` in PPBase like the
+  `NULL` of a missing row, so both tie in a sort where SQLite puts `NULL`
+  before `''` (`empty-dates.md`).
+- Json comparisons with a non-null value (`meta = 5`, `meta ?= "x"`) keep
+  PPBase's jsonb reading, not `JSON_EXTRACT`'s.
 - A stored JSON `null` of a base record is `jsonb 'null'` in PPBase and SQL
-  `NULL` in PocketBase: same served `null`, different `= null`/`!= null`
-  filters (BUMA D-0029).
+  `NULL` in PocketBase: same served `null` and, since WS-A11, the same
+  `= null`/`!= null` filters and sort (BUMA D-0029).

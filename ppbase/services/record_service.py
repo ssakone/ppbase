@@ -234,7 +234,7 @@ def _sort_term(
     """Render one ``ORDER BY`` term like PocketBase sorts it.
 
     PocketBase sorts with ``ORDER BY <identifier> ASC|DESC`` (v0.22.34
-    tools/search/sort.go l.23-37, v0.40.6 l.30-50) on SQLite, where NULL is
+    tools/search/sort.go l.23-37, v0.40.6 l.26-45) on SQLite, where NULL is
     smaller than any value: first in ascending order, last in descending
     order (https://www.sqlite.org/lang_select.html#orderby).  PostgreSQL sorts
     NULL as larger than any value, hence an explicit ``NULLS FIRST`` /
@@ -245,7 +245,7 @@ def _sort_term(
     - every column of a view (``nullable``): a ``LEFT JOIN`` without match;
     - a json value: PocketBase sorts ``JSON_EXTRACT(col, '$')``, which is SQL
       NULL for a JSON ``null`` (v0.22.34 resolvers/record_field_resolve_runner.go
-      l.465-470), stored by PPBase as ``jsonb 'null'``.
+      l.465-474), stored by PPBase as ``jsonb 'null'``.
 
     The other base and auth columns are ``NOT NULL``: their term is unchanged.
     """

@@ -1135,8 +1135,8 @@ class _FilterTransformer(Transformer):
 
         PocketBase compares ``JSON_EXTRACT(x, '$...') IS [NOT] <other>``
         without COALESCE (``NoCoalesce``: v0.22.34
-        resolvers/record_field_resolve_runner.go l.465-470 and l.495-506,
-        tools/dbutils/json.go l.31-46, tools/search/filter.go l.308-317).
+        resolvers/record_field_resolve_runner.go l.465-474 and l.481-507,
+        tools/dbutils/json.go l.30-47, tools/search/filter.go l.308-317).
         SQLite extracts a JSON ``null`` as SQL NULL, so a SQL NULL and a
         stored JSON ``null`` (``jsonb 'null'`` in PPBase) are both null, and
         only the JSON string ``""`` is ``''``.  ``None`` when ``other`` is not
