@@ -57,6 +57,7 @@ from ppbase.services.record_service import (
     list_records,
     relation_target_errors,
     resolve_collection,
+    touched_file_fields,
     update_record,
 )
 from ppbase.services.record_storage_coordinator import (
@@ -567,6 +568,8 @@ async def _file_load_errors_before_hooks(
     names again after the hooks.
     """
     if get_error_compat(request.app) != POCKETBASE_022:
+        return {}
+    if not touched_file_fields(collection, data, files):
         return {}
     auth_ctx, request_context = _prepare_rule_context(request, auth, data=data)
     rule_result = check_rule(rule, auth_ctx)

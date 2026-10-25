@@ -507,6 +507,24 @@ def has_relation_fields(collection: Any) -> bool:
     return bool(_relation_field_definitions(collection))
 
 
+def touched_file_fields(
+    collection: Any,
+    data: Any,
+    files: dict[str, list[tuple[str, bytes]]] | None,
+) -> list[FieldDefinition]:
+    """The file fields a record write addresses (no database access)."""
+    from ppbase.services.record_file_fields import is_touched, upload_counts
+
+    if not isinstance(data, dict):
+        return []
+    counts = upload_counts(files)
+    return [
+        field
+        for field in _get_schema_fields(collection)
+        if field.type == FieldType.FILE and is_touched(field.name, data, counts)
+    ]
+
+
 async def file_name_load_errors(
     engine: AsyncEngine,
     collection: Any,
@@ -526,21 +544,14 @@ async def file_name_load_errors(
     """
     from ppbase.services.record_file_fields import (
         POCKETBASE_022,
-        is_touched,
         plan_file_field,
         upload_counts,
     )
 
-    if not isinstance(data, dict):
-        return {}
-    counts = upload_counts(files)
-    touched = [
-        field
-        for field in _get_schema_fields(collection)
-        if field.type == FieldType.FILE and is_touched(field.name, data, counts)
-    ]
+    touched = touched_file_fields(collection, data, files)
     if not touched:
         return {}
+    counts = upload_counts(files)
     old_row: dict[str, Any] = {}
     if record_id is not None:
         try:
