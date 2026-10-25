@@ -19,13 +19,13 @@ current value, the request data and the uploads, with the semantics of the
 current PocketBase (``CURRENT``) or of 0.22.34 (``POCKETBASE_022``).  The two
 differ beyond the error (see each function).  ``None`` keeps the current
 semantics without the name check, for server-side callers of the record
-service (an OAuth2 avatar URL, for example).
+service (an OAuth2 avatar URL, for example), like 0.22.34 ``dao.SaveRecord``.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,6 +78,32 @@ class FilePlan:
 def semantics_for_mode(error_compat: str) -> str:
     """The semantics of an app error mode (``"0.22"`` or PPBase's own)."""
     return POCKETBASE_022 if error_compat == POCKETBASE_022 else CURRENT
+
+
+def server_semantics_for_mode(error_compat: str) -> str | None:
+    """The semantics of a server-side write (``pb.records()``, ``e.records()``).
+
+    v0.40.6 ``app.Save`` validates the record (core/db.go l.178-187,
+    l.280-286), so ``FileField.ValidateValue`` refuses a name the record does
+    not have there too (core/record_model.go l.1427-1433, core/field_file.go
+    l.241-269); 0.22.34 ``dao.SaveRecord`` saves without any form validation
+    (daos/record.go l.586-610).
+    """
+    return None if error_compat == POCKETBASE_022 else CURRENT
+
+
+class MultipartText(str):
+    """A multipart text value of a record request, in the 0.22 mode.
+
+    PocketBase 0.22.34 keeps the text values of a file field key as a list of
+    strings (forms/record_upsert.go l.191-196) and ``list.ToUniqueStringSlice``
+    never JSON-decodes a ``[]string`` (tools/list/list.go l.115-116), so
+    ``docs='["a","b"]'`` is one (unknown) name.  Only the exact field key is
+    concerned: any other key keeps its first value as a string (l.195), that
+    a modifier decodes like JSON text.  Everywhere else it is a ``str``.
+    """
+
+    __slots__ = ()
 
 
 def _entry_key(entry: str | Upload) -> Any:
@@ -238,6 +264,8 @@ def _plan_022(
     name, multiple = plan.name, plan.multiple
     old = to_unique_string_list(old_value)
     value: Any = data.get(name, old_value)
+    if isinstance(value, MultipartText):
+        value = [str(value)]
     if f"{name}+" in data:
         value = _normalize(_to_slice_022(value), multiple)
     if f"{name}-" in data:
@@ -328,11 +356,73 @@ def is_touched(name: str, data: Mapping[str, Any], uploads: Mapping[str, int]) -
     PPBase only writes the columns an update changes, so an untouched file
     field keeps its stored value as is.
     """
-    keys = (name, f"{name}+", f"+{name}", f"{name}-")
-    if any(key in data or uploads.get(key) for key in keys):
-        return True
+    return bool(field_keys(name, data)) or any(
+        uploads.get(key) for key in (name, f"{name}+", f"+{name}", f"{name}-")
+    )
+
+
+def field_keys(name: str, data: Mapping[str, Any]) -> list[str]:
+    """The keys of ``data`` that address the field ``name``.
+
+    The value, its modifiers (``f+``, ``+f``, ``f-``) and the legacy
+    ``f.<name>`` / ``f.<index>`` deletions.
+    """
+    keys = {name, f"{name}+", f"+{name}", f"{name}-"}
     prefix = f"{name}."
-    return any(isinstance(key, str) and key.startswith(prefix) for key in data)
+    return [
+        key
+        for key in data
+        if key in keys or (isinstance(key, str) and key.startswith(prefix))
+    ]
+
+
+#: Keys that 0.22.34 ``LoadData`` reads before the schema fields
+#: (forms/record_upsert.go l.367-395), or never reads from a request.
+_LOADED_BEFORE_SCHEMA = frozenset(
+    {
+        "id",
+        "username",
+        "email",
+        "emailVisibility",
+        "verified",
+        "password",
+        "passwordConfirm",
+        "oldPassword",
+        "created",
+        "updated",
+    }
+)
+
+
+def load_022_create_data(
+    fields: Sequence[Any], data: Mapping[str, Any]
+) -> dict[str, Any]:
+    """0.22.34 ``LoadData`` of an OAuth2 ``createData``, whose error is ignored.
+
+    forms/record_oauth2_login.go l.227 calls ``createForm.LoadData(
+    form.CreateData)`` and drops its error.  ``LoadData`` loads the schema
+    fields in order and returns at the first file field that names a file
+    the new record does not have (forms/record_upsert.go l.415-439), so that
+    field and every schema field after it keep their default value; the
+    fields before it and the auth fields (l.367-395) are loaded.  Returns
+    ``data`` without the keys of the fields 0.22.34 does not load.
+    """
+    result = dict(data)
+    schema = [
+        field_def
+        for field_def in fields
+        if field_def.name not in _LOADED_BEFORE_SCHEMA
+        and getattr(field_def, "type", None) != "autodate"
+    ]
+    for index, field_def in enumerate(schema):
+        if getattr(field_def, "type", None) != "file":
+            continue
+        if plan_file_field(POCKETBASE_022, field_def, None, data, {}).load_error:
+            for skipped in schema[index:]:
+                for key in field_keys(skipped.name, result):
+                    del result[key]
+            break
+    return result
 
 
 def file_value(plan: FilePlan, saved: Mapping[Upload, str]) -> str | list[str]:

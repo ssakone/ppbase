@@ -10,6 +10,7 @@ import json as _json
 import logging
 import mimetypes
 import re
+from collections.abc import Collection
 from datetime import UTC, datetime, timezone
 from typing import Any
 
@@ -176,6 +177,7 @@ def _resolve_file_fields(
     saved_upload_names: list[str],
     *,
     only_touched: bool,
+    unchecked: frozenset[str] = frozenset(),
 ) -> dict[str, str | list[str]]:
     """Resolve, check and save the file fields of a record write.
 
@@ -184,7 +186,8 @@ def _resolve_file_fields(
     others get their uploads saved and are returned with their final value.
     With the 0.22 semantics a submitted name the record does not have raises
     :class:`FileNamesLoadError` for the first such field, before anything is
-    saved (v0.22.34 forms/record_upsert.go l.415-439).
+    saved (v0.22.34 forms/record_upsert.go l.415-439).  The ``unchecked``
+    fields hold a value set by the server itself: no name check.
     """
     from ppbase.services.file_storage import save_files
     from ppbase.services.record_file_fields import (
@@ -202,7 +205,11 @@ def _resolve_file_fields(
         if only_touched and not is_touched(field_def.name, data, counts):
             continue
         plan = plan_file_field(
-            semantics, field_def, old_row.get(field_def.name), data, counts
+            None if field_def.name in unchecked else semantics,
+            field_def,
+            old_row.get(field_def.name),
+            data,
+            counts,
         )
         if plan.load_error:
             raise FileNamesLoadError({plan.name: dict(plan.error or {})})
@@ -1255,6 +1262,7 @@ async def create_record(
     files: dict[str, list[tuple[str, bytes]]] | None = None,
     *,
     file_semantics: str | None = None,
+    unchecked_file_fields: Collection[str] = (),
 ) -> dict[str, Any]:
     """Create a new record in the collection.
 
@@ -1262,9 +1270,11 @@ async def create_record(
     Handles file uploads if files dict is provided.
 
     ``file_semantics`` (``record_file_fields.CURRENT`` or ``POCKETBASE_022``,
-    passed by the record API) refuses submitted file names like PocketBase:
-    a new record has no file yet.  ``None`` (server-side callers) accepts
-    them, as before.
+    passed by the record API and ``pb.records()``) refuses submitted file
+    names like PocketBase: a new record has no file yet.  ``None``
+    (server-side callers) accepts them, as before; so do the
+    ``unchecked_file_fields`` (a value the server sets itself, like the
+    OAuth2 avatar URL mapping).
 
     Relation targets are not looked up here, like PocketBase
     ``dao.SaveRecord``; the record API checks them first with
@@ -1409,6 +1419,7 @@ async def create_record(
         errors,
         saved_upload_names,
         only_touched=False,
+        unchecked=frozenset(unchecked_file_fields),
     )
 
     try:

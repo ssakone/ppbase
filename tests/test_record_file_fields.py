@@ -8,10 +8,13 @@ from ppbase.services.record_file_fields import (
     CURRENT,
     POCKETBASE_022,
     UNKNOWN_FILENAMES,
+    MultipartText,
     Upload,
     file_value,
     is_touched,
+    load_022_create_data,
     plan_file_field,
+    server_semantics_for_mode,
 )
 
 SINGLE = SimpleNamespace(name="doc", options={"maxSelect": 1})
@@ -118,3 +121,61 @@ def test_touched_fields() -> None:
         ({}, {"docs+": 1}),
     ):
         assert is_touched("docs", data, uploads)
+
+
+def test_022_multipart_text_of_the_field_is_one_raw_name() -> None:
+    """forms/record_upsert.go l.191-196 and tools/list/list.go l.115-116."""
+    reordered = '["c.txt","a.txt","b.txt"]'
+    plan = _plan(POCKETBASE_022, MULTI, OLD, {"docs": MultipartText(reordered)})
+    assert plan.load_error and plan.error == UNKNOWN_FILENAMES
+    plan = _plan(POCKETBASE_022, MULTI, OLD, {"docs": reordered})
+    assert plan.error is None and plan.entries == ["c.txt", "a.txt", "b.txt"]
+    # Another key keeps its first value as a string, decoded by the modifier.
+    plan = _plan(POCKETBASE_022, MULTI, OLD, {"docs-": MultipartText('["a.txt"]')})
+    assert plan.error is None and plan.entries == ["b.txt", "c.txt"]
+    plan = _plan(POCKETBASE_022, MULTI, OLD, {"docs": MultipartText("")})
+    assert plan.error is None and plan.entries == []
+    # The current semantics decodes it (core/field_file.go l.728-762).
+    plan = _plan(CURRENT, MULTI, OLD, {"docs": MultipartText(reordered)})
+    assert plan.error is None and plan.entries == ["c.txt", "a.txt", "b.txt"]
+
+
+def test_022_oauth2_create_data_stops_at_the_first_refused_file_field() -> None:
+    """forms/record_oauth2_login.go l.227, forms/record_upsert.go l.367-439."""
+    fields = [
+        SimpleNamespace(name="username", type="text", options={}),
+        SimpleNamespace(name="title", type="text", options={}),
+        SimpleNamespace(name="doc", type="file", options={"maxSelect": 1}),
+        SimpleNamespace(name="docs", type="file", options={"maxSelect": 4}),
+        SimpleNamespace(name="later", type="text", options={}),
+    ]
+    data = {
+        "id": "abc",
+        "email": "e@example.invalid",
+        "username": "u",
+        "title": "t",
+        "doc": "",
+        "docs": ["x.txt"],
+        "later": "l",
+        "later+": "m",
+        "unknown": 1,
+    }
+    assert load_022_create_data(fields, data) == {
+        "id": "abc",
+        "email": "e@example.invalid",
+        "username": "u",
+        "title": "t",
+        "doc": "",
+        "unknown": 1,
+    }
+    clean = {"title": "t", "doc": "", "docs": [], "later": "l"}
+    assert load_022_create_data(fields, clean) == clean
+    # The legacy ``docs.0`` deletion runs first (models/record.go l.635-673).
+    deleted = {"docs": ["x.txt"], "docs.0": "", "later": "l"}
+    assert load_022_create_data(fields, deleted) == deleted
+
+
+def test_server_side_semantics() -> None:
+    """v0.40.6 ``app.Save`` validates; 0.22.34 ``dao.SaveRecord`` does not."""
+    assert server_semantics_for_mode("") == CURRENT
+    assert server_semantics_for_mode("0.22") is None

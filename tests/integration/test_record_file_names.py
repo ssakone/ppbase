@@ -22,7 +22,16 @@ import pytest_asyncio
 from httpx import AsyncClient
 
 from ppbase.db.engine import get_engine
+from ppbase.ext.events import RecordRequestEvent
+from ppbase.ext.record_repository import RecordRepository
+from ppbase.ext.registry import (
+    HOOK_RECORD_CREATE_REQUEST,
+    HOOK_RECORD_UPDATE_REQUEST,
+    ExtensionRegistry,
+)
 from ppbase.middleware.error_compat import set_error_compat
+from ppbase.services import oauth2_service
+from ppbase.services.record_file_fields import CURRENT
 from ppbase.services.record_service import (
     FileNamesLoadError,
     _ValidationErrors,
@@ -475,3 +484,317 @@ async def test_022_access_errors_come_first(
         json={"doc": "x.txt"},
     )
     assert response.status_code == 404, response.text
+
+
+# ---------------------------------------------------------------------------
+# Other paths into a record: request hooks, OAuth2 createData, multipart
+# text values, server-side repositories
+# ---------------------------------------------------------------------------
+
+
+def _load_error_bytes(field: str) -> bytes:
+    return (
+        b'{"code":400,"message":"'
+        + LOAD_ERROR.encode()
+        + b'","data":{"'
+        + field.encode()
+        + b'":{"code":"validation_unknown_filenames","message":"The field contains '
+        b'unknown filenames."}}}\n'
+    )
+
+
+@pytest.mark.parametrize("mode", ["", "0.22"])
+async def test_request_hooks_cannot_inject_names(
+    app_client: AsyncClient, env: dict, mode: str
+) -> None:
+    """A name that a request hook writes in ``e.data`` is checked after it.
+
+    v0.40.6 saves after the hooks with ``app.Save``, which validates
+    (apis/record_crud.go l.346-352, l.485-491).  0.22.34 validates the form
+    before the ``OnRecordBefore*Request`` hooks and ``dao.SaveRecord`` saves
+    what they set on ``e.Record`` (forms/record_upsert.go l.744-749, l.809;
+    apis/record_crud.go l.280-284, l.372-376): PPBase refuses that name in
+    the 0.22 mode too, with the 0.22 load error (deliberate divergence).
+    """
+    other = await _fresh(app_client, env)
+    record = await _fresh(app_client, env)
+    app = _app(app_client)
+    previous = getattr(app.state, "extension_registry", None)
+    registry = previous or ExtensionRegistry()
+    app.state.extension_registry = registry
+    injected = {
+        HOOK_RECORD_CREATE_REQUEST: ("doc", other["doc"]),
+        HOOK_RECORD_UPDATE_REQUEST: ("docs", [*record["docs"], other["docs"][0]]),
+    }
+    bound = []
+    for hook_name, (field, value) in injected.items():
+
+        async def inject(e: Any, field: str = field, value: Any = value) -> Any:
+            if getattr(e.collection, "name", None) == env["open"]:
+                e.data = {**e.data, field: value}
+            return await e.next()
+
+        bound.append((hook_name, registry.get_hook(hook_name).bind_func(inject)))
+    set_error_compat(app, mode)
+    url = f"/api/collections/{env['open']}/records"
+    try:
+        created = await app_client.post(url, json={"title": "hook-injected"})
+        updated = await _patch(app_client, env, record, json={"title": "hooked"})
+    finally:
+        set_error_compat(app, "")
+        for hook_name, binding in bound:
+            registry.get_hook(hook_name).unbind(binding)
+        app.state.extension_registry = previous
+    for response, (field, value) in zip(
+        (created, updated), injected.values(), strict=True
+    ):
+        assert response.status_code == 400, response.text
+        if mode == "0.22":
+            assert response.content == _load_error_bytes(field)
+        else:
+            name = value if isinstance(value, str) else value[-1]
+            assert response.json()["data"][field] == {
+                "code": "validation_invalid_file",
+                "message": f"Invalid new files: [{name}].",
+                "params": {"invalidFiles": [name]},
+            }
+    after = await _get(app_client, env, record)
+    _same_files(after, record)
+    assert after["title"] == record["title"]
+    listed = await app_client.get(
+        url, params={"filter": 'title="hook-injected"'}, headers=env["admin"]
+    )
+    assert listed.status_code == 200 and listed.json()["totalItems"] == 0
+
+
+class _FakeOAuth2Provider:
+    """In-process provider: the code names the provider user (no network)."""
+
+    def __init__(self, client_id: str, client_secret: str) -> None:
+        pass
+
+    async def exchange_code(self, code: str, redirect_url: str, verifier: str):
+        return {"access_token": f"token-{code}"}
+
+    async def get_user_info(self, access_token: str) -> dict:
+        user = access_token.removeprefix("token-")
+        return {
+            "id": f"provider-{user}",
+            "email": f"{user}@example.invalid",
+            "name": "OAuth2 User",
+            "avatarURL": "https://avatars.example.invalid/a.png",
+        }
+
+
+@pytest_asyncio.fixture
+async def oauth2_env(
+    app_client: AsyncClient, admin_token: str, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[dict]:
+    monkeypatch.setattr(
+        oauth2_service, "get_provider_credentials", lambda *a, **k: ("id", "secret")
+    )
+    monkeypatch.setattr(
+        oauth2_service, "get_provider_class", lambda name: _FakeOAuth2Provider
+    )
+    admin = {"Authorization": admin_token}
+    name = f"fnames_oauth_{uuid.uuid4().hex[:8]}"
+    response = await app_client.post(
+        "/api/collections",
+        headers=admin,
+        json={
+            "name": name,
+            "type": "auth",
+            **RULES,
+            "options": {
+                "oauth2": {"enabled": True, "mappedFields": {"avatarURL": "avatar"}}
+            },
+            "schema": [
+                {"name": "title", "type": "text"},
+                {"name": "avatar", "type": "file", "options": {"maxSelect": 1}},
+                {"name": "docs", "type": "file", "options": {"maxSelect": 4}},
+                {"name": "later", "type": "text"},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    collection = response.json()
+    root = Path(_app(app_client).state.settings.data_dir).expanduser().resolve()
+    try:
+        yield {"admin": admin, "name": name, "id": collection["id"], "root": root}
+    finally:
+        set_error_compat(_app(app_client), "")
+        await app_client.delete(f"/api/collections/{collection['id']}", headers=admin)
+
+
+async def _oauth2(client: AsyncClient, oauth2_env: dict, code: str, data: dict):
+    return await client.post(
+        f"/api/collections/{oauth2_env['name']}/auth-with-oauth2",
+        json={
+            "provider": "google",
+            "code": code,
+            "codeVerifier": "verifier",
+            "redirectUrl": "http://localhost/callback",
+            "createData": data,
+        },
+    )
+
+
+def _leftover(oauth2_env: dict, record_id: str) -> str:
+    """An unreferenced object in the directory of a record id still unused."""
+    directory = oauth2_env["root"] / "storage" / oauth2_env["id"] / record_id
+    directory.mkdir(parents=True)
+    (directory / "stray_abcdefghij.txt").write_bytes(b"leftover object\n")
+    return "stray_abcdefghij.txt"
+
+
+async def test_oauth2_create_data_cannot_reference_files(
+    app_client: AsyncClient, oauth2_env: dict
+) -> None:
+    """Current semantics: createData file names are refused (v0.40.6).
+
+    v0.40.6 creates the OAuth2 record by an internal ``POST /records``
+    (apis/record_auth_with_oauth2.go l.319, l.403-425), where
+    ``FileField.ValidateValue`` refuses them (core/field_file.go l.250-269).
+    The provider avatar URL that PPBase maps into a file field is a value of
+    the server, still stored.
+    """
+    files_url = f"/api/files/{oauth2_env['name']}"
+    records_url = f"/api/collections/{oauth2_env['name']}/records"
+    chosen = "chosenrecord001"
+    stray = _leftover(oauth2_env, chosen)
+    for code, data in (
+        ("u1", {"id": chosen, "avatar": stray}),
+        ("u2", {"id": chosen, "docs": [stray]}),
+        ("u3", {"id": chosen, "docs+": [stray]}),
+    ):
+        response = await _oauth2(app_client, oauth2_env, code, data)
+        assert response.status_code == 400, response.text
+        assert "validation_invalid_file" in response.json()["message"], response.text
+        assert stray in response.json()["message"]
+    view = await app_client.get(f"{records_url}/{chosen}", headers=oauth2_env["admin"])
+    assert view.status_code == 404, view.text
+    assert (await app_client.get(f"{files_url}/{chosen}/{stray}")).status_code == 404
+
+    response = await _oauth2(app_client, oauth2_env, "u4", {"title": "t", "docs": []})
+    assert response.status_code == 200, response.text
+    record = response.json()["record"]
+    assert record["avatar"] == "https://avatars.example.invalid/a.png"
+    assert (record["title"], record["docs"]) == ("t", [])
+
+
+async def test_022_oauth2_create_data_file_names_are_not_loaded(
+    app_client: AsyncClient, oauth2_env: dict
+) -> None:
+    """0.22 mode: like 0.22.34 ``LoadData``, whose error OAuth2 ignores.
+
+    forms/record_oauth2_login.go l.227 drops the error of
+    ``createForm.LoadData(form.CreateData)``, which returns at the first
+    file field naming a file the new record does not have
+    (forms/record_upsert.go l.415-439): that field and the schema fields
+    after it are not loaded, the record is created (measured by
+    tests/pocketbase_parity/file_names_probe.py).
+    """
+    set_error_compat(_app(app_client), "0.22")
+    files_url = f"/api/files/{oauth2_env['name']}"
+    chosen = "chosenrecord002"
+    stray = _leftover(oauth2_env, chosen)
+    response = await _oauth2(
+        app_client,
+        oauth2_env,
+        "v1",
+        {"id": chosen, "title": "t", "avatar": stray, "later": "l"},
+    )
+    assert response.status_code == 200, response.text
+    record = response.json()["record"]
+    assert record["id"] == chosen
+    # The client addressed avatar: no provider URL, and nothing loaded after.
+    assert (record["title"], record["avatar"], record["later"]) == ("t", "", "")
+    assert (await app_client.get(f"{files_url}/{chosen}/{stray}")).status_code == 404
+
+    response = await _oauth2(
+        app_client,
+        oauth2_env,
+        "v2",
+        {"title": "t2", "avatar": "", "docs": ["x.txt"], "later": "l2"},
+    )
+    assert response.status_code == 200, response.text
+    record = response.json()["record"]
+    assert (record["title"], record["avatar"], record["docs"]) == ("t2", "", [])
+    assert record["later"] == ""
+
+    response = await _oauth2(
+        app_client, oauth2_env, "v3", {"title": "t3", "docs": [], "later": "l3"}
+    )
+    assert response.status_code == 200, response.text
+    record = response.json()["record"]
+    assert (record["title"], record["later"]) == ("t3", "l3")
+    assert record["avatar"] == "https://avatars.example.invalid/a.png"
+
+
+async def test_multipart_text_json_array_follows_each_version(
+    app_client: AsyncClient, env: dict
+) -> None:
+    """A multipart text ``docs='["b2","b1"]'``: names in v0.40.6, one name in 0.22.34.
+
+    0.22.34 keeps a file field's text values as ``[]string`` (forms/
+    record_upsert.go l.191-196), never JSON-decoded (tools/list/list.go
+    l.115-116); other keys keep their first value as a string (l.195), that
+    ``docs-`` decodes.  v0.40.6 decodes the text (core/field_file.go
+    l.728-762).
+    """
+    record = await _fresh(app_client, env)
+    b1, b2, b3 = record["docs"]
+    reordered = [("docs", (None, json.dumps([b3, b1, b2])))]
+    response = await _patch(app_client, env, record, files=reordered)
+    assert response.status_code == 200, response.text
+    assert response.json()["docs"] == [b3, b1, b2]
+
+    set_error_compat(_app(app_client), "0.22")
+    try:
+        response = await _patch(
+            app_client, env, record, files=[("docs", (None, json.dumps([b1, b2])))]
+        )
+        assert response.status_code == 400
+        assert response.content == _load_error_bytes("docs")
+        assert (await _get(app_client, env, record))["docs"] == [b3, b1, b2]
+        response = await _patch(
+            app_client, env, record, files=[("docs-", (None, json.dumps([b1])))]
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["docs"] == [b3, b2]
+    finally:
+        set_error_compat(_app(app_client), "")
+
+
+async def test_repositories_check_names_like_app_save(
+    app_client: AsyncClient, env: dict
+) -> None:
+    """``pb.records()`` / ``e.records()``: v0.40.6 ``app.Save`` checks names.
+
+    core/db.go l.178-187, l.280-286 and core/record_model.go l.1427-1433
+    (v0.40.6); 0.22.34 ``dao.SaveRecord`` does not validate (daos/record.go
+    l.586-610), so the 0.22 mode keeps accepting them.
+    """
+    record = await _fresh(app_client, env)
+    engine = get_engine()
+    stray = "stray_abcdefghij.txt"
+    repository = RecordRepository(env["open"], engine=engine)
+    assert repository.file_semantics == CURRENT
+    with pytest.raises(_ValidationErrors) as refused:
+        await repository.update(record["id"], {"doc": stray})
+    assert refused.value.errors["doc"]["params"] == {"invalidFiles": [stray]}
+    with pytest.raises(_ValidationErrors):
+        await repository.create({"docs": [record["docs"][0]]})
+    updated = await repository.update(record["id"], {"docs": record["docs"][::-1]})
+    assert updated is not None and updated["docs"] == record["docs"][::-1]
+
+    app = _app(app_client)
+    event = RecordRequestEvent(app=app, engine=engine)
+    assert event.records(env["open"]).file_semantics == CURRENT
+    set_error_compat(app, "0.22")
+    try:
+        assert event.records(env["open"]).file_semantics is None
+        stored = await event.records(env["open"]).update(record["id"], {"doc": stray})
+    finally:
+        set_error_compat(app, "")
+    assert stored is not None and stored["doc"] == stray
