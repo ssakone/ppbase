@@ -142,6 +142,29 @@ def test_content_disposition_quotes_other_names_like_strconv_quote() -> None:
     assert wire == '"été"'.encode()
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Go: CR and LF become spaces, then the value is trimmed.
+        ("image/png\r\nX-Injected: 1", "image/png  X-Injected: 1"),
+        ("\r\n image/png \n", "image/png"),
+        # Other control characters, refused by uvicorn and h11: spaces.
+        ("text/plain\x00\x1f\x7f; charset=utf-8", "text/plain   ; charset=utf-8"),
+        # A horizontal tab is a legal header character, kept inside.
+        ("a\tb", "a\tb"),
+        ("image/jpeg", "image/jpeg"),
+    ],
+)
+def test_header_values_never_carry_control_characters(
+    value: str, expected: str
+) -> None:
+    """A crafted ``.attrs`` content type cannot split nor break the response."""
+    sent = latin1_header_value(value)
+    assert sent == expected
+    assert not any(ord(char) < 0x20 and char != "\t" for char in sent)
+    assert "\x7f" not in sent
+
+
 def test_thumb_sizes_are_matched_exactly() -> None:
     assert thumb_size_allowed("100x100", None)
     assert thumb_size_allowed("100x100", [])

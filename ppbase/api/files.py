@@ -904,10 +904,13 @@ async def generate_file_token(
     return await _trigger_file_token_request_hooks(request, event, _default_file_token)
 
 
-@router.api_route(
+# Two routes, so that OpenAPI keeps one ``GET`` operation (a single route
+# with both methods gives both operations the same generated id).
+@router.head(
     "/{collection_id_or_name}/{record_id}/{filename}",
-    methods=["GET", "HEAD"],
+    include_in_schema=False,
 )
+@router.get("/{collection_id_or_name}/{record_id}/{filename}")
 async def serve_file(
     collection_id_or_name: str,
     record_id: str,

@@ -189,13 +189,20 @@ def content_disposition(disposition: str, served_name: str) -> str:
 
 
 def latin1_header_value(value: str) -> str:
-    """Return ``value`` so that Starlette writes its UTF-8 bytes unchanged.
+    """Return ``value`` as Go's header writer would send it, for Starlette.
 
-    Starlette encodes header values as Latin-1; Go writes the UTF-8 bytes
-    of a header as is.  Mapping each UTF-8 byte to one Latin-1 code point
+    Go replaces CR and LF with spaces and trims the value
+    (``net/http`` ``Header.writeSubset``); the other control characters,
+    which h11 refuses, become spaces too (only a crafted ``.attrs`` holds
+    any).  Starlette encodes header values as Latin-1 while Go writes the
+    UTF-8 bytes as is: mapping each UTF-8 byte to one Latin-1 code point
     sends the same octets on the wire.
     """
-    return value.encode("utf-8", "surrogateescape").decode("latin-1")
+    cleaned = _HEADER_CONTROL_RE.sub(" ", value).strip(" \t")
+    return cleaned.encode("utf-8", "surrogateescape").decode("latin-1")
+
+
+_HEADER_CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
 
 def go_quote(value: str) -> str:
