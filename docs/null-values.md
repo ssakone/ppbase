@@ -208,10 +208,12 @@ owner). The PocketBase results are pinned in
   `day ?~ v`/`day ?!~ v`, now `day ~ v`/`day !~ v`, follow the `~`/`!~`
   difference of `empty-dates.md` (`day ?!~ "tx"` keeps the row of a missing
   target). Probe `KNOWN_DIVERGENCES`, D-0032.
-- Operands of different types: a view column is compared with the affinity
-  of its field type, which is SQLite's for a column the view selects
-  directly; a column computed by an expression has no affinity in SQLite
-  (a number never equals a numeric text there). Relation and `@collection`
+- Operands of different types: PPBase gives a view column the affinity of
+  its field type, which is SQLite's for a column the view selects directly
+  (measured). A column computed by an expression has no affinity in SQLite,
+  so there PocketBase never matches a numeric text against a number column
+  (`n = "5"`) nor a number against a text column (`t = 5` with the text
+  `'5.0'`), where PPBase does (not measured). Relation and `@collection`
   paths and `<`/`<=`/`>`/`>=` between operands of different types keep the
   typed comparison (HTTP 500, as before WS-A11).
 - Json comparisons with a non-null value keep PPBase's jsonb reading,
