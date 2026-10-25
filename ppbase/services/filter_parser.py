@@ -1843,7 +1843,7 @@ class _FilterTransformer(Transformer):
         an empty operand and a known non-empty value (numbers, ``true`` and
         ``false`` are ``1``/``0``), and ``v = w`` for two values, all compared
         by SQLite without column affinity (v0.22.34 tools/search/filter.go
-        l.226-282 and l.318-338): ``1 = null`` is false, ``1 != null`` true,
+        l.226-281 and l.318-338): ``1 = null`` is false, ``1 != null`` true,
         ``1 = "1"`` false and ``1 = true`` true.  PostgreSQL would reject
         ``1 = ''`` or ``TRUE = 1`` (HTTP 500), so the result is folded like
         ``_static_equal_sql``; a value whose SQL is evaluated by PostgreSQL

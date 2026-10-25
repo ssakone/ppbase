@@ -161,17 +161,27 @@ See `docs/null-values.md`.
   rows) and two columns compare with `COALESCE(x, '')`. A current-record
   `?op` is `op` (`num ?> 1` was a 500). Non-NULL values keep their
   comparison. `totalItems` uses the same clause.
+- Visible in API rules: a stored `''` is empty too, so `txt = null` matches
+  it (before: `txt IS NULL`), and an anonymous `@request.auth.id` (`NULL`)
+  `?= owner` lists the records without owner, like PocketBase.
+- A comparison without any column (`1 = null`, `"" = 0`, `true = 1`,
+  `1 ?= null`) is folded like SQLite compares the bound values
+  (`1 = ""` was a 500).
 - A json operand compared with `null` or `""` reads like `JSON_EXTRACT`: a
   SQL `NULL` and a stored JSON `null` are both `null` (also for a base
   collection, the filter part of BUMA D-0029), only the JSON string `""` is
   `""` (`meta = ""` was a 500); relation and `@collection` json leaves too.
+  `~`/`!~`/`?~`/`?!~` and multi-match subqueries also read a JSON `null` as
+  `NULL`, `json != v` and `json ?!= v` keep the `NULL` rows, and a json
+  operand compared with a column is NULL-safe.
 - Sort: `NULL` comes first in ascending and last in descending order for
   every view column and every json value (a JSON `null` sorts as `NULL`),
   like dates already did. Base and auth columns other than dates are
   `NOT NULL` and keep their term.
 - Still different (documented): a multi-value field sorts by its array in
   PPBase and by its JSON text in PocketBase; in a view, an empty date and a
-  `LEFT JOIN` `NULL` tie.
+  `LEFT JOIN` `NULL` tie; a json value compared with a non-null value keeps
+  PPBase's jsonb reading (`meta = 5` on a `jsonb` column is still a 500).
 
 ### Empty dates served, filtered and sorted like PocketBase
 
