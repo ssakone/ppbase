@@ -657,6 +657,49 @@ def pocketbase_022_error(
     }
 
 
+# Go's encoding/json escapes these for HTML safety (HTMLEscape); echo's
+# default JSON serializer keeps that behavior.
+_GO_HTML_ESCAPES = (
+    ("<", "\\u003c"),
+    (">", "\\u003e"),
+    ("&", "\\u0026"),
+    ("\u2028", "\\u2028"),
+    ("\u2029", "\\u2029"),
+)
+
+
+def _sorted_maps(value: Any) -> Any:
+    """Go encodes a ``map[string]any`` with its keys sorted."""
+    if isinstance(value, dict):
+        return {key: _sorted_maps(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_sorted_maps(item) for item in value]
+    return value
+
+
+def encode_like_pocketbase_022(error: dict[str, Any]) -> bytes:
+    """The bytes PocketBase 0.22.34 writes for an ``ApiError``.
+
+    ``e.HttpContext.JSON(apiErr.Code, apiErr)`` (apis/base.go l.104) goes
+    through echo's ``json.NewEncoder(...).Encode``: the struct fields in
+    order (``code``, ``message``, ``data``, apis/api_error.go l.12-15), the
+    ``data`` map with sorted keys, ``<``, ``>``, ``&``, U+2028 and U+2029
+    escaped, non-ASCII text as UTF-8 and a final newline.  Measured on the
+    0.22.34 binary: ``{"code":404,"message":"The requested resource wasn't
+    found.","data":{}}\\n`` (72 bytes) and ``"A\\u003cb\\u003ec\\u0026d\\u2028e"``
+    for a ``"a<b>c&d\\u2028e"`` message.
+    """
+    ordered = {
+        "code": error["code"],
+        "message": error["message"],
+        "data": _sorted_maps(error["data"]),
+    }
+    text = json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+    for char, escape in _GO_HTML_ESCAPES:
+        text = text.replace(char, escape)
+    return (text + "\n").encode("utf-8")
+
+
 def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
     for key, value in headers:
         if key.lower() == name:
@@ -729,9 +772,7 @@ class ErrorCompatMiddleware:
                     {"type": "http.response.body", "body": raw, "more_body": False}
                 )
                 return
-            body = json.dumps(
-                rewritten, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            body = encode_like_pocketbase_022(rewritten)
             headers = [
                 (key, value)
                 for key, value in start_message.get("headers", [])

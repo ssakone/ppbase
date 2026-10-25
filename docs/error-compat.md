@@ -57,6 +57,14 @@ every response with status >= 400 and `Content-Type: application/json`:
   l.67-75: capitalized, final period); an empty message takes the default of
   its status (l.31-65); `data` is always an object (`safeErrorsData`,
   l.77-90);
+- the rewritten body has the bytes of 0.22.34 (`encode_like_pocketbase_022`;
+  `apis/base.go` l.104 writes it with echo's `json.Encoder`): fields in
+  struct order, `data` keys sorted (a Go map), `<`, `>`, `&`, U+2028 and
+  U+2029 escaped as `\u003c`..., UTF-8 text and a final newline — measured on
+  the binary (`{"code":404,"message":"The requested resource wasn't
+  found.","data":{}}` plus `\n`, 72 bytes); the `Content-Type` stays
+  `application/json` (0.22.34 adds `; charset=UTF-8` to every JSON answer,
+  successes included, which this mode does not touch);
 - every other body is left untouched: a host route that already answers
   `{"code", ...}` (BUMA's legacy routes), a custom `{"message": ...}`,
   successes, non-JSON and streamed responses.

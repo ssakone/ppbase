@@ -14,6 +14,7 @@ from ppbase.ext.flask_like_pb import FlaskLikePB
 from ppbase.middleware.error_compat import (
     ERROR_KIND_HEADER,
     ErrorCompatMiddleware,
+    encode_like_pocketbase_022,
     error_kind_headers,
     error_kinds,
     mark_error,
@@ -377,9 +378,8 @@ def _run_middleware(mode: str, status: int, headers: dict[str, str]) -> tuple:
 def test_middleware_consumes_the_kind_header() -> None:
     headers, body = _run_middleware("0.22", 400, {ERROR_KIND_HEADER: "form"})
     assert ERROR_KIND_HEADER.encode() not in headers
-    assert int(headers[b"content-length"]) == len(
-        json.dumps(body, separators=(",", ":"))
-    )
+    # The bytes of PocketBase 0.22.34 (echo's encoder adds a final newline).
+    assert int(headers[b"content-length"]) == len(encode_like_pocketbase_022(body))
     assert body == {
         "code": 400,
         "message": "Something went wrong while processing your request.",
@@ -502,3 +502,41 @@ def test_settings_and_backup_load_errors_take_the_022_message() -> None:
         "message": LOAD_ERROR,
         "data": {},
     }
+
+
+def test_022_error_bytes_are_those_of_pocketbase_022() -> None:
+    # Measured on the 0.22.34 binary (echo's json Encoder, apis/base.go l.104):
+    # GET /api/files/nope/nope/nope.png and a pb_hooks route throwing
+    # BadRequestError("a<b>c&d\u2028e\u00e9").
+    assert (
+        encode_like_pocketbase_022(
+            {"code": 404, "message": "The requested resource wasn't found.", "data": {}}
+        )
+        == b'{"code":404,"message":"The requested resource wasn\'t found.","data":{}}\n'
+    )
+    assert encode_like_pocketbase_022(
+        {"code": 400, "message": "A<b>c&d\u2028e\u00e9.", "data": {}}
+    ) == (
+        '{"code":400,"message":"A\\u003cb\\u003ec\\u0026d\\u2028e\u00e9.","data":{}}\n'
+    ).encode("utf-8")
+    # data is a Go map: its keys are sorted, the struct fields are not.
+    assert encode_like_pocketbase_022(
+        {
+            "code": 400,
+            "message": "x",
+            "data": {
+                "password": {
+                    "message": "Cannot be blank.",
+                    "code": "validation_required",
+                },
+                "identity": {
+                    "message": "Cannot be blank.",
+                    "code": "validation_required",
+                },
+            },
+        }
+    ) == (
+        b'{"code":400,"message":"x","data":{"identity":{"code":"validation_required",'
+        b'"message":"Cannot be blank."},"password":{"code":"validation_required",'
+        b'"message":"Cannot be blank."}}}\n'
+    )
