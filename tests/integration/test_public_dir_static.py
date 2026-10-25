@@ -75,7 +75,6 @@ async def test_public_dir_keeps_api_404_shape_for_missing_api_routes(tmp_path) -
 
     assert response.status_code == 404
     assert response.json() == {
-        "code": 404,
         "status": 404,
         "message": "Not Found",
         "data": {},

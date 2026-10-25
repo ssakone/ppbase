@@ -428,11 +428,6 @@ def create_app(
     app.add_middleware(RateLimitMiddleware)
     app.add_middleware(RequestLoggerMiddleware)
 
-    # Outermost: PocketBase 0.22's error key ``code`` next to ``status``.
-    from ppbase.middleware.error_envelope import ErrorEnvelopeCodeMiddleware
-
-    app.add_middleware(ErrorEnvelopeCodeMiddleware)
-
     # API routes
     from ppbase.api.router import (
         api_router,
@@ -604,8 +599,11 @@ def create_app(
             ),
         )
 
-    # Outermost: PocketBase 0.22 error envelope/messages when the app enables
-    # it (app.state.error_compat); a pass-through otherwise.
+    # Outermost, and the only error post-processing: PPBase answers the exact
+    # envelope of current PocketBase, {status, message, data} (v0.40.6
+    # tools/router/error.go l.36-42); the opt-in 0.22 mode
+    # (app.state.error_compat) answers 0.22.34's {code, message, data} and
+    # messages (docs/error-compat.md).  A pass-through otherwise.
     from ppbase.middleware.error_compat import ErrorCompatMiddleware
 
     app.add_middleware(ErrorCompatMiddleware)

@@ -268,7 +268,16 @@ async def test_default_mode_keeps_the_ppbase_envelope(
         500,
         {"status": 500, "message": "boom", "data": {}},
     )
-    assert results["invalid_filter"][1]["message"].startswith("Invalid filter syntax")
+    # Every list filter/sort error is PocketBase's opaque 400 in both modes
+    # (NewBadRequestError("", err), v0.22.34 apis/record_crud.go l.83-86).
+    assert results["invalid_filter"] == (
+        400,
+        {
+            "status": 400,
+            "message": "Something went wrong while processing your request.",
+            "data": {},
+        },
+    )
     # Starlette's own body for an unknown route is unchanged too.
     assert results["unknown_route"] == (404, {"detail": "Not Found"})
     assert results["create_validation"][1]["message"].startswith(

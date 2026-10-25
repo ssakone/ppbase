@@ -42,8 +42,8 @@ including the bypasses found in review:
   PocketBase's opaque `400` — like every other filter/sort error, whose
   message is always "Something went wrong while processing your request."
   with `data: {}` (`NewBadRequestError("", err)`, `apis/record_crud.go`
-  l.83-86). The body carries both `code` and `status`
-  (`docs/error-envelope.md`).
+  l.83-86). The envelope is `{status, message, data}`, or 0.22.34's
+  `{code, message, data}` in the 0.22 mode (`docs/error-envelope.md`).
 - **`email` visibility guard**: for a non-admin list request (filter and
   list rule, both resolved with `allowHiddenFields=false`, l.59-66) and for a
   realtime client filter, an `email` comparison is ANDed with
