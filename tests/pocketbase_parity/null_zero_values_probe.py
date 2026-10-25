@@ -71,9 +71,10 @@ FILE_MARK = "<file>"
 
 # Filters and sorts on a NULL column (a view column that a LEFT JOIN leaves
 # NULL) and on a json null follow PocketBase since WS-A11 (empty operands
-# match NULL, ``!=`` is NULL-safe, NULL sorts first in ascending order); see
-# ``docs/null-values.md``.  What remains differs for non-NULL values or
-# cannot be told apart in a view:
+# match NULL, ``!=`` is NULL-safe, a JSON null is NULL for ``~``/``!~`` and
+# multi-match, comparisons without any column are folded, NULL sorts first
+# in ascending order); see ``docs/null-values.md``.  What remains differs
+# for non-NULL values or cannot be told apart in a view:
 # - PocketBase sorts a multi-value field by its stored JSON text ('[]' after
 #   '["x"]'), PPBase by its array ('{}' first); the NULL row is placed like
 #   PocketBase, the order of the non-NULL values is unchanged (open).
@@ -82,6 +83,13 @@ _MULTI_VALUE_SORT = "multi-value sort: JSON text vs array order of non-NULL valu
 #   date of a matched row and the NULL of a missing row are both NULL and
 #   tie, SQLite sorts NULL before ''.
 _VIEW_EMPTY_DATE_SORT = "view date: empty date and LEFT JOIN NULL tie (D-0032)"
+# - A json value compared with a non-null value: PocketBase compares
+#   JSON_EXTRACT's SQLite value (a JSON string is text, true is 1, an object
+#   its minified text), PPBase the stored jsonb.  On a jsonb column PostgreSQL
+#   rejects ``jsonb = 5``, ``jsonb = 'x'``, ``jsonb > 1`` (HTTP 500), and
+#   ``?=``/``?!=``/``?!~`` read a JSON array element by element (open; only
+#   the NULL rows follow PocketBase: ``!=`` keeps them).
+_JSON_VALUE = "json vs non-null value: stored jsonb vs JSON_EXTRACT value (open)"
 KNOWN_DIVERGENCES: dict[str, str] = {
     **{
         f"null.view_sorts.{sign}{field},title": _MULTI_VALUE_SORT
@@ -458,8 +466,8 @@ NULL_VALUES: dict[str, str | None] = {
     "rich": '"zz"',
     "num": "7",
     "flag": "true",
-    # A json field compared with a non-null value is not a NULL case (json
-    # scalar comparisons are outside this probe).
+    # A json field compared with a non-null value: ``null.json_values`` and
+    # ``null.jview_filters``.
     "meta": None,
     "sel": '"y"',
     "sels": '"y"',
@@ -585,8 +593,9 @@ async def null_scenarios(
     # PPBase requires an email even with ``requireEmail: false``, which is
     # outside this probe), no user (row c).
     people = env["people"]
+    user_ids = {}
     for nick in ("a", "b"):
-        await _create(
+        user_ids[nick] = await _create(
             client,
             people,
             {
@@ -656,6 +665,10 @@ async def null_scenarios(
         "meta != null",
         'meta = ""',
         'meta != ""',
+        # A stored '' is an empty operand too: rule-visible since WS-A11.
+        "txt = null",
+        "txt != null",
+        "null = txt",
     ):
         body = await _list(client, "zv_targets", sort="txt", filter=expression)
         out["base_filters"][expression] = (
@@ -663,6 +676,285 @@ async def null_scenarios(
             if "items" in body
             else body
         )
+    out.update(await review_scenarios(client, admin, env, user_ids))
+    return out
+
+
+# Comparisons without any column: PocketBase renders '' = v / v = w, compared
+# by SQLite without affinity (filter.go l.226-281 and l.318-338).
+CONSTANT_FILTERS = (
+    "1 = null",
+    "1 != null",
+    "0 != null",
+    "null = 0",
+    "true = null",
+    "true != null",
+    "false != null",
+    '1 = ""',
+    '1 != ""',
+    '"" = 0',
+    'true = ""',
+    'true != ""',
+    "null = null",
+    '"" != null',
+    '"x" = null',
+    '"x" != ""',
+    "1 = 1",
+    '1 = "1"',
+    "true = 1",
+    '"a" = "b"',
+    "1 ?= null",
+    "1 ?!= null",
+    "null ?= null",
+    '"a" ?= "a"',
+    'title = "a" || 1 = null',
+    'title = "a" && 1 != null',
+)
+# A base json field holding a SQL NULL in PocketBase (no value) and a JSON
+# null in PPBase (``n``), JSON nulls in objects and other JSON values.
+JSON_ROWS: tuple[tuple[str, Any], ...] = (
+    ("n", None),
+    ("kn", {"k": None}),
+    ("knu", {"k": "nu"}),
+    ("k1", {"k": 1}),
+    ("sx", "x"),
+    ("es", ""),
+    ("num5", 5),
+    ("tr", True),
+    ("arr", ["nu", "x"]),
+    ("o", {"a": 1}),
+)
+# ``~``/``!~`` read a JSON null as NULL: it never matches (JSON_EXTRACT).
+JSON_LIKE_FILTERS = (
+    'meta ~ "nu"',
+    'meta ~ "x"',
+    'meta !~ "x"',
+    'meta !~ "zz"',
+    'meta.k ~ "nu"',
+    'meta.k !~ "x"',
+    'meta.k !~ "zz"',
+    'meta ?~ "nu"',
+    'meta ?!~ "zz"',
+)
+# Comparisons of a json value with a non-null value: PocketBase compares
+# JSON_EXTRACT's SQLite value, PPBase the stored jsonb (open, see
+# ``KNOWN_DIVERGENCES``).
+JSON_VALUE_FILTERS = (
+    "meta = 5",
+    "meta != 5",
+    'meta = "x"',
+    'meta != "x"',
+    "meta = true",
+    "meta != true",
+    'meta ?= "x"',
+    'meta ?!= "x"',
+    "meta.k = 1",
+    "meta.k != 1",
+    'meta.k = "nu"',
+    "meta > 1",
+    'meta ?!~ "x"',
+)
+KNOWN_DIVERGENCES.update(
+    {f"null.json_values.{expression}": _JSON_VALUE for expression in JSON_VALUE_FILTERS}
+)
+# A multiple relation to the json field (multi-match subquery).
+MULTI_ROWS: tuple[tuple[str, tuple[str, ...], Any], ...] = (
+    ("ma", ("kn", "knu"), {"k": 1}),
+    ("mb", ("n",), None),
+    ("mc", (), None),
+    ("md", ("sx",), "x"),
+    ("me", ("knu",), {"k": "nu"}),
+    ("mf", ("n", "knu"), None),
+)
+MULTI_FILTERS = (
+    'ts.meta != ""',
+    'ts.meta = ""',
+    "ts.meta = null",
+    "ts.meta != null",
+    'ts.meta ~ "nu"',
+    'ts.meta !~ "zz"',
+    "ts.meta.k = null",
+    "ts.meta.k != null",
+    'ts.meta.k ~ "nu"',
+    'ts.meta.k !~ "zz"',
+    'ts.meta ?!= ""',
+    'ts.meta ?~ "nu"',
+    "ts.meta = meta",
+    "ts.meta != meta",
+    "ts.meta ?= meta",
+    '@collection.zv_json.meta != ""',
+    # Only the JSON null of t_empty fails (t_full and t_jnull are objects).
+    '@collection.zv_targets.meta != ""',
+    '@collection.zv_json.meta !~ "zz"',
+    "@collection.zv_json.meta ?= null",
+    '@collection.zv_json.title ?= "kn" && @collection.zv_json.meta.k ?= null',
+)
+# json columns computed by a view (PocketBase 0.22 infers ``json`` for an
+# expression), NULL for the unmatched LEFT JOIN row c: the BUMA case.
+JVIEW_FILTERS = (
+    'jtxt = ""',
+    'jtxt != ""',
+    "jtxt = null",
+    "jtxt != null",
+    'jtxt = "tx"',
+    'jtxt != "tx"',
+    '"tx" != jtxt',
+    'jtxt ?= "tx"',
+    'jtxt ?!= "tx"',
+    'jtxt ~ "t"',
+    'jtxt !~ "zz"',
+    "jnum = 0",
+    "jnum != 0",
+    "jnum != 4.5",
+    "jnum > 1",
+    "jnum = null",
+    "jtxt = txt",
+    "jtxt != txt",
+)
+JVIEW_SORTS = ("jtxt,title", "-jtxt,title", "jnum,title", "-jnum,title")
+# List rules seen by an anonymous caller (``@request.auth.id`` is NULL) and
+# by the owner of record ``oa``.
+RULES = (
+    "@request.auth.id ?= owner",
+    "@request.auth.id = owner",
+    "owner ?= @request.auth.id",
+    "@request.auth.id ?!= owner",
+    "@request.auth.id != owner",
+    '@request.auth.id ?= ""',
+    '@request.auth.id ?!= ""',
+    "@request.auth.id ?= null",
+)
+# Anonymous only: generic PPBase resolves ``@request.auth.*`` from the token
+# claims, not from the auth record (``verified`` is absent for the owner;
+# BUMA loads the record fields), which is outside this probe.
+ANONYMOUS_RULES = ("@request.auth.verified ?= false",)
+
+
+async def review_scenarios(
+    client: httpx.AsyncClient,
+    admin: dict[str, str],
+    env: dict[str, Any],
+    user_ids: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"constants": {}}
+    for expression in CONSTANT_FILTERS:
+        out["constants"][expression] = await _titles(
+            client, "zv_src", sort="title", filter=expression
+        )
+
+    json_coll = await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_json",
+            "schema": [
+                text_field("title"),
+                _base("meta", "json", {"maxSize": 2000000}),
+            ],
+        },
+    )
+    json_ids = {}
+    for title, meta in JSON_ROWS:
+        payload: dict[str, Any] = {"title": title}
+        if title != "n":
+            payload["meta"] = meta
+        json_ids[title] = (await _create(client, "zv_json", payload))["id"]
+    for key, expressions in (
+        ("json_like", JSON_LIKE_FILTERS),
+        ("json_values", JSON_VALUE_FILTERS),
+    ):
+        out[key] = {}
+        for expression in expressions:
+            out[key][expression] = await _titles(
+                client, "zv_json", sort="title", filter=expression
+            )
+
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_multi",
+            "schema": [
+                text_field("title"),
+                _base("meta", "json", {"maxSize": 2000000}),
+                relation_field("ts", json_coll["id"], 5),
+            ],
+        },
+    )
+    for title, targets, meta in MULTI_ROWS:
+        payload = {"title": title, "ts": [json_ids[t] for t in targets]}
+        if meta is not None:
+            payload["meta"] = meta
+        await _create(client, "zv_multi", payload)
+    out["multi_json"] = {}
+    for expression in MULTI_FILTERS:
+        out["multi_json"][expression] = await _titles(
+            client, "zv_multi", admin, sort="title", filter=expression
+        )
+
+    await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_jview",
+            "type": "view",
+            # The schema PocketBase 0.22.34 infers: json for an expression.
+            "schema": [
+                text_field("title"),
+                _base("jtxt", "json", {"maxSize": 2000000}),
+                _base("jnum", "json", {"maxSize": 2000000}),
+                text_field("txt"),
+            ],
+            "options": {
+                "query": (
+                    "SELECT s.id, s.title, (t.txt || '') AS jtxt, "
+                    "(t.num + 0) AS jnum, t.txt FROM zv_src s "
+                    "LEFT JOIN zv_targets t ON t.id = s.target"
+                )
+            },
+        },
+    )
+    out["jview_filters"] = {}
+    for expression in JVIEW_FILTERS:
+        out["jview_filters"][expression] = await _titles(
+            client, "zv_jview", sort="title", filter=expression
+        )
+    out["jview_sorts"] = {}
+    for sort in JVIEW_SORTS:
+        out["jview_sorts"][sort] = await _titles(client, "zv_jview", sort=sort)
+
+    owned = await _collection(
+        client,
+        admin,
+        {
+            "name": "zv_owned",
+            "schema": [
+                text_field("title"),
+                relation_field("owner", env["people_id"], 1),
+            ],
+        },
+    )
+    await _create(client, "zv_owned", {"title": "oa", "owner": user_ids["a"]["id"]})
+    await _create(client, "zv_owned", {"title": "ob", "owner": ""})
+    response = await client.post(
+        f"/api/collections/{env['people']}/auth-with-password",
+        json={"identity": "zvnulla@example.invalid", "password": USER_PASSWORD},
+    )
+    user = {"Authorization": _json(response).get("token", "")}
+    out["rules_anonymous"] = {}
+    out["rules_owner"] = {}
+    for rule in (*RULES, *ANONYMOUS_RULES):
+        response = await client.patch(
+            f"/api/collections/{owned['id']}", headers=admin, json={"listRule": rule}
+        )
+        if response.status_code != 200:
+            out["rules_anonymous"][rule] = {"status": response.status_code}
+            continue
+        out["rules_anonymous"][rule] = await _titles(client, "zv_owned", sort="title")
+        if rule in RULES:
+            out["rules_owner"][rule] = await _titles(
+                client, "zv_owned", user, sort="title"
+            )
     return out
 
 
