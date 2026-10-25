@@ -45,6 +45,10 @@ and `ppbase/storage/thumbs.py`; route: `ppbase/api/files.py`.
   is never followed through a symlink nor written outside the record
   directory; a side-car or `thumbs_` directory is never served as a file.
 - Missing record, unreferenced name or absent stored file: `404`.
+- Header values are sent like Go's header writer: CR and LF become spaces
+  and the value is trimmed (`net/http` `Header.writeSubset`). Other control
+  characters, which uvicorn refuses, also become spaces: only a crafted
+  `.attrs` content type can hold any.
 
 ## v0.22.34 and v0.40.6 differences (not applied)
 
@@ -77,6 +81,21 @@ and `ppbase/storage/thumbs.py`; route: `ppbase/api/files.py`.
 - Download hooks: `event.served_name` is the thumbnail name for a thumbnail and
   sets the `Content-Disposition` name; `event.force_download` starts from the
   `?download` boolean.
+
+## Protected files under the 0.22 error mode (not implemented)
+
+v0.22.34 refuses a protected file with `403 Insufficient permissions to
+access the file resource.` (`apis/file.go` l.136-138); v0.40.6 with a `404`
+(l.132-133), which PPBase keeps. Once the `0.22` error compatibility mode
+(`ppbase.middleware.error_compat`) is available, the minimal change is in
+`_serve_file`: route every protected-file refusal through one helper that
+returns, when `get_error_compat(request.app) == "0.22"`, a `403` with that
+message and `data: {}` (tagged with a dedicated error kind so that the
+middleware keeps the message), and `_not_found_error()` otherwise. Both
+versions evaluate the `viewRule` as a guest when the token is missing or
+invalid (v0.22.34 l.118-138, v0.40.6 l.109-134): until PPBase does too, a
+missing token is refused before the rule is read, so a public `viewRule`
+still answers the refusal instead of the file.
 
 ## Paired probe
 
