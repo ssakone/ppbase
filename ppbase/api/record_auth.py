@@ -18,7 +18,10 @@ Provides authentication endpoints for collections of type ``auth``:
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -323,6 +326,95 @@ def _build_rule_request_context(
     }
 
 
+def _auth_response_expand_context(
+    request: Request,
+    collection: Any,
+    record: dict[str, Any],
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rule context of the ``expand`` of an auth response.
+
+    PocketBase 0.22.34 ``RecordAuthResponse`` (apis/record_helpers.go
+    l.105-116) expands with a copy of the request info whose ``Admin`` is nil
+    and whose ``AuthRecord`` is the authenticated record, so every expanded
+    record must satisfy its ``viewRule`` for that record (v0.40.6
+    ``recordAuthResponse`` l.94-113: ``requestInfo.Auth = e.Record``).
+    """
+    auth_payload = {key: value for key, value in record.items() if key != "expand"}
+    auth_payload.setdefault("collectionId", getattr(collection, "id", ""))
+    auth_payload.setdefault("collectionName", getattr(collection, "name", ""))
+    auth_payload["type"] = "authRecord"
+    return _build_rule_request_context(
+        request,
+        context="default",
+        data=data if isinstance(data, dict) else None,
+        auth_payload=auth_payload,
+    )
+
+
+_logger = logging.getLogger(__name__)
+
+#: ``loader(engine, auth) -> dict`` (sync or async): extra ``@request.auth.*``
+#: values of an authenticated record, see :func:`set_auth_record_rule_context`.
+AuthRecordRuleContextLoader = Callable[[Any, dict[str, Any]], Any]
+
+_SECRET_AUTH_KEYS = frozenset({"password_hash", "token_key", "_raw_token"})
+
+
+def set_auth_record_rule_context(
+    app: Any, loader: AuthRecordRuleContextLoader | None
+) -> None:
+    """Install (or remove, with ``None``) the host's auth-record rule context.
+
+    PocketBase resolves ``@request.auth.<relation>.<field>`` from the auth
+    record itself; PPBase reads the flat ``@request.auth`` keys of the rule
+    context, which a host application may extend (BUMA flattens
+    ``role.permission.*``).  For the HTTP request's own identity the host
+    extends the records API context; an auth response (auth-with-password,
+    OTP, OAuth2, auth-refresh, impersonate, ``pb.apis.record_auth_response``)
+    expands as the *authenticated* record instead (v0.22.34
+    apis/record_helpers.go l.105-116), so it calls this loader with that
+    record's ``@request.auth`` payload and merges the returned keys.
+    """
+    if loader is not None and not callable(loader):
+        raise TypeError("The auth record rule context loader must be callable.")
+    app.state.auth_record_rule_context = loader
+
+
+async def auth_response_rule_context(
+    request: Request,
+    collection: Any,
+    record: dict[str, Any],
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The rule context of an auth response ``expand``, host extension included.
+
+    :func:`_auth_response_expand_context` (the authenticated record as
+    ``@request.auth``, no admin) merged with the keys returned by the loader
+    of :func:`set_auth_record_rule_context`.  Public for host routes that
+    authenticate themselves (BUMA's username login).  A failing loader adds
+    nothing (a role-gated expand is then refused) and never fails the
+    authentication, like any expand failure in PocketBase.
+    """
+    context = _auth_response_expand_context(request, collection, record, data)
+    state = getattr(getattr(request, "app", None), "state", None)
+    loader = getattr(state, "auth_record_rule_context", None)
+    if loader is None:
+        return context
+    try:
+        extra = loader(get_engine(), dict(context["auth"]))
+        if inspect.isawaitable(extra):
+            extra = await extra
+    except Exception:  # logged; the expand stays restrictive
+        _logger.warning("auth record rule context loader failed", exc_info=True)
+        return context
+    if isinstance(extra, dict):
+        context["auth"].update(
+            {key: value for key, value in extra.items() if key not in _SECRET_AUTH_KEYS}
+        )
+    return context
+
+
 async def _passes_auth_rule(
     engine: Any,
     collection: Any,
@@ -599,7 +691,14 @@ async def api_auth_with_password(
         if expand_str and result.get("record"):
             all_colls = await get_all_collections(engine)
             records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+                engine,
+                collection,
+                [result["record"]],
+                expand_str,
+                all_colls,
+                request_context=await auth_response_rule_context(
+                    request, collection, result["record"], payload
+                ),
             )
             result["record"] = records[0] if records else result["record"]
 
@@ -824,7 +923,14 @@ async def api_auth_with_otp(
         if expand_str and result.get("record"):
             all_colls = await get_all_collections(engine)
             records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+                engine,
+                collection,
+                [result["record"]],
+                expand_str,
+                all_colls,
+                request_context=await auth_response_rule_context(
+                    request, collection, result["record"], payload
+                ),
             )
             result["record"] = records[0] if records else result["record"]
 
@@ -993,7 +1099,14 @@ async def api_auth_with_oauth2(
             if expand_str and response_data.get("record"):
                 all_colls = await get_all_collections(engine)
                 records = await expand_records(
-                    engine, collection, [response_data["record"]], expand_str, all_colls,
+                    engine,
+                    collection,
+                    [response_data["record"]],
+                    expand_str,
+                    all_colls,
+                    request_context=await auth_response_rule_context(
+                        request, collection, response_data["record"], payload
+                    ),
                 )
                 response_data["record"] = records[0] if records else response_data["record"]
 
@@ -1118,7 +1231,14 @@ async def api_auth_refresh(
         if expand_str and result.get("record"):
             all_colls = await get_all_collections(engine)
             records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+                engine,
+                collection,
+                [result["record"]],
+                expand_str,
+                all_colls,
+                request_context=await auth_response_rule_context(
+                    request, collection, result["record"], None
+                ),
             )
             result["record"] = records[0] if records else result["record"]
 
@@ -1234,7 +1354,14 @@ async def api_impersonate_record(
     if expand_str and result.get("record"):
         all_colls = await get_all_collections(engine)
         records = await expand_records(
-            engine, collection, [result["record"]], expand_str, all_colls,
+            engine,
+            collection,
+            [result["record"]],
+            expand_str,
+            all_colls,
+            request_context=await auth_response_rule_context(
+                request, collection, result["record"], data
+            ),
         )
         result["record"] = records[0] if records else result["record"]
 

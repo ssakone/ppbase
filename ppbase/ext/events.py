@@ -39,7 +39,27 @@ class HookEvent:
         return await self._next_handler()
 
     @staticmethod
-    def _http_error(status: int, message: str, data: dict[str, Any] | None = None) -> HTTPException:
+    def _http_error(
+        status: int,
+        message: str,
+        data: dict[str, Any] | None = None,
+        *,
+        kind: str | None = None,
+    ) -> HTTPException:
+        """A PPBase error; ``kind`` names its PocketBase 0.22.34 counterpart.
+
+        ``kind`` (``ppbase.middleware.error_compat.error_kinds()``) is only
+        used by the opt-in 0.22 error mode: the app's exception handler
+        forwards it as a private header while that mode is on and drops it
+        otherwise, so the default response is unchanged.
+        """
+        headers = None
+        if kind is not None:
+            from ppbase.middleware.error_compat import ERROR_KIND_HEADER, error_kinds
+
+            if kind not in error_kinds():
+                raise ValueError(f"Unknown error compatibility kind {kind!r}.")
+            headers = {ERROR_KIND_HEADER: kind}
         return HTTPException(
             status_code=status,
             detail={
@@ -47,6 +67,7 @@ class HookEvent:
                 "message": message,
                 "data": data or {},
             },
+            headers=headers,
         )
 
     def current_auth(self) -> dict[str, Any] | None:
@@ -105,18 +126,29 @@ class HookEvent:
     def require_auth(self) -> dict[str, Any]:
         auth = self.current_auth()
         if auth is None:
+            # 0.22.34 RequireAdminOrRecordAuth (apis/middlewares.go l.165).
             raise self._http_error(
                 401,
                 "The request requires authentication.",
+                kind="admin_or_record_auth_required",
             )
         return auth
 
     def require_auth_record(self) -> dict[str, Any]:
+        if self.current_auth() is None:
+            # 0.22.34 RequireRecordAuth (apis/middlewares.go l.77).
+            raise self._http_error(
+                401,
+                "The request requires authentication.",
+                kind="record_auth_required",
+            )
         auth = self.require_auth()
         if not self.has_record_auth():
+            # An admin token: RequireRecordAuth answers l.77 too (with 401).
             raise self._http_error(
                 403,
                 "The authorized auth model is not allowed to perform this action.",
+                kind="record_auth_required",
             )
         return auth
 
@@ -124,9 +156,11 @@ class HookEvent:
         auth = self.current_auth()
         if auth is not None and self.has_superuser_auth():
             return auth
+        # 0.22.34 RequireAdminAuth (apis/middlewares.go l.119, with 401).
         raise self._http_error(
             403,
             "Only superusers can perform this action.",
+            kind="admin_auth_required",
         )
 
     def is_auth_collection(self, collection_id_or_name: str) -> bool:
@@ -170,9 +204,11 @@ class HookEvent:
     ) -> dict[str, Any]:
         auth = self.require_auth_record()
         if not self.is_same_auth_record(record_id, collection_id_or_name):
+            # 0.22.34 RequireAdminOrOwnerAuth (apis/middlewares.go l.204).
             raise self._http_error(
                 403,
                 "The authorized auth model is not allowed to perform this action.",
+                kind="owner_forbidden",
             )
         return auth
 

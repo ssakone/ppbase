@@ -109,6 +109,7 @@ All settings use the `PPBASE_` prefix:
 | `PPBASE_S3_SECRET_KEY` | _(none)_ | Secret key |
 | `PPBASE_S3_FORCE_PATH_STYLE` | `false` | Force path-style addressing |
 | `PPBASE_JWT_SECRET` | _(auto)_ | If unset, generated and persisted to `data_dir/.jwt_secret` |
+| `PPBASE_ERROR_COMPAT` | _(empty)_ | `0.22`: PocketBase 0.22 error envelope `{code, message, data}` and messages (`docs/error-compat.md`) |
 
 ### Migration ownership
 
@@ -189,7 +190,7 @@ Route kwargs: `middlewares=[...]`, `unbind=["id"]`, plus any FastAPI kwargs (tag
 | `pb.apis.require_superuser_auth()` | Admin or `_superusers` member |
 | `pb.apis.require_superuser_or_owner_auth(param)` | Superuser OR record owner via path param |
 | `pb.apis.require_guest_only()` | Rejects authenticated requests |
-| `await pb.apis.enrich_record(request, record, collection)` | Apply `?expand` / `?fields` to one record |
+| `await pb.apis.enrich_record(request, record, collection)` | Apply `?expand` / `?fields` to one record (expanded records filtered by their `viewRule`) |
 | `await pb.apis.enrich_records(request, records, collection)` | Apply to a list |
 | `await pb.apis.record_auth_response(request, record, collection, ...)` | Build PB auth response `{token, record, meta}` |
 
@@ -230,6 +231,8 @@ All hook decorators accept `id=`, `priority=` kwargs.
 | Method | Description |
 |--------|-------------|
 | `pb.configure(**kwargs)` | Override settings (must be before `start()`) |
+| `pb.set_error_compat("0.22")` | PocketBase 0.22 error envelope and messages (also from `register(pb)` at startup) |
+| `pb.set_auth_record_rule_context(loader)` | Extra `@request.auth` keys of the authenticated record for auth-response expands (`docs/expand-view-rules.md`) |
 | `pb.get_app()` | Build and return FastAPI ASGI app |
 | `pb.start(host, port)` | Start uvicorn (blocking) |
 | `pb.load_hooks("module:fn")` | Import and run a `setup(pb)` function |

@@ -31,6 +31,55 @@ See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
   collections, admins and logs lists too.
 - JSON error bodies carry PocketBase 0.22's `code` next to `status`.
 
+### Security: expand applies the related viewRule
+
+See `docs/expand-view-rules.md`.
+
+- Every expanded record must satisfy the `viewRule` of its collection for the
+  current request (PocketBase 0.22.34 `expandFetch`): admins see everything,
+  a `null` rule fails the path, any other rule is evaluated by the list
+  filter parser with the same `@request.*` context. An anonymous caller or a
+  role without the permission no longer reads protected records through a
+  public relation (BUMA: `buma_sale.customer`, `users.employee`,
+  `buma_payment.caisse_transaction`, ...).
+- Paths are normalized like PocketBase, a failing path is skipped, a failing
+  nested level drops the whole path, refused or missing targets are skipped
+  in field order; `<collection>_via_<field>` back relations are supported.
+- Expanded auth records show their email only to an admin, the owner or a
+  `manageRule` match.
+- Create/update, auth responses (as the authenticated record), realtime and
+  `pb.apis.enrich_records`/`record_auth_response` use the same rules; one
+  query per path and level, in a savepoint inside write transactions.
+- `pb.set_auth_record_rule_context(loader)` extends `@request.auth` for the
+  authenticated record of an auth response (BUMA's role permissions);
+  `ppbase.api.record_auth.auth_response_rule_context` builds that context for
+  host login routes. `pb.apis.enrich_records` appends `?expand` to
+  `default_expand` and passes a JSON body as `@request.data`.
+
+### Security: emails of listed, viewed and written auth records
+
+- The main auth records of a list, a view, a create, an update and a batch
+  write show a hidden email (`emailVisibility` false) only to an admin, the
+  owner and a `manageRule` match, like PocketBase's `EnrichRecords`. Create
+  and update responses used to always show it: a caller allowed to update an
+  auth record read its hidden email. A guest signup response now hides the
+  new email unless `emailVisibility`.
+
+### PocketBase 0.22 error compatibility (opt-in)
+
+See `docs/error-compat.md`.
+
+- `pb.set_error_compat("0.22")` or `PPBASE_ERROR_COMPAT=0.22` makes every
+  PPBase JSON error answer `{code, message, data}` with the PocketBase
+  0.22.34 messages ("Only admins can perform this action.", ...). Disabled by
+  default; status codes and non-PPBase bodies are never changed.
+- Form validation errors take the 0.22.34 message per case (record update
+  and an admin's create unwrapped, a user's create "Failed to create
+  record.", login forms with only the failing fields), required schema
+  fields "Missing required value.", and the `pb.apis` guards the messages of
+  their 0.22.34 middlewares; handlers tag these cases with a private header
+  the middleware strips.
+
 ### Absent @request.* values no longer 500; totalPages and expand key
 
 See `docs/request-static-fields.md`.

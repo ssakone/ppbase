@@ -34,10 +34,12 @@ from ppbase.ext.registry import (
     HOOK_RECORD_VIEW_REQUEST,
     get_extension_registry,
 )
+from ppbase.middleware.error_compat import compat_record_errors, mark_error
 from ppbase.services.expand_service import expand_records
 from ppbase.services.record_service import (
     RecordReferenceError,
     _ValidationErrors,
+    auth_email_visible_ids,
     check_record_rule,
     create_record,
     delete_record,
@@ -382,6 +384,108 @@ def _validation_message(base: str, errors: dict[str, Any]) -> str:
         field_names = ", ".join(errors.keys())
         return f"{base} Validation failed for: {field_names}."
     return base
+
+
+def _create_validation_error(
+    request: Request,
+    auth: dict[str, Any] | None,
+    collection: Any,
+    errors: dict[str, Any],
+) -> JSONResponse:
+    """A record create form validation error.
+
+    PocketBase 0.22.34 validates a non-admin create in the createRule
+    ``DrySubmit`` and wraps its error as "Failed to create record."
+    (apis/record_crud.go l.250-261), but returns an admin's form error
+    unwrapped (l.280, apis/base.go l.75-80): the 0.22 error mode needs the
+    difference, which the body does not carry.
+    """
+    response = _error_response(
+        400,
+        _validation_message("Failed to create record.", errors),
+        compat_record_errors(request, collection, errors),
+    )
+    if _is_superuser_payload(auth):
+        mark_error(request, response, "form")
+    return response
+
+
+def _update_validation_error(
+    request: Request, collection: Any, errors: dict[str, Any]
+) -> JSONResponse:
+    """A record update form validation error.
+
+    PocketBase 0.22.34 returns it unwrapped for every caller
+    (apis/record_crud.go l.372, forms/record_upsert.go l.744-747; only a
+    persistence error is "Failed to update record.", l.377-379).
+    """
+    return mark_error(
+        request,
+        _error_response(
+            400,
+            _validation_message("Failed to update record.", errors),
+            compat_record_errors(request, collection, errors),
+        ),
+        "form",
+    )
+
+
+async def hide_unmanaged_auth_emails(
+    engine: Any,
+    collection: Any,
+    records: list[dict[str, Any]],
+    auth: dict[str, Any] | None,
+    request_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Main auth record responses with PocketBase's email visibility.
+
+    ``EnrichRecords`` (v0.22.34 apis/record_helpers.go l.153-158 ->
+    autoIgnoreAuthRecordsEmailVisibility, l.216-279; used for the create and
+    update responses, apis/record_crud.go l.289, l.381): a hidden email is
+    shown only to an admin, the record's owner or a ``manageRule`` match,
+    one query for all the records.  ``auth`` is the token payload of the
+    requester.
+    """
+    if (getattr(collection, "type", "base") or "base") != "auth":
+        return records
+    if _is_superuser_payload(auth):
+        return records
+    hidden = [
+        record
+        for record in records
+        if "email" in record
+        and not bool(record.get("emailVisibility", False))
+        and not _is_self_auth_target(auth, collection, str(record.get("id", "")))
+    ]
+    if not hidden:
+        return records
+    visible = await auth_email_visible_ids(
+        engine,
+        collection,
+        [{"id": record.get("id"), "email_visibility": False} for record in hidden],
+        request_context,
+    )
+    refused = {id(record) for record in hidden if record.get("id") not in visible}
+    return [
+        {key: value for key, value in record.items() if key != "email"}
+        if id(record) in refused
+        else record
+        for record in records
+    ]
+
+
+async def _main_auth_record_email(
+    engine: Any,
+    collection: Any,
+    record: dict[str, Any],
+    auth: dict[str, Any] | None,
+    request_context: dict[str, Any],
+) -> dict[str, Any]:
+    """The email visibility of a created/updated auth record response."""
+    (result,) = await hide_unmanaged_auth_emails(
+        engine, collection, [record], auth, request_context
+    )
+    return result
 
 
 async def _relation_errors_before_hooks(
@@ -946,6 +1050,9 @@ async def _apply_batch_create(
             if selected_record is not None:
                 record = selected_record
 
+        record = await _main_auth_record_email(
+            engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             expanded_records = await expand_records(
                 engine,
@@ -1116,6 +1223,9 @@ async def _apply_batch_update(
             if selected_record is not None:
                 record = selected_record
 
+        record = await _main_auth_record_email(
+            engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             expanded_records = await expand_records(
                 engine,
@@ -1464,7 +1574,9 @@ async def api_list_records(
             # PocketBase wraps every filter/sort error (syntax, unknown or
             # hidden field, bad modifier...) in an opaque 400
             # (NewBadRequestError("", err), apis/record_crud.go l.83-86).
-            return _error_response(400, _FILTER_FIELD_ERROR_MESSAGE)
+            return mark_error(
+                request, _error_response(400, _FILTER_FIELD_ERROR_MESSAGE), "query"
+            )
 
         if e.expand and result["items"]:
             all_colls = await get_all_collections(e.engine or engine)
@@ -1541,11 +1653,7 @@ async def api_create_record(
                 active_engine, collection, payload, files=payload_files
             )
         except _ValidationErrors as exc:
-            return _error_response(
-                400,
-                _validation_message("Failed to create record.", exc.errors),
-                exc.errors,
-            )
+            return _create_validation_error(request, e.auth, collection, exc.errors)
         except Exception:
             import logging
 
@@ -1562,15 +1670,19 @@ async def api_create_record(
             )
             if not matches:
                 raise _AbortWithResponse(
-                    _error_response(
-                        400,
-                        "Failed to create record.",
-                        {
-                            "rule": {
-                                "code": "validation_rule_failed",
-                                "message": "Action not allowed.",
-                            }
-                        },
+                    mark_error(
+                        request,
+                        _error_response(
+                            400,
+                            "Failed to create record.",
+                            {
+                                "rule": {
+                                    "code": "validation_rule_failed",
+                                    "message": "Action not allowed.",
+                                }
+                            },
+                        ),
+                        "create_rule_failed",
                     )
                 )
 
@@ -1590,6 +1702,9 @@ async def api_create_record(
                     )
                 )
 
+        record = await _main_auth_record_email(
+            active_engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             all_colls = await get_all_collections(active_engine)
             records = await expand_records(
@@ -1620,10 +1735,8 @@ async def api_create_record(
                 request_context=request_context,
             )
             if relation_errors:
-                return _error_response(
-                    400,
-                    _validation_message("Failed to create record.", relation_errors),
-                    relation_errors,
+                return _create_validation_error(
+                    request, auth, collection, relation_errors
                 )
         event = RecordRequestEvent(
             app=request.app,
@@ -1821,15 +1934,21 @@ async def api_update_record(
                         target_record_id,
                         payload.get("oldPassword"),
                     ):
-                        return _error_response(
-                            400,
-                            "Failed to update record.",
-                            {
-                                "oldPassword": {
-                                    "code": "validation_invalid_old_password",
-                                    "message": "Missing or invalid old password.",
-                                }
-                            },
+                        # 0.22.34 checks oldPassword in the form validation
+                        # (forms/record_upsert.go l.626-637).
+                        return mark_error(
+                            request,
+                            _error_response(
+                                400,
+                                "Failed to update record.",
+                                {
+                                    "oldPassword": {
+                                        "code": "validation_invalid_old_password",
+                                        "message": "Missing or invalid old password.",
+                                    }
+                                },
+                            ),
+                            "form",
                         )
 
         try:
@@ -1841,11 +1960,7 @@ async def api_update_record(
                 files=payload_files,
             )
         except _ValidationErrors as exc:
-            return _error_response(
-                400,
-                _validation_message("Failed to update record.", exc.errors),
-                exc.errors,
-            )
+            return _update_validation_error(request, collection, exc.errors)
         except Exception:
             import logging
 
@@ -1855,6 +1970,9 @@ async def api_update_record(
         if record is None:
             return _error_response(404, "The requested resource wasn't found.")
 
+        record = await _main_auth_record_email(
+            active_engine, collection, record, e.auth, request_context
+        )
         if e.expand and record:
             all_colls = await get_all_collections(active_engine)
             records = await expand_records(
@@ -1886,11 +2004,7 @@ async def api_update_record(
                 record_id=recordId,
             )
             if relation_errors:
-                return _error_response(
-                    400,
-                    _validation_message("Failed to update record.", relation_errors),
-                    relation_errors,
-                )
+                return _update_validation_error(request, collection, relation_errors)
         event = RecordRequestEvent(
             app=request.app,
             request=request,
