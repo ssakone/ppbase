@@ -77,6 +77,19 @@ test('auth duplication resets the id and never carries password or tokenKey', ()
   assert.equal(duplicate.tokenKey, undefined)
 })
 
+test('a duplicate leaves the file fields out, like PocketBase', () => {
+  const fields = [
+    { name: 'id', type: 'text', primaryKey: true },
+    { name: 'title', type: 'text' },
+    { name: 'doc', type: 'file', maxSelect: 1 },
+    { name: 'docs', type: 'file', maxSelect: 4 },
+  ]
+  const source = { id: 'existingrecord1', title: 'T', doc: 'a.txt', docs: ['b.txt'] }
+
+  assert.deepEqual(buildRecordFormData(fields, source, true), { id: null, title: 'T' })
+  assert.deepEqual(buildRecordFormData(fields, source), source)
+})
+
 test('_superusers hides verified but keeps the public-email toggle', () => {
   const collection = {
     id: 'superusers_id',
