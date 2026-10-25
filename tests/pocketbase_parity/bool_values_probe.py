@@ -11,7 +11,8 @@ then reads each written value three times: in the write response, through
 ``GET`` and in the stored column (SQLite ``data.db`` for PocketBase,
 PostgreSQL for PPBase).  It also sends the modifier keys ``flag+``, ``flag-``
 and ``+flag`` (no-ops for a bool field), with and without a relation target
-error, and repeated ``emailVisibility``/``verified`` keys of an auth record.
+error and on a required bool already false, and repeated
+``emailVisibility``/``verified`` keys of an auth record.
 It writes ``pocketbase.json``, ``ppbase.json`` and ``diff.json`` in
 ``--out`` and backs ``tests/test_bool_field_cast.py`` and
 ``tests/integration/test_bool_field_writes.py``.  Batch writes do not exist
@@ -66,6 +67,7 @@ FLAGS = "probe_flags"
 REQUIRED = "probe_required"
 RELATED = "probe_related"
 USERS = "probe_users"
+LATE = "probe_late_required"
 MISSING_ID = "missingrecord01"
 
 GO_TRUE = ("1", "t", "T", "TRUE", "true", "True")
@@ -193,6 +195,15 @@ RELATED_CREATES: tuple[dict[str, Any], ...] = (
     {"rel": MISSING_ID, "req+": "true"},
     {"rel": MISSING_ID},
 )
+# Written to LATE, whose ``req`` became required after a false and a true
+# record were saved: every field is validated (0.22.34
+# forms/validators/record_data.go l.74-90), a no-op modifier changes nothing.
+LATE_BODIES: tuple[dict[str, Any], ...] = (
+    {"req+": "x"},
+    {"req-": "true"},
+    {"+req": "x"},
+    {"req": "true", "req+": "false"},
+)
 # Repeated auth flags (no 0.22.34 schema fields: values[0], then cast.ToBool).
 AUTH_FLAGS = ("emailVisibility", "verified")
 AUTH_REPEATED = (("true", "false"), ("false", "true"), ("1", ""), ("T", "0"))
@@ -226,7 +237,9 @@ def known_divergence(path: str, compat: str) -> str | None:
         return "default mode: a repeated multipart key is a list, as in v0.40.6"
     if path.startswith("required.") and path.endswith(".message"):
         return "default mode wording of a required bool (0.22 mode: 0.22.34 wording)"
-    if path.startswith("related.") and path.endswith(".req.message"):
+    if path.startswith(("related.", "late_required.")) and path.endswith(
+        ".req.message"
+    ):
         return "default mode wording of a required bool (0.22 mode: 0.22.34 wording)"
     return None
 
@@ -527,6 +540,42 @@ async def run_scenarios(
         related[f"create:{json.dumps(body)}"] = await _observe_all(
             client, stored, RELATED, response, ("req",)
         )
+
+    late_fields = [
+        _field("label", "text", {"min": None, "max": None, "pattern": ""}),
+        _field("req", "bool", {}),
+    ]
+    late = await client.post(
+        "/api/collections",
+        headers=admin,
+        json={"name": LATE, "type": "base", "schema": late_fields, **PUBLIC},
+    )
+    if late.status_code != 200:
+        raise RuntimeError(f"collection {LATE} failed: {late.text[:400]}")
+    late_url = f"/api/collections/{LATE}/records"
+    seeds: list[tuple[bool, dict[str, Any], str]] = []
+    for body in LATE_BODIES:
+        for initial in (False, True):
+            seeded = await client.post(late_url, json={"label": "a", "req": initial})
+            if seeded.status_code != 200:
+                raise RuntimeError(f"late seed failed: {seeded.text[:300]}")
+            seeds.append((initial, body, seeded.json()["id"]))
+    # Keep the field ids of the response: the update must not recreate them.
+    schema = late.json().get("schema") or late.json().get("fields")
+    for field in schema:
+        if field.get("name") == "req":
+            field["required"] = True
+    changed = await client.patch(
+        f"/api/collections/{late.json()['id']}", headers=admin, json={"schema": schema}
+    )
+    if changed.status_code != 200:
+        raise RuntimeError(f"late required failed: {changed.text[:400]}")
+    results["late_required"] = {}
+    for initial, body, record_id in seeds:
+        response = await _send(client, "PATCH", f"{late_url}/{record_id}", "json", body)
+        observed = await _observe_all(client, stored, LATE, response, ("req",))
+        observed["seed_stored"] = await stored(LATE, record_id, "req")
+        results["late_required"][f"{json.dumps(initial)}:{json.dumps(body)}"] = observed
 
     users_url = f"/api/collections/{USERS}/records"
     password = "probe-User-Password-1"

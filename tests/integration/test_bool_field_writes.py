@@ -692,3 +692,56 @@ async def test_batch_ignores_bool_modifier_keys(
     assert bodies[0]["id"] == record_id
     stored = [await _check(app_client, collection, body) for body in bodies]
     assert stored == [True, False, True]
+
+
+@pytest.mark.parametrize("mode", ["default", "0.22"])
+async def test_bool_modifier_keys_still_validate_a_required_bool_already_false(
+    app_client: AsyncClient, bool_env: dict, mode: str
+) -> None:
+    # A record can hold false in a required bool (the field became required
+    # later, or a hook saved it).  Both versions validate every field of the
+    # record (0.22.34 forms/validators/record_data.go l.74-90, v0.40.6
+    # core/record_model.go l.1427-1441): a no-op modifier does not let such
+    # an update through, and does not refuse it for a true record.
+    admin = bool_env["admin"]
+    name = f"boolw_late_{uuid.uuid4().hex[:8]}"
+    fields = [
+        {"name": "label", "type": "text", "options": {}},
+        {"name": "req", "type": "bool", "required": False, "options": {}},
+    ]
+    created = await app_client.post(
+        "/api/collections",
+        headers=admin,
+        json={"name": name, "type": "base", "schema": fields, **PUBLIC},
+    )
+    assert created.status_code == 200, created.text
+    collection_id = created.json()["id"]
+    url = f"/api/collections/{name}/records"
+    try:
+        ids = {}
+        for value in (False, True):
+            response = await app_client.post(url, json={"label": "a", "req": value})
+            assert response.status_code == 200, response.text
+            ids[value] = response.json()["id"]
+        fields[1]["required"] = True
+        response = await app_client.patch(
+            f"/api/collections/{collection_id}", headers=admin, json={"schema": fields}
+        )
+        assert response.status_code == 200, response.text
+        message = "Missing required value." if mode == "0.22" else "Must be true."
+        with _mode(app_client, mode):
+            for key in ("req+", "req-", "+req"):
+                response = await app_client.patch(
+                    f"{url}/{ids[False]}", json={key: "x"}
+                )
+                assert response.status_code == 400, (key, response.text)
+                assert response.json()["data"] == {
+                    "req": {"code": "validation_required", "message": message}
+                }
+                response = await app_client.patch(f"{url}/{ids[True]}", json={key: "x"})
+                assert response.status_code == 200, (key, response.text)
+                assert response.json()["req"] is True
+        assert await _stored(name, ids[False], "req") is False
+        assert await _stored(name, ids[True], "req") is True
+    finally:
+        await app_client.delete(f"/api/collections/{collection_id}", headers=admin)

@@ -1687,6 +1687,9 @@ async def update_record(
             continue
         field_state[field_name] = raw_row.get(field_name)
 
+    # Bool fields named by a modifier key: validated even when unchanged.
+    bool_modifier_fields: set[str] = set()
+
     # Apply plain/modifier body values first.
     for key, value in data.items():
         if key == "id":
@@ -1708,7 +1711,12 @@ async def update_record(
             # unknown key.  v0.40.6 BoolField has no FindSetter, so
             # SetIfFieldExists ignores all three keys (core/record_model.go
             # l.869-889; ReplaceModifiers l.1374-1404, RecordUpsert.Load
-            # forms/record_upsert.go l.109-115).
+            # forms/record_upsert.go l.109-115).  The field is still
+            # validated: both versions validate every field of the record
+            # (0.22.34 forms/validators/record_data.go l.74-90, v0.40.6
+            # core/record_model.go l.1427-1441), so a required bool already
+            # false fails whatever the request.
+            bool_modifier_fields.add(field_name)
             continue
 
         current = field_state.get(field_name)
@@ -1750,7 +1758,7 @@ async def update_record(
                 continue
 
             raw_current = raw_row.get(field_name)
-            if value == raw_current:
+            if value == raw_current and field_name not in bool_modifier_fields:
                 continue
 
             processed_fields.add(field_name)
