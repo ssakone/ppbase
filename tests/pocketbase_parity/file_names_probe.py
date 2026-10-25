@@ -15,11 +15,17 @@ duplicated, unknown, ``.attrs``, another record's name, a name with a
 separator, a removed name sent again, the ``+``/``-`` modifiers and the
 legacy ``field.<name>`` / ``field.<index>`` deletions), multipart updates
 (uploads, names sent with uploads, ``docs+`` uploads, two uploads on a
-single field, too many files), creates, and the 403/404 precedence.  For
-each request it records the status, the exact error bytes, the record value
-afterwards and the download status of the files involved.  Stored file names
-are compared without their random suffix (``alpha_<10 chars>.txt`` ->
-``alpha.txt``).
+single field, too many files, a JSON array sent as one text value), creates,
+the 403/404 precedence and the ``createData`` of ``auth-with-oauth2``
+(0.22.34 ignores the ``LoadData`` error there, so the refused file field and
+the schema fields after it are not loaded).  For each request it records the
+status, the exact error bytes, the record value afterwards and the download
+status of the files involved.  Stored file names are compared without their
+random suffix (``alpha_<10 chars>.txt`` -> ``alpha.txt``).
+
+OAuth2 never leaves the machine: PocketBase's GitLab provider points at a
+local fake server (custom ``authUrl``/``tokenUrl``/``userApiUrl``), and
+PPBase's provider lookup is replaced in-process by the same fake user.
 
 Only synthetic records are created.  PocketBase runs in a temporary data
 directory on a random loopback port and is always stopped; PPBase runs
@@ -42,10 +48,14 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 
@@ -123,7 +133,171 @@ def _text(value: str) -> tuple[None, str]:
     return (None, value)
 
 
-async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> dict:
+@dataclass
+class Side:
+    """What differs between the two servers of the probe."""
+
+    #: The directory holding ``<collectionId>/<recordId>/<file>``.
+    storage: Path
+    #: The auth collection options that enable OAuth2.
+    oauth2_options: dict[str, Any]
+
+
+def _plant(side: Side, collection_id: str, record_id: str, name: str) -> None:
+    """A leftover object in the directory of a record id not created yet."""
+    directory = side.storage / collection_id / record_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(b"leftover object\n")
+
+
+async def run_oauth2_scenarios(
+    client: httpx.AsyncClient, admin: dict[str, str], side: Side
+) -> dict:
+    """``createData`` of ``auth-with-oauth2`` (each code is a new user)."""
+    response = await client.post(
+        "/api/collections",
+        headers=admin,
+        json={
+            "name": "oprobe",
+            "type": "auth",
+            **PUBLIC,
+            "options": side.oauth2_options,
+            "schema": [
+                text_field("title"),
+                file_field("doc", 1),
+                file_field("docs", MAX_DOCS),
+                text_field("later"),
+            ],
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"collection oprobe: {response.text[:300]}")
+    collection_id = response.json()["id"]
+    chosen, stray = "chosenoauth0001", "stray_abcdefghij.txt"
+    _plant(side, collection_id, chosen, stray)
+    out: dict[str, Any] = {}
+    cases = {
+        "oauth2_create_unknown_name": {
+            "title": "t",
+            "doc": "unknown.txt",
+            "later": "l",
+        },
+        "oauth2_create_leftover_chosen_id": {"id": chosen, "docs": [stray]},
+        "oauth2_create_second_file_field": {
+            "title": "t3",
+            "doc": "",
+            "docs": ["unknown.txt"],
+            "later": "l3",
+        },
+        "oauth2_create_attrs_modifier": {
+            "title": "t5",
+            "docs-": ["x"],
+            "doc": "a.attrs",
+        },
+        "oauth2_create_clean": {"title": "t4", "doc": "", "docs": [], "later": "l4"},
+    }
+    for index, (key, create_data) in enumerate(cases.items()):
+        response = await client.post(
+            "/api/collections/oprobe/auth-with-oauth2",
+            json={
+                "provider": "gitlab",
+                "code": f"code{index}",
+                "codeVerifier": "probe-verifier",
+                "redirectUrl": "http://127.0.0.1/callback",
+                "createData": create_data,
+            },
+        )
+        row: dict[str, Any] = {"status": response.status_code}
+        if response.status_code >= 400:
+            row["error_bytes"] = response.text
+        else:
+            payload = response.json()
+            record = payload.get("record") or {}
+            row["record"] = {
+                k: norm(record.get(k)) for k in ("title", "doc", "docs", "later")
+            }
+            row["isNew"] = (payload.get("meta") or {}).get("isNew")
+            row["id_is_chosen"] = record.get("id") == chosen
+        download = await client.get(f"/api/files/oprobe/{chosen}/{stray}")
+        row["leftover_download"] = download.status_code
+        out[key] = row
+    return out
+
+
+class _FakeGitLab(BaseHTTPRequestHandler):
+    """Token and user endpoints of a GitLab provider, synthetic user only."""
+
+    def log_message(self, *args: Any) -> None:  # silence the access log
+        pass
+
+    def _json(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        form = parse_qs(self.rfile.read(length).decode())
+        code = (form.get("code") or [""])[0]
+        self._json(
+            {
+                "access_token": f"token-{code}",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+        )
+
+    def do_GET(self) -> None:
+        token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        code = token.removeprefix("token-")
+        self._json(
+            {
+                "id": 1000 + int(code.removeprefix("code") or 0),
+                "name": "Probe User",
+                "username": "",
+                "email": f"{code}@example.invalid",
+                "avatar_url": "",
+            }
+        )
+
+
+@contextlib.contextmanager
+def fake_gitlab() -> Iterator[str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeGitLab)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+class _FakePPBaseProvider:
+    """The same synthetic user for PPBase's provider interface."""
+
+    def __init__(self, client_id: str, client_secret: str) -> None:
+        pass
+
+    async def exchange_code(self, code: str, redirect_url: str, verifier: str):
+        return {"access_token": f"token-{code}"}
+
+    async def get_user_info(self, access_token: str) -> dict[str, Any]:
+        code = access_token.removeprefix("token-")
+        return {
+            "id": str(1000 + int(code.removeprefix("code") or 0)),
+            "email": f"{code}@example.invalid",
+            "name": "Probe User",
+        }
+
+
+async def run_scenarios(
+    client: httpx.AsyncClient, admin: dict[str, str], side: Side
+) -> dict:
     for name, rules in (("fprobe", PUBLIC), ("fprobe_locked", LOCKED)):
         response = await client.post(
             "/api/collections",
@@ -338,6 +512,18 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> dic
         h,
         files=[("docs", _text(h["docs"][2])), ("docs", _text(h["docs"][1]))],
     )
+    m = await fresh()
+    await case(
+        "mp_text_json_array",
+        m,
+        files=[("docs", _text(json.dumps([m["docs"][1], m["docs"][0], m["docs"][2]])))],
+    )
+    await case(
+        "mp_text_json_array_minus",
+        m,
+        files=[("docs-", _text(json.dumps([m["docs"][0]])))],
+        check_files=m["docs"],
+    )
 
     # -- Creates ------------------------------------------------------------
     await case("create_json_unknown", None, "POST", json={"doc": "unknown.txt"})
@@ -382,6 +568,7 @@ async def run_scenarios(client: httpx.AsyncClient, admin: dict[str, str]) -> dic
         record_id="missingrecord00",
         json={"doc": "unknown.txt"},
     )
+    out.update(await run_oauth2_scenarios(client, admin, side))
     return out
 
 
@@ -392,7 +579,9 @@ def _free_port() -> int:
 
 
 @contextlib.asynccontextmanager
-async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
+async def pocketbase_client(
+    binary: Path,
+) -> AsyncIterator[tuple[httpx.AsyncClient, Path]]:
     with tempfile.TemporaryDirectory(prefix="ppbase-pb-filenames-") as root:
         flags = [
             "--dir",
@@ -444,7 +633,7 @@ async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
                     if time.monotonic() > deadline:
                         raise RuntimeError("PocketBase did not start")
                     await asyncio.sleep(0.2)
-                yield client
+                yield client, Path(root) / "pb_data"
         finally:
             if process.returncode is None:
                 process.terminate()
@@ -456,13 +645,44 @@ async def pocketbase_client(binary: Path) -> AsyncIterator[httpx.AsyncClient]:
 
 
 async def run_pocketbase(binary: Path) -> dict[str, Any]:
-    async with pocketbase_client(binary) as client:
-        response = await client.post(
-            "/api/admins/auth-with-password",
-            json={"identity": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
-        )
-        response.raise_for_status()
-        return await run_scenarios(client, {"Authorization": response.json()["token"]})
+    with fake_gitlab() as provider_url:
+        async with pocketbase_client(binary) as (client, data_dir):
+            response = await client.post(
+                "/api/admins/auth-with-password",
+                json={"identity": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+            )
+            response.raise_for_status()
+            admin = {"Authorization": response.json()["token"]}
+            response = await client.patch(
+                "/api/settings",
+                headers=admin,
+                json={
+                    "gitlabAuth": {
+                        "enabled": True,
+                        "clientId": "probe-client",
+                        "clientSecret": "probe-secret",
+                        "authUrl": f"{provider_url}/oauth/authorize",
+                        "tokenUrl": f"{provider_url}/oauth/token",
+                        "userApiUrl": f"{provider_url}/api/v4/user",
+                    }
+                },
+            )
+            response.raise_for_status()
+            side = Side(
+                storage=data_dir / "storage",
+                oauth2_options={
+                    "allowOAuth2Auth": True,
+                    "allowEmailAuth": True,
+                    "allowUsernameAuth": True,
+                    "exceptEmailDomains": None,
+                    "onlyEmailDomains": None,
+                    "manageRule": None,
+                    "minPasswordLength": 8,
+                    "onlyVerified": False,
+                    "requireEmail": False,
+                },
+            )
+            return await run_scenarios(client, admin, side)
 
 
 async def run_ppbase(database_url: str) -> dict[str, Any]:
@@ -475,6 +695,7 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
     from ppbase.db.bootstrap import bootstrap_system_collections
     from ppbase.db.engine import close_engine, init_engine
     from ppbase.db.system_tables import CollectionRecord, create_system_tables
+    from ppbase.services import oauth2_service
     from ppbase.services.admin_service import create_admin
     from ppbase.services.auth_service import create_admin_token
 
@@ -521,10 +742,16 @@ async def run_ppbase(database_url: str) -> dict[str, Any]:
                 admin_record, _TokenSettings(), superusers_collection=superusers
             )
             transport = ASGITransport(app=app, raise_app_exceptions=False)
+            side = Side(
+                storage=Path(data_dir).resolve() / "storage",
+                oauth2_options={"oauth2": {"enabled": True}},
+            )
+            oauth2_service.get_provider_credentials = lambda *a, **k: ("id", "secret")
+            oauth2_service.get_provider_class = lambda name: _FakePPBaseProvider
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver", timeout=60
             ) as client:
-                return await run_scenarios(client, {"Authorization": token})
+                return await run_scenarios(client, {"Authorization": token}, side)
         finally:
             await close_engine()
 
