@@ -170,7 +170,10 @@ strings, so this needs two accounts sharing an id.
 ## Known differences
 
 - Error envelope: PPBase answers `{status, message, data}` (current
-  PocketBase), PocketBase 0.22 `{code, message, data}`.
+  PocketBase), PocketBase 0.22 `{code, message, data}`; a host whose clients
+  were written for 0.22 enables the 0.22 error mode
+  (`pb.set_error_compat("0.22")`, `docs/error-compat.md`), which answers the
+  0.22.34 envelope and messages of the errors above.
 - Tokens issued by PPBase use `type=auth`, so PocketBase 0.22 rejects them
   and the PocketBase JS SDK 0.21 `isAuthRecord` is false after a PPBase
   refresh.

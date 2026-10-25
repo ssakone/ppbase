@@ -73,7 +73,9 @@ hidden fields (`autoResolveRecordsFlags`).
 ## PPBase implementation
 
 - `expand_records(engine, collection, records, expand, all_collections,
-  request_context=None)`. With a `request_context` (all PPBase API callers)
+  request_context=None)` is the only expand implementation (an earlier
+  per-relation `viewRule` filter of WS-A5, `_viewable_ids`, was redundant
+  with it and is removed). With a `request_context` (all PPBase API callers)
   the semantics above apply; the admin test is the records API one (`type`
   admin, or a `_superusers` record). Without one, the server-side
   `Dao.ExpandRecords(..., nil)` semantics are kept: every related record,
@@ -140,9 +142,22 @@ email (BUMA: `users.updateRule` lets every logged-in user update users, and
 response therefore hides the new record's email unless `emailVisibility`
 (0.22.34 and v0.40.6 alike). A `manageRule` that fails to evaluate shows no
 extra email; PocketBase 0.22.34 then also skips the expand of the main
-records, which PPBase does not reproduce. The realtime messages of auth
-records keep their previous behavior (0.22.34 `apis/realtime.go` l.439-448
-uses another test, not compared).
+records, which PPBase does not reproduce.
+
+Realtime messages follow another rule. 0.22.34 broadcasts a clean copy of
+the record and ignores the email visibility only when the subscriber's auth
+record *is* the broadcast record and the collection `manageRule` matches it
+(`apis/realtime.go` l.439-448, with `canAccessRecord` l.553-593): the owner
+sees its hidden email only through the `manageRule`, and an admin, a manager
+or another user never receives it (`extractAuthIdFromGetter` l.539-551
+returns the admin id, never a record id). At the base of this work every
+subscriber — even an anonymous one when the `listRule` is public — received
+the hidden email of the main record; WS-A5 fixed it
+(`realtime_service._realtime_shows_hidden_email`): the payload of an auth
+record is built per subscriber and the email is dropped unless that rule
+holds (an expanded auth record follows `expandFetch` as above). Since v0.23
+the owner always sees it, and managers too (v0.40.6 `apis/realtime.go`
+l.690-696); BUMA clients see 0.22.34.
 
 ## Evidence
 
@@ -163,11 +178,40 @@ uses another test, not compared).
   binary: 105 expand checks (list/view for seven callers, including the
   emails of the listed auth records), 18 writes (create/update/delete,
   signups, the update response email per caller), 8 auth responses (among
-  them the BUMA role rule through the host loader) and 4 realtime events
-  identical. The only known difference of these groups is outside expand: a
+  them the BUMA role rule through the host loader), 4 realtime events with
+  expand and 9 realtime events of an auth record (`realtime_email`: guest,
+  owner without and with the `manageRule`, manager, other user, admin)
+  identical; the 5 `realtime_delete` events are the documented divergence
+  above. The only known difference of these groups is outside expand: a
   guest signup that sets `emailVisibility` is refused by PPBase (manage
   access required) and accepted by 0.22.34 (`forms/record_upsert.go`
   l.380-381; only `verified` is guarded, l.514-522) — pre-existing, open.
+
+## Realtime delete events
+
+0.22.34 builds the delete messages before the delete (`OnModelBeforeDelete`,
+`apis/realtime.go` l.310-322, `broadcastRecord` with the dry cache l.371-503)
+and sends them after it (`OnModelAfterDelete`, l.324-336,
+`broadcastDryCachedRecord` l.509-533): every subscriber whose rule and client
+filter matched the record receives the whole record, expanded with its own
+request info, emails per the rule above.
+
+PPBase learns a delete from PostgreSQL after the commit
+(`realtime_service.listen_for_db_events`, `NOTIFY` of the record tables):
+the row is gone, so no rule, filter, expand or email can be evaluated. It
+sends `{"action": "delete", "record": {"id": ...}}` to admins and to
+subscriptions whose rule is public (`""`) without a client filter, and
+nothing to the others. Reproducing 0.22.34 needs the messages to be built
+inside the delete, before the row disappears, for subscribers that may be
+connected to another PPBase process: not a local change, left open.
+
+Client impact (0.22 SDK `subscribe` callbacks): a delete event carries only
+`record.id` (a client reading other fields or `expand` gets `undefined`); a
+non-admin subscriber of a collection whose rule is not public, or with a
+`filter` option, receives no delete event at all and keeps the deleted
+record until it reloads. Pinned by
+`test_realtime_delete_events_carry_only_the_id`; the probe's
+`realtime_delete` group records the 0.22.34 messages (known difference).
 
 ## Open
 

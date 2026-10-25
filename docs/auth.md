@@ -99,7 +99,7 @@ from ppbase.ext.events import RecordRequestEvent
 @pb.on_record_delete_request("posts")
 async def guard(event: RecordRequestEvent):
     auth = event.require_auth()         # raises 401 if no auth
-    event.require_superuser()           # raises 403 if not superuser
+    event.require_superuser()           # raises 401 without auth, 403 if not superuser
 
     # Only the record's owner can delete it
     post = await event.records("posts").get(event.record_id, fields="id,author_id")

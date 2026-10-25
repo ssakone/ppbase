@@ -15,7 +15,10 @@ PPBase answers errors with the envelope of current PocketBase versions,
 (`apis/api_error.go` l.11-15, `apis/record_crud.go` l.57). Clients written
 against 0.22 (the 0.22 JS/Dart SDKs read `code`) can select a compatibility
 mode. It is **disabled by default**: without it, PPBase's responses are
-unchanged byte for byte.
+unchanged byte for byte, and every PPBase error body is exactly
+`{status, message, data}`. This middleware is the only place that
+post-processes error bodies (an interim additive `code` next to `status` was
+removed, see `docs/error-envelope.md`).
 
 ## Enabling it
 
@@ -76,6 +79,7 @@ default mode is unchanged. A tagged error skips the message table:
 | Tag | PocketBase 0.22.34 error | Source (v0.22.34) |
 | --- | --- | --- |
 | `form` | default message of the status ("Something went wrong while processing your request."), the form errors as `data` (pydantic's "Field required" in ozzo's words, "Cannot be blank.") | `apis/base.go` l.75-80; record update `apis/record_crud.go` l.372, admin create l.280, admin login `apis/admin.go` l.92 |
+| `body_load` | the `c.Bind` failure of the route, `data` `{}`: "Failed to load the submitted data due to invalid formatting." for admin create and update, "An error occurred while loading the submitted data." otherwise | `apis/admin.go` l.247-249, l.293-295, l.83-85; `apis/backup.go` l.76-77 |
 | `query` | default message, `data` `{}` | `apis/record_crud.go` l.83-86 (search provider parse error: filter, sort, page, perPage, skipTotal) |
 | `create_rule_failed` | "Failed to create record.", `data` `{}` | `apis/record_crud.go` l.250-261 |
 | `guest_only` | The request can be accessed only by guests. | `apis/middlewares.go` l.37 |
@@ -88,8 +92,9 @@ default mode is unchanged. A tagged error skips the message table:
 Tagged by PPBase: record create validation errors of an admin (relation
 targets and fields), every record update validation error (and the
 `oldPassword` check), a `createRule` mismatch, the list filter/sort parse
-errors, pydantic request validation errors (`query` when only query or path
-parameters fail, else `form`), and the guards:
+errors, pydantic request validation errors (`body_load` when the body is not
+JSON or not an object, `query` when only query or path parameters fail, else
+`form`), and the guards:
 
 | PPBase guard | PocketBase 0.22.34 counterpart | Tags |
 | --- | --- | --- |
@@ -99,7 +104,13 @@ parameters fail, else `form`), and the guards:
 | `pb.apis.require_auth("c", "_superusers")` | `RequireAdminOrRecordAuth("c")` | `admin_or_record_auth_required`, `record_collection_forbidden` |
 | `pb.apis.require_superuser_auth()` | `RequireAdminAuth()` | `admin_auth_required` |
 | `pb.apis.require_superuser_or_owner_auth(p)` | `RequireAdminOrOwnerAuth(p)` | `admin_or_record_auth_required`, `owner_forbidden` |
+| `pb.require_auth()` (FastAPI dependency, also `POST /api/files/token`) | `RequireAdminOrRecordAuth()` | `admin_or_record_auth_required` |
+| `pb.require_record_auth()` (FastAPI dependency) | `RequireRecordAuth()` | `record_auth_required` (no auth, admin token) |
 | `event.require_auth()` / `require_auth_record()` / `require_superuser()` / `require_same_auth_record()` | the same middlewares | `admin_or_record_auth_required` / `record_auth_required` / `admin_auth_required` / `owner_forbidden` |
+
+`event.require_superuser()` answers 401 without auth (it answered 403), like
+`pb.apis.require_superuser_auth()`, 0.22.34 `RequireAdminAuth()` (l.114-124)
+and v0.40.6 `RequireSuperuserAuth()` (`apis/middlewares.go` l.91-95, l.108).
 
 A host route tags its own errors the same way when it reproduces a
 PocketBase 0.22.34 error the body cannot identify:
@@ -125,13 +136,19 @@ PocketBase 0.22.34 error the body cannot identify:
 | 400 | Failed to authenticate. (data `identity` `validation_invalid_credentials`) | Failed to authenticate. (data `{}`) | record and admin auth-with-password | `apis/record_auth.go` l.316-317, `apis/admin.go` l.97-98 |
 | 404 | Collection '<name>' not found. | The requested resource wasn't found. | `/api/collections/{c}` (admin) | `apis/collection.go` l.62, l.117, l.156 |
 | 404 | Log not found. | The requested resource wasn't found. | `/api/logs/…` | `apis/logs.go` l.72, l.77 |
-| 400 | Invalid settings payload. | An error occurred while loading the submitted data. | PATCH `/api/settings` | `apis/settings.go` l.53 |
+| 400 | Invalid settings payload. (also an invalid JSON body, which answered a plain 500) | An error occurred while loading the submitted data. | PATCH `/api/settings` | `apis/settings.go` l.52-54 |
+| 400 | Failed to send the test email. (data `body` `validation_invalid_value`: a body that is not a JSON object; an invalid JSON body answered a plain 500) | An error occurred while loading the submitted data. (data `{}`) | POST `/api/settings/test/email` | `apis/settings.go` l.112-115 |
+| 400 | Invalid UTF-8 JSON body. | An error occurred while loading the submitted data. | POST `/api/backups` | `apis/backup.go` l.76-77 |
 | 404 | Not Found (Starlette `detail`) | Not Found. | unknown route | `apis/base.go` l.72-74 (echo `HTTPError` through `NewApiError`) |
 
 Messages already identical (e.g. "The requested resource wasn't found.",
-"Failed to authenticate.", "Only admins can filter by @collection.",
-"Missing or invalid client id.", a persistence error's "Failed to
-create/update record.") only change envelope. A 400 of a list route that is
+"Failed to authenticate.", "Only admins can filter by @collection." and
+"... @request.", "Missing or invalid client id.", "The current and the
+previous request authorization don't match.", "The request requires auth
+record from <collection> collection.", a persistence error's "Failed to
+create/update record.", the 0.22 admin forms and admin password reset of
+`docs/pocketbase-022-compatibility.md`, already worded like 0.22.34) only
+change envelope. A 400 of a list route that is
 not tagged (for example raised by a host list-request hook) keeps its
 message.
 
@@ -152,30 +169,42 @@ keep ozzo's "Cannot be blank.".
   bodies untouched, the tag never leaks) and
   `tests/integration/test_error_compat_guards.py` (every guard, both modes).
 - `tests/pocketbase_parity/expand_rules_probe.py` against the 0.22.34
-  binary: `errors` group (52 requests) and `guards` group (20, the `$apis`
-  middlewares in `pb_hooks` against `pb.apis`): every message and `data`
-  identical; the known differences are the statuses and the token detail
-  listed below.
+  binary: `errors` group (82 requests) and `guards` group (40: the `$apis`
+  middlewares in `pb_hooks` against `pb.apis`, the `pb.require_auth()` /
+  `pb.require_record_auth()` dependencies and the `event.require_*()`
+  helpers), plus `realtime_auth` (5 successive subscription requests of one
+  client): every message and `data` identical; the known differences are the
+  statuses and the token detail listed below. The `errors` group includes
+  the errors WS-A5 and WS-A2 added or changed: hidden fields, modifiers and
+  qualified paths in a list filter/sort (opaque 400), "Only admins can
+  filter by @request." (filter and sort), the admin create/update forms
+  (blank, short password), the admin password reset request/confirm (blank,
+  invalid e-mail, unknown e-mail 204, bad token, mismatch, invalid JSON),
+  admin auth-refresh without a token or with a record token,
+  request-email-change with an admin token, settings and logs guards, and
+  the `c.Bind` failures of the admin, settings and backup forms.
 
 ## Known differences (not rewritten)
 
 Status codes that PPBase answers differently, which this mode does not
 change:
 
-- auth-refresh with an admin token: PPBase 403 "The request requires auth
-  record from <collection> collection.", 0.22.34 401 (`apis/middlewares.go`
-  l.97-100);
 - an auth route on a non-auth collection: PPBase 404 "The collection … is not
   an auth collection.", 0.22.34 400 "Unsupported collection type."
-  (l.269-271);
-- `POST /api/files/token` without auth: PPBase 401, 0.22.34 400 "Failed to
-  generate file token." (`apis/file.go` l.74);
+  (`apis/middlewares.go` l.269-271);
+- `POST /api/files/token` without auth: PPBase 401 (0.22 mode: "The request
+  requires admin or record authorization token to be set.", the
+  `pb.require_auth()` guard of the route), 0.22.34 400 "Failed to generate
+  file token." (`apis/file.go` l.39, l.72-75: the route has no guard; current
+  PocketBase binds `RequireAuth()`, v0.40.6 `apis/file.go` l.44). Aligning it
+  needs a change of `ppbase/api/files.py`, outside this mode;
 - an unknown method on a known path: PPBase 405, 0.22.34 404 "Not Found.";
 - route guards (message identical, status not): `require_guest_only()`
   with any auth PPBase 403, 0.22.34 400 (`apis/middlewares.go` l.37);
-  `require_auth("c")` with an admin token PPBase 403, 0.22.34 401 (l.77);
-  `require_superuser_auth()` with a record token PPBase 403, 0.22.34 401
-  (l.119).
+  `require_auth("c")`, `pb.require_record_auth()` and
+  `event.require_auth_record()` with an admin token PPBase 403, 0.22.34 401
+  (l.77); `require_superuser_auth()` and `event.require_superuser()` with a
+  record token PPBase 403, 0.22.34 401 (l.119).
 
 Validation details inside `data` keep PPBase's wording outside the cases
 above (client impact: the text of `ClientResponseError.response.data[field]

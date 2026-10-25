@@ -2,10 +2,23 @@
 
 ## Unreleased
 
+### Error envelope: current PocketBase by default, 0.22 on demand
+
+See `docs/error-envelope.md` and `docs/error-compat.md`.
+
+- The default error envelope is exactly current PocketBase's `{status,
+  message, data}` (v0.40.6 `tools/router/error.go` l.36-42). The interim
+  `code` key next to `status` (never released) is removed again: it matched
+  neither version and hid PPBase's envelope from the 0.22 mode.
+- The opt-in PocketBase 0.22 mode (`pb.set_error_compat("0.22")`,
+  `PPBASE_ERROR_COMPAT=0.22`, `Settings(error_compat="0.22")`) is the API
+  for clients written against PocketBase 0.22: exactly `{code, message,
+  data}` with the 0.22.34 messages. One outermost middleware is the only
+  error post-processing.
+
 ### Security follow-up: qualified paths, modifiers, realtime payload, expand
 
-See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
-`docs/error-envelope.md`.
+See `docs/hidden-auth-fields.md` and `docs/request-static-fields.md`.
 
 - A dotted filter path must start with a relation, a back relation or a JSON
   field: `users.password_hash~"$2b$"` (table-qualified self reference) used to
@@ -18,7 +31,6 @@ See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
 - Realtime payloads no longer send a hidden email to every subscriber: only
   the owner whose `manageRule` check passes receives it, like PocketBase
   0.22.34 (admins do not).
-- Expand applies the related collection's `viewRule` (nil: admins only).
 - `emailVisibility`/`verified` are parsed like Go's `cast.ToBool` on create
   and update: the multipart/JSON string `"false"` is false.
 - `username` resolves in a filter/sort only when the auth collection has a
@@ -29,7 +41,6 @@ See `docs/hidden-auth-fields.md`, `docs/request-static-fields.md` and
   value is SQL NULL, so `<`, `>`, `~` never match it.
 - `totalPages` is `ceil(totalItems / perPage)` (0 when empty) for the
   collections, admins and logs lists too.
-- JSON error bodies carry PocketBase 0.22's `code` next to `status`.
 
 ### Security: expand applies the related viewRule
 
@@ -53,8 +64,14 @@ See `docs/expand-view-rules.md`.
 - `pb.set_auth_record_rule_context(loader)` extends `@request.auth` for the
   authenticated record of an auth response (BUMA's role permissions);
   `ppbase.api.record_auth.auth_response_rule_context` builds that context for
-  host login routes. `pb.apis.enrich_records` appends `?expand` to
-  `default_expand` and passes a JSON body as `@request.data`.
+  host login routes. `pb.apis.enrich_records` passes a JSON body as
+  `@request.data`.
+- Behavior change: `pb.apis.enrich_record(s)` expands `default_expand` and
+  appends the request's `?expand` paths (PocketBase `EnrichRecords`); it used
+  to apply `default_expand` only when the request had no `?expand`.
+- Realtime delete events still carry only `{id}` and reach only admins and
+  public-rule subscriptions without a filter (0.22.34 sends the whole
+  record to every matching subscriber): a documented open divergence.
 
 ### Security: emails of listed, viewed and written auth records
 
@@ -76,9 +93,16 @@ See `docs/error-compat.md`.
 - Form validation errors take the 0.22.34 message per case (record update
   and an admin's create unwrapped, a user's create "Failed to create
   record.", login forms with only the failing fields), required schema
-  fields "Missing required value.", and the `pb.apis` guards the messages of
-  their 0.22.34 middlewares; handlers tag these cases with a private header
-  the middleware strips.
+  fields "Missing required value.", and the `pb.apis` guards, the
+  `pb.require_auth()`/`pb.require_record_auth()` dependencies and the
+  `event.require_*()` helpers the messages of their 0.22.34 middlewares;
+  handlers tag these cases with a private header the middleware strips.
+- A body that cannot be bound (invalid JSON, not an object) answers the
+  `c.Bind` message of its 0.22.34 route.
+- `event.require_superuser()` answers 401 without auth (was 403), like
+  `pb.apis.require_superuser_auth()` and both PocketBase versions.
+- `PATCH /api/settings` and `POST /api/settings/test/email` answer their 400
+  load error to an invalid JSON body (was a plain 500).
 
 ### Absent @request.* values no longer 500; totalPages and expand key
 
