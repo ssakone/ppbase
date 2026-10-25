@@ -58,15 +58,32 @@ responses. Any other value is the default.
   `thumbGenPending` singleflight, v0.22.34 l.252-275, v0.40.6 l.219-242),
   and publishes it with a `fileblob` side-car, so that PocketBase can serve
   it too. Any failure serves the original. A thumbnail is never followed
-  through a symlink nor written outside the record directory; a side-car or
+  through a symlink nor written outside the record directory, and a
   `thumbs_` directory is never served as a file.
+- **Reserved `.attrs` names**: on local storage, a requested name ending in
+  `.attrs` is a `404` before any file is opened, even when a record
+  references it (with or without `?thumb`, `?download`, `HEAD`): `fileblob`
+  refuses any key with its side-car suffix (gocloud v0.40.0 `fileblob` in
+  v0.22.34, measured on the binary; v0.40.6
+  `internal/fileblob/fileblob.go` l.185-187), and PocketBase answers the
+  error with a `404` (v0.22.34 `apis/file.go` l.166-168 and l.213-215,
+  v0.40.6 l.168-170 and l.209-212). S3 storage has no such rule.
 - Missing record, unreferenced name or absent stored file: `404`.
 - Header values are sent like Go's header writer: CR and LF become spaces
   and the value is trimmed (`net/http` `Header.writeSubset`). Other control
   characters, which uvicorn refuses, also become spaces, and a lone
   surrogate becomes U+FFFD: only a crafted `.attrs` or a hook can hold any.
-- A protected file needs a file token (the first `?token` value, untrimmed,
-  as `c.QueryParam` and `URL.Query().Get` read it); see the open points.
+- A protected file needs a file token: the first `?token` value
+  (`c.QueryParam`, v0.22.34 `apis/file.go` l.119; `URL.Query().Get`,
+  v0.40.6 l.115), trimmed or not depending on the version (table). It must
+  then decode like golang-jwt does (v4 in v0.22.34, v5 in v0.40.6): exactly
+  three segments of `base64.RawURLEncoding` text, so that padding (`=`) or
+  any character outside the URL-safe alphabet makes it no token, while CR
+  and LF are skipped by Go's decoder (in the signature segment they change
+  nothing; in the two signed ones the signature fails). PyJWT, which
+  verifies the token, accepts padding and refuses CR/LF: PPBase checks and
+  normalizes the token first (`file_token_to_verify`). See the open points
+  for a missing or refused token.
 
 ## v0.22.34 and v0.40.6 differences
 
@@ -79,12 +96,16 @@ responses. Any other value is the default.
 | Thumbnail format | from the thumbnail name, `imaging.FormatFromFilename` (jpg/jpeg, png, gif, tif/tiff, bmp, case-insensitive, else PNG; imaging v1.6.2 `io.go` l.117-156; `filesystem.go` l.511-516), recorded with the original's type (l.501-503) | from the original's type: `image/jpeg`, `image/gif` (`image/tiff`, `image/bmp`) keep theirs, anything else (`image/png`, `image/jpg`, webp) is PNG recorded `image/png` (l.700-721) |
 | `.attrs` decoding | gocloud v0.40.0 `fileblob`, `json.Decoder` (v1): first value only, last duplicate member wins, names matched case-insensitively (Go `foldName`: `USER.CONTENT_TYPE`, `uſer...`), invalid UTF-8 and lone surrogate escapes become U+FFFD, `md5` from base64 ignoring CR/LF or from an array of bytes | `encoding/json/v2` `UnmarshalRead` (`internal/fileblob/attrs.go` l.4, l.80): the whole input is one value, duplicate names, invalid UTF-8 and invalid surrogate escapes are errors (`404`), names match exactly (others are ignored), `md5` from strict base64 |
 | `.attrs` PPBase writes (thumbnails) | `json.Encoder.Encode`: `null` metadata, HTML characters escaped, final newline | `json.MarshalWrite` (l.53): `{}` metadata, no HTML escaping, no final newline |
+| Protected-file token | trimmed with `strings.TrimSpace`, whose spaces are Go's `unicode.IsSpace` (Unicode `White_Space`: `\t`, `\n`, `\v`, `\f`, `\r`, space, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F, U+205F, U+3000; Python's `str.strip()` also removes U+001C-U+001F, which Go keeps); empty means no token (`apis/file.go` l.221-225) | verified as received (l.115-116, `core/record_query.go` l.483-488): surrounding spaces make it invalid, while a trailing CR or LF is skipped by Go's base64 decoder |
 | Protected file refused | `403 Insufficient permissions to access the file resource.` (`apis/file.go` l.136-138) | `404` (l.132-133) |
 | Source size guard | none | `250 << 20` pixels, `PB_THUMBS_MAX_SOURCE_PIXELS` (`filesystem.go` l.649-663) |
 
 In both versions a `null` value leaves a field empty, a `null` metadata
 value is `""`, unknown members are ignored, and a wrong type, `NaN` or a
-non-base64 `md5` is a `404`. The 0.22 column is checked against the
+non-base64 `md5` is a `404`; so is, in v0.22.34, an `md5` array element
+that is not a byte (`strconv.ParseUint` range error, however many digits:
+PPBase never converts more than three, so a 5000-digit one is a `404`, not a
+`500`). The 0.22 column is checked against the
 v0.22.34 binary by the paired probe, crafted side-cars included; the v0.40.6
 column comes from the source and the json/v2 documentation (no v0.40.6
 binary was run).
@@ -125,6 +146,14 @@ protected files (v0.40.6 `apis/file.go` l.118-125) and the protected-file
   sharing the failure (both end with a thumbnail or the original).
 - `.attrs` decoding: nesting deeper than Python's recursion limit is refused
   (Go allows 10000 levels); only crafted side-cars nest at all.
+- `.attrs` size: PPBase reads at most 64 KiB of a side-car
+  (`ATTRS_MAX_BYTES`, `ppbase/storage/local_variants.py`); a larger one is
+  undecodable, so the original is a `404` and a stored thumbnail is
+  generated again, while PocketBase decodes a side-car of any size. The
+  side-cars PocketBase writes hold the content type, an MD5 and the
+  original file name, cut to 255 bytes (v0.22.34 `filesystem.go`
+  l.203-208): a few hundred bytes, under 2 KiB even if every byte of the
+  name is escaped.
 - A protected file whose `viewRule` lets guests in is still refused without a
   valid file token: both versions evaluate the rule as a guest (v0.22.34
   `apis/file.go` l.118-138, v0.40.6 l.109-134), PPBase refuses before
@@ -153,12 +182,16 @@ file, a `null` rule refuses it.
 
 `tests/pocketbase_parity/files_probe.py` uploads synthetic files to a
 disposable PocketBase 0.22 binary, replaces some side-cars by crafted ones,
-copies its storage under PPBase, recreates the records and compares 95
-requests (originals, download values, HEAD, ranges, allowed, refused and
-generated thumbnails, an absent stored file, crafted side-cars, protected
-files, 404s). On v0.22.34 the 0.22 mode reports only the `.attrs`-less
-and protected-file differences (9); the default mode adds the documented
-v0.40.6 differences (171 in all, 0 unexpected):
+makes a record reference another file's `.attrs` side-car (in PocketBase's
+SQLite, as an import would), copies its storage under PPBase, recreates the
+records and compares 109 requests (originals, download values, HEAD,
+ranges, allowed, refused and generated thumbnails, an absent stored file,
+crafted side-cars, the referenced `.attrs` name, protected files without a
+token and with eight forms of a token each server issued). On v0.22.34 the
+0.22 mode reports only the `.attrs`-less and protected-file differences
+(14); the default mode adds the documented v0.40.6 differences (182 in
+all, 0 unexpected). A protected-file or token difference is only known for
+its documented status pair:
 
 ```bash
 PYTHONPATH=. python tests/pocketbase_parity/files_probe.py \

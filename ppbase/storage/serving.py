@@ -18,9 +18,10 @@ identically hold in every mode.  Where the two versions differ, PPBase
 follows v0.40.6 by default and v0.22.34 when the application runs in the
 PocketBase 0.22 compatibility mode (:func:`pocketbase_compat`): the quoting
 of the ``Content-Disposition`` file name, the extension overrides,
-``Cross-Origin-Opener-Policy``, webp thumbnails, the thumbnail format and
-the JSON decoding of side-cars.  Each constant cites its sources; the list
-of differences is in ``docs/file-serving.md``.
+``Cross-Origin-Opener-Policy``, webp thumbnails, the thumbnail format, the
+JSON decoding of side-cars and the trimming of a protected-file token.  Each
+constant cites its sources; the list of differences is in
+``docs/file-serving.md``.
 """
 
 from __future__ import annotations

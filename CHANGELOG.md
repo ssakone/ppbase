@@ -48,10 +48,20 @@ See `docs/file-serving.md`.
   original), one generation per thumbnail at a time.
 - Where PocketBase 0.22.34 and 0.40.6 differ (file name quoting, `.js` and
   Office overrides, `Cross-Origin-Opener-Policy`, webp thumbnails, thumbnail
-  format, `.attrs` JSON decoding), PPBase follows 0.40.6 by default and
-  0.22.34 when `app.state.error_compat` is `"0.22"` (the PocketBase 0.22
-  mode).
-- A protected file's token is the first `?token` value, untrimmed.
+  format, `.attrs` JSON decoding, file token trimming), PPBase follows 0.40.6
+  by default and 0.22.34 when `app.state.error_compat` is `"0.22"` (the
+  PocketBase 0.22 mode).
+- A protected file's token is the first `?token` value, trimmed like Go's
+  `strings.TrimSpace` in the 0.22 mode (as PocketBase 0.22.34: Go's Unicode
+  spaces, not Python's `str.strip()` set; an empty result is no token) and
+  verified as received by default (as 0.40.6).
+  It must decode like golang-jwt: a padded token or one with any other
+  character than the URL-safe alphabet is refused (PyJWT accepted
+  `token=`), CR/LF in its signature segment are skipped.
+- On local storage a name ending in `.attrs` is a `404`, even when a record
+  references it (it was served as a JSON attachment).
+- In the 0.22 mode an `.attrs` md5 array element that is not a byte is a
+  `404` whatever its length (a 5000-digit one was a `500`).
 
 ### Absent @request.* values no longer 500; totalPages and expand key
 

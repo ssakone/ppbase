@@ -24,7 +24,8 @@ from ppbase.services.file_storage import (
 from ppbase.storage.serving import ATTRS_SUFFIX
 
 #: A PocketBase side-car is a few hundred bytes (the original file name is
-#: capped at 255 characters, v0.22.34 ``filesystem.go`` l.203-208).
+#: cut to 255 bytes, v0.22.34 ``filesystem.go`` l.203-208).  PocketBase
+#: itself reads any size; see "Known differences" in docs/file-serving.md.
 ATTRS_MAX_BYTES = 64 * 1024
 
 
