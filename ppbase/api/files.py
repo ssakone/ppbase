@@ -15,6 +15,7 @@ live in :mod:`ppbase.storage.serving` and :mod:`ppbase.storage.thumbs`; see
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import mimetypes
 import os
 import re
@@ -65,18 +66,21 @@ from ppbase.storage.serving import (
     ATTRS_SUFFIX,
     CACHE_CONTROL,
     CONTENT_SECURITY_POLICY,
-    FILE_SECURITY_HEADERS,
     FORCE_ATTACHMENT_PARAM,
-    THUMB_IMAGE_CONTENT_TYPES,
+    POCKETBASE_022,
     InvalidFileAttributes,
     content_disposition,
     disposition_type,
     encode_attrs,
+    file_security_headers,
     force_attachment,
     latin1_header_value,
     parse_attrs,
+    pocketbase_compat,
     response_content_type,
+    thumb_image_content_types,
     thumb_names,
+    thumb_output,
     thumb_size_allowed,
 )
 from ppbase.storage.thumbs import create_thumb_bytes
@@ -111,6 +115,21 @@ _SQL_KEYWORDS = {
 _THUMB_GENERATION_MAX_WAIT_SECONDS = 60.0
 _thumb_generation_semaphores: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+@dataclass
+class _PendingThumbnail:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+#: Generations in progress per event loop and thumbnail path, the role of
+#: PocketBase's ``thumbGenPending`` singleflight group (v0.22.34
+#: ``apis/file.go`` l.259-273, v0.40.6 l.226-240): concurrent requests for
+#: the same missing thumbnail generate it once.
+_thumb_generation_pending: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, ...], _PendingThumbnail]
 ] = weakref.WeakKeyDictionary()
 
 #: Returned by :func:`_resolve_thumbnail` on a lock-free cache miss.
@@ -185,6 +204,7 @@ def _original_content_type(
     collection_id: str,
     record_id: str,
     filename: str,
+    compat: str,
 ) -> str:
     """The real content type of a stored file (``Serve``'s ``ContentType``).
 
@@ -199,7 +219,7 @@ def _original_content_type(
         raise InvalidFileAttributes(str(exc)) from exc
     if raw is None:
         return _fallback_content_type(filename)
-    return parse_attrs(raw).content_type
+    return parse_attrs(raw, compat=compat).content_type
 
 
 def _thumb_generation_semaphore() -> asyncio.Semaphore:
@@ -211,6 +231,33 @@ def _thumb_generation_semaphore() -> asyncio.Semaphore:
     return semaphore
 
 
+@contextlib.asynccontextmanager
+async def _thumb_generation_slot(key: tuple[str, ...]) -> AsyncIterator[None]:
+    """Hold the generation of one thumbnail path for this event loop.
+
+    A request that waited re-checks the published thumbnail before
+    generating it.  Unlike singleflight, a waiter does not share the first
+    request's failure: it tries again (and falls back to the original).
+    """
+    loop = asyncio.get_running_loop()
+    pending = _thumb_generation_pending.get(loop)
+    if pending is None:
+        pending = {}
+        _thumb_generation_pending[loop] = pending
+    entry = pending.get(key)
+    if entry is None:
+        entry = _PendingThumbnail(asyncio.Lock())
+        pending[key] = entry
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and pending.get(key) is entry:
+            del pending[key]
+
+
 def _open_existing_thumbnail(
     storage_config: Any,
     collection_id: str,
@@ -218,6 +265,7 @@ def _open_existing_thumbnail(
     thumb_dir: str,
     thumb_name: str,
     original_content_type: str,
+    compat: str,
 ) -> _ServedThumbnail | None:
     """Open a stored thumbnail and its side-car, ``None`` when missing.
 
@@ -241,7 +289,7 @@ def _open_existing_thumbnail(
             thumb_name,
             directory_name=thumb_dir,
         )
-        attrs = parse_attrs(raw) if raw is not None else None
+        attrs = parse_attrs(raw, compat=compat) if raw is not None else None
     except (InvalidFileAttributes, OversizedFileAttributes):
         stream.close()
         return None
@@ -279,14 +327,19 @@ async def _create_thumbnail(
     original_content_type: str,
     storage_config: Any,
     lease: WriteBarrierLease,
+    compat: str,
 ) -> bool:
     """Generate and publish one thumbnail like ``CreateThumb``.
 
-    The side-car is written first, like ``fileblob``'s writer, with the
-    original's content type (v0.22.34 ``filesystem.go`` l.501-503).  Any
-    failure, including a write failure or the 60 s wait, means "serve the
-    original" (v0.22.34 ``apis/file.go`` l.179-190).
+    The format and the recorded content type follow
+    :func:`thumb_output` (v0.22.34 ``filesystem.go`` l.501-516, v0.40.6
+    l.700-721).  The side-car is written first, like ``fileblob``'s writer.
+    Any failure, including a write failure or the 60 s wait, means "serve
+    the original" (v0.22.34 ``apis/file.go`` l.179-190).
     """
+    thumb_format, thumb_content_type = thumb_output(
+        original_content_type, thumb_name, compat=compat
+    )
     semaphore = _thumb_generation_semaphore()
     try:
         await asyncio.wait_for(
@@ -307,7 +360,9 @@ async def _create_thumbnail(
             return False
         if source is None:
             return False
-        generated = await asyncio.to_thread(create_thumb_bytes, source, thumb_size)
+        generated = await asyncio.to_thread(
+            create_thumb_bytes, source, thumb_size, thumb_format
+        )
         if generated is None:
             return False
         try:
@@ -316,7 +371,7 @@ async def _create_thumbnail(
                 record_id,
                 thumb_dir,
                 f"{thumb_name}{ATTRS_SUFFIX}",
-                encode_attrs(generated, original_content_type),
+                encode_attrs(generated, thumb_content_type, compat=compat),
                 lease=lease,
                 config=storage_config,
             )
@@ -344,6 +399,7 @@ async def _resolve_thumbnail(
     original_content_type: str,
     storage_config: Any,
     lease: WriteBarrierLease | None,
+    compat: str,
 ) -> _ServedThumbnail | object | None:
     """Return the thumbnail to serve, ``None`` to serve the original.
 
@@ -352,8 +408,9 @@ async def _resolve_thumbnail(
     shared barrier before generating it.
     """
     thumb_dir, thumb_name = thumb_names(thumb_size, filename)
-    try:
-        existing = await asyncio.to_thread(
+
+    async def _existing() -> _ServedThumbnail | None:
+        return await asyncio.to_thread(
             _open_existing_thumbnail,
             storage_config,
             collection_id,
@@ -361,7 +418,11 @@ async def _resolve_thumbnail(
             thumb_dir,
             thumb_name,
             original_content_type,
+            compat,
         )
+
+    try:
+        existing = await _existing()
     except (OSError, StorageSafetyError):
         # An unsafe variant path (a symlink...) is never followed nor
         # replaced: the original is served.
@@ -370,31 +431,39 @@ async def _resolve_thumbnail(
         return existing
     if lease is None:
         return _THUMBNAIL_CACHE_MISS
-    created = await _create_thumbnail(
+    slot_key = (
+        str(getattr(storage_config, "data_dir", "") or ""),
         collection_id,
         record_id,
-        filename,
         thumb_dir,
         thumb_name,
-        thumb_size,
-        original_content_type,
-        storage_config,
-        lease,
     )
-    if not created:
-        return None
-    try:
-        reopened = await asyncio.to_thread(
-            _open_existing_thumbnail,
-            storage_config,
+    async with _thumb_generation_slot(slot_key):
+        try:
+            existing = await _existing()
+        except (OSError, StorageSafetyError):
+            return None
+        if existing is not None:
+            # Published by a concurrent request while this one waited.
+            return existing
+        created = await _create_thumbnail(
             collection_id,
             record_id,
+            filename,
             thumb_dir,
             thumb_name,
+            thumb_size,
             original_content_type,
+            storage_config,
+            lease,
+            compat,
         )
-    except (OSError, StorageSafetyError) as exc:
-        raise _not_found_error() from exc
+        if not created:
+            return None
+        try:
+            reopened = await _existing()
+        except (OSError, StorageSafetyError) as exc:
+            raise _not_found_error() from exc
     if reopened is None:
         # PocketBase serves the thumbnail it has just written; when that
         # read fails ``Serve`` returns an error and the request is a 404.
@@ -987,9 +1056,13 @@ async def _serve_file(
     if matched_file_field is None:
         raise _not_found_error()
     field_def, is_protected = matched_file_field
+    compat = pocketbase_compat(request.app)
 
     if is_protected:
-        file_token = str(request.query_params.get("token", "") or "").strip()
+        # The first value, untrimmed, like ``c.QueryParam("token")``
+        # (v0.22.34 apis/file.go l.119) and ``URL.Query().Get`` (v0.40.6
+        # l.115).
+        file_token = _first_query_value(request, "token") or ""
         if not file_token:
             raise _not_found_error()
         token_auth = await _verify_file_token(session, file_token)
@@ -1043,6 +1116,7 @@ async def _serve_file(
             storage_collection_id,
             storage_record_id,
             filename,
+            compat,
         )
         served_content_type = original_content_type
 
@@ -1055,7 +1129,7 @@ async def _serve_file(
             and thumb_size_allowed(
                 thumb_size, _normalize_file_options(field_def).get("thumbs")
             )
-            and original_content_type in THUMB_IMAGE_CONTENT_TYPES
+            and original_content_type in thumb_image_content_types(compat)
         ):
             thumbnail = await _resolve_thumbnail(
                 storage_collection_id,
@@ -1065,6 +1139,7 @@ async def _serve_file(
                 original_content_type,
                 storage_config,
                 thumbnail_write_lease,
+                compat,
             )
             if thumbnail is _THUMBNAIL_CACHE_MISS:
                 raise _ThumbnailGenerationRequiresBarrier
@@ -1136,22 +1211,26 @@ async def _serve_file(
 
         return FileResponse(str(resolved_served_path), content_disposition_type="inline")
 
-    # Serve (v0.22.34 tools/filesystem/filesystem.go l.393-430 == v0.40.6
-    # l.562-599 for everything below but the quoting of non-token names).
+    # Serve (v0.22.34 tools/filesystem/filesystem.go l.393-430, v0.40.6
+    # l.562-599).  The versions differ on the quoting of the file name, the
+    # extension overrides (and the name they read: the served name in
+    # v0.22.34 l.414, the served key in v0.40.6 l.583) and the
+    # Cross-Origin-Opener-Policy header; see ppbase.storage.serving.
     disposition_name = str(event.served_name or "") or served_name
+    override_name = disposition_name if compat == POCKETBASE_022 else served_name
     disposition = disposition_type(
         served_content_type, forced=bool(event.force_download)
     )
     headers: dict[str, str] = {
         "Content-Disposition": latin1_header_value(
-            content_disposition(disposition, disposition_name)
+            content_disposition(disposition, disposition_name, compat=compat)
         ),
         "Content-Type": latin1_header_value(
-            response_content_type(served_content_type, disposition_name)
+            response_content_type(served_content_type, override_name, compat=compat)
         ),
         "Content-Security-Policy": CONTENT_SECURITY_POLICY,
         "Cache-Control": CACHE_CONTROL,
-        **FILE_SECURITY_HEADERS,
+        **file_security_headers(compat),
         "Accept-Ranges": "bytes",
     }
     if served_stream.etag:

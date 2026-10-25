@@ -12,8 +12,11 @@ l.439-526, identical in v0.40.6 l.608-738 (both use
   orientation of a JPEG applied (``imaging.AutoOrientation(true)``), only the
   first frame of an animation, JPEG quality 95 (imaging's default).
 
-Pillow and Go do not produce the same bytes: the dimensions, the format and
-the anchoring are the contract, not the pixel values.
+The output format is chosen by the caller
+(:func:`ppbase.storage.serving.thumb_output`): v0.22.34 and v0.40.6 choose
+it differently.  Pillow and Go do not produce the same bytes: the
+dimensions, the format and the anchoring are the contract, not the pixel
+values.
 """
 
 from __future__ import annotations
@@ -27,14 +30,14 @@ from typing import Any
 THUMB_SIZE_RE = re.compile(r"([0-9]+)x([0-9]+)(t|b|f)?")
 
 _JPEG_QUALITY = 95
-# PIL format of the decoded original -> format of the thumbnail.  A format
-# outside this table is encoded as PNG, like imaging's fallback.
-_OUTPUT_FORMATS = {
-    "JPEG": "JPEG",
-    "MPO": "JPEG",
-    "PNG": "PNG",
-    "GIF": "GIF",
-    "WEBP": "WEBP",
+#: The formats ``imaging.Encode`` writes (imaging v1.6.2 ``io.go``
+#: l.218-255), with Pillow options close to imaging's defaults.
+OUTPUT_FORMATS = {
+    "JPEG": {"quality": _JPEG_QUALITY},
+    "PNG": {},
+    "GIF": {},
+    "TIFF": {"compression": "tiff_adobe_deflate"},
+    "BMP": {},
 }
 
 
@@ -50,14 +53,16 @@ def parse_thumb_size(thumb_size: str) -> tuple[int, int, str] | None:
     return width, height, match.group(3) or ""
 
 
-def create_thumb_bytes(source: bytes, thumb_size: str) -> bytes | None:
-    """Return the encoded thumbnail, or ``None`` when PocketBase would fail.
+def create_thumb_bytes(
+    source: bytes, thumb_size: str, output_format: str = "PNG"
+) -> bytes | None:
+    """Return the thumbnail encoded as ``output_format``, ``None`` on failure.
 
     ``None`` makes the caller serve the original, like the fallback of
     ``apis/file.go`` (v0.22.34 l.179-190, v0.40.6 l.181-193).
     """
     parsed = parse_thumb_size(thumb_size)
-    if parsed is None:
+    if parsed is None or output_format not in OUTPUT_FORMATS:
         return None
     width, height, mode = parsed
     try:
@@ -81,12 +86,9 @@ def create_thumb_bytes(source: bytes, thumb_size: str) -> bytes | None:
                 thumb = _fill(image, width, height, mode)
             if thumb is None:
                 return None
-            output_format = _OUTPUT_FORMATS.get(source_format, "PNG")
-            save_kwargs: dict[str, Any] = {}
-            if output_format == "JPEG":
-                if thumb.mode != "RGB":
-                    thumb = thumb.convert("RGB")
-                save_kwargs["quality"] = _JPEG_QUALITY
+            save_kwargs: dict[str, Any] = dict(OUTPUT_FORMATS[output_format])
+            if output_format == "JPEG" and thumb.mode != "RGB":
+                thumb = thumb.convert("RGB")
             output = BytesIO()
             thumb.save(output, format=output_format, **save_kwargs)
             return output.getvalue()

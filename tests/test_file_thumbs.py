@@ -3,7 +3,8 @@
 Expected sizes follow ``disintegration/imaging`` v1.6.2 as called by
 v0.22.34 ``tools/filesystem/filesystem.go`` l.451-499 (identical in v0.40.6
 l.628-698): ``Resize`` rounds half up with a 1px minimum, ``Fit`` never
-upscales and truncates, ``Fill`` always returns the exact box.
+upscales and truncates, ``Fill`` always returns the exact box.  The output
+format is the caller's (``ppbase.storage.serving.thumb_output``).
 """
 
 from __future__ import annotations
@@ -117,18 +118,21 @@ def test_same_size_fill_is_a_clone() -> None:
     assert list(thumb.getdata()) == list(original.getdata())
 
 
-@pytest.mark.parametrize(
-    ("fmt", "expected"),
-    [
-        ("PNG", "PNG"),
-        ("JPEG", "JPEG"),
-        ("GIF", "GIF"),
-        ("WEBP", "WEBP"),
-        ("BMP", "PNG"),
-    ],
-)
-def test_output_format(fmt: str, expected: str) -> None:
-    assert _thumb(_image((60, 40), fmt), "20x20").format == expected
+@pytest.mark.parametrize("source_format", ["PNG", "JPEG", "GIF", "WEBP", "BMP"])
+@pytest.mark.parametrize("output_format", ["PNG", "JPEG", "GIF", "TIFF", "BMP"])
+def test_output_format_is_the_callers(source_format: str, output_format: str) -> None:
+    """The caller picks the format (``serving.thumb_output``), not the source."""
+    generated = create_thumb_bytes(
+        _image((60, 40), source_format), "20x20", output_format
+    )
+    assert generated is not None
+    with Image.open(BytesIO(generated)) as image:
+        assert image.format == output_format
+        assert image.size == (20, 20)
+
+
+def test_unknown_output_format_fails() -> None:
+    assert create_thumb_bytes(_image((60, 40)), "20x20", "WEBP") is None
 
 
 def test_jpeg_exif_orientation_is_applied() -> None:
@@ -143,7 +147,9 @@ def test_animated_gif_keeps_the_first_frame_only() -> None:
     frames = [Image.new("RGB", (40, 40), color) for color in (RED, BLUE)]
     output = BytesIO()
     frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:])
-    thumb = _thumb(output.getvalue(), "20x20")
+    generated = create_thumb_bytes(output.getvalue(), "20x20", "GIF")
+    assert generated is not None
+    thumb = Image.open(BytesIO(generated))
     assert thumb.format == "GIF"
     assert getattr(thumb, "n_frames", 1) == 1
     pixel = thumb.convert("RGB").getpixel((10, 10))
