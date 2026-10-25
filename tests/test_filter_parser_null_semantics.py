@@ -17,7 +17,11 @@ from datetime import UTC, datetime
 import pytest
 
 from ppbase.db.system_tables import CollectionRecord
-from ppbase.services.filter_parser import parse_filter
+from ppbase.services.filter_parser import (
+    _sqlite_numeric_text,
+    _sqlite_real_text,
+    parse_filter,
+)
 from ppbase.services.record_service import (
     _build_relation_index_from_collections,
     _sort_term,
@@ -294,3 +298,171 @@ def test_json_any_not_equal_keeps_a_null_row() -> None:
     assert sql.startswith('("v"."meta" IS NULL OR (CASE WHEN'), sql
     # ?= is unchanged: a NULL never equals a known non-empty value.
     assert _sql('meta ?= "x"').startswith("(CASE WHEN")
+
+
+def _parse(expression: str, request_context: dict | None = None) -> tuple[str, dict]:
+    target = _coll("tg", [{"name": "tj", "type": "json"}], kind="base")
+    view = _coll(
+        "v",
+        [
+            {"name": "title", "type": "text"},
+            {"name": "txt", "type": "text"},
+            {"name": "num", "type": "number"},
+            {"name": "flag", "type": "bool"},
+            {"name": "meta", "type": "json"},
+            {"name": "sels", "type": "select", "options": {"maxSelect": 2}},
+            {"name": "d", "type": "date"},
+        ],
+    )
+    index = _build_relation_index_from_collections([view, target])
+    return parse_filter(
+        expression,
+        request_context=request_context,
+        relation_resolver=index,
+        collection_resolver=index,
+        current_table="v",
+    )
+
+
+_D_TEXT = (
+    """COALESCE(to_char("v"."d" AT TIME ZONE 'UTC', """
+    """'YYYY-MM-DD HH24:MI:SS.MS"Z"'), '')"""
+)
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected", "text"),
+    [
+        # A TEXT column turns a value into text: a filter number is a REAL
+        # ('1.0'), true/false the integers 1/0.  ?= is = (current record).
+        ("txt ?= 0", '("v"."txt" = :_fp1)', "0.0"),
+        ("txt = 1", '("v"."txt" = :_fp1)', "1.0"),
+        ("txt ?= 4.5", '("v"."txt" = :_fp1)', "4.5"),
+        ("1 ?!= txt", '(:_fp1 IS DISTINCT FROM "v"."txt")', "1.0"),
+        ("title ?= true", '("v"."title" = :_fp1)', "1"),
+        ("txt != false", '("v"."txt" IS DISTINCT FROM :_fp1)', "0"),
+        # A date column is its PocketBase text.
+        ('d ?= "x"', f"({_D_TEXT} = :_fp1)", "x"),
+        ("d != 1", f"({_D_TEXT} IS DISTINCT FROM :_fp1)", "1.0"),
+        # A NUMERIC column (number, bool, multi-value json) turns a numeric
+        # text into a number; any other text never equals a number.
+        ('num ?= "x"', "FALSE", None),
+        ('num ?!= "x"', "TRUE", None),
+        ('num = " 1 "', '("v"."num" = 1)', None),
+        ('num ?= "4.5"', """("v"."num" = CAST('4.5' AS double precision))""", None),
+        ("num = true", '("v"."num" = 1)', None),
+        ('flag ?= "1"', '(("v"."flag")::int = 1)', None),
+        ("flag = 1", """(("v"."flag")::int = CAST('1.0' AS double precision))""", None),
+        ('flag ?!= "true"', "TRUE", None),
+        ("sels ?= 1", "FALSE", None),
+        # Two columns: COALESCE(a, '') = COALESCE(b, ''), without affinity.
+        (
+            "num ?!= txt",
+            """(NOT ("v"."num" IS NULL AND COALESCE("v"."txt", '') = ''))""",
+            None,
+        ),
+        ("num = flag", '("v"."num" IS NOT DISTINCT FROM ("v"."flag")::int)', None),
+        (
+            "d ?= txt",
+            f"""(COALESCE({_D_TEXT}, '') = COALESCE("v"."txt", ''))""",
+            None,
+        ),
+        # Operands of one type keep their typed comparison.
+        ('txt ?= "x"', '"v"."txt" = :_fp1', "x"),
+        ("num ?!= 7", '"v"."num" IS DISTINCT FROM 7', None),
+    ],
+)
+def test_operands_of_different_types_compare_like_sqlite(
+    expression: str, expected: str, text: str | None
+) -> None:
+    sql, params = _parse(expression)
+    assert sql == expected
+    if text is not None:
+        assert params["_fp1"] == text
+
+
+def test_request_values_of_another_type_compare_like_sqlite() -> None:
+    context = {"query": {"q": "1", "x": "x"}, "data": {"n": 4.5, "b": True}}
+    assert _parse("@request.query.q ?= num", context)[0] == '(1 = "v"."num")'
+    assert _parse("@request.query.x = num", context)[0] == "FALSE"
+    sql, params = _parse("@request.data.n ?= txt", context)
+    assert sql == '(:_fp2 = "v"."txt")'
+    assert params["_fp2"] == "4.5"
+    sql, params = _parse("@request.data.b != txt", context)
+    assert sql == '(:_fp2 IS DISTINCT FROM "v"."txt")'
+    assert params["_fp2"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("expression", "distinct"),
+    [
+        ("meta ?= txt", "IS NOT DISTINCT FROM"),
+        ("meta ?!= txt", "IS DISTINCT FROM"),
+        ("txt ?!= meta", "IS DISTINCT FROM"),
+        ("meta ?= meta", "IS NOT DISTINCT FROM"),
+    ],
+)
+def test_json_any_equal_to_a_column_is_null_safe(
+    expression: str, distinct: str
+) -> None:
+    # ?= / ?!= are = / != : JSON_EXTRACT(x) IS [NOT] y, no "x IS NULL OR".
+    sql = _parse(expression)[0]
+    assert sql.startswith("(NULLIF(to_jsonb(") and f") {distinct} NULLIF(" in sql
+    assert "IS NULL OR" not in sql
+
+
+def test_json_compared_with_a_date_column_reads_its_text() -> None:
+    sql = _parse("meta ?!= d")[0]
+    assert sql == (
+        """(NULLIF(to_jsonb("v"."meta"), 'null'::jsonb) IS DISTINCT FROM """
+        f"""NULLIF(to_jsonb({_D_TEXT}), 'null'::jsonb))"""
+    )
+
+
+def test_any_equal_of_an_unknown_operand_keeps_the_text_comparison() -> None:
+    # Without metadata the type of a field is unknown: ?= keeps the text
+    # comparison instead of a typed one PostgreSQL could reject.
+    sql, _params = parse_filter("x ?= 1")
+    assert sql.startswith("(CASE WHEN jsonb_typeof(to_jsonb(")
+    assert "1::text = " in sql
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (1.0, "1.0"),
+        (0.0, "0.0"),
+        (0.1, "0.1"),
+        (4.5, "4.5"),
+        (-1.0, "-1.0"),
+        (100.0, "100.0"),
+        (1e21, "1.0e+21"),
+        (1e-05, "1.0e-05"),
+        (123456789012345678.0, "1.23456789012346e+17"),
+    ],
+)
+def test_sqlite_real_text(value: float, text: str) -> None:
+    assert _sqlite_real_text(value) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "number"),
+    [
+        ("1", 1),
+        (" 1 ", 1),
+        ("+1", 1),
+        ("-2", -2),
+        ("1.0", 1.0),
+        ("1e0", 1.0),
+        (".5", 0.5),
+        ("5.", 5.0),
+        ("x", None),
+        ("", None),
+        ("true", None),
+        ("0x10", None),
+        ("1e", None),
+        ("1 2", None),
+    ],
+)
+def test_sqlite_numeric_text(text: str, number: float | None) -> None:
+    assert _sqlite_numeric_text(text) == number

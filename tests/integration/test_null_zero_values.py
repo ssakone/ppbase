@@ -1000,6 +1000,13 @@ async def test_json_null_filters_of_a_base_collection(
         assert await matching("meta.k != null") == ["t_full"]
         assert await matching('meta = ""') == []
         assert await matching('meta != ""') == ["t_empty", "t_jnull", "t_full"]
+        # A date compared with json is its text: the empty date of t_empty is
+        # '', not NULL (probe ``types.json_base``).
+        everyone = ["t_empty", "t_jnull", "t_full"]
+        for expression in ("meta = day", "meta ?= day", "day ?= meta"):
+            assert await matching(expression) == [], expression
+        for expression in ("meta != day", "meta ?!= day", "day ?!= meta"):
+            assert await matching(expression) == everyone, expression
     finally:
         await app_client.delete(
             f"/api/collections/{tn}/records/{jnull['id']}",
@@ -1374,3 +1381,539 @@ async def test_any_equal_rules_on_an_empty_owner_follow_pocketbase(
         if owned is not None:
             await app_client.delete(f"/api/collections/{owned['id']}", headers=headers)
         await app_client.delete(f"/api/collections/{people['id']}", headers=headers)
+
+
+# Operands of different types (review of WS-A11).  PocketBase 0.22.34 builds
+# a current-record ``?=``/``?!=`` like ``=``/``!=`` and SQLite compares a
+# column with a value through the column affinity, two columns through
+# ``COALESCE(x, '')`` without affinity (``docs/null-values.md``).  Values of
+# the probe ``types`` section (rows a to i, view row n without target);
+# PPBase answered HTTP 500 to every one of them before this change, except
+# the operands of one type.
+_TYPE_DAY = "2024-01-02 03:04:05.000Z"
+_TYPE_ROWS: tuple[tuple[str, dict[str, Any]], ...] = (
+    (
+        "a",
+        {
+            "txt": "1",
+            "num": 1,
+            "flag": True,
+            "day": _TYPE_DAY,
+            "sel": "x",
+            "sels": ["x"],
+            "rel": "ra",
+            "rels": ["ra"],
+        },
+    ),
+    (
+        "b",
+        {
+            "txt": "1.0",
+            "num": 4.5,
+            "sel": "y",
+            "sels": ["x", "y"],
+            "rels": ["ra", "rb"],
+        },
+    ),
+    ("c", {"txt": "4.5", "flag": True}),
+    ("d", {"txt": "true", "num": 2}),
+    ("e", {"txt": "0.1", "num": 0.1}),
+    ("f", {}),
+    ("g", {"txt": _TYPE_DAY, "day": _TYPE_DAY}),
+    ("h", {"txt": "0.0", "num": -1, "flag": True}),
+    ("i", {"txt": "0", "num": 1}),
+)
+_TYPE_FIELDS = ("txt", "num", "flag", "day", "sel", "sels", "rel", "rels")
+_TYPE_OPERANDS = (
+    "0",
+    "1",
+    "4.5",
+    "0.1",
+    "-1",
+    "true",
+    "false",
+    '"1"',
+    '"1.0"',
+    '"4.5"',
+    '"0.1"',
+    '"true"',
+    '"x"',
+    '" 1 "',
+    '"1e0"',
+    '"+1"',
+    f'"{_TYPE_DAY}"',
+    "txt",
+    "num",
+    "flag",
+    "day",
+    "sel",
+    "sels",
+    "title",
+)
+
+
+@pytest.fixture(scope="module")
+async def zt_env(app_client: AsyncClient, admin_token: str) -> Any:
+    suffix = uuid.uuid4().hex[:8]
+    refs = await _post_collection(
+        app_client,
+        admin_token,
+        {"name": f"zt_refs_{suffix}", "schema": [_f("name", "text")]},
+    )
+    ref_ids = {
+        name: (await _create(app_client, refs["name"], {"name": name}))["id"]
+        for name in ("ra", "rb")
+    }
+    types = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zt_types_{suffix}",
+            "schema": [
+                _f("title", "text"),
+                _f("txt", "text"),
+                _f("num", "number"),
+                _f("flag", "bool"),
+                _f("day", "date"),
+                _f("sel", "select", maxSelect=1, values=["x", "y"]),
+                _f("sels", "select", maxSelect=2, values=["x", "y"]),
+                _f("rel", "relation", collectionId=refs["id"], maxSelect=1),
+                _f("rels", "relation", collectionId=refs["id"], maxSelect=5),
+            ],
+        },
+    )
+    link = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zt_link_{suffix}",
+            "schema": [
+                _f("title", "text"),
+                _f("target", "relation", collectionId=types["id"], maxSelect=1),
+            ],
+        },
+    )
+    for title, values in _TYPE_ROWS:
+        payload: dict[str, Any] = {"title": title, **values}
+        if "rel" in payload:
+            payload["rel"] = ref_ids[payload["rel"]]
+        if "rels" in payload:
+            payload["rels"] = [ref_ids[name] for name in payload["rels"]]
+        created = await _create(app_client, types["name"], payload)
+        await _create(
+            app_client, link["name"], {"title": title, "target": created["id"]}
+        )
+    await _create(app_client, link["name"], {"title": "n", "target": ""})
+    view = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zt_view_{suffix}",
+            "type": "view",
+            "schema": [
+                field
+                for field in types["schema"]
+                if field["name"] in {"title", *_TYPE_FIELDS}
+            ],
+            "options": {
+                "query": (
+                    "SELECT l.id, l.title, "
+                    + ", ".join(f"t.{name}" for name in _TYPE_FIELDS)
+                    + f" FROM {link['name']} l LEFT JOIN {types['name']} t "
+                    "ON t.id = l.target"
+                )
+            },
+        },
+    )
+    yield {"types": types["name"], "view": view["name"]}
+    headers = {"Authorization": admin_token}
+    for collection in (view, link, types, refs):
+        await app_client.delete(f"/api/collections/{collection['id']}", headers=headers)
+
+
+_PB_TYPES_BASE = {
+    "txt ?= 0": "h",
+    "txt ?= 1": "b",
+    "txt ?= 4.5": "c",
+    "txt ?= true": "a",
+    'txt ?= "1"': "a",
+    'txt ?= "1.0"': "b",
+    'txt ?= "x"': "",
+    'txt ?= " 1 "': "",
+    "txt ?!= 0": "abcdefgi",
+    "txt ?!= 1": "acdefghi",
+    "txt ?!= 4.5": "abdefghi",
+    "txt ?!= true": "bcdefghi",
+    'txt ?!= "1"': "bcdefghi",
+    'txt ?!= "1.0"': "acdefghi",
+    'txt ?!= "x"': "abcdefghi",
+    'txt ?!= " 1 "': "abcdefghi",
+    "num ?= 0": "cfg",
+    "num ?= 1": "ai",
+    "num ?= 4.5": "b",
+    "num ?= true": "ai",
+    'num ?= "1"': "ai",
+    'num ?= "1.0"': "ai",
+    'num ?= "x"': "",
+    'num ?= " 1 "': "ai",
+    "num ?!= 0": "abdehi",
+    "num ?!= 1": "bcdefgh",
+    "num ?!= 4.5": "acdefghi",
+    "num ?!= true": "bcdefgh",
+    'num ?!= "1"': "bcdefgh",
+    'num ?!= "1.0"': "bcdefgh",
+    'num ?!= "x"': "abcdefghi",
+    'num ?!= " 1 "': "bcdefgh",
+    "flag ?= 0": "bdefgi",
+    "flag ?= 1": "ach",
+    "flag ?= 4.5": "",
+    "flag ?= true": "ach",
+    'flag ?= "1"': "ach",
+    'flag ?= "1.0"': "ach",
+    'flag ?= "x"': "",
+    'flag ?= " 1 "': "ach",
+    "flag ?!= 0": "ach",
+    "flag ?!= 1": "bdefgi",
+    "flag ?!= 4.5": "abcdefghi",
+    "flag ?!= true": "bdefgi",
+    'flag ?!= "1"': "bdefgi",
+    'flag ?!= "1.0"': "bdefgi",
+    'flag ?!= "x"': "abcdefghi",
+    'flag ?!= " 1 "': "bdefgi",
+    "day ?= 0": "",
+    "day ?= 1": "",
+    "day ?= 4.5": "",
+    "day ?= true": "",
+    'day ?= "1"': "",
+    'day ?= "1.0"': "",
+    'day ?= "x"': "",
+    'day ?= " 1 "': "",
+    "day ?!= 0": "abcdefghi",
+    "day ?!= 1": "abcdefghi",
+    "day ?!= 4.5": "abcdefghi",
+    "day ?!= true": "abcdefghi",
+    'day ?!= "1"': "abcdefghi",
+    'day ?!= "1.0"': "abcdefghi",
+    'day ?!= "x"': "abcdefghi",
+    'day ?!= " 1 "': "abcdefghi",
+    "sel ?= 0": "",
+    "sel ?= 1": "",
+    "sel ?= 4.5": "",
+    "sel ?= true": "",
+    'sel ?= "1"': "",
+    'sel ?= "1.0"': "",
+    'sel ?= "x"': "a",
+    'sel ?= " 1 "': "",
+    "sel ?!= 0": "abcdefghi",
+    "sel ?!= 1": "abcdefghi",
+    "sel ?!= 4.5": "abcdefghi",
+    "sel ?!= true": "abcdefghi",
+    'sel ?!= "1"': "abcdefghi",
+    'sel ?!= "1.0"': "abcdefghi",
+    'sel ?!= "x"': "bcdefghi",
+    'sel ?!= " 1 "': "abcdefghi",
+    "sels ?= 0": "",
+    "sels ?= 1": "",
+    "sels ?= 4.5": "",
+    "sels ?= true": "",
+    'sels ?= "1"': "",
+    'sels ?= "1.0"': "",
+    'sels ?= "x"': "",
+    'sels ?= " 1 "': "",
+    "sels ?!= 0": "abcdefghi",
+    "sels ?!= 1": "abcdefghi",
+    "sels ?!= 4.5": "abcdefghi",
+    "sels ?!= true": "abcdefghi",
+    'sels ?!= "1"': "abcdefghi",
+    'sels ?!= "1.0"': "abcdefghi",
+    'sels ?!= "x"': "abcdefghi",
+    'sels ?!= " 1 "': "abcdefghi",
+    "rel ?= 0": "",
+    "rel ?= 1": "",
+    "rel ?= 4.5": "",
+    "rel ?= true": "",
+    'rel ?= "1"': "",
+    'rel ?= "1.0"': "",
+    'rel ?= "x"': "",
+    'rel ?= " 1 "': "",
+    "rel ?!= 0": "abcdefghi",
+    "rel ?!= 1": "abcdefghi",
+    "rel ?!= 4.5": "abcdefghi",
+    "rel ?!= true": "abcdefghi",
+    'rel ?!= "1"': "abcdefghi",
+    'rel ?!= "1.0"': "abcdefghi",
+    'rel ?!= "x"': "abcdefghi",
+    'rel ?!= " 1 "': "abcdefghi",
+    "rels ?= 0": "",
+    "rels ?= 1": "",
+    "rels ?= 4.5": "",
+    "rels ?= true": "",
+    'rels ?= "1"': "",
+    'rels ?= "1.0"': "",
+    'rels ?= "x"': "",
+    'rels ?= " 1 "': "",
+    "rels ?!= 0": "abcdefghi",
+    "rels ?!= 1": "abcdefghi",
+    "rels ?!= 4.5": "abcdefghi",
+    "rels ?!= true": "abcdefghi",
+    'rels ?!= "1"': "abcdefghi",
+    'rels ?!= "1.0"': "abcdefghi",
+    'rels ?!= "x"': "abcdefghi",
+    'rels ?!= " 1 "': "abcdefghi",
+    "num ?= txt": "",
+    "num ?!= txt": "abcdefghi",
+    "txt ?= day": "fg",
+    "day ?= sel": "cdefhi",
+    "num ?= flag": "afg",
+    "flag ?!= num": "bcdehi",
+    "sels ?= num": "",
+    "rel ?= day": "bcdefhi",
+    "txt = 1": "b",
+    'num = "1"': "ai",
+    "flag = 1": "ach",
+    "day != 1": "abcdefghi",
+    "num != txt": "abcdefghi",
+    "1 ?= txt": "b",
+    '"1" ?!= num': "bcdefgh",
+    "true ?= flag": "ach",
+    'sels:length ?= "1"': "",
+    "sels:length ?!= txt": "abcdefghi",
+    '@now ?= "x"': "",
+    "@now = txt": "",
+}
+_PB_TYPES_VIEW = {
+    "txt ?= 0": "h",
+    "txt ?= 1": "b",
+    "txt ?= 4.5": "c",
+    "txt ?= true": "a",
+    'txt ?= "1"': "a",
+    'txt ?= "1.0"': "b",
+    'txt ?= "x"': "",
+    'txt ?= " 1 "': "",
+    "txt ?!= 0": "abcdefgin",
+    "txt ?!= 1": "acdefghin",
+    "txt ?!= 4.5": "abdefghin",
+    "txt ?!= true": "bcdefghin",
+    'txt ?!= "1"': "bcdefghin",
+    'txt ?!= "1.0"': "acdefghin",
+    'txt ?!= "x"': "abcdefghin",
+    'txt ?!= " 1 "': "abcdefghin",
+    "num ?= 0": "cfg",
+    "num ?= 1": "ai",
+    "num ?= 4.5": "b",
+    "num ?= true": "ai",
+    'num ?= "1"': "ai",
+    'num ?= "1.0"': "ai",
+    'num ?= "x"': "",
+    'num ?= " 1 "': "ai",
+    "num ?!= 0": "abdehin",
+    "num ?!= 1": "bcdefghn",
+    "num ?!= 4.5": "acdefghin",
+    "num ?!= true": "bcdefghn",
+    'num ?!= "1"': "bcdefghn",
+    'num ?!= "1.0"': "bcdefghn",
+    'num ?!= "x"': "abcdefghin",
+    'num ?!= " 1 "': "bcdefghn",
+    "flag ?= 0": "bdefgi",
+    "flag ?= 1": "ach",
+    "flag ?= 4.5": "",
+    "flag ?= true": "ach",
+    'flag ?= "1"': "ach",
+    'flag ?= "1.0"': "ach",
+    'flag ?= "x"': "",
+    'flag ?= " 1 "': "ach",
+    "flag ?!= 0": "achn",
+    "flag ?!= 1": "bdefgin",
+    "flag ?!= 4.5": "abcdefghin",
+    "flag ?!= true": "bdefgin",
+    'flag ?!= "1"': "bdefgin",
+    'flag ?!= "1.0"': "bdefgin",
+    'flag ?!= "x"': "abcdefghin",
+    'flag ?!= " 1 "': "bdefgin",
+    "day ?= 0": "",
+    "day ?= 1": "",
+    "day ?= 4.5": "",
+    "day ?= true": "",
+    'day ?= "1"': "",
+    'day ?= "1.0"': "",
+    'day ?= "x"': "",
+    'day ?= " 1 "': "",
+    "day ?!= 0": "abcdefghin",
+    "day ?!= 1": "abcdefghin",
+    "day ?!= 4.5": "abcdefghin",
+    "day ?!= true": "abcdefghin",
+    'day ?!= "1"': "abcdefghin",
+    'day ?!= "1.0"': "abcdefghin",
+    'day ?!= "x"': "abcdefghin",
+    'day ?!= " 1 "': "abcdefghin",
+    "sel ?= 0": "",
+    "sel ?= 1": "",
+    "sel ?= 4.5": "",
+    "sel ?= true": "",
+    'sel ?= "1"': "",
+    'sel ?= "1.0"': "",
+    'sel ?= "x"': "a",
+    'sel ?= " 1 "': "",
+    "sel ?!= 0": "abcdefghin",
+    "sel ?!= 1": "abcdefghin",
+    "sel ?!= 4.5": "abcdefghin",
+    "sel ?!= true": "abcdefghin",
+    'sel ?!= "1"': "abcdefghin",
+    'sel ?!= "1.0"': "abcdefghin",
+    'sel ?!= "x"': "bcdefghin",
+    'sel ?!= " 1 "': "abcdefghin",
+    "sels ?= 0": "",
+    "sels ?= 1": "",
+    "sels ?= 4.5": "",
+    "sels ?= true": "",
+    'sels ?= "1"': "",
+    'sels ?= "1.0"': "",
+    'sels ?= "x"': "",
+    'sels ?= " 1 "': "",
+    "sels ?!= 0": "abcdefghin",
+    "sels ?!= 1": "abcdefghin",
+    "sels ?!= 4.5": "abcdefghin",
+    "sels ?!= true": "abcdefghin",
+    'sels ?!= "1"': "abcdefghin",
+    'sels ?!= "1.0"': "abcdefghin",
+    'sels ?!= "x"': "abcdefghin",
+    'sels ?!= " 1 "': "abcdefghin",
+    "rel ?= 0": "",
+    "rel ?= 1": "",
+    "rel ?= 4.5": "",
+    "rel ?= true": "",
+    'rel ?= "1"': "",
+    'rel ?= "1.0"': "",
+    'rel ?= "x"': "",
+    'rel ?= " 1 "': "",
+    "rel ?!= 0": "abcdefghin",
+    "rel ?!= 1": "abcdefghin",
+    "rel ?!= 4.5": "abcdefghin",
+    "rel ?!= true": "abcdefghin",
+    'rel ?!= "1"': "abcdefghin",
+    'rel ?!= "1.0"': "abcdefghin",
+    'rel ?!= "x"': "abcdefghin",
+    'rel ?!= " 1 "': "abcdefghin",
+    "rels ?= 0": "",
+    "rels ?= 1": "",
+    "rels ?= 4.5": "",
+    "rels ?= true": "",
+    'rels ?= "1"': "",
+    'rels ?= "1.0"': "",
+    'rels ?= "x"': "",
+    'rels ?= " 1 "': "",
+    "rels ?!= 0": "abcdefghin",
+    "rels ?!= 1": "abcdefghin",
+    "rels ?!= 4.5": "abcdefghin",
+    "rels ?!= true": "abcdefghin",
+    'rels ?!= "1"': "abcdefghin",
+    'rels ?!= "1.0"': "abcdefghin",
+    'rels ?!= "x"': "abcdefghin",
+    'rels ?!= " 1 "': "abcdefghin",
+    "num ?= txt": "n",
+    "num ?!= txt": "abcdefghi",
+    "txt ?= day": "fgn",
+    "day ?= sel": "cdefhin",
+    "num ?= flag": "afgn",
+    "flag ?!= num": "bcdehi",
+    "sels ?= num": "n",
+    "rel ?= day": "bcdefhin",
+    "txt = 1": "b",
+    'num = "1"': "ai",
+    "flag = 1": "ach",
+    "day != 1": "abcdefghin",
+    "num != txt": "abcdefghi",
+    "1 ?= txt": "b",
+    '"1" ?!= num': "bcdefghn",
+    "true ?= flag": "ach",
+    'sels:length ?= "1"': "",
+    "sels:length ?!= txt": "abcdefghin",
+    '@now ?= "x"': "",
+    "@now = txt": "",
+}
+_PB_TYPE_QUERIES = {
+    ("1", "@request.query.q ?= num"): "ai",
+    ("1", "@request.query.q ?!= flag"): "bdefgin",
+    ("1.0", "@request.query.q ?= txt"): "b",
+    ("x", "@request.query.q ?!= num"): "abcdefghin",
+    ("1", "@request.query.q = day"): "",
+    ("x", "@request.query.q != sels"): "abcdefghin",
+}
+_PB_JSON_COLUMNS = {
+    "meta ?= txt": "c",
+    "meta ?!= txt": "ab",
+    "meta ?= meta": "abc",
+    "meta ?!= meta": "",
+    "txt ?= meta": "c",
+    "num ?!= meta": "ab",
+    "meta ?= sels": "c",
+    "meta ?!= tid": "ab",
+    "meta = flag": "c",
+    "meta != rel": "ab",
+}
+
+
+async def test_operands_of_different_types_compare_like_sqlite(
+    app_client: AsyncClient, zt_env: dict
+) -> None:
+    mismatches = {}
+    for name, expected_values in (
+        (zt_env["types"], _PB_TYPES_BASE),
+        (zt_env["view"], _PB_TYPES_VIEW),
+    ):
+        for expression, expected in expected_values.items():
+            got = await _titles(app_client, name, sort="title", filter=expression)
+            if got != expected:
+                mismatches[(name, expression)] = {
+                    "pocketbase": expected,
+                    "ppbase": got,
+                }
+    assert mismatches == {}
+
+
+async def test_request_values_of_another_type_compare_like_sqlite(
+    app_client: AsyncClient, admin_token: str, zt_env: dict
+) -> None:
+    # ``@request.*`` in a list filter is an admin-only feature.
+    headers = {"Authorization": admin_token}
+    mismatches = {}
+    for (q, expression), expected in _PB_TYPE_QUERIES.items():
+        got = await _titles(
+            app_client, zt_env["view"], headers, sort="title", filter=expression, q=q
+        )
+        if got != expected:
+            mismatches[(q, expression)] = {"pocketbase": expected, "ppbase": got}
+    assert mismatches == {}
+
+
+async def test_any_equal_never_fails_on_operands_of_another_type(
+    app_client: AsyncClient, zt_env: dict
+) -> None:
+    """``?=``/``?!=`` with every operand type answer 200 (they compared
+    texts before WS-A11 and turned into HTTP 500 as ``=``/``!=``)."""
+    failures = {}
+    for field in _TYPE_FIELDS:
+        for op in ("?=", "?!="):
+            for operand in _TYPE_OPERANDS:
+                expression = f"{field} {op} {operand}"
+                response = await app_client.get(
+                    f"/api/collections/{zt_env['view']}/records",
+                    params={"filter": expression, "perPage": 200},
+                )
+                if response.status_code != 200:
+                    failures[expression] = response.status_code
+    assert failures == {}
+
+
+async def test_json_any_equal_to_a_column_follows_pocketbase(
+    app_client: AsyncClient, zv_env: dict
+) -> None:
+    """``json ?= column``/``?!=`` are ``=``/``!=``: two NULLs are equal (view
+    row c), a NULL differs from any value (PocketBase 0.22.34, probe
+    ``types.json_columns``)."""
+    mismatches = {}
+    for expression, expected in _PB_JSON_COLUMNS.items():
+        got = await _titles(app_client, zv_env["view"], sort="title", filter=expression)
+        if got != expected:
+            mismatches[expression] = {"pocketbase": expected, "ppbase": got}
+    assert mismatches == {}
