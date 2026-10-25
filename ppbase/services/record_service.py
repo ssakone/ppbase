@@ -223,16 +223,38 @@ def _fields_filter(fields_param: str | None) -> list[str] | None:
     return [f.strip() for f in fields_param.split(",") if f.strip()]
 
 
-def _sort_term(column: str, direction: str, date_fields: set[str]) -> str:
+def _sort_term(
+    column: str,
+    direction: str,
+    date_fields: set[str],
+    *,
+    nullable: bool = False,
+    json_fields: frozenset[str] | set[str] = frozenset(),
+) -> str:
     """Render one ``ORDER BY`` term like PocketBase sorts it.
 
-    PocketBase sorts a date column as SQLite text, where the empty date ''
-    comes before any date (``ORDER BY [[col]] ASC|DESC``, v0.22.34
-    tools/search/sort.go l.23-37).  PPBase stores that empty date as NULL,
-    which PostgreSQL sorts last in ascending order, hence the explicit
-    ``NULLS FIRST``/``NULLS LAST``.
+    PocketBase sorts with ``ORDER BY <identifier> ASC|DESC`` (v0.22.34
+    tools/search/sort.go l.23-37, v0.40.6 l.30-50) on SQLite, where NULL is
+    smaller than any value: first in ascending order, last in descending
+    order (https://www.sqlite.org/lang_select.html#orderby).  PostgreSQL sorts
+    NULL as larger than any value, hence an explicit ``NULLS FIRST`` /
+    ``NULLS LAST`` on every column that can hold NULL:
+
+    - a date: PPBase stores the empty date '' as NULL, and SQLite sorts ''
+      before any date text;
+    - every column of a view (``nullable``): a ``LEFT JOIN`` without match;
+    - a json value: PocketBase sorts ``JSON_EXTRACT(col, '$')``, which is SQL
+      NULL for a JSON ``null`` (v0.22.34 resolvers/record_field_resolve_runner.go
+      l.465-470), stored by PPBase as ``jsonb 'null'``.
+
+    The other base and auth columns are ``NOT NULL``: their term is unchanged.
     """
-    if column.strip('"') not in date_fields:
+    name = column.strip('"')
+    if column.endswith("()") or name == "ctid":
+        return f"{column} {direction}"
+    if name in json_fields:
+        column = f"NULLIF(to_jsonb({column}), 'null'::jsonb)"
+    elif not nullable and name not in date_fields:
         return f"{column} {direction}"
     nulls = "NULLS FIRST" if direction == "ASC" else "NULLS LAST"
     return f"{column} {direction} {nulls}"
@@ -941,8 +963,15 @@ async def list_records(
                 column = _AUTH_FIELD_COLUMNS.get(col_name, col_name)
                 resolved_parts.append((f'"{column}"', direction))
             date_fields = {f.name for f in schema_fields if f.type == FieldType.DATE}
+            json_fields = {f.name for f in schema_fields if f.type == FieldType.JSON}
             order_sql = ", ".join(
-                _sort_term(col, direction, date_fields)
+                _sort_term(
+                    col,
+                    direction,
+                    date_fields,
+                    nullable=col_type == "view",
+                    json_fields=json_fields,
+                )
                 for col, direction in resolved_parts
             )
 
