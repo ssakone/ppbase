@@ -649,7 +649,14 @@ async def null_scenarios(
         "t_jnull",
     )
     out["base_filters"] = {}
-    for expression in ("meta.k = null", "meta.k != null", "meta = null"):
+    for expression in (
+        "meta.k = null",
+        "meta.k != null",
+        "meta = null",
+        "meta != null",
+        'meta = ""',
+        'meta != ""',
+    ):
         body = await _list(client, "zv_targets", sort="txt", filter=expression)
         out["base_filters"][expression] = (
             [labels.by_id.get(item["id"], item["id"]) for item in body["items"]]

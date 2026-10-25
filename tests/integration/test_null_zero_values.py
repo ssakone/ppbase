@@ -227,6 +227,7 @@ async def zv_env(app_client: AsyncClient, admin_token: str) -> Any:
     yield {
         "refs": rn,
         "targets": tn,
+        "src": sn,
         "view": view["name"],
         "view_ref": view_ref["name"],
         "ra": ra,
@@ -308,7 +309,7 @@ async def test_expand_from_and_into_view_records(
     assert _values(items["a"]["expand"]["vref"]) == _full_values(zv_env)
 
 
-async def test_filters_sorts_and_totals_are_unchanged(
+async def test_filters_sorts_and_totals_follow_pocketbase(
     app_client: AsyncClient, zv_env: dict
 ) -> None:
     async def titles(**params: Any) -> list[str]:
@@ -327,11 +328,10 @@ async def test_filters_sorts_and_totals_are_unchanged(
     assert await titles(filter='txt != ""') == ["a"]
     assert await titles(filter="num = 0") == ["b"]
     assert await titles(filter="flag = false") == ["b"]
-    # Open divergences, unchanged by the NULL serialization (probe
-    # KNOWN_DIVERGENCES): PocketBase 0.22.34 gives ["b", "c"] and ["c", "b",
-    # "a"]; PostgreSQL keeps the SQL NULL semantics.
-    assert await titles(filter='txt = ""') == ["b"]
-    assert await titles(sort="txt,title") == ["b", "a", "c"]
+    # The NULL of row c is "" for ``= ""`` and sorts first (WS-A11; before,
+    # PostgreSQL's NULL semantics gave ["b"] and ["b", "a", "c"]).
+    assert await titles(filter='txt = ""') == ["b", "c"]
+    assert await titles(sort="txt,title") == ["c", "b", "a"]
 
 
 async def test_base_columns_are_not_null_and_serve_their_defaults(
@@ -501,4 +501,507 @@ async def test_a_forced_null_is_served_as_zero_value_on_every_path(
     finally:
         await app_client.delete(
             f"/api/collections/{people['id']}", headers={"Authorization": admin_token}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Filters and sorts on NULL columns (WS-A11)
+# ---------------------------------------------------------------------------
+#
+# PocketBase 0.22.34 results measured by
+# ``tests/pocketbase_parity/null_zero_values_probe.py`` (``null`` section) on
+# the same rows: the titles of the matching view rows, sorted by title.  Row
+# c is the unmatched LEFT JOIN (every joined column NULL), row b the empty
+# target.  PocketBase builds ``=``/``!=`` with ``resolveEqualExpr``
+# (v0.22.34 tools/search/filter.go l.284-368) and sorts on SQLite, where
+# NULL comes first in ascending order.
+_PB_VIEW_FILTERS: dict[str, str] = {
+    '"" = day': "bc",
+    '"" = doc': "bc",
+    '"" = docs': "c",
+    '"" = flag': "c",
+    '"" = link': "bc",
+    '"" = mail': "bc",
+    '"" = meta': "",
+    '"" = num': "c",
+    '"" = rel': "bc",
+    '"" = relnull': "c",
+    '"" = rels': "c",
+    '"" = rich': "bc",
+    '"" = sel': "bc",
+    '"" = sels': "c",
+    '"" = tid': "c",
+    '"" = txt': "bc",
+    '"2030-01-01 00:00:00.000Z" != day': "abc",
+    '"https://zz.invalid" != link': "abc",
+    '"y" != sel': "abc",
+    '"y" != sels': "abc",
+    '"zz" != rich': "abc",
+    '"zz" != txt': "abc",
+    '"zz.txt" != doc': "abc",
+    '"zz.txt" != docs': "abc",
+    '"zz@example.invalid" != mail': "abc",
+    '"zzzzzzzzzzzzzzz" != rel': "abc",
+    '"zzzzzzzzzzzzzzz" != relnull': "abc",
+    '"zzzzzzzzzzzzzzz" != rels': "abc",
+    '"zzzzzzzzzzzzzzz" != tid': "abc",
+    "7 != num": "abc",
+    'day != ""': "a",
+    'day != "2030-01-01 00:00:00.000Z"': "abc",
+    "day != null": "a",
+    'day = ""': "bc",
+    'day = "2030-01-01 00:00:00.000Z"': "",
+    "day = null": "bc",
+    'day ?!= ""': "a",
+    'day ?!= "2030-01-01 00:00:00.000Z"': "abc",
+    "day ?!= null": "a",
+    'day ?= ""': "bc",
+    "day ?= null": "bc",
+    'doc != ""': "a",
+    'doc != "zz.txt"': "abc",
+    "doc != null": "a",
+    'doc = ""': "bc",
+    'doc = "zz.txt"': "",
+    "doc = null": "bc",
+    'doc ?!= ""': "a",
+    'doc ?!= "zz.txt"': "abc",
+    "doc ?!= null": "a",
+    'doc ?= ""': "bc",
+    "doc ?= null": "bc",
+    'docs != ""': "ab",
+    'docs != "zz.txt"': "abc",
+    "docs != null": "ab",
+    'docs = ""': "c",
+    'docs = "zz.txt"': "",
+    "docs = null": "c",
+    'docs ?!= ""': "ab",
+    'docs ?!= "zz.txt"': "abc",
+    "docs ?!= null": "ab",
+    'docs ?= ""': "c",
+    "docs ?= null": "c",
+    'flag != ""': "ab",
+    "flag != null": "ab",
+    "flag != true": "bc",
+    'flag = ""': "c",
+    "flag = null": "c",
+    "flag = true": "a",
+    'flag ?!= ""': "ab",
+    "flag ?!= null": "ab",
+    "flag ?!= true": "bc",
+    'flag ?= ""': "c",
+    "flag ?= null": "c",
+    'link != ""': "a",
+    'link != "https://zz.invalid"': "abc",
+    "link != null": "a",
+    'link = ""': "bc",
+    'link = "https://zz.invalid"': "",
+    "link = null": "bc",
+    'link ?!= ""': "a",
+    'link ?!= "https://zz.invalid"': "abc",
+    "link ?!= null": "a",
+    'link ?= ""': "bc",
+    "link ?= null": "bc",
+    'mail != ""': "a",
+    'mail != "zz@example.invalid"': "abc",
+    "mail != null": "a",
+    'mail = ""': "bc",
+    'mail = "zz@example.invalid"': "",
+    "mail = null": "bc",
+    'mail ?!= ""': "a",
+    'mail ?!= "zz@example.invalid"': "abc",
+    "mail ?!= null": "a",
+    'mail ?= ""': "bc",
+    "mail ?= null": "bc",
+    'meta != ""': "abc",
+    "meta != null": "a",
+    'meta = ""': "",
+    "meta = null": "bc",
+    'meta ?!= ""': "abc",
+    "meta ?!= null": "a",
+    'meta ?= ""': "",
+    "meta ?= null": "bc",
+    "meta.k != null": "a",
+    "meta.k = null": "bc",
+    "null != day": "a",
+    "null != doc": "a",
+    "null != docs": "ab",
+    "null != flag": "ab",
+    "null != link": "a",
+    "null != mail": "a",
+    "null != meta": "a",
+    "null != num": "ab",
+    "null != rel": "a",
+    "null != relnull": "ab",
+    "null != rels": "ab",
+    "null != rich": "a",
+    "null != sel": "a",
+    "null != sels": "ab",
+    "null != tid": "ab",
+    "null != txt": "a",
+    'num != ""': "ab",
+    "num != 7": "abc",
+    "num != null": "ab",
+    "num < 9": "ab",
+    "num <= 0": "b",
+    'num = ""': "c",
+    "num = 7": "",
+    "num = null": "c",
+    "num > 1": "a",
+    'num ?!= ""': "ab",
+    "num ?!= 7": "abc",
+    "num ?!= null": "ab",
+    'num ?= ""': "c",
+    "num ?= null": "c",
+    'rel != ""': "a",
+    'rel != "zzzzzzzzzzzzzzz"': "abc",
+    "rel != null": "a",
+    'rel !~ "zz"': "ab",
+    'rel = ""': "bc",
+    'rel = "zzzzzzzzzzzzzzz"': "",
+    "rel = null": "bc",
+    "rel = tid": "c",
+    'rel ?!= ""': "a",
+    'rel ?!= "zzzzzzzzzzzzzzz"': "abc",
+    "rel ?!= null": "a",
+    'rel ?= ""': "bc",
+    "rel ?= null": "bc",
+    'relnull != ""': "ab",
+    'relnull != "zzzzzzzzzzzzzzz"': "abc",
+    "relnull != null": "ab",
+    'relnull = ""': "c",
+    'relnull = "zzzzzzzzzzzzzzz"': "",
+    "relnull = null": "c",
+    'relnull ?!= ""': "ab",
+    'relnull ?!= "zzzzzzzzzzzzzzz"': "abc",
+    "relnull ?!= null": "ab",
+    'relnull ?= ""': "c",
+    "relnull ?= null": "c",
+    'rels != ""': "ab",
+    'rels != "zzzzzzzzzzzzzzz"': "abc",
+    "rels != null": "ab",
+    'rels = ""': "c",
+    'rels = "zzzzzzzzzzzzzzz"': "",
+    "rels = null": "c",
+    'rels ?!= ""': "ab",
+    'rels ?!= "zzzzzzzzzzzzzzz"': "abc",
+    "rels ?!= null": "ab",
+    'rels ?= ""': "c",
+    "rels ?= null": "c",
+    'rich != ""': "a",
+    'rich != "zz"': "abc",
+    "rich != null": "a",
+    'rich = ""': "bc",
+    'rich = "zz"': "",
+    "rich = null": "bc",
+    'rich ?!= ""': "a",
+    'rich ?!= "zz"': "abc",
+    "rich ?!= null": "a",
+    'rich ?= ""': "bc",
+    "rich ?= null": "bc",
+    'sel != ""': "a",
+    'sel != "y"': "abc",
+    "sel != null": "a",
+    "sel != txt": "a",
+    'sel = ""': "bc",
+    'sel = "y"': "",
+    "sel = null": "bc",
+    'sel ?!= ""': "a",
+    'sel ?!= "y"': "abc",
+    "sel ?!= null": "a",
+    'sel ?= ""': "bc",
+    "sel ?= null": "bc",
+    'sels != ""': "ab",
+    'sels != "y"': "abc",
+    "sels != null": "ab",
+    'sels !~ "zz"': "ab",
+    'sels = ""': "c",
+    'sels = "y"': "",
+    "sels = null": "c",
+    'sels ?!= ""': "ab",
+    'sels ?!= "y"': "abc",
+    "sels ?!= null": "ab",
+    'sels ?= ""': "c",
+    "sels ?= null": "c",
+    'tid != ""': "ab",
+    'tid != "zzzzzzzzzzzzzzz"': "abc",
+    "tid != null": "ab",
+    'tid = ""': "c",
+    'tid = "zzzzzzzzzzzzzzz"': "",
+    "tid = null": "c",
+    'tid ?!= ""': "ab",
+    'tid ?!= "zzzzzzzzzzzzzzz"': "abc",
+    "tid ?!= null": "ab",
+    'tid ?= ""': "c",
+    "tid ?= null": "c",
+    "true != flag": "bc",
+    'txt != ""': "a",
+    'txt != "zz"': "abc",
+    "txt != null": "a",
+    "txt != title": "abc",
+    'txt !~ "zz"': "ab",
+    'txt < "zz"': "ab",
+    'txt = ""': "bc",
+    'txt = "zz"': "",
+    "txt = null": "bc",
+    "txt = sel": "bc",
+    'txt > ""': "a",
+    'txt ?!= ""': "a",
+    'txt ?!= "zz"': "abc",
+    "txt ?!= null": "a",
+    'txt ?= ""': "bc",
+    "txt ?= null": "bc",
+    "txt ?= sel": "bc",
+    'txt ~ ""': "ab",
+}
+_PB_VIEW_SORTS: dict[str, str] = {
+    "-day,title": "abc",
+    "-doc,title": "abc",
+    "-docs,title": "bac",
+    "-flag,title": "abc",
+    "-link,title": "abc",
+    "-mail,title": "abc",
+    "-meta,title": "abc",
+    "-num,title": "abc",
+    "-rel,title": "abc",
+    "-relnull,title": "bac",
+    "-rels,title": "bac",
+    "-rich,title": "abc",
+    "-sel,title": "abc",
+    "-sels,title": "bac",
+    "-txt,title": "abc",
+    "day,title": "cba",
+    "doc,title": "cba",
+    "docs,title": "cab",
+    "flag,title": "cba",
+    "link,title": "cba",
+    "mail,title": "cba",
+    "meta,title": "bca",
+    "num,title": "cba",
+    "rel,title": "cba",
+    "relnull,title": "cab",
+    "rels,title": "cab",
+    "rich,title": "cba",
+    "sel,title": "cba",
+    "sels,title": "cab",
+    "txt,title": "cba",
+}
+# Documented differences of non-NULL values (probe KNOWN_DIVERGENCES): the
+# NULL row is placed like PocketBase, the rest keeps PPBase's order.
+_PPBASE_VIEW_SORTS = {
+    # PocketBase sorts a multi-value field by its JSON text ('[]' after
+    # '["x"]'), PPBase by its array ('{}' first).
+    **{
+        f"{sign}{field},title": order
+        for field in ("sels", "docs", "rels", "relnull")
+        for sign, order in (("", "cba"), ("-", "abc"))
+    },
+    # The empty date of row b is NULL in PPBase (D-0032) and ties with the
+    # NULL of row c; SQLite sorts NULL before ''.
+    "day,title": "bca",
+}
+
+
+async def _titles(
+    client: AsyncClient, name: str, headers: dict | None = None, **params: Any
+) -> str:
+    params.setdefault("perPage", 200)
+    response = await client.get(
+        f"/api/collections/{name}/records", params=params, headers=headers
+    )
+    assert response.status_code == 200, (params, response.text)
+    body = response.json()
+    titles = "".join(item["title"] for item in body["items"])
+    # totalItems counts with the same WHERE clause.
+    assert body["totalItems"] == len(titles), params
+    return titles
+
+
+async def test_view_null_filters_match_pocketbase(
+    app_client: AsyncClient, zv_env: dict
+) -> None:
+    mismatches = {}
+    for expression, expected in _PB_VIEW_FILTERS.items():
+        got = await _titles(app_client, zv_env["view"], sort="title", filter=expression)
+        if got != expected:
+            mismatches[expression] = {"pocketbase": expected, "ppbase": got}
+    assert mismatches == {}
+
+
+async def test_view_null_sorts_match_pocketbase(
+    app_client: AsyncClient, zv_env: dict
+) -> None:
+    mismatches = {}
+    for sort, expected in {**_PB_VIEW_SORTS, **_PPBASE_VIEW_SORTS}.items():
+        got = await _titles(app_client, zv_env["view"], sort=sort)
+        if got != expected:
+            mismatches[sort] = {"expected": expected, "ppbase": got}
+    assert mismatches == {}
+
+
+async def test_relation_and_collection_paths_into_a_view_compare_null(
+    app_client: AsyncClient, admin_token: str, zv_env: dict
+) -> None:
+    # PocketBase 0.22.34 (probe ``null.path_filters``).
+    expected_vref = {
+        'vref.txt = ""': "bc",
+        'vref.txt != "zz"': "abc",
+        "vref.num != 7": "abc",
+        'vref.rel = ""': "bc",
+        'vref.sel ?= ""': "bc",
+        'vref.sels ?= ""': "c",
+        "vref.flag != true": "bc",
+        "vref.meta = null": "bc",
+        "vref.meta != null": "a",
+        "vref.meta.k = null": "bc",
+        'vref.tid = ""': "c",
+    }
+    for expression, expected in expected_vref.items():
+        got = await _titles(
+            app_client, zv_env["view_ref"], sort="title", filter=expression
+        )
+        assert got == expected, expression
+    view = zv_env["view"]
+    expected_collection = {
+        f'@collection.{view}.txt ?= ""': "bc",
+        f'@collection.{view}.txt ?!= "zz"': "abc",
+        f"@collection.{view}.num ?!= 7": "abc",
+        f"@collection.{view}.meta ?= null": "bc",
+        f"@collection.{view}.meta ?!= null": "a",
+        f'@collection.{view}.rels ?= ""': "c",
+        # Without ``?`` every row of the view must match: none.
+        f'@collection.{view}.sel = ""': "",
+    }
+    headers = {"Authorization": admin_token}
+    for condition, expected in expected_collection.items():
+        expression = f"@collection.{view}.id ?= id && {condition}"
+        got = await _titles(
+            app_client, zv_env["src"], headers, sort="title", filter=expression
+        )
+        assert got == expected, expression
+
+
+async def test_auth_records_through_a_left_join_compare_null(
+    app_client: AsyncClient, admin_token: str, zv_env: dict
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    people = await _post_collection(
+        app_client,
+        admin_token,
+        {
+            "name": f"zv_people_{suffix}",
+            "type": "auth",
+            "schema": [
+                _f("nick", "text"),
+                _f("score", "number"),
+                _f("tags", "select", maxSelect=2, values=["x", "y"]),
+            ],
+            "options": {
+                "allowEmailAuth": True,
+                "allowUsernameAuth": True,
+                "allowOAuth2Auth": False,
+                "minPasswordLength": 8,
+                "requireEmail": False,
+            },
+        },
+    )
+    headers = {"Authorization": admin_token}
+    uview = None
+    try:
+        password = "probe-User-Password-1"
+        for nick in ("a", "b"):
+            await _create(
+                app_client,
+                people["name"],
+                {
+                    "username": f"zvnull{nick}{suffix}",
+                    "email": f"zvnull{nick}{suffix}@example.invalid",
+                    "nick": nick,
+                    "score": 3,
+                    "password": password,
+                    "passwordConfirm": password,
+                },
+            )
+        uview = await _post_collection(
+            app_client,
+            admin_token,
+            {
+                "name": f"zv_uview_{suffix}",
+                "type": "view",
+                "schema": [
+                    _f("title", "text"),
+                    _f("uid", "relation", collectionId=people["id"], maxSelect=1),
+                    _f("uemail", "email"),
+                    _f("uver", "bool"),
+                    _f("uscore", "number"),
+                    _f("utags", "select", maxSelect=2, values=["x", "y"]),
+                ],
+                "options": {
+                    "query": (
+                        "SELECT s.id, s.title, u.id AS uid, u.email AS uemail, "
+                        "u.verified AS uver, u.score AS uscore, u.tags AS utags "
+                        f"FROM {zv_env['src']} s LEFT JOIN {people['name']} u "
+                        "ON u.nick = s.title"
+                    )
+                },
+            },
+        )
+        # PocketBase 0.22.34 (probe ``null.auth_view_*``).
+        expected = {
+            'uemail = ""': "c",
+            'uemail != ""': "ab",
+            'uemail != "zz@example.invalid"': "abc",
+            "uver = false": "ab",
+            "uver != true": "abc",
+            'uid = ""': "c",
+            "uscore != 1": "abc",
+            'utags = ""': "c",
+            'utags ?= ""': "c",
+        }
+        for expression, titles in expected.items():
+            got = await _titles(
+                app_client, uview["name"], sort="title", filter=expression
+            )
+            assert got == titles, expression
+        sorts = {
+            "uemail,title": "cab",
+            "-uemail,title": "bac",
+            "uver,title": "cab",
+            "-uscore,title": "abc",
+        }
+        for sort, titles in sorts.items():
+            assert await _titles(app_client, uview["name"], sort=sort) == titles, sort
+    finally:
+        if uview is not None:
+            await app_client.delete(f"/api/collections/{uview['id']}", headers=headers)
+        await app_client.delete(f"/api/collections/{people['id']}", headers=headers)
+
+
+async def test_json_null_filters_of_a_base_collection(
+    app_client: AsyncClient, admin_token: str, zv_env: dict
+) -> None:
+    """A stored JSON null is null for ``= null`` (BUMA D-0029 filter part)."""
+    tn = zv_env["targets"]
+    jnull = await _create(app_client, tn, {"txt": "jn", "meta": {"k": None}})
+    labels = {
+        zv_env["full"]: "t_full",
+        zv_env["empty"]: "t_empty",
+        jnull["id"]: "t_jnull",
+    }
+    try:
+
+        async def matching(expression: str) -> list[str]:
+            items = await _items(app_client, tn, sort="txt", filter=expression)
+            return [labels[item["id"]] for item in items]
+
+        # PocketBase 0.22.34 (probe ``read.base_filters``, ``null.base_filters``).
+        assert await matching("meta = null") == ["t_empty"]
+        assert await matching("meta != null") == ["t_jnull", "t_full"]
+        assert await matching("meta.k = null") == ["t_empty", "t_jnull"]
+        assert await matching("meta.k != null") == ["t_full"]
+        assert await matching('meta = ""') == []
+        assert await matching('meta != ""') == ["t_empty", "t_jnull", "t_full"]
+    finally:
+        await app_client.delete(
+            f"/api/collections/{tn}/records/{jnull['id']}",
+            headers={"Authorization": admin_token},
         )

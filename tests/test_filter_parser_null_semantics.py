@@ -7,7 +7,7 @@ empty operand (``""``/``null``) also matches NULL, ``!=`` is NULL-safe
 operand without COALESCE (``JSON_EXTRACT(x) IS [NOT] y``).  A current-record
 ``?op`` is ``op``.  SQLite sorts NULL first in ascending order.  The
 PostgreSQL behaviour is checked in
-``tests/integration/test_null_filters_sorts.py``; see ``docs/null-values.md``.
+``tests/integration/test_null_zero_values.py``; see ``docs/null-values.md``.
 """
 
 from __future__ import annotations
