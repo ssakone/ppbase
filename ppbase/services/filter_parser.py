@@ -9,8 +9,10 @@ SQL strings -- to prevent SQL injection.
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -261,6 +263,33 @@ class _Side:
     kind: str
     node: tuple
     is_json: bool = False
+
+
+# A value not known while parsing (``_SqliteOperand.value``).
+_UNKNOWN: Any = object()
+
+
+@dataclass(frozen=True)
+class _SqliteOperand:
+    """How PocketBase's SQLite sees one operand of a direct ``=``/``!=``.
+
+    ``family`` is the PPBase type ("text", "number", "bool" or "date"): two
+    operands of one family keep PPBase's typed comparison.  ``affinity`` is
+    the SQLite affinity ("text", "numeric" or "" for none), ``storage`` the
+    storage class of a non-NULL value ("text" or "numeric"); ``text`` and
+    ``number`` are the SQL of the SQLite text or number of the value,
+    ``value`` the value when it is known while parsing.  ``column`` marks a
+    per-row operand: PocketBase compares two of them through ``COALESCE``.
+    """
+
+    family: str
+    affinity: str
+    storage: str
+    sql: str
+    text: str | None = None
+    number: str | None = None
+    value: Any = _UNKNOWN
+    column: bool = False
 
 
 class _Cond:
@@ -1031,6 +1060,21 @@ class _FilterTransformer(Transformer):
                     sql = f"({sql} AND {node[3]})"
             return sql
 
+        if op in {"=", "!=", "?=", "?!="}:
+            equal = op in {"=", "?="}
+            # A json operand and another column (NoCoalesce), dates included.
+            typed_sql = self._json_column_equal_sql(
+                left, left_sql, right, right_sql, equal=equal
+            )
+            # Operands of different types: SQLite's comparison, never a
+            # PostgreSQL type error.
+            if typed_sql is None and op in {"=", "!="}:
+                typed_sql = self._sqlite_equal_sql(
+                    left, left_sql, right, right_sql, equal=equal
+                )
+            if typed_sql is not None:
+                return _guarded(typed_sql)
+
         date_sql = _empty_date_condition(self, left, left_sql, op, right, right_sql)
         if date_sql is not None:
             return _guarded(date_sql)
@@ -1127,13 +1171,19 @@ class _FilterTransformer(Transformer):
         ``null`` and ``@request.*``/``@now`` values never multi-match either
         (static values, v0.22.34 resolvers/record_field_resolver.go
         l.162-225).  Kept as is: json operands (PPBase's array-any reading),
-        ``:each`` operands and fields without metadata.
+        ``:each`` operands and fields without metadata; ``?=``/``?!=`` also
+        keep the text comparison of an operand whose SQLite type is unknown
+        (``_equal_operand_known``), never a typed PostgreSQL comparison.
         """
         if op not in _ANY_STANDARD_OPS and op not in _ANY_LIKE_OPS:
             return op
         nodes = (left, right)
         if any(
             self._is_each_node(node) or self._is_json_operand(node) for node in nodes
+        ):
+            return op
+        if op in {"?=", "?!="} and not all(
+            self._equal_operand_known(node) for node in nodes
         ):
             return op
         if all(
@@ -1149,6 +1199,31 @@ class _FilterTransformer(Transformer):
             ):
                 return op[1:]
         return op
+
+    def _equal_operand_known(self, node: Any) -> bool:
+        """Whether ``_sqlite_operand`` classifies ``node`` (or it is empty).
+
+        A ``?=``/``?!=`` rewritten as ``=``/``!=`` must never compare
+        operands of different PostgreSQL types (HTTP 500).
+        """
+        kind = node[0] if isinstance(node, tuple) and node else ""
+        if kind in {"literal", "null"}:
+            return True
+        if kind == "macro":
+            name = str(node[1]).lstrip("@")
+            if name.startswith("request."):
+                return not name.endswith(":changed")
+            return name in _SQLITE_INT_MACROS or name in _SQLITE_DATE_MACROS
+        if kind == "field_modifier":
+            return len(node) > 2 and node[2] in {"lower", "length"}
+        if kind == "field":
+            return self._operand_field_type(node) in {
+                *_SQLITE_TEXT_FIELD_TYPES,
+                *_DATETIME_FIELD_TYPES,
+                "number",
+                "bool",
+            }
+        return False
 
     def _json_empty_sql(
         self, json_sql: str, other: _Side, *, equal: bool
@@ -1250,8 +1325,7 @@ class _FilterTransformer(Transformer):
         left_side = self._side_from_sql(left, left_sql)
         right_side = self._side_from_sql(right, right_sql)
         if self._is_json_operand(left) or self._is_json_operand(right):
-            if left_side.kind == "column" and right_side.kind == "column":
-                return self._json_columns_equal_sql(left_sql, right_sql, equal=equal)
+            # (A json operand and another column: ``_json_column_equal_sql``.)
             # A json operand and a known non-empty value: ``x IS [NOT] v``,
             # so ``!=`` keeps a NULL row (NoCoalesce, filter.go l.308-316).
             # The value comparison itself is unchanged: PPBase compares the
@@ -1337,6 +1411,222 @@ class _FilterTransformer(Transformer):
             f"AND ({left_sql} IS NOT NULL OR {right_text} <> '') "
             f"AND ({right_sql} IS NOT NULL OR {left_text} <> ''))"
         )
+
+    # -- Operands of different types (SQLite affinity) ---------------------
+
+    def _sqlite_value_operand(
+        self, value: Any, sql: str, *, real: bool
+    ) -> _SqliteOperand | None:
+        """A literal or bound value; ``None`` for an empty or other value.
+
+        ``real``: a number is a Go float64 (a filter number, a JSON number),
+        else an int (``:length``).  An empty operand keeps the NULL rules of
+        ``resolveEqualExpr``; a date literal only meets a date column.
+        """
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            number = 1 if value else 0
+            return _SqliteOperand(
+                "bool", "", "numeric", sql, number=str(number), value=number
+            )
+        if isinstance(value, (int, float)):
+            number = float(value) if real else value
+            return _SqliteOperand(
+                "number",
+                "",
+                "numeric",
+                sql,
+                number=_sqlite_number_sql(number),
+                value=number,
+            )
+        if isinstance(value, str):
+            return _SqliteOperand("text", "", "text", sql, text=sql, value=value)
+        return None
+
+    def _sqlite_operand(self, node: Any, sql: str) -> _SqliteOperand | None:
+        """Classify a direct comparison operand, ``None`` when unknown.
+
+        Unknown: an empty operand, a json operand, a field without metadata
+        and any other expression; those keep their previous SQL.
+        """
+        kind = node[0] if isinstance(node, tuple) and node else ""
+        if kind == "literal":
+            return self._sqlite_value_operand(node[1], sql, real=True)
+        if kind == "macro":
+            if self._is_bound_param(sql):
+                real = not str(node[1]).endswith(":length")
+                return self._sqlite_value_operand(self._params[sql[1:]], sql, real=real)
+            name = str(node[1]).lstrip("@")
+            if name in _SQLITE_INT_MACROS:
+                return _SqliteOperand(
+                    "number",
+                    "",
+                    "numeric",
+                    sql,
+                    text=f"CAST({sql} AS text)",
+                    number=sql,
+                )
+            if name in _SQLITE_DATE_MACROS:
+                return _SqliteOperand(
+                    "date", "", "text", sql, text=_pb_date_text_sql(sql)
+                )
+            return None
+        if kind == "field_modifier":
+            # ``LOWER(x)`` and the ``:length`` count have no affinity.
+            modifier = node[2] if len(node) > 2 else ""
+            if modifier == "lower":
+                return _SqliteOperand("text", "", "text", sql, text=sql, column=True)
+            if modifier == "length":
+                return _SqliteOperand(
+                    "number",
+                    "",
+                    "numeric",
+                    sql,
+                    text=f"CAST({sql} AS text)",
+                    number=sql,
+                    column=True,
+                )
+            return None
+        if kind != "field":
+            return None
+        if sql in self._json_text_operands:
+            # A multi-value field: a JSON column holding its JSON text.
+            return _SqliteOperand("text", "numeric", "text", sql, text=sql, column=True)
+        field_type = self._operand_field_type(node)
+        if field_type in _DATETIME_FIELD_TYPES:
+            return _SqliteOperand(
+                "date", "text", "text", sql, text=_pb_date_text_sql(sql), column=True
+            )
+        if field_type == "number":
+            return _SqliteOperand(
+                "number", "numeric", "numeric", sql, number=sql, column=True
+            )
+        if field_type == "bool":
+            return _SqliteOperand(
+                "bool", "numeric", "numeric", sql, number=f"({sql})::int", column=True
+            )
+        if field_type in _SQLITE_TEXT_FIELD_TYPES:
+            return _SqliteOperand("text", "text", "text", sql, text=sql, column=True)
+        return None
+
+    def _sqlite_to_numeric(self, operand: _SqliteOperand) -> _SqliteOperand:
+        """NUMERIC affinity: a numeric text becomes a number."""
+        if operand.storage != "text" or not isinstance(operand.value, str):
+            return operand
+        number = _sqlite_numeric_text(operand.value)
+        if number is None:
+            return operand
+        return replace(
+            operand, storage="numeric", number=_sqlite_number_sql(number), value=number
+        )
+
+    def _sqlite_to_text(self, operand: _SqliteOperand) -> _SqliteOperand:
+        """TEXT affinity: a number becomes its SQLite text."""
+        if operand.storage != "numeric":
+            return operand
+        if operand.value is _UNKNOWN:
+            return replace(operand, storage="text")
+        value = operand.value
+        text = _sqlite_real_text(value) if isinstance(value, float) else str(value)
+        return replace(
+            operand, storage="text", text=f":{self._next_param(text)}", value=text
+        )
+
+    def _sqlite_equal_sql(
+        self,
+        left: Any,
+        left_sql: str,
+        right: Any,
+        right_sql: str,
+        *,
+        equal: bool,
+    ) -> str | None:
+        """``=``/``!=`` of operands of different types like SQLite, else ``None``.
+
+        A column keeps its affinity against a value (``col = v``); two
+        columns are ``COALESCE(a, '') = COALESCE(b, '')``, without affinity,
+        so a NULL equals an empty text; after the conversion a number never
+        equals a text.  ``!=`` is ``IS NOT`` (filter.go l.284-366).  Empty
+        operands, json operands, operands of one type and values known while
+        parsing keep their SQL (``_direct_equal_sql``, ``_static_equal_sql``,
+        ``_empty_date_condition``).
+        """
+        a = self._sqlite_operand(left, left_sql)
+        b = self._sqlite_operand(right, right_sql)
+        if a is None or b is None or a.family == b.family:
+            return None
+        if a.value is not _UNKNOWN and b.value is not _UNKNOWN:
+            return None
+        if a.column and b.column:
+            return self._sqlite_columns_equal_sql(a, b, equal=equal)
+        if a.affinity == "numeric" and b.affinity != "numeric":
+            b = self._sqlite_to_numeric(b)
+        elif b.affinity == "numeric" and a.affinity != "numeric":
+            a = self._sqlite_to_numeric(a)
+        elif a.affinity == "text" and not b.affinity:
+            b = self._sqlite_to_text(b)
+        elif b.affinity == "text" and not a.affinity:
+            a = self._sqlite_to_text(a)
+        if a.storage != b.storage:
+            # A NULL column is NULL for = and TRUE for IS NOT, like this.
+            return "FALSE" if equal else "TRUE"
+        if a.storage == "numeric":
+            left_value, right_value = a.number, b.number
+        else:
+            left_value, right_value = a.text, b.text
+        if equal:
+            return f"({left_value} = {right_value})"
+        return f"({left_value} IS DISTINCT FROM {right_value})"
+
+    @staticmethod
+    def _sqlite_columns_equal_sql(
+        a: _SqliteOperand, b: _SqliteOperand, *, equal: bool
+    ) -> str:
+        """``COALESCE(a, '') = COALESCE(b, '')`` of two columns of different
+        types: numbers compare as numbers (a bool is 1/0), texts as texts (a
+        date as its PocketBase text) and a number equals a text only when
+        the number is NULL and the text empty or NULL."""
+        if a.storage == b.storage == "numeric":
+            sql = f"({a.number} IS NOT DISTINCT FROM {b.number})"
+        elif a.storage == b.storage == "text":
+            sql = f"(COALESCE({a.text}, '') = COALESCE({b.text}, ''))"
+        else:
+            text, number = (a, b) if a.storage == "text" else (b, a)
+            sql = f"({number.sql} IS NULL AND COALESCE({text.text}, '') = '')"
+        return sql if equal else f"(NOT {sql})"
+
+    def _json_column_equal_sql(
+        self,
+        left: Any,
+        left_sql: str,
+        right: Any,
+        right_sql: str,
+        *,
+        equal: bool,
+    ) -> str | None:
+        """A json operand and another column, ``=``/``?=`` and ``!=``/``?!=``.
+
+        PocketBase builds ``?=``/``?!=`` like ``=``/``!=`` (filter.go
+        l.150-154) and compares a json operand without COALESCE:
+        ``JSON_EXTRACT(x) IS [NOT] y`` (l.308-316), so two NULLs are equal and
+        a NULL differs from any value (``_json_columns_equal_sql``).  A date
+        column is its PocketBase text ('' when empty).  ``None`` when no
+        operand is json or an operand is not a column.
+        """
+        if not (self._is_json_operand(left) or self._is_json_operand(right)):
+            return None
+        sides = []
+        for node, sql in ((left, left_sql), (right, right_sql)):
+            if self._side_from_sql(node, sql).kind != "column":
+                return None
+            if (
+                not self._is_json_operand(node)
+                and self._operand_field_type(node) in _DATETIME_FIELD_TYPES
+            ):
+                sql = _pb_date_text_sql(sql)
+            sides.append(sql)
+        return self._json_columns_equal_sql(sides[0], sides[1], equal=equal)
 
     # -- @collection comparison helpers --------------------------------------
 
@@ -3037,6 +3327,88 @@ def _sqlite_compare(left: Any, right: Any) -> int:
     if left_rank != right_rank:
         return -1 if left_rank < right_rank else 1
     return (left_value > right_value) - (left_value < right_value)
+
+
+# ---------------------------------------------------------------------------
+# Equality of operands of different types, like SQLite
+# ---------------------------------------------------------------------------
+#
+# PocketBase 0.22.34 compares a column with a known non-empty value directly
+# (``col = {:p}``) and two columns through ``COALESCE(a, '') = COALESCE(b,
+# '')`` (tools/search/filter.go l.318-366, v0.40.6 l.373-420).  SQLite then
+# converts by affinity (https://www.sqlite.org/datatype3.html, section 4.2):
+# a column declared ``NUMERIC`` (number), ``BOOLEAN`` (bool) or ``JSON``
+# (multi-value) has NUMERIC affinity and turns a numeric text into a number;
+# a ``TEXT`` column (text, email, url, editor, date, single select, file and
+# relation; models/schema/schema_field.go l.150-165) turns a number into its
+# text; a bound value and a ``COALESCE`` have none, and a number never
+# equals a text.  A filter number is bound as a float64 (a REAL: 1 is the
+# text '1.0', filter.go l.270-276), ``true``/``false`` are the integers 1/0
+# (l.249-262).  PostgreSQL rejects these comparisons (HTTP 500).
+
+# PocketBase 0.22 field types stored in a ``TEXT`` column (single value).
+_SQLITE_TEXT_FIELD_TYPES = {
+    "text",
+    "email",
+    "url",
+    "editor",
+    "select",
+    "file",
+    "relation",
+}
+# Macros bound as a Go int (INTEGER) and as a date text
+# (tools/search/identifier_macros.go).
+_SQLITE_INT_MACROS = {"second", "minute", "hour", "weekday", "day", "month", "year"}
+_SQLITE_DATE_MACROS = {
+    "now",
+    "yesterday",
+    "tomorrow",
+    "todayStart",
+    "todayEnd",
+    "monthStart",
+    "monthEnd",
+    "yearStart",
+    "yearEnd",
+}
+_SQLITE_SPACES = " \t\n\v\f\r"
+_SQLITE_NUMBER = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _sqlite_numeric_text(text: str) -> int | float | None:
+    """The number NUMERIC affinity makes of ``text``, ``None`` if it stays TEXT.
+
+    SQLite converts a decimal integer or real literal, with an optional sign
+    and exponent and surrounding spaces; never a hexadecimal one
+    (``sqlite3AtoF``).
+    """
+    stripped = text.strip(_SQLITE_SPACES)
+    if not _SQLITE_NUMBER.fullmatch(stripped):
+        return None
+    if stripped.lstrip("+-").isdigit():
+        return int(stripped)
+    return float(stripped)
+
+
+def _sqlite_real_text(value: float) -> str:
+    """The text SQLite makes of a REAL (``%!.15g``): 1.0 -> '1.0', 0.1 -> '0.1'.
+
+    Fifteen significant digits, always a decimal point (1e21 -> '1.0e+21').
+    """
+    if not math.isfinite(value):
+        return "Inf" if value > 0 else "-Inf"
+    mantissa, sep, exponent = f"{value:.15g}".partition("e")
+    if "." not in mantissa:
+        mantissa += ".0"
+    return mantissa + sep + exponent
+
+
+def _sqlite_number_sql(value: float) -> str:
+    """A number as a PostgreSQL literal, exact for an integer."""
+    if isinstance(value, int):
+        return str(value)
+    if math.isfinite(value):
+        return f"CAST('{value!r}' AS double precision)"
+    return f"CAST('{'Infinity' if value > 0 else '-Infinity'}' AS double precision)"
 
 
 def _bool_sql(value: bool | None) -> str:
