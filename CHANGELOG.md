@@ -159,8 +159,18 @@ See `docs/null-values.md`.
   also match `NULL` (`txt = ""`, `sel = ""`, `rel = ""`, an auth email read
   through a `LEFT JOIN`), `!=` is NULL-safe (`txt != "x"` keeps the `NULL`
   rows) and two columns compare with `COALESCE(x, '')`. A current-record
-  `?op` is `op` (`num ?> 1` was a 500). Non-NULL values keep their
-  comparison. `totalItems` uses the same clause.
+  `?op` is `op` (`num ?> 1` was a 500). Non-NULL values of one type keep
+  their comparison. `totalItems` uses the same clause.
+- Operands of different types compare like SQLite instead of a PostgreSQL
+  type error (`txt ?= 0`, `num ?= "x"`, `flag ?= 1`, `num ?!= txt` and
+  their `=`/`!=` forms were HTTP 500; `?=`/`?!=` had compared texts before
+  the current-record rewrite): a TEXT column reads a filter number as its
+  REAL text (`txt = 1` matches `'1.0'`, `txt = true` matches `'1'`), a
+  number, bool or multi-value column reads a numeric text as a number
+  (`num = " 1 "` matches 1, `flag = "1"` the true rows), two columns go
+  through `COALESCE(x, '')` without affinity and a number never equals a
+  text. A `?=`/`?!=` whose operand type is unknown keeps the text
+  comparison.
 - Visible in API rules: a stored `''` is empty too, so `txt = null` matches
   it (before: `txt IS NULL`), and an anonymous `@request.auth.id` (`NULL`)
   `?= owner` lists the records without owner, like PocketBase.
@@ -173,15 +183,21 @@ See `docs/null-values.md`.
   `""` (`meta = ""` was a 500); relation and `@collection` json leaves too.
   `~`/`!~`/`?~`/`?!~` and multi-match subqueries also read a JSON `null` as
   `NULL`, `json != v` and `json ?!= v` keep the `NULL` rows, and a json
-  operand compared with a column is NULL-safe.
+  operand compared with a column is NULL-safe for `=`, `!=`, `?=` and `?!=`
+  (`meta ?!= txt` no longer keeps, and `meta ?= txt` no longer misses, a
+  row where both are `NULL`); a date compared with json reads as its text
+  (`meta = day` was a 500).
 - Sort: `NULL` comes first in ascending and last in descending order for
   every view column and every json value (a JSON `null` sorts as `NULL`),
   like dates already did. Base and auth columns other than dates are
   `NOT NULL` and keep their term.
 - Still different (documented): a multi-value field sorts by its array in
   PPBase and by its JSON text in PocketBase; in a view, an empty date and a
-  `LEFT JOIN` `NULL` tie; a json value compared with a non-null value keeps
-  PPBase's jsonb reading (`meta = 5` on a `jsonb` column is still a 500).
+  `LEFT JOIN` `NULL` tie, and a view date compared with json or matched by
+  `?~`/`?!~` reads that `NULL` as an empty date; a json value compared with
+  a non-null value keeps PPBase's jsonb reading (`meta = 5` on a `jsonb`
+  column is still a 500); relation paths and `<`/`>` between operands of
+  different types keep the typed comparison.
 
 ### Empty dates served, filtered and sorted like PocketBase
 

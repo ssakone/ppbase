@@ -50,8 +50,9 @@ same for every 0.22 operand: `NoCoalesce` became
 serves filter functions 0.22 does not have (`tools/search/token_functions.go`
 l.109 and l.145), so PPBase applies it by default. PPBase
 (`ppbase/services/filter_parser.py`: `_direct_equal_sql`, `_pb_equal_sql`,
-`_folded_equal_sql`, `_json_empty_sql`, `_json_like_text_sql`) builds the
-same result in PostgreSQL:
+`_folded_equal_sql`, `_sqlite_equal_sql`, `_json_empty_sql`,
+`_json_column_equal_sql`, `_json_like_text_sql`) builds the same result in
+PostgreSQL:
 
 | Filter | PocketBase SQL | Matches a `NULL` |
 | --- | --- | --- |
@@ -64,7 +65,7 @@ same result in PostgreSQL:
 | json `x = null` / `x != null` | `JSON_EXTRACT(x) IS [NOT] NULL` | yes / no |
 | json `x = ""` / `x != ""` | `JSON_EXTRACT(x) IS [NOT] ''` | no / yes |
 | json `x != v` (`v` non-empty) | `JSON_EXTRACT(x) IS NOT v` | yes |
-| json `x = y` / `x != y` (`y` a column) | `JSON_EXTRACT(x) IS [NOT] y` | equals another `NULL` |
+| json `x = y` / `x != y`, `x ?= y` / `x ?!= y` (`y` a column) | `JSON_EXTRACT(x) IS [NOT] y` | equals another `NULL` |
 | json `x ~ v` / `x !~ v` | `JSON_EXTRACT(x) [NOT] LIKE v` | no |
 
 - The same rules apply to every column type (text, email, url, editor,
@@ -82,8 +83,11 @@ same result in PostgreSQL:
   current-record field, a literal and a `@request.*` value never multi-match
   (v0.22.34 `resolvers/record_field_resolve_runner.go` l.454-476,
   `resolvers/record_field_resolver.go` l.162-225). Json operands, `:each`
-  and fields without metadata keep PPBase's array-any reading. Visible in
-  API rules: for an anonymous caller `@request.auth.id` is `NULL`, so
+  and fields without metadata keep PPBase's array-any reading, and a
+  `?=`/`?!=` whose operand has no known SQLite type (a field without
+  metadata, `:isset`/`:changed`) keeps the text comparison it had before
+  WS-A11 rather than a typed PostgreSQL one. Visible in API rules: for an
+  anonymous caller `@request.auth.id` is `NULL`, so
   `@request.auth.id ?= owner` lists the records without owner, like
   PocketBase (none before WS-A11).
 - A comparison without any column (literals, `null`, `@request.*` values)
@@ -92,8 +96,10 @@ same result in PostgreSQL:
   `1`/`0`, a text stays a text (filter.go l.226-281 and l.318-338). It was
   a PostgreSQL type error (`1 = ''`, `TRUE = 1`). A `@now` value is only
   folded against an empty operand.
-- Two non-NULL columns keep PostgreSQL's typed comparison: only the `NULL`
-  cases follow `COALESCE(x, '')`.
+- Two non-NULL operands of the same PPBase type (text, number, bool, date)
+  keep PostgreSQL's typed comparison: only the `NULL` cases follow
+  `COALESCE(x, '')`. Operands of different types follow SQLite's
+  conversions (next section) instead of a PostgreSQL type error.
 - Json: SQLite extracts a JSON `null` as SQL `NULL` (`tools/dbutils/json.go`
   l.30-47), so a SQL `NULL` and a stored JSON `null` (`jsonb 'null'` in
   PPBase) are both `null`, for a view, a base collection (the filter part of
@@ -103,10 +109,57 @@ same result in PostgreSQL:
   clause (filter.go l.680-706) rejects a related JSON `null`
   (`rels.meta != ""` fails a record with a related JSON `null`). A json
   operand compared with a column is NULL-safe (`IS` / `IS NOT`, compared as
-  jsonb), and `json ?!= v` (PPBase's array-any reading) keeps a SQL `NULL`.
+  jsonb) for `=`, `!=`, `?=` and `?!=` alike, so two `NULL`s are equal and
+  a `NULL` differs from any value (before the review of WS-A11 `?=`/`?!=`
+  kept the array-any reading: `meta ?!= txt` kept, and `meta ?= txt`
+  missed, a row where both are `NULL`); a date column compared with json is
+  its PocketBase text (`''` when empty), not a PostgreSQL type error.
+  `json ?!= v` against a known non-empty value (PPBase's array-any reading)
+  keeps a SQL `NULL`.
 - `<`, `<=`, `>`, `>=`, `~`, `!~` are otherwise unchanged: a `NULL` never
   matches, as in SQLite.
 - `totalItems` counts with the same `WHERE` clause.
+
+### Operands of different types
+
+A current-record `?=`/`?!=` is `=`/`!=` (above), so it compares operands of
+different types the way SQLite does in PocketBase 0.22.34, where PostgreSQL
+would reject the comparison (HTTP 500; before WS-A11 `?=`/`?!=` compared
+texts and `=`/`!=` were already HTTP 500). PocketBase compares a column with
+a known non-empty value directly (`col = {:p}`) and two columns through
+`COALESCE(a, '') = COALESCE(b, '')` (v0.22.34 `tools/search/filter.go`
+l.323-367, v0.40.6 l.377-421); SQLite then converts by affinity
+(https://www.sqlite.org/datatype3.html, section 4.2). The 0.22 columns are
+declared `NUMERIC` (number), `BOOLEAN` (bool), `JSON` (json and multi-value
+fields) and `TEXT` (every other field, dates included;
+`models/schema/schema_field.go` l.150-165): the first three have NUMERIC
+affinity, `TEXT` has TEXT affinity, a bound value or a `COALESCE` none. A
+filter number is bound as a float64 (a REAL, filter.go l.272-278), `true`
+and `false` are the integers `1`/`0` (l.249-262), `@now` is a date text and
+`@second`... a Go int (`tools/search/identifier_macros.go`). PPBase
+(`_sqlite_equal_sql`) applies the same rules to operands of different
+PPBase types (text, number, bool, date; a multi-value field is its JSON
+text, a date its PocketBase text):
+
+| Filter | SQLite | Matches |
+| --- | --- | --- |
+| text column `= 1`, `= 0.1`, `= true` | TEXT affinity: the REAL text `'1.0'`, `'0.1'`, the integer text `'1'` | `txt = '1.0'`, `'0.1'`, `'1'` |
+| date column `= 1`, `= "x"` | TEXT affinity | its PocketBase text equals `'1.0'`, `'x'`: never |
+| number column `= "1"`, `= " 1 "`, `= "1e0"`, `= "4.5"` | NUMERIC affinity: a numeric text is a number | `num = 1`, `num = 4.5` |
+| number or bool column `= "x"`, `= "true"`, `= "0x2"` | stays a text: a number never equals a text | none (`!=`: every row) |
+| bool column `= 1`, `= "1"`, number column `= true` | NUMERIC: a bool is `1`/`0` | `flag` true, `num = 1` |
+| multi-value column `= 1`, `= "1"` | JSON column: its JSON text never equals a number | none |
+| two columns of different types (`num = txt`, `day = txt`, `num = flag`) | `COALESCE` without affinity | texts as texts, numbers as numbers (a bool is `1`/`0`), a number equals a text only when the number is `NULL` and the text empty or `NULL` |
+| `:length` (an integer without affinity) `= "1"` | no conversion | none |
+| `@now = "x"`, `@now = txt` | two texts | the PocketBase text of now |
+
+`!=`/`?!=` are `IS NOT` of the same comparison, so a `NULL` column differs
+from any value. Operands of one type, empty operands and values known while
+parsing keep their SQL (typed comparison, `NULL` rules, folding).
+Measured: the probe `types` section (2 068 filters on a base collection
+and on its `LEFT JOIN` view: the 0.22 field types against 24 operands,
+reversed operands, `@request.query`, `:length`, `@now`, json against every
+column) equals PocketBase except 10 `D-0032` view-date cases (below).
 
 Sort: PocketBase sorts `ORDER BY <identifier> ASC|DESC`
 (`tools/search/sort.go` l.23-37; v0.40.6 l.26-45) and SQLite treats `NULL`
@@ -122,7 +175,10 @@ auth columns are `NOT NULL` and keep a plain, index-friendly term. Non-`NULL`
 values keep their order.
 
 Measured by `tests/pocketbase_parity/null_zero_values_probe.py` against the
-official PocketBase 0.22.34 binary. Its `null` section holds 413 results:
+official PocketBase 0.22.34 binary. Its `types` section holds 2 068 results
+(883 filters each on a base collection and on its `LEFT JOIN` view, 192
+`@request.query` comparisons, 100 json-to-column filters, 6 base json-to-date
+filters and 4 `~`/`?~` on a view date). Its `null` section holds 413 results:
 236 filters and 30 sorts of a `LEFT JOIN` view (every 0.22 field type,
 every operator, both operand orders and sort directions), 9 base filters,
 18 relation and `@collection` paths into the view, 9 filters and 4 sorts of
@@ -145,7 +201,19 @@ owner). The PocketBase results are pinned in
   PocketBase (probe `KNOWN_DIVERGENCES`; open, not a `NULL` case).
 - In a view, the empty date of a matched row is `NULL` in PPBase like the
   `NULL` of a missing row, so both tie in a sort where SQLite puts `NULL`
-  before `''` (`empty-dates.md`).
+  before `''` (`empty-dates.md`). For the same reason a view date compared
+  with a json operand reads the `NULL` of a missing row as an empty date
+  (`meta = day` misses, and `meta != day` keeps, a row where PocketBase
+  compares two `NULL`s; right for a base record and a matched view row), and
+  `day ?~ v`/`day ?!~ v`, now `day ~ v`/`day !~ v`, follow the `~`/`!~`
+  difference of `empty-dates.md` (`day ?!~ "tx"` keeps the row of a missing
+  target). Probe `KNOWN_DIVERGENCES`, D-0032.
+- Operands of different types: a view column is compared with the affinity
+  of its field type, which is SQLite's for a column the view selects
+  directly; a column computed by an expression has no affinity in SQLite
+  (a number never equals a numeric text there). Relation and `@collection`
+  paths and `<`/`<=`/`>`/`>=` between operands of different types keep the
+  typed comparison (HTTP 500, as before WS-A11).
 - Json comparisons with a non-null value keep PPBase's jsonb reading,
   where PocketBase compares `JSON_EXTRACT`'s SQLite value. On a `jsonb`
   column PostgreSQL rejects `meta = 5`, `meta = "x"`, `meta = true`,

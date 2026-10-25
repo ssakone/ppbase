@@ -1547,7 +1547,7 @@ class _FilterTransformer(Transformer):
         A column keeps its affinity against a value (``col = v``); two
         columns are ``COALESCE(a, '') = COALESCE(b, '')``, without affinity,
         so a NULL equals an empty text; after the conversion a number never
-        equals a text.  ``!=`` is ``IS NOT`` (filter.go l.284-366).  Empty
+        equals a text.  ``!=`` is ``IS NOT`` (filter.go l.290-368).  Empty
         operands, json operands, operands of one type and values known while
         parsing keep their SQL (``_direct_equal_sql``, ``_static_equal_sql``,
         ``_empty_date_condition``).
@@ -3335,7 +3335,7 @@ def _sqlite_compare(left: Any, right: Any) -> int:
 #
 # PocketBase 0.22.34 compares a column with a known non-empty value directly
 # (``col = {:p}``) and two columns through ``COALESCE(a, '') = COALESCE(b,
-# '')`` (tools/search/filter.go l.318-366, v0.40.6 l.373-420).  SQLite then
+# '')`` (tools/search/filter.go l.323-367, v0.40.6 l.377-421).  SQLite then
 # converts by affinity (https://www.sqlite.org/datatype3.html, section 4.2):
 # a column declared ``NUMERIC`` (number), ``BOOLEAN`` (bool) or ``JSON``
 # (multi-value) has NUMERIC affinity and turns a numeric text into a number;
@@ -3343,7 +3343,7 @@ def _sqlite_compare(left: Any, right: Any) -> int:
 # relation; models/schema/schema_field.go l.150-165) turns a number into its
 # text; a bound value and a ``COALESCE`` have none, and a number never
 # equals a text.  A filter number is bound as a float64 (a REAL: 1 is the
-# text '1.0', filter.go l.270-276), ``true``/``false`` are the integers 1/0
+# text '1.0', filter.go l.272-278), ``true``/``false`` are the integers 1/0
 # (l.249-262).  PostgreSQL rejects these comparisons (HTTP 500).
 
 # PocketBase 0.22 field types stored in a ``TEXT`` column (single value).
