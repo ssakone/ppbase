@@ -646,6 +646,71 @@ async def test_realtime_expand_applies_the_view_rule(
     assert _names(events["admin"]["expand"]["customers"]) == ["c2", "c3", "c1"]
 
 
+async def test_realtime_delete_events_carry_only_the_id(
+    app_client: AsyncClient, env: dict[str, Any]
+) -> None:
+    """Documented divergence (docs/expand-view-rules.md, realtime deletes).
+
+    PocketBase 0.22.34 builds each delete message before the delete, with
+    the whole record, its expand and the rule and client filter of every
+    subscriber (apis/realtime.go l.310-336, l.371-533).  PPBase learns the
+    delete from PostgreSQL after the commit (``listen_for_db_events``): it
+    sends ``{"id"}`` to admins and to public-rule subscriptions without a
+    client filter, and nothing to the subscriptions it cannot check any
+    more.  The paired probe measures the 0.22.34 side (realtime_delete).
+    """
+    engine = get_engine()
+    sales = await resolve_collection(engine, env["names"]["s"])
+    customers = await resolve_collection(engine, env["names"]["c"])
+    admin = {"id": "admin", "type": "admin"}
+    manager = SubscriptionManager()
+    subscriptions = {
+        "sale_guest_expand": (sales, None, {"expand": "customer"}),
+        "sale_admin_expand": (sales, admin, {"expand": "customer"}),
+        "sale_guest_filter": (sales, None, {"filter": 'label != ""'}),
+        "customer_guest": (customers, None, {}),
+        "customer_admin": (customers, admin, {}),
+    }
+    clients = {}
+    for key, (collection, auth, query) in subscriptions.items():
+        client_id = manager.register_client()
+        await manager.add_subscription(
+            client_id,
+            f"{collection.name}/*",
+            auth_payload=auth,
+            options_query=query,
+        )
+        clients[key] = client_id
+
+    deleted = {sales.name: "deletedsale0001", customers.name: "deletedcust0001"}
+    for collection in (sales, customers):
+        await broadcast_record_change(
+            manager,
+            collection.name,
+            deleted[collection.name],
+            "delete",
+            None,
+            engine=engine,
+            collection=collection,
+        )
+
+    received = {}
+    for key, client_id in clients.items():
+        queue = manager.get_session(client_id).response_queue
+        received[key] = None if queue.empty() else queue.get_nowait()["data"]
+    only_id = {"action": "delete", "record": {"id": deleted[sales.name]}}
+    assert received == {
+        "sale_guest_expand": only_id,
+        "sale_admin_expand": only_id,
+        "sale_guest_filter": None,
+        "customer_guest": None,
+        "customer_admin": {
+            "action": "delete",
+            "record": {"id": deleted[customers.name]},
+        },
+    }
+
+
 async def test_list_expand_runs_one_query_per_collection_and_level(
     app_client: AsyncClient, env: dict[str, Any]
 ) -> None:
