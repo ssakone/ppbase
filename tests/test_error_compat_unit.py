@@ -24,6 +24,9 @@ from ppbase.middleware.error_compat import (
     set_error_compat,
 )
 
+INVALID_FORMATTING = "Failed to load the submitted data due to invalid formatting."
+LOAD_ERROR = "An error occurred while loading the submitted data."
+
 
 def test_modes_are_explicit_and_off_by_default() -> None:
     assert Settings().error_compat == ""
@@ -439,3 +442,63 @@ def test_every_rule_cites_its_pocketbase_source() -> None:
         assert rule.replacement, rule
     for kind, spec in error_kinds().items():
         assert spec.source and "l." in spec.source, kind
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "message"),
+    [
+        # apis/admin.go l.247-249 (create), l.293-295 (update)
+        ("POST", "/api/admins", INVALID_FORMATTING),
+        ("PATCH", "/api/admins/aaaaaaaaaaaaaaa", INVALID_FORMATTING),
+        # apis/admin.go l.83-85, apis/backup.go l.76-77, PPBase-only routes
+        ("POST", "/api/admins/auth-with-password", LOAD_ERROR),
+        ("POST", "/api/admins/aaaaaaaaaaaaaaa/change-password", LOAD_ERROR),
+        ("POST", "/api/backups", LOAD_ERROR),
+    ],
+)
+def test_an_unbound_body_takes_the_message_of_its_route(
+    method: str, path: str, message: str
+) -> None:
+    body = {
+        "status": 400,
+        "message": "Something went wrong while processing your request.",
+        "data": {"1": {"code": "validation_required", "message": "JSON decode error"}},
+    }
+    assert pocketbase_022_error(
+        400, body, method=method, path=path, kind="body_load"
+    ) == {"code": 400, "message": message, "data": {}}
+
+
+def test_settings_and_backup_load_errors_take_the_022_message() -> None:
+    test_email = {
+        "status": 400,
+        "message": "Failed to send the test email.",
+        "data": {
+            "body": {
+                "code": "validation_invalid_value",
+                "message": "Invalid request body.",
+            }
+        },
+    }
+    assert pocketbase_022_error(
+        400, test_email, method="POST", path="/api/settings/test/email"
+    ) == {"code": 400, "message": LOAD_ERROR, "data": {}}
+    # A form error of the same route keeps its message (apis/settings.go l.121).
+    form_error = {
+        **test_email,
+        "data": {
+            "email": {"code": "validation_required", "message": "Cannot be blank."}
+        },
+    }
+    assert (
+        pocketbase_022_error(
+            400, form_error, method="POST", path="/api/settings/test/email"
+        )["message"]
+        == "Failed to send the test email."
+    )
+    backup = {"status": 400, "message": "Invalid UTF-8 JSON body.", "data": {}}
+    assert pocketbase_022_error(400, backup, method="POST", path="/api/backups") == {
+        "code": 400,
+        "message": LOAD_ERROR,
+        "data": {},
+    }

@@ -79,6 +79,15 @@ class _ErrorKind:
     #: ``True``: 0.22.34 passes a non-validation error, so ``data`` is ``{}``.
     clear_data: bool = False
     source: str = ""
+    #: ``(path, methods, message)``: routes whose 0.22.34 handler words this
+    #: error differently (first match wins, else ``message``).
+    routes: tuple[tuple[re.Pattern[str], frozenset[str], str], ...] = ()
+
+    def message_for(self, method: str, path: str) -> str:
+        for pattern, methods, message in self.routes:
+            if method in methods and pattern.match(path):
+                return message
+        return self.message
 
 
 _ERROR_KINDS: dict[str, _ErrorKind] = {
@@ -98,6 +107,29 @@ _ERROR_KINDS: dict[str, _ErrorKind] = {
         "fails the DrySubmit lookup (l.251-253), a plain error wrapped as "
         "NewBadRequestError('Failed to create record.', testErr): no "
         "validation data (apis/api_error.go l.77-90)",
+    ),
+    "body_load": _ErrorKind(
+        "An error occurred while loading the submitted data.",
+        clear_data=True,
+        routes=(
+            (
+                re.compile(r"^/api/admins/?$"),
+                frozenset({"POST"}),
+                "Failed to load the submitted data due to invalid formatting.",
+            ),
+            (
+                re.compile(r"^/api/admins/[^/]+/?$"),
+                frozenset({"PATCH"}),
+                "Failed to load the submitted data due to invalid formatting.",
+            ),
+        ),
+        source="c.Bind failure of a body that is not a JSON object of the form "
+        "(PPBase: a pydantic body model rejects the JSON itself): "
+        "apis/admin.go l.83-85 (auth-with-password), apis/backup.go l.76-77, "
+        "apis/settings.go l.52-54; admin create l.247-249 and update "
+        "l.293-295 say 'Failed to load the submitted data due to invalid "
+        "formatting.'; not a validation error, so data is {} (apis/api_error.go "
+        "l.77-90)",
     ),
     "query": _ErrorKind(
         clear_data=True,
@@ -336,6 +368,8 @@ _REALTIME_ROUTE = re.compile(r"^/api/realtime/?$")
 _COLLECTION_ADMIN_ROUTE = re.compile(r"^/api/collections/[^/]+(?:/truncate)?/?$")
 _LOGS_ROUTE = re.compile(r"^/api/logs/")
 _SETTINGS_ROUTE = re.compile(r"^/api/settings/?$")
+_SETTINGS_TEST_EMAIL_ROUTE = re.compile(r"^/api/settings/test/email/?$")
+_BACKUPS_ROUTE = re.compile(r"^/api/backups/?$")
 _BODY_ERRORS = ("Invalid JSON body.", "Request body must be a JSON object.")
 
 #: PocketBase 0.22.34 wording of the PPBase messages that differ
@@ -473,6 +507,24 @@ _MESSAGE_RULES: tuple[_MessageRule, ...] = (
     ),
     _MessageRule(
         400,
+        messages=("Invalid UTF-8 JSON body.",),
+        replacement="An error occurred while loading the submitted data.",
+        path=_BACKUPS_ROUTE,
+        methods=frozenset({"POST"}),
+        source="apis/backup.go l.76-77 (c.Bind failure of the backup create form)",
+    ),
+    _MessageRule(
+        400,
+        messages=("Failed to send the test email.",),
+        replacement="An error occurred while loading the submitted data.",
+        path=_SETTINGS_TEST_EMAIL_ROUTE,
+        methods=frozenset({"POST"}),
+        data={},
+        data_codes={"body": "validation_invalid_value"},
+        source="apis/settings.go l.112-115 (c.Bind failure of the test email form)",
+    ),
+    _MessageRule(
+        400,
         messages=("Failed to authenticate.",),
         replacement="Something went wrong while processing your request.",
         path=_RECORD_PASSWORD_AUTH_ROUTE,
@@ -584,7 +636,7 @@ def pocketbase_022_error(
     message, data = parsed
     spec = _ERROR_KINDS.get(kind) if kind else None
     if spec is not None:
-        message = spec.message
+        message = spec.message_for(method.upper(), path)
         data = {} if spec.clear_data else _ozzo_required_messages(data)
     else:
         for rule in _MESSAGE_RULES:

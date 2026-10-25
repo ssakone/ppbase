@@ -4,7 +4,7 @@ PPBase's guards follow current PocketBase; in the opt-in ``"0.22"`` mode
 each one answers the message of its PocketBase 0.22.34 counterpart
 (``apis/middlewares.go``), as measured on the 0.22.34 binary by
 ``tests/pocketbase_parity/expand_rules_probe.py`` (``guards`` group).
-Statuses are never rewritten: the three that differ are listed in
+Statuses are never rewritten: those that differ are listed in
 docs/error-compat.md.  No database is needed (the auth dependency is faked).
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
 from ppbase import PPBase
@@ -106,6 +107,51 @@ EXPECTED: dict[tuple[str, str], tuple[int, str, str]] = {
         "The authorized auth model is not allowed to perform this action.",
         "You are not allowed to perform this request.",  # l.204
     ),
+    # pb.require_auth() / pb.require_record_auth() (FastAPI dependencies of
+    # ppbase/api/deps.py): RequireAdminOrRecordAuth() / RequireRecordAuth().
+    ("/dep-any", "guest"): (
+        401,
+        "The request requires authentication.",
+        "The request requires admin or record authorization token to be set.",  # l.165
+    ),
+    ("/dep-record", "guest"): (
+        401,
+        "The request requires authentication.",
+        "The request requires valid record authorization token to be set.",  # l.77
+    ),
+    ("/dep-record", "admin"): (
+        403,
+        "The authorized auth model is not allowed to perform this action.",
+        "The request requires valid record authorization token to be set.",  # l.77
+    ),
+    # event.require_auth() / require_auth_record() / require_superuser().
+    ("/event-any", "guest"): (
+        401,
+        "The request requires authentication.",
+        "The request requires admin or record authorization token to be set.",
+    ),
+    ("/event-record", "guest"): (
+        401,
+        "The request requires authentication.",
+        "The request requires valid record authorization token to be set.",
+    ),
+    ("/event-record", "admin"): (
+        403,
+        "The authorized auth model is not allowed to perform this action.",
+        "The request requires valid record authorization token to be set.",
+    ),
+    # 401 without auth, like 0.22.34 RequireAdminAuth (l.114-124) and v0.40.6
+    # RequireSuperuserAuth; it used to answer 403.
+    ("/event-admin", "guest"): (
+        401,
+        "The request requires authentication.",
+        "The request requires valid admin authorization token to be set.",  # l.119
+    ),
+    ("/event-admin", "user"): (
+        403,
+        "Only superusers can perform this action.",
+        "The request requires valid admin authorization token to be set.",
+    ),
 }
 ALLOWED = {
     ("/guest", "guest"),
@@ -117,11 +163,23 @@ ALLOWED = {
     ("/admin", "admin"),
     ("/owner/u1", "user"),
     ("/owner/u1", "admin"),
+    ("/dep-any", "user"),
+    ("/dep-any", "admin"),
+    ("/dep-record", "user"),
+    ("/event-any", "user"),
+    ("/event-any", "admin"),
+    ("/event-record", "user"),
+    ("/event-admin", "admin"),
 }
 
 
 def _guarded_app(monkeypatch: pytest.MonkeyPatch, mode: str) -> Any:
+    dependency = deps_module.get_optional_auth
+
     async def fake_get_optional_auth(request, session=None):
+        return TOKENS.get(request.headers.get("authorization", ""))
+
+    async def fake_auth_dependency(request: Request) -> Any:
         return TOKENS.get(request.headers.get("authorization", ""))
 
     async def fake_get_async_session():
@@ -147,7 +205,39 @@ def _guarded_app(monkeypatch: pytest.MonkeyPatch, mode: str) -> Any:
 
         ok.__name__ = f"guard_route_{index}"
         app_pb.get(path, middlewares=[guard])(ok)
-    return app_pb.get_app()
+
+    any_auth = app_pb.require_auth()
+    record_auth = app_pb.require_record_auth()
+
+    @app_pb.get("/ext/guard/dep-any")
+    async def dep_any(_auth: Any = any_auth) -> dict[str, bool]:
+        return {"ok": True}
+
+    @app_pb.get("/ext/guard/dep-record")
+    async def dep_record(_auth: Any = record_auth) -> dict[str, bool]:
+        return {"ok": True}
+
+    for index, (path, helper) in enumerate(
+        (
+            ("/ext/guard/event-any", "require_auth"),
+            ("/ext/guard/event-record", "require_auth_record"),
+            ("/ext/guard/event-admin", "require_superuser"),
+        )
+    ):
+
+        async def event_guard(event: Any, name: str = helper) -> Any:
+            getattr(event, name)()
+            return await event.next()
+
+        async def event_ok() -> dict[str, bool]:
+            return {"ok": True}
+
+        event_ok.__name__ = f"event_guard_route_{index}"
+        app_pb.get(path, middlewares=[event_guard])(event_ok)
+
+    app = app_pb.get_app()
+    app.dependency_overrides[dependency] = fake_auth_dependency
+    return app
 
 
 async def _responses(app: Any) -> dict[tuple[str, str], Any]:

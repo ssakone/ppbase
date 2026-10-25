@@ -257,6 +257,12 @@ def test_hook_event_require_superuser_checks_both_admin_and_superusers_collectio
         user.require_superuser()
     assert user_exc.value.status_code == 403
 
+    # Without auth: 401 like pb.apis.require_superuser_auth(), 0.22.34
+    # RequireAdminAuth and v0.40.6 RequireSuperuserAuth (it used to be 403).
+    with pytest.raises(HTTPException) as missing_exc:
+        RecordRequestEvent(auth=None).require_superuser()
+    assert missing_exc.value.status_code == 401
+
 
 def test_hook_event_require_same_auth_record_rejects_different_identity() -> None:
     event = RecordRequestEvent(

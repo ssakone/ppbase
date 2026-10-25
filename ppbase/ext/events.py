@@ -154,9 +154,18 @@ class HookEvent:
 
     def require_superuser(self) -> dict[str, Any]:
         auth = self.current_auth()
-        if auth is not None and self.has_superuser_auth():
+        if auth is None:
+            # Without auth, 401 like pb.apis.require_superuser_auth(), 0.22.34
+            # RequireAdminAuth (apis/middlewares.go l.114-124) and v0.40.6
+            # RequireSuperuserAuth (apis/middlewares.go l.91-95, l.108).
+            raise self._http_error(
+                401,
+                "The request requires authentication.",
+                kind="admin_auth_required",
+            )
+        if self.has_superuser_auth():
             return auth
-        # 0.22.34 RequireAdminAuth (apis/middlewares.go l.119, with 401).
+        # 0.22.34 RequireAdminAuth answers a record token l.119 (with 401).
         raise self._http_error(
             403,
             "Only superusers can perform this action.",

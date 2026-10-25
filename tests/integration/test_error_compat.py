@@ -139,6 +139,8 @@ async def compat_022(app_client: AsyncClient) -> AsyncIterator[None]:
 
 
 GENERIC = "Something went wrong while processing your request."
+INVALID_FORMATTING = "Failed to load the submitted data due to invalid formatting."
+LOAD_ERROR = "An error occurred while loading the submitted data."
 
 
 async def _cases(client: AsyncClient, env: dict) -> dict[str, Any]:
@@ -228,6 +230,52 @@ async def _cases(client: AsyncClient, env: dict) -> dict[str, Any]:
         params={"filter": "(("},
     )
     await record("unknown_route", "GET", "/api/errc-unknown-route")
+    # c.Bind failures of the admin, settings and backup forms.
+    raw_json = {**admin, "content-type": "application/json"}
+    admins = await client.get("/api/admins", headers=admin)
+    admin_id = admins.json()["items"][0]["id"]
+    await record(
+        "admin_create_invalid_json",
+        "POST",
+        "/api/admins",
+        content=b"{bad",
+        headers=raw_json,
+    )
+    await record(
+        "admin_update_array_body",
+        "PATCH",
+        f"/api/admins/{admin_id}",
+        content=b"[1]",
+        headers=raw_json,
+    )
+    await record(
+        "admin_password_invalid_json",
+        "POST",
+        "/api/admins/auth-with-password",
+        content=b"{bad",
+        headers={"content-type": "application/json"},
+    )
+    await record(
+        "settings_invalid_json",
+        "PATCH",
+        "/api/settings",
+        content=b"{bad",
+        headers=raw_json,
+    )
+    await record(
+        "test_email_invalid_json",
+        "POST",
+        "/api/settings/test/email",
+        content=b"{bad",
+        headers=raw_json,
+    )
+    await record(
+        "backup_create_invalid_json",
+        "POST",
+        "/api/backups",
+        content=b"{bad",
+        headers=raw_json,
+    )
     await record("internal_error", "GET", f"{prefix}/boom")
     await record("legacy_code_body", "GET", f"{prefix}/legacy-code")
     await record("legacy_message_body", "GET", f"{prefix}/legacy-message")
@@ -251,10 +299,40 @@ async def test_default_mode_keeps_the_ppbase_envelope(
         "admin_route_without_token",
         "password_bad_credentials",
         "internal_error",
+        "admin_create_invalid_json",
+        "admin_update_array_body",
+        "admin_password_invalid_json",
+        "settings_invalid_json",
+        "test_email_invalid_json",
+        "backup_create_invalid_json",
     ):
         status, body = results[key]
         assert set(body) == {"status", "message", "data"}, (key, body)
         assert body["status"] == status, key
+    # An invalid settings JSON body is a 400, no longer a 500.
+    assert results["settings_invalid_json"] == (
+        400,
+        {"status": 400, "message": "Invalid settings payload.", "data": {}},
+    )
+    assert results["test_email_invalid_json"] == (
+        400,
+        {
+            "status": 400,
+            "message": "Failed to send the test email.",
+            "data": {
+                "body": {
+                    "code": "validation_invalid_value",
+                    "message": "Invalid request body.",
+                }
+            },
+        },
+    )
+    assert results["backup_create_invalid_json"] == (
+        400,
+        {"status": 400, "message": "Invalid UTF-8 JSON body.", "data": {}},
+    )
+    for key in ("admin_create_invalid_json", "admin_password_invalid_json"):
+        assert results[key][1]["message"] == GENERIC, key
     assert results["list_admin_only"] == (
         403,
         {
@@ -359,6 +437,15 @@ async def test_022_mode_answers_like_pocketbase_022(
         "password_empty_body": (400, GENERIC),
         "admin_password_empty_body": (400, GENERIC),
         "list_bad_per_page": (400, GENERIC),
+        # c.Bind failures (probe errors group): apis/admin.go l.247-249 and
+        # l.293-295, l.83-85; apis/settings.go l.52-54, l.112-115;
+        # apis/backup.go l.76-77.
+        "admin_create_invalid_json": (400, INVALID_FORMATTING),
+        "admin_update_array_body": (400, INVALID_FORMATTING),
+        "admin_password_invalid_json": (400, LOAD_ERROR),
+        "settings_invalid_json": (400, LOAD_ERROR),
+        "test_email_invalid_json": (400, LOAD_ERROR),
+        "backup_create_invalid_json": (400, LOAD_ERROR),
     }
     for key, (status, message) in expected.items():
         got_status, body = results[key]
@@ -397,6 +484,9 @@ async def test_022_mode_answers_like_pocketbase_022(
         "password": blank,
     }
     assert results["list_bad_per_page"][1]["data"] == {}
+    for key, (_status, message) in expected.items():
+        if message in {INVALID_FORMATTING, LOAD_ERROR}:
+            assert results[key][1]["data"] == {}, key
 
     # Host bodies that are not a PPBase envelope, and successes, are untouched.
     assert results["legacy_code_body"] == (

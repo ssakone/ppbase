@@ -25,8 +25,15 @@ response.  It then runs the same HTTP list/view/create/update/auth/realtime
 requests for seven callers, the email visibility of listed, created and
 updated auth records (``manageRule``), a list of error requests (form
 validation errors of create/update/auth by caller, a ``createRule``
-mismatch, list parse errors) and the route guards (``$apis`` middlewares in
-``pb_hooks`` against ``pb.apis``), and writes ``pocketbase.json``,
+mismatch, list parse errors, hidden-field filters, the admin forms and
+password reset, the c.Bind failures of the admin, settings and backup
+forms) and the route guards (``$apis`` middlewares in ``pb_hooks`` against
+``pb.apis``, the ``pb.require_auth()``/``pb.require_record_auth()``
+dependencies and the ``event.require_*()`` helpers).  Realtime: update
+events with expand, the email of the broadcast auth record per subscriber
+(``realtime_email``), delete events (``realtime_delete``, a documented
+divergence) and successive subscription requests of one client
+(``realtime_auth``).  It writes ``pocketbase.json``,
 ``ppbase.json`` and ``diff.json`` in ``--out``.  ``created``/``updated`` timestamps and the auth ``username``
 (PPBase has no username column on a fresh auth collection) are dropped
 before the comparison.  Differences listed in ``KNOWN_DIVERGENCES`` are
@@ -152,13 +159,6 @@ AUTH_OPTIONS = {
 # Differences that are known and documented (status codes the compatibility
 # mode never changes, and PPBase validation details).
 KNOWN_DIVERGENCES: dict[str, str] = {
-    "errors.refresh_admin_token.status": (
-        "PPBase answers 403 'requires auth record from <collection>' to an "
-        "admin token; 0.22.34 RequireSameContextRecordAuth answers 401 "
-        "(apis/middlewares.go l.97-100). Status not rewritten."
-    ),
-    "errors.refresh_admin_token.body.code": "same case as the status",
-    "errors.refresh_admin_token.body.message": "same case as the status",
     "errors.password_on_base_collection.status": (
         "PPBase answers 404 'not an auth collection'; 0.22.34 "
         "LoadCollectionContext answers 400 'Unsupported collection type.' "
@@ -206,10 +206,23 @@ KNOWN_DIVERGENCES: dict[str, str] = {
             ("guest_only", "RequireGuestOnly", 400, 37, ("reader", "plain", "admin")),
             ("record_auth", "RequireRecordAuth", 401, 77, ("admin",)),
             ("admin_auth", "RequireAdminAuth", 401, 119, ("reader", "plain")),
+            ("dep_record", "RequireRecordAuth", 401, 77, ("admin",)),
+            ("event_record", "RequireRecordAuth", 401, 77, ("admin",)),
+            ("event_admin", "RequireAdminAuth", 401, 119, ("reader", "plain")),
         )
         for caller in callers
         for key in ("status", "body.code")
     },
+    # Documented divergence (docs/expand-view-rules.md, "Realtime delete
+    # events"): 0.22.34 builds each delete message before the delete
+    # (apis/realtime.go l.310-336, l.371-533); PPBase learns the delete
+    # from PostgreSQL after the commit.
+    "realtime_delete.*": (
+        "PPBase sends {id} only, to admins and to public-rule subscriptions "
+        "without a client filter; 0.22.34 sends the full record (expand, "
+        "email visibility) to every subscriber whose rule and filter matched "
+        "it before the delete."
+    ),
 }
 
 
@@ -839,6 +852,190 @@ async def realtime_scenarios(
     return result
 
 
+async def realtime_events(
+    client: httpx.AsyncClient,
+    auth: dict[str, str],
+    topic: str,
+    trigger: Callable[[], Awaitable[None]],
+    wait: float = 5.0,
+) -> Any:
+    """Like ``realtime_event`` but ``{"event": None}`` when nothing arrives."""
+    async with client.stream("GET", "/api/realtime") as stream:
+        lines = stream.aiter_lines()
+        connect = await asyncio.wait_for(_next_event(lines), 15)
+        client_id = json.loads(connect["data"])["clientId"]
+        response = await client.post(
+            "/api/realtime",
+            headers=auth,
+            json={"clientId": client_id, "subscriptions": [topic]},
+        )
+        if response.status_code != 204:
+            return {"subscribe": response.status_code, "body": _json(response)}
+        await trigger()
+        deadline = time.monotonic() + wait
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                event = await asyncio.wait_for(_next_event(lines), left)
+            except TimeoutError:
+                break
+            if event.get("event") == topic:
+                data = json.loads(event["data"])
+                return {
+                    "action": data.get("action"),
+                    "record": _clean(data.get("record")),
+                }
+    return {"event": None}
+
+
+async def realtime_email_scenarios(
+    client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """Email of the broadcast auth record itself (apis/realtime.go l.439-448).
+
+    0.22.34 shows a hidden email only to the subscriber that *is* the record
+    and passes the collection ``manageRule``; an admin, a manager or another
+    user never receives it.  ``plain`` is managed by ``manager`` (the rule
+    does not match its owner); ``reader`` is made self-managed for the second
+    series, then restored.
+    """
+    users = f"/api/collections/{N['users']}/records"
+    result: dict[str, Any] = {}
+
+    def toggler(record: str, index: int) -> Callable[[], Awaitable[None]]:
+        async def trigger() -> None:
+            await _ok(
+                await client.patch(
+                    f"{users}/{R[record]}",
+                    headers=headers["admin"],
+                    json={"customer": R["c1"] if index % 2 == 0 else R["c2"]},
+                ),
+                "realtime email trigger",
+            )
+
+        return trigger
+
+    for index, caller in enumerate(("guest", "plain", "manager", "reader", "admin")):
+        result[f"managed_{caller}"] = await realtime_event(
+            client,
+            headers[caller],
+            f"{N['users']}/{R['plain']}",
+            toggler("plain", index),
+        )
+    await _ok(
+        await client.patch(
+            f"{users}/{R['reader']}",
+            headers=headers["admin"],
+            json={"managers": [R["reader"]]},
+        ),
+        "reader self-managed",
+    )
+    for index, caller in enumerate(("guest", "reader", "plain", "admin")):
+        result[f"self_managed_{caller}"] = await realtime_event(
+            client,
+            headers[caller],
+            f"{N['users']}/{R['reader']}",
+            toggler("reader", index),
+        )
+    for record in ("plain", "reader"):
+        await _ok(
+            await client.patch(
+                f"{users}/{R[record]}",
+                headers=headers["admin"],
+                json={
+                    "customer": R["c2"],
+                    **({"managers": []} if record == "reader" else {}),
+                },
+            ),
+            f"{record} restored",
+        )
+    return result
+
+
+async def realtime_delete_scenarios(
+    client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """Delete events (apis/realtime.go l.310-336, l.371-533).
+
+    0.22.34 builds each subscriber's message before the delete (rule,
+    client filter, expand and email checked on the existing record) and
+    sends it after.  The records are synthetic and created for this group.
+    """
+    sale = f"/api/collections/{N['sale']}/records"
+    customer = f"/api/collections/{N['customer']}/records"
+    options = quote(json.dumps({"query": {"expand": "customer,customers,user"}}))
+    result: dict[str, Any] = {}
+    for index, caller in enumerate(("guest", "reader", "admin")):
+        record_id = f"wsa8delsale000{index}"
+        await _ok(
+            await client.post(
+                sale,
+                headers=headers["admin"],
+                json={
+                    "id": record_id,
+                    "label": f"del{index}",
+                    "customer": R["c2"],
+                    "customers": [R["c2"], R["c3"], R["c1"]],
+                    "user": R["plain"],
+                },
+            ),
+            "delete scenario sale",
+        )
+
+        async def trigger(rid: str = record_id) -> None:
+            response = await client.delete(f"{sale}/{rid}", headers=headers["admin"])
+            if response.status_code != 204:
+                raise RuntimeError(f"delete trigger: {response.status_code}")
+
+        result[f"public_rule_{caller}"] = await realtime_events(
+            client, headers[caller], f"{N['sale']}/*?options={options}", trigger
+        )
+    # A rule that is not public: "public = true || ..." matches this record.
+    for index, caller in enumerate(("guest", "reader")):
+        record_id = f"wsa8delcustom0{index}"
+        await _ok(
+            await client.post(
+                customer,
+                headers=headers["admin"],
+                json={"id": record_id, "name": f"delc{index}", "public": True},
+            ),
+            "delete scenario customer",
+        )
+
+        async def trigger_customer(rid: str = record_id) -> None:
+            response = await client.delete(
+                f"{customer}/{rid}", headers=headers["admin"]
+            )
+            if response.status_code != 204:
+                raise RuntimeError(f"delete trigger: {response.status_code}")
+
+        result[f"rule_{caller}"] = await realtime_events(
+            client, headers[caller], f"{N['customer']}/*", trigger_customer
+        )
+    return result
+
+
+async def realtime_auth_scenarios(
+    client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """One SSE client, successive subscription requests (l.187-203)."""
+    async with client.stream("GET", "/api/realtime") as stream:
+        lines = stream.aiter_lines()
+        connect = await asyncio.wait_for(_next_event(lines), 15)
+        client_id = json.loads(connect["data"])["clientId"]
+        result: dict[str, Any] = {}
+        for step, caller in enumerate(("guest", "reader", "plain", "guest", "reader")):
+            response = await client.post(
+                "/api/realtime",
+                headers=headers[caller],
+                json={"clientId": client_id, "subscriptions": [f"{N['sale']}/*"]},
+            )
+            result[f"{step}_{caller}"] = {
+                "status": response.status_code,
+                "body": _json(response),
+            }
+    return result
+
+
 async def error_scenarios(
     client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
 ) -> dict[str, Any]:
@@ -848,6 +1045,10 @@ async def error_scenarios(
     users = f"/api/collections/{N['users']}"
     raw_json = {"content-type": "application/json"}
     missing_customer = {"json": {"customer": "zzzzzzzzzzzzzzz"}}
+    admins = await _ok(
+        await client.get("/api/admins", headers=headers["admin"]), "admins"
+    )
+    admin_id = admins["items"][0]["id"]
     cases: dict[str, tuple[str, str, dict[str, Any]]] = {
         # Form validation errors: unwrapped for an update (any caller) and
         # an admin's create, "Failed to create record." for a user's create.
@@ -1009,6 +1210,140 @@ async def error_scenarios(
             "/api/admins/auth-with-password",
             {"json": {"identity": ADMIN_EMAIL, "password": "wrong-password-1"}},
         ),
+        # WS-A5: hidden fields, modifiers and admin-only fields of a list.
+        "hidden_modifier_filter": (
+            "GET",
+            f"{users}/records",
+            {"params": {"filter": 'email:lower = "x"'}},
+        ),
+        "hidden_field_filter": (
+            "GET",
+            f"{users}/records",
+            {"params": {"filter": 'tokenKey != ""'}},
+        ),
+        "hidden_qualified_filter": (
+            "GET",
+            f"{users}/records",
+            {"params": {"filter": f'{N["users"]}.passwordHash ~ "$"'}},
+        ),
+        "hidden_field_sort": (
+            "GET",
+            f"{users}/records",
+            {"params": {"sort": "-tokenKey"}},
+        ),
+        "system_field_modifier": ("GET", sale, {"params": {"filter": "id:length > 1"}}),
+        "admin_only_request_filter": (
+            "GET",
+            sale,
+            {"params": {"filter": '@request.auth.id != ""'}, "headers": "reader"},
+        ),
+        "admin_only_sort": ("GET", sale, {"params": {"sort": "@request.auth.id"}}),
+        # WS-A2: admin forms, admin password reset, auth guards of the routes.
+        "admin_reset_request_empty": (
+            "POST",
+            "/api/admins/request-password-reset",
+            {"json": {}},
+        ),
+        "admin_reset_request_invalid_email": (
+            "POST",
+            "/api/admins/request-password-reset",
+            {"json": {"email": "not-an-email"}},
+        ),
+        "admin_reset_request_unknown": (
+            "POST",
+            "/api/admins/request-password-reset",
+            {"json": {"email": "nobody@example.invalid"}},
+        ),
+        "admin_reset_request_invalid_json": (
+            "POST",
+            "/api/admins/request-password-reset",
+            {"content": b"{bad", "headers": raw_json},
+        ),
+        "admin_reset_confirm_empty": (
+            "POST",
+            "/api/admins/confirm-password-reset",
+            {"json": {}},
+        ),
+        "admin_reset_confirm_bad": (
+            "POST",
+            "/api/admins/confirm-password-reset",
+            {"json": {"token": "bad", "password": "short", "passwordConfirm": "other"}},
+        ),
+        "admin_create_empty": ("POST", "/api/admins", {"json": {}, "headers": "admin"}),
+        "admin_create_short_password": (
+            "POST",
+            "/api/admins",
+            {
+                "json": {
+                    "email": "wsa8-new@example.invalid",
+                    "password": "short",
+                    "passwordConfirm": "short",
+                },
+                "headers": "admin",
+            },
+        ),
+        "admin_create_invalid_json": (
+            "POST",
+            "/api/admins",
+            {"content": b"{bad", "headers": {**headers["admin"], **raw_json}},
+        ),
+        "admin_update_short_password": (
+            "PATCH",
+            f"/api/admins/{admin_id}",
+            {
+                "json": {"password": "short", "passwordConfirm": "short"},
+                "headers": "admin",
+            },
+        ),
+        "admin_update_unknown": (
+            "PATCH",
+            "/api/admins/zzzzzzzzzzzzzzz",
+            {"json": {"password": "short"}, "headers": "admin"},
+        ),
+        "admin_view_unknown": (
+            "GET",
+            "/api/admins/zzzzzzzzzzzzzzz",
+            {"headers": "admin"},
+        ),
+        "admin_list_record_token": ("GET", "/api/admins", {"headers": "reader"}),
+        "admin_refresh_guest": ("POST", "/api/admins/auth-refresh", {}),
+        "admin_refresh_record_token": (
+            "POST",
+            "/api/admins/auth-refresh",
+            {"headers": "reader"},
+        ),
+        "email_change_admin_token": (
+            "POST",
+            f"{users}/request-email-change",
+            {"json": {"newEmail": "new@example.invalid"}, "headers": "admin"},
+        ),
+        "settings_record_token": ("GET", "/api/settings", {"headers": "reader"}),
+        "settings_invalid_json": (
+            "PATCH",
+            "/api/settings",
+            {"content": b"{bad", "headers": {**headers["admin"], **raw_json}},
+        ),
+        "logs_guest": ("GET", "/api/logs", {}),
+        "settings_test_email_invalid_json": (
+            "POST",
+            "/api/settings/test/email",
+            {"content": b"{bad", "headers": {**headers["admin"], **raw_json}},
+        ),
+        "admin_password_invalid_json": (
+            "POST",
+            "/api/admins/auth-with-password",
+            {"content": b"{bad", "headers": raw_json},
+        ),
+        "admin_update_invalid_json": (
+            "PATCH",
+            f"/api/admins/{admin_id}",
+            {"content": b"[1]", "headers": {**headers["admin"], **raw_json}},
+        ),
+        "backup_create_invalid_json": (
+            "POST",
+            "/api/backups",
+            {"content": b"{bad", "headers": {**headers["admin"], **raw_json}},
+        ),
     }
     result: dict[str, Any] = {}
     for name, (method, url, options) in cases.items():
@@ -1035,6 +1370,16 @@ routerAdd("GET", "/wsa6/any", (c) => c.json(200, {"ok": true}),
     $apis.requireAdminOrRecordAuth())
 routerAdd("GET", "/wsa6/owner/:id", (c) => c.json(200, {"ok": true}),
     $apis.requireAdminOrOwnerAuth("id"))
+routerAdd("GET", "/wsa8/dep-any", (c) => c.json(200, {"ok": true}),
+    $apis.requireAdminOrRecordAuth())
+routerAdd("GET", "/wsa8/dep-record", (c) => c.json(200, {"ok": true}),
+    $apis.requireRecordAuth())
+routerAdd("GET", "/wsa8/event-any", (c) => c.json(200, {"ok": true}),
+    $apis.requireAdminOrRecordAuth())
+routerAdd("GET", "/wsa8/event-record", (c) => c.json(200, {"ok": true}),
+    $apis.requireRecordAuth())
+routerAdd("GET", "/wsa8/event-admin", (c) => c.json(200, {"ok": true}),
+    $apis.requireAdminAuth())
 """.replace("@USERS@", N["users"])
 
 
@@ -1054,6 +1399,38 @@ def register_ppbase_guards(pb: Any) -> None:
         ok.__name__ = f"wsa6_guard_{index}"
         pb.get(path, middlewares=[guard])(ok)
 
+    # FastAPI dependencies: pb.require_auth() / pb.require_record_auth().
+    any_auth = pb.require_auth()
+    record_auth = pb.require_record_auth()
+
+    async def dep_any(_auth: Any = any_auth) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def dep_record(_auth: Any = record_auth) -> dict[str, bool]:
+        return {"ok": True}
+
+    pb.get("/wsa8/dep-any")(dep_any)
+    pb.get("/wsa8/dep-record")(dep_record)
+
+    # Route middlewares calling the event helpers.
+    for index, (path, helper) in enumerate(
+        (
+            ("/wsa8/event-any", "require_auth"),
+            ("/wsa8/event-record", "require_auth_record"),
+            ("/wsa8/event-admin", "require_superuser"),
+        )
+    ):
+
+        async def event_guard(event: Any, name: str = helper) -> Any:
+            getattr(event, name)()
+            return await event.next()
+
+        async def event_ok() -> dict[str, bool]:
+            return {"ok": True}
+
+        event_ok.__name__ = f"wsa8_event_guard_{index}"
+        pb.get(path, middlewares=[event_guard])(event_ok)
+
 
 async def guard_scenarios(
     client: httpx.AsyncClient, headers: dict[str, dict[str, str]]
@@ -1064,6 +1441,11 @@ async def guard_scenarios(
         "admin_auth": "/wsa6/admin",
         "admin_or_record": "/wsa6/any",
         "admin_or_owner": f"/wsa6/owner/{R['reader']}",
+        "dep_any": "/wsa8/dep-any",
+        "dep_record": "/wsa8/dep-record",
+        "event_any": "/wsa8/event-any",
+        "event_record": "/wsa8/event-record",
+        "event_admin": "/wsa8/event-admin",
     }
     result: dict[str, Any] = {}
     for name, url in routes.items():
@@ -1087,6 +1469,9 @@ async def run_scenarios(
         "writes": await write_scenarios(client, headers),
         "auth": await auth_scenarios(client, headers),
         "realtime": await realtime_scenarios(client, headers),
+        "realtime_email": await realtime_email_scenarios(client, headers),
+        "realtime_delete": await realtime_delete_scenarios(client, headers),
+        "realtime_auth": await realtime_auth_scenarios(client, headers),
         "errors": await error_scenarios(client, headers),
         "guards": await guard_scenarios(client, headers),
     }

@@ -575,10 +575,17 @@ def create_app(
     ) -> JSONResponse:
         data: dict = {}
         query_only = True
+        body_unbound = False
         for err in exc.errors():
             loc = err.get("loc", ())
             if not loc or loc[0] not in ("query", "path"):
                 query_only = False
+            # The JSON itself, or a body that is not an object: what the
+            # 0.22.34 c.Bind fails on (a missing body binds an empty form).
+            if err.get("type") == "json_invalid" or (
+                tuple(loc) in {(), ("body",)} and err.get("type") != "missing"
+            ):
+                body_unbound = True
             # Field name is typically the last element after "body"
             field_name = str(loc[-1]) if loc else "unknown"
             data[field_name] = {
@@ -586,7 +593,8 @@ def create_app(
                 "message": err.get("msg", "Invalid value."),
             }
         # PocketBase 0.22.34: a bad page/perPage/skipTotal is a search
-        # provider parse error, a bad body a form validation error.
+        # provider parse error, an unparsable body a c.Bind error, a bad
+        # body a form validation error.
         return JSONResponse(
             content={
                 "status": 400,
@@ -595,7 +603,8 @@ def create_app(
             },
             status_code=400,
             headers=error_kind_headers(
-                request.app, "query" if query_only else "form"
+                request.app,
+                "body_load" if body_unbound else "query" if query_only else "form",
             ),
         )
 
