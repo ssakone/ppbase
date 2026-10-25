@@ -139,7 +139,9 @@ def test_date_sort_puts_empty_dates_where_sqlite_puts_empty_text(
         ("d < e", '("t"."d" < "t"."e" OR ("t"."d" IS NULL AND "t"."e" IS NOT NULL))'),
         ("d >= e", '("t"."d" >= "t"."e" OR "t"."e" IS NULL)'),
         ("created < d", '"t"."d" > "t"."created"'),
-        ('title = ""', '"t"."title" = :_fp1'),
+        # A text column is not a date: PocketBase's generic empty operand
+        # (also NULL), see tests/test_filter_parser_null_semantics.py.
+        ('title = ""', '("t"."title"::text = \'\' OR "t"."title" IS NULL)'),
     ],
 )
 def test_date_comparisons_treat_null_as_the_empty_text(

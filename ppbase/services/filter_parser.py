@@ -1001,6 +1001,8 @@ class _FilterTransformer(Transformer):
         right: tuple[str, Any],
     ) -> str | _Cond:
         op = str(op_token).strip()
+        if not (self._is_path_node(left) or self._is_path_node(right)):
+            op = self._direct_op(op, left, right)
         if op in _STANDARD_OPS:
             left, right = self._coerce_comparison_literals(left, right)
 
@@ -1048,17 +1050,12 @@ class _FilterTransformer(Transformer):
         # Standard comparisons
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
-            # NULL special handling
-            if right[0] == "null":
-                if sql_op == "=":
-                    return _guarded(f"{left_sql} IS NULL")
-                elif sql_op == "!=":
-                    return _guarded(f"{left_sql} IS NOT NULL")
-            if left[0] == "null":
-                if sql_op == "=":
-                    return _guarded(f"{right_sql} IS NULL")
-                elif sql_op == "!=":
-                    return _guarded(f"{right_sql} IS NOT NULL")
+            if sql_op in {"=", "!="}:
+                return _guarded(
+                    self._direct_equal_sql(
+                        left, left_sql, right, right_sql, equal=sql_op == "="
+                    )
+                )
             return _guarded(f"{left_sql} {sql_op} {right_sql}")
 
         # LIKE / NOT LIKE
@@ -1069,6 +1066,12 @@ class _FilterTransformer(Transformer):
         # ANY standard operators (for array columns)
         if op in _ANY_STANDARD_OPS:
             sql_op = _ANY_STANDARD_OPS[op]
+            if sql_op in {"=", "!="}:
+                json_null = self._json_null_equal_sql(
+                    left, left_sql, right, right_sql, equal=sql_op == "="
+                )
+                if json_null is not None:
+                    return _guarded(json_null)
             return _guarded(self._scalar_or_array_any_sql(left_sql, right_sql, sql_op))
 
         # ANY LIKE operators
@@ -1078,6 +1081,177 @@ class _FilterTransformer(Transformer):
             return _guarded(self._scalar_or_array_like_sql(left_sql, pattern_sql, sql_op))
 
         return _guarded(f"{left_sql} = {right_sql}")
+
+    # -- NULL-aware equality of current-record operands ---------------------
+
+    @staticmethod
+    def _is_each_node(node: Any) -> bool:
+        """``field:each`` or ``@request.data.field:each`` (its own multi-match)."""
+        if not isinstance(node, tuple) or len(node) < 2:
+            return False
+        if node[0] == "field_modifier":
+            return len(node) >= 3 and node[2] == "each"
+        return node[0] == "macro" and str(node[1]).endswith(":each")
+
+    def _is_json_operand(self, node: Any) -> bool:
+        """A json field or a json path (a PocketBase ``NoCoalesce`` operand)."""
+        if not isinstance(node, tuple) or not node:
+            return False
+        if node[0] == "sql_ref":
+            return node[2:3] == (True,)
+        return node[0] == "field" and self._operand_field_type(node) == "json"
+
+    def _direct_op(self, op: str, left: Any, right: Any) -> str:
+        """``?op`` between current-record operands is ``op``.
+
+        PocketBase builds ``?=`` like ``=`` (and so on): the operators share
+        one case and only a relation/``@collection`` path adds the
+        multi-match subquery (v0.22.34 tools/search/filter.go l.150-215,
+        v0.40.6 l.188-252).  A current-record field never multi-matches; a
+        multi-value one is compared through its JSON text.  Kept as is: json
+        operands (PPBase's array-any reading), ``:each`` operands and fields
+        without metadata.
+        """
+        if op not in _ANY_STANDARD_OPS and op not in _ANY_LIKE_OPS:
+            return op
+        nodes = (left, right)
+        if any(
+            self._is_each_node(node) or self._is_json_operand(node) for node in nodes
+        ):
+            return op
+        for node in nodes:
+            if not isinstance(node, tuple) or not node:
+                continue
+            if node[0] == "field_modifier" or (
+                node[0] == "field" and self._operand_field_type(node)
+            ):
+                return op[1:]
+        return op
+
+    def _json_empty_sql(
+        self, json_sql: str, other: _Side, *, equal: bool
+    ) -> str | None:
+        """``x = null`` / ``x = ""`` (and ``!=``) of a json operand.
+
+        PocketBase compares ``JSON_EXTRACT(x, '$...') IS [NOT] <other>``
+        without COALESCE (``NoCoalesce``: v0.22.34
+        resolvers/record_field_resolve_runner.go l.465-470 and l.495-506,
+        tools/dbutils/json.go l.31-46, tools/search/filter.go l.308-317).
+        SQLite extracts a JSON ``null`` as SQL NULL, so a SQL NULL and a
+        stored JSON ``null`` (``jsonb 'null'`` in PPBase) are both null, and
+        only the JSON string ``""`` is ``''``.  ``None`` when ``other`` is not
+        an empty operand (any other json comparison keeps its SQL).
+        """
+        if other.kind != "empty":
+            return None
+        is_null = other.sql == "NULL" or (
+            self._is_bound_param(other.sql) and self._params[other.sql[1:]] is None
+        )
+        if is_null:
+            if equal:
+                return f"({json_sql} IS NULL OR jsonb_typeof(to_jsonb({json_sql})) = 'null')"
+            return (
+                f"({json_sql} IS NOT NULL "
+                f"AND jsonb_typeof(to_jsonb({json_sql})) <> 'null')"
+            )
+        compare = "=" if equal else "IS DISTINCT FROM"
+        return f"(to_jsonb({json_sql}) {compare} '\"\"'::jsonb)"
+
+    def _json_null_equal_sql(
+        self,
+        left: Any,
+        left_sql: str,
+        right: Any,
+        right_sql: str,
+        *,
+        equal: bool,
+    ) -> str | None:
+        """A json operand compared with ``null``/``""``, else ``None``."""
+        for json_node, json_sql, other, other_sql in (
+            (left, left_sql, right, right_sql),
+            (right, right_sql, left, left_sql),
+        ):
+            if self._is_json_operand(json_node):
+                sql = self._json_empty_sql(
+                    json_sql, self._side_from_sql(other, other_sql), equal=equal
+                )
+                if sql is not None:
+                    return sql
+        return None
+
+    @staticmethod
+    def _side_is_json(side: _Side) -> bool:
+        """A json path leaf, with (``is_json``) or without a JSON sub-path."""
+        node = side.node
+        return side.is_json or (
+            isinstance(node, tuple)
+            and len(node) > 3
+            and node[0] == "sql_ref"
+            and node[3] == "json"
+        )
+
+    def _side_from_sql(self, node: Any, sql: str) -> _Side:
+        """Classify a rendered operand like ``resolveEqualExpr``."""
+        kind = node[0] if isinstance(node, tuple) and node else ""
+        if kind == "null" or sql == "NULL":
+            return _Side(sql, "empty", node)
+        if self._is_bound_param(sql):
+            value = self._params[sql[1:]]
+            return _Side(sql, "empty" if value in ("", None) else "value", node)
+        if kind in {"literal", "macro"}:
+            return _Side(sql, "value", node)
+        return _Side(sql, "column", node)
+
+    def _direct_equal_sql(
+        self,
+        left: Any,
+        left_sql: str,
+        right: Any,
+        right_sql: str,
+        *,
+        equal: bool,
+    ) -> str:
+        """``=``/``!=`` of current-record operands like ``resolveEqualExpr``.
+
+        PocketBase 0.22.34 (tools/search/filter.go l.284-368, the same in
+        v0.40.6 l.334-422): ``!=`` is NULL-safe (``IS NOT``), an empty operand
+        (``""``, ``null``) also matches NULL, two columns are compared with
+        ``COALESCE(x, '')`` and a json operand without COALESCE.  Only NULL
+        values change: two non-NULL values keep their typed comparison.
+        """
+        json_null = self._json_null_equal_sql(
+            left, left_sql, right, right_sql, equal=equal
+        )
+        if json_null is not None:
+            return json_null
+        if self._is_json_operand(left) or self._is_json_operand(right):
+            # Any other json comparison is not a NULL case: unchanged SQL.
+            return f"{left_sql} {'=' if equal else '!='} {right_sql}"
+        left_side = self._side_from_sql(left, left_sql)
+        right_side = self._side_from_sql(right, right_sql)
+        if left_side.kind == "column" and right_side.kind == "column":
+            return self._columns_equal_sql(left_sql, right_sql, equal=equal)
+        return self._pb_equal_sql(left_side, right_side, equal=equal)
+
+    def _columns_equal_sql(self, left_sql: str, right_sql: str, *, equal: bool) -> str:
+        """``COALESCE(a, '') = COALESCE(b, '')``, typed for non-NULL values.
+
+        A NULL operand equals an empty one (``''``) or another NULL; two
+        non-NULL values keep PPBase's typed comparison.  ``!=`` is never NULL.
+        """
+        left_text = f"COALESCE({self._text_cast_sql(left_sql)}, '')"
+        right_text = f"COALESCE({self._text_cast_sql(right_sql)}, '')"
+        if equal:
+            return (
+                f"({left_sql} = {right_sql} "
+                f"OR ({left_sql} IS NULL AND {right_text} = '') "
+                f"OR ({right_sql} IS NULL AND {left_text} = ''))"
+            )
+        return (
+            f"({left_sql} IS DISTINCT FROM {right_sql} "
+            f"AND ({left_sql} IS NOT NULL OR {right_text} <> '') "
+            f"AND ({right_sql} IS NOT NULL OR {left_text} <> ''))"
+        )
 
     # -- @collection comparison helpers --------------------------------------
 
@@ -1466,16 +1640,7 @@ class _FilterTransformer(Transformer):
         if path is not None:
             node = ("sql_ref", path.sql, path.is_json, path.field_type, path.row_id)
             return _Side(path.sql, "column", node, is_json=path.is_json)
-        sql = self._operand_to_sql(node)
-        kind = node[0] if isinstance(node, tuple) and node else ""
-        if kind == "null" or sql == "NULL":
-            return _Side(sql, "empty", node)
-        if self._is_bound_param(sql):
-            value = self._params[sql[1:]]
-            return _Side(sql, "empty" if value in ("", None) else "value", node)
-        if kind in {"literal", "macro"}:
-            return _Side(sql, "value", node)
-        return _Side(sql, "column", node)
+        return self._side_from_sql(node, self._operand_to_sql(node))
 
     def _static_equal_sql(self, left: tuple, right: tuple, *, equal: bool) -> str:
         """``=``/``!=`` when a ``@request.*`` static value is involved.
@@ -1492,6 +1657,11 @@ class _FilterTransformer(Transformer):
         """
         left_side = self._side(left, None)
         right_side = self._side(right, None)
+        json_sql = self._json_null_equal_sql(
+            left, left_side.sql, right, right_side.sql, equal=equal
+        )
+        if json_sql is not None:
+            return json_sql
         left_empty = left_side.kind == "empty"
         right_empty = right_side.kind == "empty"
         if left_empty and right_empty:
@@ -1606,6 +1776,14 @@ class _FilterTransformer(Transformer):
 
     def _compare_sides(self, left: _Side, op: str, right: _Side) -> str:
         """One comparison of a path leaf (``?`` only disables multi-match)."""
+        if op.removeprefix("?") in {"=", "!="}:
+            for json_side, other in ((left, right), (right, left)):
+                if self._side_is_json(json_side):
+                    sql = self._json_empty_sql(
+                        json_side.sql, other, equal=op.removeprefix("?") == "="
+                    )
+                    if sql is not None:
+                        return sql
         if left.is_json or right.is_json:
             # JSON leaves keep PPBase's JSON comparison.
             ref, other, ref_is_left = (left, right, True) if left.is_json else (
@@ -1665,7 +1843,9 @@ class _FilterTransformer(Transformer):
         nullable date leaf, whose NULL value is an empty date)."""
         value = f'"{alias}"."v"'
         if mm.row_id is None:
-            return _Side(value, "column", ("sql_ref", value), is_json=side.is_json), value
+            leaf_type = side.node[3] if len(side.node) > 3 else ""
+            node = ("sql_ref", value, side.is_json, leaf_type)
+            return _Side(value, "column", node, is_json=side.is_json), value
         row_id = f'"{alias}"."r"'
         node = ("sql_ref", value, False, side.node[3], row_id)
         return _Side(value, "column", node), row_id
