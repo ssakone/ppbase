@@ -71,7 +71,8 @@ async def get_optional_auth(
     except jwt.InvalidTokenError:
         return None
 
-    token_type = unverified.get("type")
+    from ppbase.services.auth_service import normalize_auth_token_type
+    token_type = normalize_auth_token_type(unverified.get("type"))
     token_id = unverified.get("id")
     if not token_id:
         return None
@@ -132,6 +133,7 @@ async def get_optional_auth(
         full_secret = record_token_key + auth_secret
         try:
             payload = jwt.decode(token, full_secret, algorithms=["HS256"])
+            payload["type"] = "authRecord"
             return payload
         except jwt.InvalidTokenError:
             return None

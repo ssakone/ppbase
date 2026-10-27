@@ -13,6 +13,17 @@ import jwt
 # Alphabet for token key generation
 _TOKEN_KEY_ALPHABET = string.ascii_letters + string.digits
 
+# PocketBase >= 0.23 signs record auth tokens with ``type: "auth"`` (same
+# claims and same ``token_key + collection secret`` key as ppbase's
+# ``authRecord``). Accepting it lets clients keep their sessions when a
+# PocketBase database is migrated to ppbase with its collection secrets.
+POCKETBASE_AUTH_TOKEN_TYPE = "auth"
+
+
+def normalize_auth_token_type(token_type: Any) -> Any:
+    """Map PocketBase's ``auth`` token type to ppbase's ``authRecord``."""
+    return "authRecord" if token_type == POCKETBASE_AUTH_TOKEN_TYPE else token_type
+
 
 def hash_password(password: str) -> str:
     """Hash a plaintext password using bcrypt."""
