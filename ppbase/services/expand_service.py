@@ -238,9 +238,19 @@ async def _expand_path(
         if value is None:
             continue
 
+        # Another path may already have expanded this field (``a.b,a`` or
+        # ``a.b,a.c``): keep those records so their nested expansions are merged
+        # rather than overwritten (PocketBase ``Record.MergeExpand``).
+        previous = record["expand"].get(field_name)
+        previous_by_id = {
+            str(item.get("id")): item
+            for item in (previous if isinstance(previous, list) else [previous])
+            if isinstance(item, dict)
+        }
+
         if is_multi and isinstance(value, list):
             expanded_list = [
-                related_responses[str(v)]
+                previous_by_id.get(str(v), related_responses[str(v)])
                 for v in value
                 if str(v) in related_responses
             ]
@@ -249,7 +259,7 @@ async def _expand_path(
         elif not is_multi:
             rid = str(value) if value else ""
             if rid in related_responses:
-                record["expand"][field_name] = related_responses[rid]
+                record["expand"][field_name] = previous_by_id.get(rid, related_responses[rid])
 
     # If there are remaining segments, recurse into the expanded records
     if remaining:

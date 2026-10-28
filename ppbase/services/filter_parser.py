@@ -43,10 +43,12 @@ OPERATOR: "?!~" | "?!=" | "?>=" | "?<=" | "?>" | "?<" | "?~" | "?="
         | macro
         | field_path
 
-string: ESCAPED_STRING
+string: DOUBLE_STRING
       | SINGLE_STRING
 
-SINGLE_STRING: "'" /[^']*/ "'"
+// Quoted text ends at the first unescaped matching quote (PocketBase fexpr).
+DOUBLE_STRING: /"(?:[^"\\]|\\.)*"/s
+SINGLE_STRING: /'(?:[^'\\]|\\.)*'/s
 
 number: SIGNED_NUMBER
 
@@ -65,7 +67,6 @@ field_path: FIELD_IDENT ("." FIELD_IDENT)*
 
 FIELD_IDENT: /[a-zA-Z_][a-zA-Z0-9_:]*/
 
-%import common.ESCAPED_STRING
 %import common.SIGNED_NUMBER
 %import common.WS
 %ignore WS
@@ -238,6 +239,38 @@ _SAFE_IDENT_CHARS = frozenset(
 _MODIFIER_NAMES = {"isset", "changed", "length", "each", "lower"}
 
 
+_TEXT_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", '"': '"'}
+
+
+def _unescape_text(raw: str) -> str:
+    """Unescape quoted filter text like PocketBase's fexpr scanner.
+
+    ``\\n``, ``\\t``, ``\\r``, ``\\\\``, ``\\'`` and ``\\"`` are unescaped; any other
+    backslash is kept as is (``'C:\\dir'`` stays ``C:\\dir``). The JS SDK
+    ``pb.filter()`` relies on this to quote values containing apostrophes.
+    """
+    if "\\" not in raw:
+        return raw
+    out: list[str] = []
+    chars = iter(raw)
+    for ch in chars:
+        if ch != "\\":
+            out.append(ch)
+            continue
+        nxt = next(chars, "")
+        out.append(_TEXT_ESCAPES.get(nxt, "\\" + nxt))
+    return "".join(out)
+
+
+def _is_empty_operand(node: Any) -> bool:
+    """``null``, ``''`` or ``""`` (PocketBase compares them all as "empty")."""
+    return (
+        isinstance(node, tuple)
+        and len(node) >= 2
+        and (node[0] == "null" or (node[0] == "literal" and node[1] == ""))
+    )
+
+
 def _sanitize_ident(s: str) -> str:
     """Raise if *s* contains characters unsuitable for a SQL identifier."""
     for ch in s:
@@ -275,15 +308,8 @@ class _FilterTransformer(Transformer):
     # -- Leaf nodes ----------------------------------------------------------
 
     def string(self, items: list) -> tuple[str, str]:
-        raw = str(items[0])
-        # Strip surrounding quotes
-        if raw.startswith("'") and raw.endswith("'"):
-            val = raw[1:-1]
-        elif raw.startswith('"') and raw.endswith('"'):
-            val = raw[1:-1]
-        else:
-            val = raw
-        return ("literal", val)
+        # Strip the surrounding quotes, then unescape like PocketBase (fexpr).
+        return ("literal", _unescape_text(str(items[0])[1:-1]))
 
     def number(self, items: list) -> tuple[str, float | int]:
         raw = str(items[0])
@@ -474,6 +500,47 @@ class _FilterTransformer(Transformer):
         if kind == "sql_ref" and len(node) >= 4:
             return str(node[3] or "")
         return ""
+
+    def _is_json_operand(self, node: tuple[str, Any]) -> bool:
+        kind = node[0] if isinstance(node, tuple) and node else None
+        if kind == "sql_ref" and len(node) > 2 and node[2]:
+            return True
+        if kind == "relation_ref" and len(node) > 3 and node[3]:
+            return True
+        return self._operand_field_type(node) in {"json", "geoPoint"}
+
+    def _empty_equality_sql(
+        self,
+        sql_op: str,
+        left: tuple[str, Any],
+        left_sql: str,
+        right: tuple[str, Any],
+        right_sql: str,
+    ) -> str | None:
+        """PocketBase ``=``/``!=`` semantics against ``""`` or ``null``.
+
+        PocketBase treats ``""`` and ``null`` alike: ``a = ""`` is
+        ``(a = '' OR a IS NULL)`` and ``a != ""`` is ``(a IS NOT '' AND a IS NOT NULL)``
+        (search/filter.go ``resolveEqualExpr``). The text cast keeps the comparison valid for
+        boolean, numeric, date and array columns (never ``''``, so only NULL matches).
+        Returns ``None`` when the generic comparison applies: no empty operand, a non-empty
+        literal on the other side, or a JSON operand.
+        """
+        if sql_op not in {"=", "!="}:
+            return None
+        left_empty = _is_empty_operand(left)
+        right_empty = _is_empty_operand(right)
+        if not left_empty and not right_empty:
+            return None
+        if left_empty and right_empty:
+            return "TRUE" if sql_op == "=" else "FALSE"
+        other, other_sql = (right, right_sql) if left_empty else (left, left_sql)
+        if other[0] == "literal" or self._is_json_operand(other):
+            return None
+        text_sql = self._text_cast_sql(other_sql)
+        if sql_op == "=":
+            return f"({text_sql} = '' OR {text_sql} IS NULL)"
+        return f"({text_sql} <> '' AND {text_sql} IS NOT NULL)"
 
     def _coerce_comparison_literals(
         self,
@@ -743,6 +810,9 @@ class _FilterTransformer(Transformer):
         # Standard comparisons
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
+            empty_sql = self._empty_equality_sql(sql_op, left, left_sql, right, right_sql)
+            if empty_sql is not None:
+                return empty_sql
             # NULL special handling
             if right[0] == "null":
                 if sql_op == "=":
@@ -972,7 +1042,16 @@ class _FilterTransformer(Transformer):
 
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
+            empty_sql = self._empty_equality_sql(
+                sql_op,
+                ("sql_ref", ref_sql, ref.leaf_is_json, ref.leaf_type),
+                ref_sql,
+                other,
+                other_sql,
+            )
+            if empty_sql is not None:
+                condition = empty_sql
+            elif other[0] == "null":
                 if sql_op == "=":
                     condition = f"{ref_sql} IS NULL"
                 elif sql_op == "!=":
@@ -1165,7 +1244,11 @@ class _FilterTransformer(Transformer):
 
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
-            if other[0] == "null":
+            rel_node = left if rel_is_left else right
+            empty_sql = self._empty_equality_sql(sql_op, rel_node, rel_col, other, other_sql)
+            if empty_sql is not None:
+                where_cond = empty_sql
+            elif other[0] == "null":
                 if sql_op == "=":
                     where_cond = f"{rel_col} IS NULL"
                 elif sql_op == "!=":
@@ -1282,6 +1365,11 @@ class _FilterTransformer(Transformer):
 
         if op in _STANDARD_OPS:
             sql_op = _STANDARD_OPS[op]
+            empty_sql = self._empty_equality_sql(
+                sql_op, ("sql_ref", item_sql), item_sql, other, other_sql,
+            )
+            if empty_sql is not None:
+                return empty_sql
             if other[0] == "null":
                 if sql_op == "=":
                     return f"{item_sql} IS NULL"
