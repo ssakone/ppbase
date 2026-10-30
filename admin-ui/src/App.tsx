@@ -64,6 +64,11 @@ const LogsPage = lazy(async () => {
   return { default: module.LogsPage }
 })
 
+const SqlConsolePage = lazy(async () => {
+  const module = await import('@/routes/sql')
+  return { default: module.SqlConsolePage }
+})
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -120,6 +125,7 @@ export default function App() {
                   <Route path="/migrations" element={withSuspense(<MigrationsPage />)} />
                   <Route path="/hooks" element={withSuspense(<HooksPage />)} />
                   <Route path="/logs" element={withSuspense(<LogsPage />)} />
+                  <Route path="/sql" element={withSuspense(<SqlConsolePage />)} />
                   <Route path="/settings" element={withSuspense(<SettingsPage />)} />
                   <Route path="/settings/backups" element={withSuspense(<BackupsPage />)} />
                 </Route>

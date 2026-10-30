@@ -218,3 +218,48 @@ export interface HooksRuntime {
   canRestart: boolean
   restartPending: boolean
 }
+
+export type SqlStatementKind =
+  | 'read'
+  | 'modify'
+  | 'delete'
+  | 'schema'
+  | 'maintenance'
+  | 'other'
+
+export interface SqlColumn {
+  name: string
+  type: string
+}
+
+export interface SqlStatementResult {
+  index: number
+  sql: string
+  command: string
+  kind: SqlStatementKind
+  mutating: boolean
+  warning: string | null
+  columns?: SqlColumn[]
+  rows?: unknown[][]
+  rowCount?: number | null
+  truncated?: boolean
+  status?: string
+  durationMs?: number
+}
+
+export interface SqlExecuteResult {
+  requiresConfirmation: boolean
+  executed: boolean
+  committed: boolean
+  statements: SqlStatementResult[]
+  durationMs?: number
+}
+
+export interface SqlErrorData {
+  statementIndex?: number
+  sql?: string
+  sqlstate?: string | null
+  detail?: string
+  hint?: string
+  position?: string
+}
