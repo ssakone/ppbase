@@ -96,8 +96,8 @@ export function SystemFieldsDisplay({ type }: SystemFieldsDisplayProps) {
         <>
           <SystemFieldRow
             icon="P"
-            bg="#f8fafc"
-            color="#475569"
+            bg={cfg.editor.bg}
+            color={cfg.editor.color}
             name="password"
             badges={[
               { label: 'Nonempty', variant: 'green' },

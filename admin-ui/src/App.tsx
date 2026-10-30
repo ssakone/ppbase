@@ -6,6 +6,7 @@ import { CheckCircle2, CircleAlert } from 'lucide-react'
 import { AuthProvider } from '@/context/auth-context'
 import { CommandPaletteProvider } from '@/context/command-palette-context'
 import { SidebarProvider } from '@/context/sidebar-context'
+import { ThemeProvider, useTheme } from '@/context/theme-context'
 import { CommandPalette } from '@/components/command-palette'
 import { RouteTransitionFallback } from '@/components/route-transition-fallback'
 
@@ -83,59 +84,69 @@ function withSuspense(element: ReactElement) {
   return <Suspense fallback={<RouteTransitionFallback />}>{element}</Suspense>
 }
 
+function AppToaster() {
+  const { resolvedTheme } = useTheme()
+  return (
+    <Toaster
+      theme={resolvedTheme}
+      position="bottom-center"
+      closeButton
+      toastOptions={{
+        classNames: {
+          toast:
+            'w-[min(560px,calc(100vw-2rem))] rounded-xl border border-slate-200 bg-white text-slate-900 shadow-lg',
+          icon: 'order-1 shrink-0',
+          content: 'order-2 min-w-0 flex-1',
+          title: 'text-sm font-medium',
+          description: 'text-xs text-slate-600',
+          closeButton:
+            '!static !top-auto !left-auto !right-auto !translate-x-0 !translate-y-0 order-3 ml-auto shrink-0 border border-slate-200 bg-white text-slate-500 hover:bg-slate-100 hover:text-slate-700',
+          success:
+            '!border-emerald-200 !bg-emerald-50/90 [&_[data-icon]]:text-emerald-600',
+          error:
+            '!border-red-200 !bg-red-50/90 [&_[data-icon]]:text-red-600',
+        },
+      }}
+      icons={{
+        success: <CheckCircle2 className="h-4 w-4" />,
+        error: <CircleAlert className="h-4 w-4" />,
+      }}
+    />
+  )
+}
+
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <BrowserRouter basename="/_">
-          <CommandPaletteProvider>
-            <SidebarProvider>
-              <Toaster
-                position="bottom-center"
-                closeButton
-                toastOptions={{
-                  classNames: {
-                    toast:
-                      'w-[min(560px,calc(100vw-2rem))] rounded-xl border border-slate-200 bg-white text-slate-900 shadow-lg',
-                    icon: 'order-1 shrink-0',
-                    content: 'order-2 min-w-0 flex-1',
-                    title: 'text-sm font-medium',
-                    description: 'text-xs text-slate-600',
-                    closeButton:
-                      '!static !top-auto !left-auto !right-auto !translate-x-0 !translate-y-0 order-3 ml-auto shrink-0 border border-slate-200 bg-white text-slate-500 hover:bg-slate-100 hover:text-slate-700',
-                    success:
-                      '!border-emerald-200 !bg-emerald-50/90 [&_[data-icon]]:text-emerald-600',
-                    error:
-                      '!border-red-200 !bg-red-50/90 [&_[data-icon]]:text-red-600',
-                  },
-                }}
-                icons={{
-                  success: <CheckCircle2 className="h-4 w-4" />,
-                  error: <CircleAlert className="h-4 w-4" />,
-                }}
-              />
-              <Routes>
-                <Route path="/login" element={withSuspense(<LoginPage />)} />
-                <Route path="/setup" element={withSuspense(<SetupPage />)} />
-                <Route element={withSuspense(<Layout />)}>
-                  <Route index element={<Navigate to="/dashboard" replace />} />
-                  <Route path="/dashboard" element={withSuspense(<DashboardPage />)} />
-                  <Route path="/collections" element={withSuspense(<CollectionsPage />)} />
-                  <Route path="/collections/:id" element={withSuspense(<RecordsPage />)} />
-                  <Route path="/migrations" element={withSuspense(<MigrationsPage />)} />
-                  <Route path="/hooks" element={withSuspense(<HooksPage />)} />
-                  <Route path="/logs" element={withSuspense(<LogsPage />)} />
-                  <Route path="/sql" element={withSuspense(<SqlConsolePage />)} />
-                  <Route path="/settings" element={withSuspense(<SettingsPage />)} />
-                  <Route path="/settings/backups" element={withSuspense(<BackupsPage />)} />
-                </Route>
-                <Route path="*" element={<Navigate to="/dashboard" replace />} />
-              </Routes>
-              <CommandPalette />
-            </SidebarProvider>
-          </CommandPaletteProvider>
-        </BrowserRouter>
-      </AuthProvider>
-    </QueryClientProvider>
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <BrowserRouter basename="/_">
+            <CommandPaletteProvider>
+              <SidebarProvider>
+                <AppToaster />
+                <Routes>
+                  <Route path="/login" element={withSuspense(<LoginPage />)} />
+                  <Route path="/setup" element={withSuspense(<SetupPage />)} />
+                  <Route element={withSuspense(<Layout />)}>
+                    <Route index element={<Navigate to="/dashboard" replace />} />
+                    <Route path="/dashboard" element={withSuspense(<DashboardPage />)} />
+                    <Route path="/collections" element={withSuspense(<CollectionsPage />)} />
+                    <Route path="/collections/:id" element={withSuspense(<RecordsPage />)} />
+                    <Route path="/migrations" element={withSuspense(<MigrationsPage />)} />
+                    <Route path="/hooks" element={withSuspense(<HooksPage />)} />
+                    <Route path="/logs" element={withSuspense(<LogsPage />)} />
+                    <Route path="/sql" element={withSuspense(<SqlConsolePage />)} />
+                    <Route path="/settings" element={withSuspense(<SettingsPage />)} />
+                    <Route path="/settings/backups" element={withSuspense(<BackupsPage />)} />
+                  </Route>
+                  <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                </Routes>
+                <CommandPalette />
+              </SidebarProvider>
+            </CommandPaletteProvider>
+          </BrowserRouter>
+        </AuthProvider>
+      </QueryClientProvider>
+    </ThemeProvider>
   )
 }

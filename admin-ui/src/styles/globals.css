@@ -32,6 +32,67 @@
     --input: 214.3 31.8% 91.4%;
     --ring: 243 75% 59%;
     --radius: 0.6rem;
+
+    /* Field type badges (lib/field-types.ts) */
+    --field-text-bg: #eff6ff;      --field-text-fg: #1d4ed8;
+    --field-editor-bg: #f8fafc;    --field-editor-fg: #475569;
+    --field-number-bg: #f5f3ff;    --field-number-fg: #7c3aed;
+    --field-bool-bg: #ecfdf5;      --field-bool-fg: #059669;
+    --field-email-bg: #eef2ff;     --field-email-fg: #4f46e5;
+    --field-date-bg: #fffbeb;      --field-date-fg: #d97706;
+    --field-select-bg: #fdf4ff;    --field-select-fg: #a855f7;
+    --field-json-bg: #f0fdf4;      --field-json-fg: #16a34a;
+    --field-file-bg: #fff7ed;      --field-file-fg: #ea580c;
+    --field-relation-bg: #fef2f2;  --field-relation-fg: #dc2626;
+    --field-id-bg: #f0f0f0;        --field-id-fg: #64748b;
+
+    --scrollbar-thumb: hsl(214.3 31.8% 82%);
+    --scrollbar-thumb-hover: hsl(214.3 31.8% 65%);
+    --skeleton-base: hsl(214.3 31.8% 94%);
+    --skeleton-shine: 255 255 255;
+  }
+
+  /* Hard-coded palette classes (bg-white, text-slate-*, bg-red-50...) are
+     remapped for dark mode in tailwind.config.ts. */
+  .dark {
+    color-scheme: dark;
+
+    --background: 222 47.4% 11.2%;
+    --foreground: 214 31.8% 91.4%;
+    --card: 222 47.4% 11.2%;
+    --card-foreground: 214 31.8% 91.4%;
+    --popover: 222 44.1% 13.3%;
+    --popover-foreground: 214 31.8% 91.4%;
+    --primary: 239 83.5% 66.7%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 34.2% 15.5%;
+    --secondary-foreground: 214 31.8% 91.4%;
+    --muted: 220 34.2% 15.5%;
+    --muted-foreground: 216 19% 61.8%;
+    --accent: 217 32.6% 17.5%;
+    --accent-foreground: 214 31.8% 91.4%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 218 30.6% 19.2%;
+    --input: 221 31.1% 23.9%;
+    --ring: 239 83.5% 66.7%;
+
+    --field-text-bg: #172554;      --field-text-fg: #93c5fd;
+    --field-editor-bg: #1a2335;    --field-editor-fg: #a3b0c2;
+    --field-number-bg: #2e1065;    --field-number-fg: #c4b5fd;
+    --field-bool-bg: #022c22;      --field-bool-fg: #6ee7b7;
+    --field-email-bg: #1e1b4b;     --field-email-fg: #a5b4fc;
+    --field-date-bg: #451a03;      --field-date-fg: #fcd34d;
+    --field-select-bg: #3b0764;    --field-select-fg: #e9d5ff;
+    --field-json-bg: #052e16;      --field-json-fg: #86efac;
+    --field-file-bg: #431407;      --field-file-fg: #fdba74;
+    --field-relation-bg: #450a0a;  --field-relation-fg: #fca5a5;
+    --field-id-bg: #1a2335;        --field-id-fg: #8b9ab0;
+
+    --scrollbar-thumb: hsl(218 25% 26%);
+    --scrollbar-thumb-hover: hsl(218 22% 36%);
+    --skeleton-base: hsl(220 34% 15.5%);
+    --skeleton-shine: 51 65 85;
   }
 
   /* ─── Global font scale ────────────────────────────────────────────── */
@@ -58,8 +119,8 @@
   /* ─── Custom scrollbars ────────────────────────────────────────────── */
   ::-webkit-scrollbar        { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track  { background: transparent; }
-  ::-webkit-scrollbar-thumb  { background: hsl(214.3 31.8% 82%); border-radius: 999px; }
-  ::-webkit-scrollbar-thumb:hover { background: hsl(214.3 31.8% 65%); }
+  ::-webkit-scrollbar-thumb  { background: var(--scrollbar-thumb); border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 
   /* ─── Smooth transitions on interactive elements ───────────────────── */
   button, a, input, select, textarea, [role="button"] {
@@ -86,6 +147,15 @@
   .sql-hl-comment    { color: #94a3b8; }
   .sql-hl-operator   { color: #db2777; }
   .sql-hl-identifier { color: #b45309; }
+
+  .dark .sql-hl-keyword    { color: #c4b5fd; }
+  .dark .sql-hl-type       { color: #67e8f9; }
+  .dark .sql-hl-function   { color: #93c5fd; }
+  .dark .sql-hl-string     { color: #6ee7b7; }
+  .dark .sql-hl-number     { color: #fcd34d; }
+  .dark .sql-hl-comment    { color: #64748b; }
+  .dark .sql-hl-operator   { color: #f9a8d4; }
+  .dark .sql-hl-identifier { color: #fdba74; }
 }
 
 @layer utilities {
@@ -130,7 +200,7 @@
   .skeleton-shimmer {
     position: relative;
     overflow: hidden;
-    background: hsl(214.3 31.8% 94%);
+    background: var(--skeleton-base);
   }
 
   .skeleton-shimmer::after {
@@ -141,9 +211,9 @@
     background: linear-gradient(
       90deg,
       transparent 0%,
-      rgba(255, 255, 255, 0.7) 45%,
-      rgba(255, 255, 255, 0.95) 50%,
-      rgba(255, 255, 255, 0.7) 55%,
+      rgb(var(--skeleton-shine) / 0.7) 45%,
+      rgb(var(--skeleton-shine) / 0.95) 50%,
+      rgb(var(--skeleton-shine) / 0.7) 55%,
       transparent 100%
     );
     animation: shimmer 1.2s ease-in-out infinite;
