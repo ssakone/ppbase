@@ -130,6 +130,12 @@ admin-ui/src/
 └── styles/globals.css
 ```
 
+### Light / dark theme
+
+Theme is `light | dark | system` (`context/theme-context.tsx`, stored in `localStorage.ppbase_theme`, applied before first paint by the inline script in `index.html`; toggle in the sidebar and the command palette). Dark mode is the `.dark` class on `<html>`.
+
+Components use plain palette classes (`bg-white`, `text-slate-600`, `bg-emerald-50`, `border-red-200`...) — these are dark-aware: `tailwind.config.ts` routes the light shades through CSS variables (separate mappings for bg / text / border) that `.dark` redefines. So new code needs no `dark:` variants as long as it uses those classes or the shadcn tokens. Exceptions: inline hex colors (use CSS variables, see `--field-*` in `globals.css`) and things that must stay white on colored backgrounds (`bg-white/10` → use `bg-[rgb(255_255_255/0.1)]`).
+
 ### Serving
 
 `ppbase/app.py` mounts `/_/assets` → `ppbase/admin/dist/` (StaticFiles) and returns `index.html` for all `/_/*` routes (SPA catch-all). No changes needed to app.py for the React build.

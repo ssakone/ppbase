@@ -208,7 +208,7 @@ export function DashboardPage() {
                   Track collections, health, logs and migrations in one place.
                 </p>
               </div>
-              <div className="rounded-xl bg-white/10 px-4 py-3 text-sm backdrop-blur">
+              <div className="rounded-xl bg-[rgb(255_255_255/0.1)] px-4 py-3 text-sm backdrop-blur">
                 <p className="text-indigo-100">System status</p>
                 <div className="mt-1 flex items-center gap-2">
                   {healthLoading ? (
