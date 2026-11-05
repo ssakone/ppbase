@@ -13,6 +13,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  SquareTerminal,
   Zap,
 } from 'lucide-react'
 import { useCommandPalette } from '@/context/command-palette-context'
@@ -110,6 +111,16 @@ export function CommandPalette() {
         icon: Activity,
         prefetch: 'logs',
         run: go('/logs'),
+      },
+      {
+        id: 'go-sql',
+        label: 'Go to SQL Console',
+        hint: 'Navigation',
+        group: 'Navigation',
+        keywords: ['sql', 'query', 'database', 'postgres', 'console'],
+        icon: SquareTerminal,
+        prefetch: 'sql',
+        run: go('/sql'),
       },
       {
         id: 'go-backups',

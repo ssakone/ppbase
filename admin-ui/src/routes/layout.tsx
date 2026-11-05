@@ -28,6 +28,7 @@ export function Layout() {
         'migrations',
         'hooks',
         'logs',
+        'sql',
         'backups',
         'settings',
       ])
@@ -63,6 +64,7 @@ export function Layout() {
     if (location.pathname === '/migrations') return 'Migrations'
     if (location.pathname === '/hooks') return 'Hooks'
     if (location.pathname === '/logs') return 'Logs'
+    if (location.pathname === '/sql') return 'SQL Console'
     if (location.pathname === '/settings/backups') return 'Backups'
     if (location.pathname === '/settings') return 'Settings'
     return 'PPBase'

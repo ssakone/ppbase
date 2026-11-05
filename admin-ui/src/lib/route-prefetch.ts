@@ -5,6 +5,7 @@ export type PrefetchKey =
   | 'migrations'
   | 'hooks'
   | 'logs'
+  | 'sql'
   | 'settings'
   | 'backups'
 
@@ -15,6 +16,7 @@ const prefetchLoaders: Record<PrefetchKey, () => Promise<unknown>> = {
   migrations: () => import('@/routes/migrations'),
   hooks: () => import('@/routes/hooks'),
   logs: () => import('@/routes/logs'),
+  sql: () => import('@/routes/sql'),
   settings: () => import('@/routes/settings'),
   backups: () => import('@/routes/settings/backups'),
 }

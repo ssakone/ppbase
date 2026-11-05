@@ -152,6 +152,15 @@ Detailed specs live in `project_docs/` (~10K lines):
 
 **Not yet implemented:** Hooks, S3 storage, image thumbnails.
 
+## SQL Console
+
+Admin page `/_/sql` backed by `POST /api/sql/execute` (`api/sql_console.py`, logic in `services/sql_console.py`).
+
+- Scripts are split on top-level `;` and each statement is classified (`read`, `modify`, `delete`, `schema`, `maintenance`, `other`). If any statement is mutating and the body lacks `confirm: true`, nothing runs and the response has `requiresConfirmation: true` — the UI then shows a confirmation dialog.
+- Unconfirmed scripts run in a `READ ONLY` transaction, so writes hidden in functions/`DO` blocks are rejected by PostgreSQL (SQLSTATE 25006) and turned into a confirmation request.
+- The whole script is one transaction (commit on success, rollback on error), with a 30s `statement_timeout`. Transaction control (`BEGIN`/`COMMIT`/…), `SET TRANSACTION` and `COPY` are rejected.
+- Runs on a dedicated connection via raw asyncpg, invalidated afterwards so session state never leaks into the pool. Confirmed scripts hold the shared write barrier.
+
 ## OAuth2 Configuration
 
 OAuth2 providers are configured via environment variables (global) or collection options (per-collection):

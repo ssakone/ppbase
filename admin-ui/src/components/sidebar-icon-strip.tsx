@@ -15,6 +15,7 @@ import {
   LayoutGrid,
   LogOut,
   Settings,
+  SquareTerminal,
   Users2,
   Zap,
 } from 'lucide-react'
@@ -42,6 +43,7 @@ export function SidebarIconStrip() {
     if (section === 'migrations') return location.pathname === '/migrations'
     if (section === 'hooks') return location.pathname === '/hooks'
     if (section === 'logs') return location.pathname === '/logs'
+    if (section === 'sql') return location.pathname === '/sql'
     if (section === 'backups') return location.pathname === '/settings/backups'
     if (section === 'settings') return location.pathname === '/settings'
     return false
@@ -49,7 +51,7 @@ export function SidebarIconStrip() {
 
   const handleNav = (
     path: string,
-    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'backups' | 'settings',
+    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'sql' | 'backups' | 'settings',
   ) => {
     if (section) setActiveSection(section)
     setSidebarOpen(false)
@@ -192,6 +194,21 @@ export function SidebarIconStrip() {
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" className="text-sm">Logs</TooltipContent>
+        </Tooltip>
+
+        {/* SQL console */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className={cn(btnClass, isActive('sql') && activeClass)}
+              onClick={() => handleNav('/sql', 'sql')}
+              onMouseEnter={() => prefetchRoute('sql')}
+              onFocus={() => prefetchRoute('sql')}
+            >
+              <SquareTerminal className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-sm">SQL Console</TooltipContent>
         </Tooltip>
 
         {/* Backups */}
