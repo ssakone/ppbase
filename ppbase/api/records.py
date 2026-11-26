@@ -54,6 +54,11 @@ from ppbase.services.record_storage_coordinator import (
     run_record_storage_transaction,
 )
 from ppbase.services.client_filter_guard import assert_client_query_allowed
+from ppbase.services.record_access import (
+    build_collection_filter_access,
+    build_rule_auth_context,
+    can_access_record,
+)
 from ppbase.services.rule_engine import check_rule
 from ppbase.services.write_barrier import WriteBarrierTimeoutError
 
@@ -83,25 +88,7 @@ def _prepare_rule_context(
       when a rule expression is used as a SQL WHERE filter.
     """
     # Auth context for the rule engine ---
-    if token_payload is None:
-        auth_ctx: dict[str, Any] | None = None
-    elif token_payload.get("type") == "admin" or (
-        token_payload.get("type") == "authRecord"
-        and token_payload.get("collectionName") == "_superusers"
-    ):
-        auth_ctx = {
-            "is_admin": True,
-            "@request.auth.id": token_payload.get("id", ""),
-            "@request.auth.email": token_payload.get("email", ""),
-        }
-    else:
-        auth_ctx = {
-            "is_admin": False,
-            "@request.auth.id": token_payload.get("id", ""),
-            "@request.auth.collectionId": token_payload.get("collectionId", ""),
-            "@request.auth.collectionName": token_payload.get("collectionName", ""),
-            "@request.auth.type": token_payload.get("type", ""),
-        }
+    auth_ctx = build_rule_auth_context(token_payload)
 
     # Request context for the filter parser (macro resolution) ---
     auth_info: dict[str, Any] = {}
@@ -1312,24 +1299,26 @@ async def api_list_records(
         except ValueError as exc:
             return _error_response(400, str(exc))
 
-        effective_filter = e.filter
-        if isinstance(rule_result, str):
-            if effective_filter:
-                effective_filter = f"({rule_result}) && ({effective_filter})"
-            else:
-                effective_filter = rule_result
+        rule_filter = rule_result if isinstance(rule_result, str) else None
 
         try:
+            collection_access = await build_collection_filter_access(
+                e.engine or engine,
+                auth_ctx,
+                e.filter,
+            )
             result = await list_records(
                 e.engine or engine,
                 collection,
                 page=e.page or 1,
                 per_page=e.per_page or 30,
                 sort=e.sort,
-                filter_str=effective_filter,
+                filter_str=e.filter,
                 fields=e.fields,
                 skip_total=bool(e.skip_total),
                 request_context=request_context,
+                rule_filter=rule_filter,
+                collection_access=collection_access,
             )
         except ValueError as exc:
             return _error_response(400, str(exc))
@@ -1568,12 +1557,13 @@ async def api_get_record(
             return _error_response(404, "The requested resource wasn't found.")
 
         if isinstance(rule_result, str):
-            matches = await check_record_rule(
+            matches = await can_access_record(
                 active_engine,
                 collection,
                 e.record_id or recordId,
-                rule_result,
-                request_context,
+                collection.view_rule,
+                auth_ctx=auth_ctx,
+                request_context=request_context,
             )
             if not matches:
                 return _error_response(404, "The requested resource wasn't found.")

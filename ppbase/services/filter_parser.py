@@ -12,10 +12,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 from lark import Lark, Transformer, v_args
 from lark.exceptions import VisitError
+
+# Decides how an ``@collection.<name>`` reference resolves for the caller:
+# ``True`` = unrestricted, ``False`` = not resolvable, ``str`` = list rule to
+# apply inside the generated subquery.
+CollectionAccess = Callable[[str], "bool | str"]
 
 # Accepted datetime literal shapes for date/autodate comparisons:
 #   2026-11-01
@@ -340,22 +345,83 @@ class _FilterTransformer(Transformer):
         relation_resolver: dict[str, dict[str, Any]] | None = None,
         collection_resolver: dict[str, dict[str, Any]] | None = None,
         current_table: str | None = None,
+        collection_access: CollectionAccess | None = None,
+        param_prefix: str = "_fp",
     ) -> None:
         super().__init__()
         self._param_counter = 0
         self._params: dict[str, Any] = {}
+        self._param_prefix = _sanitize_ident(param_prefix)
         self._request_context = request_context or {}
         # Maps relation field name → recursive relation metadata.
         self._relation_resolver = relation_resolver or {}
         # Maps collection name → {"table": name, "relations": RelationResolver}.
         self._collection_resolver = collection_resolver or {}
         self._current_table = _sanitize_ident(current_table) if current_table else None
+        # Optional per-collection list access for ``@collection`` references.
+        self._collection_access = collection_access
+        self._collection_rules: dict[str, str | None] = {}
+        self._collection_rule_sql: dict[str, str] = {}
 
     def _next_param(self, value: Any) -> str:
         self._param_counter += 1
-        name = f"_fp{self._param_counter}"
+        name = f"{self._param_prefix}{self._param_counter}"
         self._params[name] = value
         return name
+
+    # -- @collection access --------------------------------------------------
+
+    def _require_collection_access(self, table_name: str) -> None:
+        """Resolve the list access of an ``@collection`` target.
+
+        Without an access callback every collection is resolvable (trusted
+        expressions such as API rules).  Otherwise a denied collection fails
+        resolution and an expression list rule is remembered so it can be
+        applied inside the generated subquery.
+        """
+        if self._collection_access is None or table_name in self._collection_rules:
+            return
+        access = self._collection_access(table_name)
+        if access is False:
+            raise ValueError(f"Failed to resolve @collection.{table_name} reference.")
+        self._collection_rules[table_name] = access if isinstance(access, str) and access else None
+
+    def _collection_rule_condition(self, table_name: str) -> str | None:
+        """Return the SQL for the list rule of an ``@collection`` target."""
+        rule = self._collection_rules.get(table_name)
+        if not rule:
+            return None
+        cached = self._collection_rule_sql.get(table_name)
+        if cached is not None:
+            return cached
+        try:
+            tree = _parser.parse(rule)
+        except Exception as exc:
+            raise ValueError(f"Failed to resolve @collection.{table_name} reference.") from exc
+        # The rule is a trusted expression evaluated against the referenced
+        # table; it shares this transformer's parameter namespace.
+        child = _FilterTransformer(
+            self._request_context,
+            self._collection_resolver or self._relation_resolver,
+            self._collection_resolver,
+            table_name,
+            param_prefix=self._param_prefix,
+        )
+        child._param_counter = self._param_counter
+        child._params = self._params
+        sql = f"({child.transform(tree)})"
+        self._param_counter = child._param_counter
+        self._collection_rule_sql[table_name] = sql
+        return sql
+
+    def _collection_exists_sql(self, table_names: list[str], conditions: list[str]) -> str:
+        all_conditions = list(conditions)
+        for table_name in table_names:
+            rule_sql = self._collection_rule_condition(table_name)
+            if rule_sql:
+                all_conditions.append(rule_sql)
+        tables = ", ".join(f'"{name}"' for name in table_names)
+        return f"EXISTS (SELECT 1 FROM {tables} WHERE {' AND '.join(all_conditions)})"
 
     # -- Leaf nodes ----------------------------------------------------------
 
@@ -969,6 +1035,7 @@ class _FilterTransformer(Transformer):
         coll_name = _sanitize_ident(str(node[1]))
         field_path = tuple(_sanitize_ident(str(part)) for part in node[2])
         group_key = str(node[3])
+        self._require_collection_access(coll_name)
 
         if len(field_path) == 1:
             field_type = self._field_type_for_collection_resolver(
@@ -1172,9 +1239,9 @@ class _FilterTransformer(Transformer):
             if l_ref.group_key == r_ref.group_key:
                 return _CollectionCondition(l_ref.table_name, l_ref.group_key, inner)
             # Cross-collection → inline EXISTS with two tables
-            return (
-                f'EXISTS (SELECT 1 FROM "{l_ref.table_name}", "{r_ref.table_name}" '
-                f"WHERE {inner})"
+            return self._collection_exists_sql(
+                [l_ref.table_name, r_ref.table_name],
+                [inner],
             )
 
         # One side is @collection -------------------------------------------
@@ -1474,7 +1541,7 @@ class _FilterTransformer(Transformer):
         for item in items:
             if isinstance(item, _CollectionCondition):
                 parts.append(
-                    f'EXISTS (SELECT 1 FROM "{item.table_name}" WHERE {item.inner_sql})'
+                    self._collection_exists_sql([item.table_name], [item.inner_sql])
                 )
             elif isinstance(item, _RelationCondition):
                 conds = " AND ".join([item.join_cond, item.where_cond])
@@ -1507,9 +1574,8 @@ class _FilterTransformer(Transformer):
         # @collection groups
         for group_key, conditions in coll_groups.items():
             table_name = coll_tables[group_key]
-            inner = " AND ".join(conditions)
             regular_parts.append(
-                f'EXISTS (SELECT 1 FROM "{table_name}" WHERE {inner})'
+                self._collection_exists_sql([table_name], conditions)
             )
 
         # Relation traversal groups — join_cond is the same for all items
@@ -1775,6 +1841,9 @@ def parse_filter(
     relation_resolver: dict[str, dict[str, Any]] | None = None,
     collection_resolver: dict[str, dict[str, Any]] | None = None,
     current_table: str | None = None,
+    *,
+    collection_access: CollectionAccess | None = None,
+    param_prefix: str = "_fp",
 ) -> tuple[str, dict[str, Any]]:
     """Parse a PocketBase filter expression into a SQL WHERE clause.
 
@@ -1791,6 +1860,14 @@ def parse_filter(
             ``@collection.collection.relation.field`` references.
         current_table: Optional current table name used to qualify outer field
             references inside correlated ``@collection`` subqueries.
+        collection_access: Optional callback deciding how ``@collection.<name>``
+            references resolve for the caller.  It receives the collection
+            name and returns ``True`` (unrestricted), ``False`` (the reference
+            fails to resolve) or a rule expression that is applied inside the
+            generated subquery.  ``None`` leaves every collection resolvable,
+            which is what trusted expressions such as API rules use.
+        param_prefix: Prefix for generated bind parameter names, so several
+            parsed expressions can share one SQL statement.
 
     Returns:
         A tuple of ``(where_sql, params)`` where ``where_sql`` is a SQL
@@ -1813,6 +1890,8 @@ def parse_filter(
         relation_resolver,
         collection_resolver,
         current_table,
+        collection_access=collection_access,
+        param_prefix=param_prefix,
     )
     try:
         where_sql = transformer.transform(tree)

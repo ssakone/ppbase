@@ -21,7 +21,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ppbase.api.deps import get_session, get_settings, require_auth, resolve_collection
+from ppbase.api.deps import (
+    get_optional_auth,
+    get_session,
+    get_settings,
+    require_auth,
+    resolve_collection,
+)
 from ppbase.core.storage_safety import StorageSafetyError
 from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import CollectionRecord, SuperuserRecord
@@ -43,8 +49,7 @@ from ppbase.services.file_storage import (
     read_local_storage_variant_bytes,
     write_local_storage_variant_bytes,
 )
-from ppbase.services.record_service import check_record_rule
-from ppbase.services.rule_engine import check_rule
+from ppbase.services.record_access import build_rule_auth_context, can_access_record
 from ppbase.services.write_barrier import (
     WriteBarrierLease,
     mutation_write_barrier_on_connection,
@@ -736,22 +741,12 @@ async def _trigger_file_download_request_hooks(
 
 def _build_rule_context(
     request: Request,
-    auth_payload: dict[str, Any],
+    auth_payload: dict[str, Any] | None,
+    *,
+    context: str = "protectedFile",
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    if auth_payload.get("type") == "admin":
-        auth_ctx: dict[str, Any] | None = {
-            "is_admin": True,
-            "@request.auth.id": auth_payload.get("id", ""),
-            "@request.auth.email": auth_payload.get("email", ""),
-        }
-    else:
-        auth_ctx = {
-            "is_admin": False,
-            "@request.auth.id": auth_payload.get("id", ""),
-            "@request.auth.collectionId": auth_payload.get("collectionId", ""),
-            "@request.auth.collectionName": auth_payload.get("collectionName", ""),
-            "@request.auth.type": auth_payload.get("type", ""),
-        }
+    auth_payload = auth_payload if isinstance(auth_payload, dict) else {}
+    auth_ctx = build_rule_auth_context(auth_payload)
 
     headers_info: dict[str, str] = {}
     for key, value in request.headers.items():
@@ -760,7 +755,7 @@ def _build_rule_context(
         headers_info[lower.replace("-", "_")] = value
 
     request_context = {
-        "context": "protectedFile",
+        "context": context,
         "method": request.method.upper(),
         "headers": headers_info,
         "auth": {
@@ -769,37 +764,57 @@ def _build_rule_context(
             "type": auth_payload.get("type", ""),
             "collectionId": auth_payload.get("collectionId", ""),
             "collectionName": auth_payload.get("collectionName", ""),
-        },
+        }
+        if auth_payload
+        else {},
         "data": {},
         "query": dict(request.query_params),
     }
     return auth_ctx, request_context
 
 
-async def _check_protected_file_view_rule(
+async def _check_file_view_rule(
     request: Request,
     collection: CollectionRecord,
     record_id: str,
-    auth_payload: dict[str, Any],
+    auth_payload: dict[str, Any] | None,
+    *,
+    context: str = "protectedFile",
 ) -> bool:
-    auth_ctx, request_context = _build_rule_context(request, auth_payload)
-    rule_result = check_rule(collection.view_rule, auth_ctx)
-    if rule_result is False:
-        return False
-    if rule_result is True:
-        return True
-
-    engine = get_engine()
+    """Return whether the file's owning record passes the collection viewRule."""
+    auth_ctx, request_context = _build_rule_context(
+        request,
+        auth_payload,
+        context=context,
+    )
     try:
-        return await check_record_rule(
-            engine,
+        return await can_access_record(
+            get_engine(),
             collection,
             record_id,
-            str(rule_result),
-            request_context,
+            collection.view_rule,
+            auth_ctx=auth_ctx,
+            request_context=request_context,
         )
     except Exception:
         return False
+
+
+async def _resolve_file_caller(
+    request: Request,
+    session: AsyncSession,
+) -> dict[str, Any] | None:
+    """Resolve who is downloading an unprotected file.
+
+    A valid ``?token=`` file token (usable from ``<img>`` tags) takes
+    precedence, otherwise the regular ``Authorization`` header is used.
+    """
+    file_token = str(request.query_params.get("token", "") or "").strip()
+    if file_token:
+        token_auth = await _verify_file_token(session, file_token)
+        if token_auth is not None:
+            return token_auth
+    return await get_optional_auth(request, session)
 
 
 @router.post("/token")
@@ -908,11 +923,21 @@ async def _serve_file(
         token_auth = await _verify_file_token(session, file_token)
         if token_auth is None:
             raise _not_found_error()
-        has_view_access = await _check_protected_file_view_rule(
+        has_view_access = await _check_file_view_rule(
             request, collection, record_id, token_auth
         )
-        if not has_view_access:
-            raise _not_found_error()
+    else:
+        # Unprotected files still belong to a record: only serve them when
+        # the caller may view that record.
+        has_view_access = collection.view_rule == "" or await _check_file_view_rule(
+            request,
+            collection,
+            record_id,
+            await _resolve_file_caller(request, session),
+            context="default",
+        )
+    if not has_view_access:
+        raise _not_found_error()
 
     thumb_option = _parse_thumb_option(request)
     storage_collection_id = collection.id
