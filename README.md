@@ -168,6 +168,23 @@ Records support PocketBase filter syntax:
 GET /api/collections/posts/records?filter=title~"hello" && views>5&sort=-created&page=1&perPage=20
 ```
 
+Date fields accept ISO 8601 and PocketBase datetime strings: `"2026-11-01"`,
+`"2026-11-01T00:00:00Z"`, `"2026-11-01T02:00:00+02:00"`,
+`"2026-11-01 00:00:00.000Z"`. Values without an offset are UTC, and `due = ""`
+matches records without a date. Other values return `400`.
+
+### Updating collection fields
+
+`PATCH /api/collections/:id` with `fields` (or `schema`) expects the full field
+list, as in PocketBase. To keep columns and their data from being dropped by
+mistake:
+
+- Fields sent without an `id` are matched to existing fields by name.
+- An existing field is removed only when sent with `"_toDelete": true`, e.g.
+  `{"name": "legacy", "_toDelete": true}`.
+- A list that leaves out existing fields is rejected with `400`, naming the
+  missing fields.
+
 ### Expand Relations
 
 ```
