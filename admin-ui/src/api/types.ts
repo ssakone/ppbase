@@ -16,6 +16,7 @@ export interface Collection {
 }
 
 export interface Field {
+  id?: string
   name: string
   type: string
   required?: boolean
@@ -34,6 +35,8 @@ export interface Field {
   onlyDomains?: string[]
   exceptDomains?: string[]
   convertURLs?: boolean
+  // Marks an existing field for removal in a collection update.
+  _toDelete?: boolean
 }
 
 export interface FieldOptions {

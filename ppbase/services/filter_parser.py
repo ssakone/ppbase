@@ -9,6 +9,7 @@ SQL strings -- to prevent SQL injection.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
@@ -20,6 +21,56 @@ from lark.exceptions import VisitError
 # ``True`` = unrestricted, ``False`` = not resolvable, ``str`` = list rule to
 # apply inside the generated subquery.
 CollectionAccess = Callable[[str], "bool | str"]
+
+# Accepted datetime literal shapes for date/autodate comparisons:
+#   2026-11-01
+#   2026-11-01T10:20 / 2026-11-01 10:20
+#   2026-11-01T10:20:30 / 2026-11-01 10:20:30.123 (PocketBase storage format)
+# each optionally followed by "Z" or a numeric UTC offset (+02:00, -0530).
+_DATETIME_LITERAL_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})"
+    r"(?:[T ](?P<time>\d{2}:\d{2}(?::\d{2})?)(?:\.(?P<frac>\d{1,9}))?)?"
+    r"\s*(?P<tz>Z|z|[+-]\d{2}(?::?\d{2})?)?$"
+)
+
+
+def parse_datetime_literal(value: str) -> datetime:
+    """Parse a filter string literal compared against a date field.
+
+    Returns an aware UTC ``datetime``. Naive values are interpreted as UTC,
+    matching PocketBase. Raises ``ValueError`` for anything that is not a
+    recognised ISO 8601 / PocketBase datetime string.
+    """
+    match = _DATETIME_LITERAL_RE.match(value.strip())
+    if match is None:
+        raise ValueError(f"Invalid datetime value {value!r}.")
+
+    tz = match.group("tz")
+    if tz and tz not in ("Z", "z") and ":" not in tz and len(tz) == 5:
+        tz = f"{tz[:3]}:{tz[3:]}"
+    elif tz in ("Z", "z"):
+        tz = "+00:00"
+
+    normalized = match.group("date")
+    time_part = match.group("time")
+    if time_part:
+        normalized += f"T{time_part}"
+        frac = match.group("frac")
+        if frac:
+            # Python supports microsecond precision; truncate extra digits.
+            normalized += f".{frac[:6].ljust(6, '0')}"
+    if tz:
+        if not time_part:
+            normalized += "T00:00:00"
+        normalized += tz
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError(f"Invalid datetime value {value!r}.") from None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 # ---------------------------------------------------------------------------
 # Lark grammar for PocketBase filter syntax
@@ -537,20 +588,9 @@ class _FilterTransformer(Transformer):
 
         value = node[1].strip()
         if not value:
-            return node
-
-        normalized = value.replace("Z", "+00:00")
-        if " " in normalized and "T" not in normalized:
-            normalized = normalized.replace(" ", "T", 1)
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return node
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        else:
-            parsed = parsed.astimezone(UTC)
-        return ("literal", parsed)
+            # PocketBase stores "no date" as an empty string; PPBase uses NULL.
+            return ("null", None)
+        return ("literal", parse_datetime_literal(value))
 
     def _operand_field_type(self, node: tuple[str, Any]) -> str:
         if not isinstance(node, tuple) or len(node) < 2:
@@ -1856,14 +1896,12 @@ def parse_filter(
     try:
         where_sql = transformer.transform(tree)
     except VisitError as exc:
-        # Surface the transformer's own validation errors as ValueError so
-        # callers can report them as bad requests.
-        orig: BaseException = exc
-        while isinstance(orig, VisitError):
-            orig = orig.orig_exc
-        if isinstance(orig, ValueError):
-            raise orig from None
-        raise
+        # Lark wraps errors raised by transformer callbacks; surface the
+        # original validation error so callers can report it as a 400.
+        original = exc.orig_exc
+        if isinstance(original, ValueError):
+            raise original from None
+        raise ValueError(f"Invalid filter: {original}") from original
     return (str(where_sql), transformer._params)
 
 

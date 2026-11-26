@@ -87,6 +87,82 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
 
 
 # ---------------------------------------------------------------------------
+# Field updates
+# ---------------------------------------------------------------------------
+
+_FIELD_DELETE_MARKER = "_toDelete"
+
+
+def _pop_delete_marker(field_def: dict[str, Any]) -> bool:
+    """Remove the explicit field-removal marker and return whether it was set.
+
+    ``CollectionUpdate`` nests unknown keys under ``options``, so the marker
+    may live at either level.
+    """
+    marked = bool(field_def.pop(_FIELD_DELETE_MARKER, False))
+    options = field_def.get("options")
+    if isinstance(options, dict) and _FIELD_DELETE_MARKER in options:
+        marked = bool(options.pop(_FIELD_DELETE_MARKER)) or marked
+    return marked
+
+
+def _reconcile_schema_update(
+    old_schema: list[dict[str, Any]],
+    new_schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve an incoming ``fields``/``schema`` list against the stored one.
+
+    * Incoming fields without an ``id`` that share a name with an existing
+      field inherit that field's ``id``, so the column is kept (instead of
+      being dropped and re-created empty).
+    * A field is removed only when it is sent with ``"_toDelete": true``.
+    * Existing fields that are simply absent from the list are rejected,
+      because removing them would drop their column and data.
+    """
+    old_fields = [f for f in old_schema if isinstance(f, dict)]
+    old_by_id = {str(f["id"]): f for f in old_fields if f.get("id")}
+    old_by_name = {str(f.get("name") or ""): f for f in old_fields}
+
+    entries = [
+        (field_def, _pop_delete_marker(field_def))
+        for field_def in new_schema
+        if isinstance(field_def, dict)
+    ]
+    claimed: set[int] = set()
+
+    # Explicit ids first, so a renamed field keeps its column even when a new
+    # field reuses its previous name in the same request.
+    for field_def, _ in entries:
+        field_id = field_def.get("id")
+        match = old_by_id.get(str(field_id)) if field_id else None
+        if match is not None and id(match) not in claimed:
+            claimed.add(id(match))
+    for field_def, _ in entries:
+        if field_def.get("id"):
+            continue
+        match = old_by_name.get(str(field_def.get("name") or ""))
+        if match is not None and id(match) not in claimed:
+            claimed.add(id(match))
+            if match.get("id"):
+                field_def["id"] = match["id"]
+
+    kept = [field_def for field_def, to_delete in entries if not to_delete]
+
+    missing = [
+        str(f.get("name") or f.get("id") or "")
+        for f in old_fields
+        if id(f) not in claimed
+    ]
+    if missing:
+        raise ValueError(
+            "The fields list must include every existing field. Missing: "
+            f"{', '.join(missing)}. To remove a field, send it with "
+            f'"{_FIELD_DELETE_MARKER}": true.'
+        )
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -553,7 +629,13 @@ async def update_collection(
         record.system = data.system
     if data.schema is not None:
         import copy
-        record.schema = copy.deepcopy(data.schema)
+        incoming_schema = copy.deepcopy(data.schema)
+        if (record.type or "base") != "view" and old_snapshot.type != "view":
+            incoming_schema = _reconcile_schema_update(
+                old_snapshot.schema,
+                incoming_schema,
+            )
+        record.schema = incoming_schema
         flag_modified(record, "schema")
     if data.indexes is not None:
         import copy
