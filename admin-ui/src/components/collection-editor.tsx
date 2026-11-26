@@ -191,7 +191,21 @@ export function CollectionEditor({
     } else {
       // Send schema for both base and auth collections.
       // This allows editing fields on the default "users" auth collection.
-      const schema = fields.filter((f) => f.name.trim());
+      const schema: Field[] = fields.filter((f) => f.name.trim());
+      // The API rejects updates that omit existing fields; fields removed in
+      // the editor are sent with an explicit `_toDelete` marker instead.
+      if (mode === "edit" && existingCollection) {
+        const original: Field[] =
+          existingCollection.fields || existingCollection.schema || [];
+        const keptIds = new Set(schema.map((f) => f.id).filter(Boolean));
+        const keptNames = new Set(schema.map((f) => f.name));
+        for (const field of original) {
+          const kept = field.id ? keptIds.has(field.id) : keptNames.has(field.name);
+          if (!kept) {
+            schema.push({ ...field, _toDelete: true });
+          }
+        }
+      }
       payload.schema = schema;
 
       if (type === "auth") {
