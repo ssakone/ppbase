@@ -2,6 +2,12 @@
 
 All notable changes to PPBase are documented in this file.
 
+## 0.3.4
+
+- The published distributions now include the admin interface (`/_/`). The
+  0.3.3 artifacts were built from a checkout where the interface had not been
+  compiled, so they shipped without it.
+
 ## 0.3.3
 
 ### Read paths and collection rules
