@@ -23,6 +23,7 @@ from ppbase.backup.automation import BackupCronError, BackupCronSchedule
 from ppbase.core.id_generator import generate_id
 from ppbase.db.engine import get_engine
 from ppbase.db.system_tables import ParamRecord
+from ppbase.middleware.rate_limit import DEFAULT_AUTH_RATE_LIMIT
 from ppbase.models.field_types import _EMAIL_RE
 from ppbase.services.file_storage import configure_storage_runtime_from_settings_payload
 from ppbase.services.write_barrier import (
@@ -94,6 +95,8 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
         "enabled": False,
         "maxRequests": 1000,
         "window": 60,
+        # Separate limit for password auth, OTP and password reset endpoints.
+        "auth": dict(DEFAULT_AUTH_RATE_LIMIT),
     },
     "trustedProxy": {
         "headers": [],

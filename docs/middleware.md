@@ -285,6 +285,26 @@ PPBase also ships a core middleware (`RateLimitMiddleware`) for built-in API end
 - Skips `/api/health` and `/api/realtime`.
 - Returns PocketBase-style `429` on limit breach.
 
+Auth endpoints have their own limit, `settings.rateLimiting.auth`, applied per
+client and per endpoint path independently of the global limit:
+
+- `POST /api/collections/{collection}/auth-with-password`
+- `POST /api/collections/{collection}/request-otp` and `auth-with-otp`
+- `POST /api/collections/{collection}/request-password-reset` and `confirm-password-reset`
+- `POST /api/admins/auth-with-password`
+
+New installs start with `{"enabled": true, "maxRequests": 20, "window": 60}`.
+Settings saved by earlier versions without `rateLimiting.auth` keep their
+previous behaviour until the limit is set. Change or disable it with
+`PATCH /api/settings` or from the dashboard (Settings → Rate Limiting):
+
+```json
+{"rateLimiting": {"auth": {"enabled": true, "maxRequests": 10, "window": 60}}}
+```
+
+Each OTP also accepts at most 5 password checks (`options.otp.maxAttempts` on
+the auth collection); after that it is deleted and a new one must be requested.
+
 Response headers:
 
 - `X-RateLimit-Limit`

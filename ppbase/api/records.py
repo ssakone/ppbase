@@ -20,6 +20,9 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import text
+from sqlalchemy.exc import DataError as SQLDataError
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import ProgrammingError as SQLProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import Headers, QueryParams, URL
 
@@ -291,6 +294,31 @@ async def _has_manage_access_for_auth_record(
 # ---------------------------------------------------------------------------
 # Error helpers
 # ---------------------------------------------------------------------------
+
+
+# PostgreSQL errors caused by values in a client filter: all "data exception"
+# (class 22) errors plus type/operator mismatches and syntax errors.
+_QUERY_INPUT_SQLSTATES = frozenset({"42601", "42725", "42804", "42846", "42883"})
+
+
+def _is_query_input_error(exc: DBAPIError) -> bool:
+    """Return whether a driver error was caused by query input values."""
+    if isinstance(exc, (SQLDataError, SQLProgrammingError)):
+        return True
+    orig = getattr(exc, "orig", None)
+    for candidate in (orig, getattr(orig, "__cause__", None)):
+        if candidate is None:
+            continue
+        sqlstate = getattr(candidate, "sqlstate", None)
+        if isinstance(sqlstate, str) and (
+            sqlstate.startswith("22") or sqlstate in _QUERY_INPUT_SQLSTATES
+        ):
+            return True
+        # asyncpg rejects mistyped bind arguments client-side (e.g. a string
+        # compared with a number column) with a ValueError subclass.
+        if isinstance(candidate, ValueError):
+            return True
+    return False
 
 
 def _error_response(status: int, message: str, data: Any = None) -> JSONResponse:
@@ -1305,6 +1333,17 @@ async def api_list_records(
             )
         except ValueError as exc:
             return _error_response(400, str(exc))
+        except DBAPIError as exc:
+            if not (e.filter or e.sort) or not _is_query_input_error(exc):
+                raise
+            # Values from the client's filter/sort that PostgreSQL rejects
+            # (type mismatches, out-of-range literals, ...) are request errors.
+            logger.info("Rejected list query for %s: %s", collection.name, exc.orig)
+            return _error_response(
+                400,
+                "Something went wrong while processing your request. "
+                "Invalid filter or sort parameters.",
+            )
 
         if e.expand and result["items"]:
             all_colls = await get_all_collections(e.engine or engine)

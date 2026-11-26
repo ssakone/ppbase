@@ -119,6 +119,23 @@ def _otp_config(collection: CollectionRecord) -> tuple[int, int]:
     return duration, length
 
 
+DEFAULT_OTP_MAX_ATTEMPTS = 5
+
+
+def _otp_max_attempts(collection: CollectionRecord) -> int:
+    """Return how many password checks a single OTP allows.
+
+    Configurable per collection with ``options.otp.maxAttempts``.
+    """
+    opts = collection.options or {}
+    otp = opts.get("otp", {}) or {}
+    try:
+        value = int(otp.get("maxAttempts", DEFAULT_OTP_MAX_ATTEMPTS))
+    except (TypeError, ValueError):
+        return DEFAULT_OTP_MAX_ATTEMPTS
+    return value if value >= 1 else DEFAULT_OTP_MAX_ATTEMPTS
+
+
 def _generate_otp_password(length: int) -> str:
     return "".join(secrets.choice(_OTP_ALPHABET) for _ in range(length))
 
@@ -370,8 +387,37 @@ async def auth_with_otp(
             )
         return None
 
+    # Reserve one attempt before checking the password, so concurrent
+    # requests cannot exceed the limit. Each OTP allows ``max_attempts``
+    # checks; it is deleted once they are used up.
+    max_attempts = _otp_max_attempts(collection)
+    async with engine.begin() as conn:
+        reserved = (
+            await conn.execute(
+                text(
+                    'UPDATE "_otps" SET "attempts" = "attempts" + 1 '
+                    'WHERE "id" = :otp_id AND "attempts" < :max_attempts '
+                    'RETURNING "attempts"'
+                ),
+                {"otp_id": otp_id, "max_attempts": max_attempts},
+            )
+        ).first()
+        if reserved is None:
+            await conn.execute(
+                text('DELETE FROM "_otps" WHERE "id" = :otp_id'),
+                {"otp_id": otp_id},
+            )
+            return None
+    attempts_used = int(reserved[0])
+
     otp_hash = otp_row.get("password", "")
     if not otp_hash or not verify_password(otp_password, otp_hash):
+        if attempts_used >= max_attempts:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text('DELETE FROM "_otps" WHERE "id" = :otp_id'),
+                    {"otp_id": otp_id},
+                )
         return None
 
     record_id = otp_row.get("recordRef", "")
@@ -379,12 +425,16 @@ async def auth_with_otp(
     if row is None:
         return None
 
-    # OTP is single-use.
+    # OTP is single-use: only the request that deletes it may authenticate.
     async with engine.begin() as conn:
-        await conn.execute(
-            text('DELETE FROM "_otps" WHERE "id" = :otp_id'),
-            {"otp_id": otp_id},
-        )
+        consumed = (
+            await conn.execute(
+                text('DELETE FROM "_otps" WHERE "id" = :otp_id RETURNING "id"'),
+                {"otp_id": otp_id},
+            )
+        ).first()
+    if consumed is None:
+        return None
 
     token = create_record_auth_token(row, collection, settings)
     record = build_record_response(
