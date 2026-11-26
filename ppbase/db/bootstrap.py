@@ -16,6 +16,7 @@ from typing import TypeAlias
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from ppbase.core.id_generator import generate_id
 from ppbase.db.schema_manager import create_collection_table
@@ -319,6 +320,16 @@ async def ensure_mfas_collection(
 # _otps
 # ---------------------------------------------------------------------------
 
+# Number of password checks made against an OTP (see record_auth_service).
+_OTP_ATTEMPTS_FIELD = {
+    "name": "attempts",
+    "type": "number",
+    "required": False,
+    "hidden": True,
+    "options": {"onlyInt": True},
+}
+
+
 async def ensure_otps_collection(
     session: AsyncSession,
     engine: DatabaseBind,
@@ -328,8 +339,25 @@ async def ensure_otps_collection(
     stmt = select(CollectionRecord).where(CollectionRecord.name == "_otps")
     existing = (await session.execute(stmt)).scalars().first()
     if existing is not None:
+        schema = list(existing.schema) if isinstance(existing.schema, list) else []
+        if not any(
+            isinstance(f, dict) and f.get("name") == _OTP_ATTEMPTS_FIELD["name"]
+            for f in schema
+        ):
+            existing.schema = [*schema, dict(_OTP_ATTEMPTS_FIELD)]
+            flag_modified(existing, "schema")
+            await session.flush()
         if not await _table_exists(bind, "_otps"):
             await create_collection_table(bind, existing)
+        elif not await _column_exists(bind, "_otps", "attempts"):
+            async with _bind_connection(bind, transactional=True) as conn:
+                await conn.execute(
+                    text(
+                        'ALTER TABLE "_otps" ADD COLUMN IF NOT EXISTS '
+                        '"attempts" INTEGER NOT NULL DEFAULT 0'
+                    )
+                )
+            logger.info("Added _otps.attempts column")
         return
 
     owner_rule = (
@@ -349,6 +377,7 @@ async def ensure_otps_collection(
             {"name": "recordRef", "type": "text", "required": True, "options": {}},
             {"name": "password", "type": "password", "required": False, "options": {}},
             {"name": "sentTo", "type": "text", "required": False, "options": {}},
+            dict(_OTP_ATTEMPTS_FIELD),
         ],
         indexes=[
             'CREATE INDEX IF NOT EXISTS "idx__otps_cr" '

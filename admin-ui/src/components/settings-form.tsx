@@ -301,17 +301,31 @@ function RateLimitTab({ settings, onSave, saving }: { settings: SettingsData; on
   const [enabled, setEnabled] = useState(false)
   const [maxRequests, setMaxRequests] = useState('1000')
   const [window, setWindow] = useState('60')
+  const [authEnabled, setAuthEnabled] = useState(false)
+  const [authMaxRequests, setAuthMaxRequests] = useState('20')
+  const [authWindow, setAuthWindow] = useState('60')
 
   useEffect(() => {
     const r = settings.rateLimiting ?? {}
     setEnabled(!!r.enabled)
     setMaxRequests(String(r.maxRequests ?? 1000))
     setWindow(String(r.window ?? 60))
+    const a = (r.auth ?? {}) as Record<string, unknown>
+    setAuthEnabled(!!a.enabled)
+    setAuthMaxRequests(String(a.maxRequests ?? 20))
+    setAuthWindow(String(a.window ?? 60))
   }, [settings])
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    void onSave({ rateLimiting: { enabled, maxRequests: Number(maxRequests), window: Number(window) } })
+    void onSave({
+      rateLimiting: {
+        enabled,
+        maxRequests: Number(maxRequests),
+        window: Number(window),
+        auth: { enabled: authEnabled, maxRequests: Number(authMaxRequests), window: Number(authWindow) },
+      },
+    })
   }
 
   return (
@@ -328,6 +342,22 @@ function RateLimitTab({ settings, onSave, saving }: { settings: SettingsData; on
             </Field>
             <Field label="Window (seconds)">
               <Input type="number" value={window} onChange={(e) => setWindow(e.target.value)} placeholder="60" />
+            </Field>
+          </div>
+        )}
+        <div className="flex items-center gap-2">
+          <Checkbox id="rate-auth-enabled" checked={authEnabled} onCheckedChange={(v) => setAuthEnabled(!!v)} />
+          <Label htmlFor="rate-auth-enabled" className="cursor-pointer text-sm">
+            Limit auth endpoints (password auth, OTP, password reset) per client
+          </Label>
+        </div>
+        {authEnabled && (
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Max auth requests">
+              <Input type="number" value={authMaxRequests} onChange={(e) => setAuthMaxRequests(e.target.value)} placeholder="20" />
+            </Field>
+            <Field label="Window (seconds)">
+              <Input type="number" value={authWindow} onChange={(e) => setAuthWindow(e.target.value)} placeholder="60" />
             </Field>
           </div>
         )}
