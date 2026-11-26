@@ -352,6 +352,7 @@ async def test_thumbnail_cache_miss_reopens_current_backend_after_switch(
         id=collection_id,
         name="posts",
         type="base",
+        view_rule="",
         schema=[
             {
                 "name": "attachment",

@@ -74,7 +74,13 @@ After upload, file fields store only the generated filename. Build file URLs usi
 /api/files/{collectionIdOrName}/{recordId}/{filename}
 ```
 
-Protected file fields require a file token:
+A file is only served when the caller may view the record that owns it
+(the collection `viewRule`); otherwise the response is `404`. Collections with
+a public `viewRule` (`""`) serve their unprotected files to anyone. The caller
+is taken from the `Authorization` header or, for `<img>`-style URLs, a file
+token passed as `?token=`.
+
+Protected file fields always require a file token:
 
 1. `POST /api/files/token` with auth
 2. Append `?token=<fileToken>` to the file URL

@@ -372,30 +372,11 @@ def _build_rule_context(
     token_payload: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Build rule-engine and filter-parser contexts from token payload."""
-    if token_payload is None:
-        auth_ctx: dict[str, Any] | None = None
-        auth_info: dict[str, Any] = {}
-    elif token_payload.get("type") == "admin":
-        auth_ctx = {
-            "is_admin": True,
-            "@request.auth.id": token_payload.get("id", ""),
-            "@request.auth.email": token_payload.get("email", ""),
-        }
-        auth_info = {
-            "id": token_payload.get("id", ""),
-            "email": token_payload.get("email", ""),
-            "type": token_payload.get("type", ""),
-            "collectionId": token_payload.get("collectionId", ""),
-            "collectionName": token_payload.get("collectionName", ""),
-        }
-    else:
-        auth_ctx = {
-            "is_admin": False,
-            "@request.auth.id": token_payload.get("id", ""),
-            "@request.auth.collectionId": token_payload.get("collectionId", ""),
-            "@request.auth.collectionName": token_payload.get("collectionName", ""),
-            "@request.auth.type": token_payload.get("type", ""),
-        }
+    from ppbase.services.record_access import build_rule_auth_context
+
+    auth_ctx = build_rule_auth_context(token_payload)
+    auth_info: dict[str, Any] = {}
+    if token_payload is not None:
         auth_info = {
             "id": token_payload.get("id", ""),
             "email": token_payload.get("email", ""),
@@ -424,6 +405,7 @@ async def _is_subscription_allowed_for_event(
     action: str,
 ) -> bool:
     """Check if a subscription is allowed to receive a specific event."""
+    from ppbase.services.record_access import build_collection_filter_access
     from ppbase.services.record_service import check_record_rule
     from ppbase.services.rule_engine import check_rule
 
@@ -444,15 +426,10 @@ async def _is_subscription_allowed_for_event(
     # Optional per-subscription filter
     filter_value = subscription.options_query.get("filter")
     filter_expr = filter_value.strip() if isinstance(filter_value, str) else ""
-    if filter_expr:
-        if rule_result is True:
-            rule_result = filter_expr
-        elif isinstance(rule_result, str):
-            rule_result = f"({rule_result}) && ({filter_expr})"
 
     if rule_result is False:
         return False
-    if rule_result is True:
+    if rule_result is True and not filter_expr:
         return True
 
     # For expression rules we need the row to exist in DB.
@@ -461,12 +438,19 @@ async def _is_subscription_allowed_for_event(
         return False
 
     try:
+        collection_access = await build_collection_filter_access(
+            engine,
+            auth_ctx,
+            filter_expr,
+        )
         return await check_record_rule(
             engine,
             collection,
             record_id,
-            rule_result,
+            rule_result if isinstance(rule_result, str) else "",
             request_context,
+            client_filter=filter_expr or None,
+            collection_access=collection_access,
         )
     except Exception as exc:
         logger.warning(

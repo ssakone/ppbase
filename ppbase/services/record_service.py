@@ -32,7 +32,7 @@ from ppbase.models.record import (
     build_record_response,
     format_datetime,
 )
-from ppbase.services.filter_parser import parse_filter, parse_sort
+from ppbase.services.filter_parser import CollectionAccess, parse_filter, parse_sort
 from ppbase.services.write_barrier import require_mutation_write_barrier
 
 logger = logging.getLogger(__name__)
@@ -453,8 +453,14 @@ async def list_records(
     fields: str | None = None,
     skip_total: bool = False,
     request_context: dict[str, Any] | None = None,
+    rule_filter: str | None = None,
+    collection_access: CollectionAccess | None = None,
 ) -> dict[str, Any]:
     """List records with filtering, sorting, and pagination.
+
+    ``rule_filter`` is a trusted API rule expression; ``filter_str`` is the
+    caller supplied filter whose ``@collection`` references are resolved
+    through ``collection_access`` when given.
 
     Returns a paginated response dict.
     """
@@ -464,21 +470,14 @@ async def list_records(
     ff = _fields_filter(fields)
 
     # Build WHERE clause
-    where_sql = "1=1"
-    params: dict[str, Any] = {}
-    if filter_str:
-        relation_resolver, collection_resolver = await _build_filter_resolvers(
-            engine,
-            collection,
-            filter_str,
-        )
-        where_sql, params = parse_filter(
-            filter_str,
-            request_context,
-            relation_resolver,
-            collection_resolver,
-            table,
-        )
+    where_sql, params = await compile_record_filters(
+        engine,
+        collection,
+        rule_filter=rule_filter,
+        client_filter=filter_str,
+        request_context=request_context,
+        collection_access=collection_access,
+    )
 
     # Build ORDER BY clause
     # View collections may lack "created" — fall back to no explicit order
@@ -1470,33 +1469,83 @@ async def _cascade_delete(
 # ---------------------------------------------------------------------------
 
 
+async def compile_record_filters(
+    engine: AsyncEngine,
+    collection: CollectionRecord,
+    *,
+    rule_filter: str | None = None,
+    client_filter: str | None = None,
+    request_context: dict[str, Any] | None = None,
+    collection_access: CollectionAccess | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Compile an API rule and a caller filter into one WHERE clause.
+
+    The rule is trusted and resolves every ``@collection`` reference.  The
+    caller filter resolves ``@collection`` references through
+    ``collection_access`` (``None`` keeps them unrestricted).  Both parts use
+    distinct bind parameter prefixes so they can share one statement.
+    """
+    table = _table_name(collection)
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    sources = (
+        (rule_filter, "_rp", None),
+        (client_filter, "_fp", collection_access),
+    )
+    for expression, prefix, access in sources:
+        if not expression or not expression.strip():
+            continue
+        relation_resolver, collection_resolver = await _build_filter_resolvers(
+            engine,
+            collection,
+            expression,
+        )
+        part_sql, part_params = parse_filter(
+            expression,
+            request_context,
+            relation_resolver,
+            collection_resolver,
+            table,
+            collection_access=access,
+            param_prefix=prefix,
+        )
+        parts.append(part_sql)
+        params.update(part_params)
+
+    if not parts:
+        return "1=1", params
+    if len(parts) == 1:
+        return parts[0], params
+    return " AND ".join(f"({part})" for part in parts), params
+
+
 async def check_record_rule(
     engine: AsyncEngine,
     collection: CollectionRecord,
     record_id: str,
     rule_filter: str,
     request_context: dict[str, Any] | None = None,
+    *,
+    client_filter: str | None = None,
+    collection_access: CollectionAccess | None = None,
 ) -> bool:
     """Check if a record matches a rule filter expression.
 
     Used for view/update/delete rule enforcement.  Parses the rule as a
     PocketBase filter expression and runs it as a WHERE clause against the
-    record's row.
+    record's row.  An optional caller filter is applied on top (see
+    :func:`compile_record_filters`).
 
     Returns True if the record matches the rule, False otherwise.
     """
     table = _table_name(collection)
-    relation_resolver, collection_resolver = await _build_filter_resolvers(
+    where_sql, params = await compile_record_filters(
         engine,
         collection,
-        rule_filter,
-    )
-    where_sql, params = parse_filter(
-        rule_filter,
-        request_context,
-        relation_resolver,
-        collection_resolver,
-        table,
+        rule_filter=rule_filter,
+        client_filter=client_filter,
+        request_context=request_context,
+        collection_access=collection_access,
     )
     sql = (
         f'SELECT 1 FROM "{table}" WHERE "id" = :_rule_rec_id AND ({where_sql}) LIMIT 1'

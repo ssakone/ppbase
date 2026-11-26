@@ -385,6 +385,41 @@ def _build_rule_request_context(
     }
 
 
+async def _expand_auth_record(
+    request: Request,
+    engine: Any,
+    collection: Any,
+    record: dict[str, Any],
+    expand_str: str,
+) -> dict[str, Any]:
+    """Expand an auth response record with the authenticated record as caller.
+
+    Related records are filtered through their collection ``viewRule`` for
+    that record, like any other read.
+    """
+    request_context = _build_rule_request_context(
+        request,
+        context="default",
+        auth_payload={
+            "id": record.get("id", ""),
+            "email": record.get("email", ""),
+            "type": "authRecord",
+            "collectionId": collection.id,
+            "collectionName": collection.name,
+        },
+    )
+    all_colls = await get_all_collections(engine)
+    records = await expand_records(
+        engine,
+        collection,
+        [record],
+        expand_str,
+        all_colls,
+        request_context=request_context,
+    )
+    return records[0] if records else record
+
+
 async def _passes_auth_rule(
     engine: Any,
     collection: Any,
@@ -646,11 +681,9 @@ async def api_auth_with_password(
 
         expand_str = request.query_params.get("expand", "")
         if expand_str and result.get("record"):
-            all_colls = await get_all_collections(engine)
-            records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+            result["record"] = await _expand_auth_record(
+                request, engine, collection, result["record"], expand_str
             )
-            result["record"] = records[0] if records else result["record"]
 
         fields_param = request.query_params.get("fields", "")
         if fields_param and result.get("record"):
@@ -871,11 +904,9 @@ async def api_auth_with_otp(
 
         expand_str = request.query_params.get("expand", "")
         if expand_str and result.get("record"):
-            all_colls = await get_all_collections(engine)
-            records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+            result["record"] = await _expand_auth_record(
+                request, engine, collection, result["record"], expand_str
             )
-            result["record"] = records[0] if records else result["record"]
 
         fields_param = request.query_params.get("fields", "")
         if fields_param and result.get("record"):
@@ -1040,11 +1071,9 @@ async def api_auth_with_oauth2(
 
             expand_str = request.query_params.get("expand", "")
             if expand_str and response_data.get("record"):
-                all_colls = await get_all_collections(engine)
-                records = await expand_records(
-                    engine, collection, [response_data["record"]], expand_str, all_colls,
+                response_data["record"] = await _expand_auth_record(
+                    request, engine, collection, response_data["record"], expand_str
                 )
-                response_data["record"] = records[0] if records else response_data["record"]
 
             fields_param = request.query_params.get("fields", "")
             if fields_param and response_data.get("record"):
@@ -1146,11 +1175,9 @@ async def api_auth_refresh(
 
         expand_str = request.query_params.get("expand", "")
         if expand_str and result.get("record"):
-            all_colls = await get_all_collections(engine)
-            records = await expand_records(
-                engine, collection, [result["record"]], expand_str, all_colls,
+            result["record"] = await _expand_auth_record(
+                request, engine, collection, result["record"], expand_str
             )
-            result["record"] = records[0] if records else result["record"]
 
         fields_param = request.query_params.get("fields", "")
         if fields_param and result.get("record"):
@@ -1262,11 +1289,9 @@ async def api_impersonate_record(
     # Apply expand if requested
     expand_str = request.query_params.get("expand", "")
     if expand_str and result.get("record"):
-        all_colls = await get_all_collections(engine)
-        records = await expand_records(
-            engine, collection, [result["record"]], expand_str, all_colls,
+        result["record"] = await _expand_auth_record(
+            request, engine, collection, result["record"], expand_str
         )
-        result["record"] = records[0] if records else result["record"]
 
     # Apply fields filter if requested
     fields_param = request.query_params.get("fields", "")

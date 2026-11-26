@@ -10,11 +10,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ppbase.db.system_tables import CollectionRecord
 from ppbase.models.record import build_record_response, format_datetime
+from ppbase.services.record_access import (
+    fetch_records_with_rule,
+    rule_auth_context_from_request,
+)
 
 # Maximum nesting depth for relation expansion (PocketBase limit).
 MAX_EXPAND_DEPTH = 6
@@ -76,33 +79,38 @@ def _get_relation_field(
     return None
 
 
+_TRUSTED = object()
+
+
 async def _batch_fetch_records(
     engine: AsyncEngine,
     collection: CollectionRecord,
     record_ids: list[str],
+    *,
+    auth_ctx: Any = _TRUSTED,
+    request_context: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Fetch multiple records from a collection table by IDs.
+    """Fetch multiple related records by IDs.
+
+    Related records are filtered through the target collection's
+    ``viewRule`` for the caller described by ``auth_ctx`` (PocketBase omits
+    related records the caller may not view, without an error).  Without a
+    caller (``_TRUSTED``) every record is returned.
 
     Returns a dict mapping record ID -> raw row dict.
     """
     if not record_ids:
         return {}
 
-    table = collection.name
-    # Use parameterized IN clause
-    placeholders = ", ".join(f":_eid{i}" for i in range(len(record_ids)))
-    sql = f'SELECT * FROM "{table}" WHERE "id" IN ({placeholders})'
-    params = {f"_eid{i}": rid for i, rid in enumerate(record_ids)}
-
-    async with engine.connect() as conn:
-        result = await conn.execute(text(sql), params)
-        rows = result.mappings().all()
-
-    records: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        row_dict = dict(row)
-        records[row_dict["id"]] = row_dict
-    return records
+    rule = "" if auth_ctx is _TRUSTED else collection.view_rule
+    return await fetch_records_with_rule(
+        engine,
+        collection,
+        record_ids,
+        rule,
+        auth_ctx=None if auth_ctx is _TRUSTED else auth_ctx,
+        request_context=request_context,
+    )
 
 
 async def expand_records(
@@ -124,6 +132,11 @@ async def expand_records(
             ``build_record_response``).
         expand_str: The raw expand query parameter value.
         all_collections: All collections for resolving relation targets.
+        request_context: The caller's filter request context.  When given,
+            every related record must pass its collection ``viewRule`` for
+            that caller (superusers see everything); related records that do
+            not are left out of ``expand``.  When omitted the expansion is
+            treated as a trusted internal call.
 
     Returns:
         The same list of records, now with ``expand`` dicts attached.
@@ -135,6 +148,10 @@ async def expand_records(
     if not paths:
         return records
 
+    auth_ctx: Any = _TRUSTED
+    if isinstance(request_context, dict):
+        auth_ctx = rule_auth_context_from_request(request_context)
+
     # Group paths by first segment for efficient batch loading
     for path in paths:
         await _expand_path(
@@ -145,6 +162,7 @@ async def expand_records(
             all_collections,
             depth=0,
             request_context=request_context,
+            auth_ctx=auth_ctx,
         )
 
     return records
@@ -158,6 +176,7 @@ async def _expand_path(
     all_collections: list[CollectionRecord],
     depth: int,
     request_context: dict[str, Any] | None = None,
+    auth_ctx: Any = _TRUSTED,
 ) -> None:
     """Recursively expand a single dot-notation path on a set of records."""
     if depth >= MAX_EXPAND_DEPTH or not path:
@@ -195,7 +214,13 @@ async def _expand_path(
         return
 
     # Batch fetch related records
-    related_rows = await _batch_fetch_records(engine, target_coll, list(all_ids))
+    related_rows = await _batch_fetch_records(
+        engine,
+        target_coll,
+        list(all_ids),
+        auth_ctx=auth_ctx,
+        request_context=request_context,
+    )
 
     # Build response dicts for related records
     target_schema: list[dict[str, Any]] = target_coll.schema or []
@@ -274,4 +299,5 @@ async def _expand_path(
                 all_collections,
                 depth + 1,
                 request_context=request_context,
+                auth_ctx=auth_ctx,
             )
