@@ -8,16 +8,19 @@ interface SqlEditorProps {
   value: string
   onChange: (value: string) => void
   placeholder?: string
+  minHeight?: number
 }
 
 export function SqlEditor({
   value,
   onChange,
   placeholder = 'SELECT id, created, updated FROM posts WHERE published = true',
+  minHeight = 120,
 }: SqlEditorProps) {
   const { data: tables = [] } = useDatabaseTables()
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const highlightRef = useRef<HTMLPreElement>(null)
+  const lineNumbersRef = useRef<HTMLDivElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
 
   const [acItems, setAcItems] = useState<AutocompleteItem[]>([])
@@ -31,6 +34,9 @@ export function SqlEditor({
     if (textareaRef.current && highlightRef.current) {
       highlightRef.current.scrollTop = textareaRef.current.scrollTop
       highlightRef.current.scrollLeft = textareaRef.current.scrollLeft
+    }
+    if (textareaRef.current && lineNumbersRef.current) {
+      lineNumbersRef.current.scrollTop = textareaRef.current.scrollTop
     }
   }, [])
 
@@ -286,11 +292,13 @@ export function SqlEditor({
     <div
       ref={wrapperRef}
       className="relative rounded-md border bg-background font-mono text-sm overflow-hidden"
-      style={{ minHeight: 120 }}
+      style={{ minHeight }}
     >
       {/* Line numbers */}
+      {/* Same line height as the code (text-sm × 1.5) so numbers stay aligned. */}
       <div
-        className="absolute left-0 top-0 bottom-0 w-10 bg-muted/50 text-right pr-2 pt-[9px] text-xs text-muted-foreground select-none overflow-hidden leading-[1.5]"
+        ref={lineNumbersRef}
+        className="absolute left-0 top-0 bottom-0 w-10 bg-muted/50 text-right pr-2 pt-[9px] text-xs text-muted-foreground select-none overflow-hidden leading-[1.3125rem]"
         aria-hidden="true"
       >
         {Array.from({ length: lineCount }, (_, i) => (
@@ -310,7 +318,8 @@ export function SqlEditor({
       {/* Textarea */}
       <textarea
         ref={textareaRef}
-        className="relative w-full min-h-[120px] pl-12 pt-2 pr-3 pb-2 bg-transparent text-transparent caret-foreground resize-y outline-none leading-[1.5] text-sm"
+        className="relative w-full pl-12 pt-2 pr-3 pb-2 bg-transparent text-transparent caret-foreground resize-y outline-none leading-[1.5] text-sm"
+        style={{ minHeight }}
         spellCheck={false}
         autoComplete="off"
         autoCapitalize="off"

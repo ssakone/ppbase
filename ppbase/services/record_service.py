@@ -32,6 +32,7 @@ from ppbase.models.record import (
     build_record_response,
     format_datetime,
 )
+from ppbase.services.request_macros import resolve_request_macros
 from ppbase.services.filter_parser import CollectionAccess, parse_filter, parse_sort
 from ppbase.services.write_barrier import require_mutation_write_barrier
 
@@ -420,7 +421,7 @@ def _filter_needs_relation_index(filter_expression: str) -> bool:
             unquoted.append(" ")
             if escaped:
                 escaped = False
-            elif quote == '"' and char == "\\":
+            elif char == "\\":
                 escaped = True
             elif char == quote:
                 quote = None
@@ -1500,6 +1501,7 @@ async def compile_record_filters(
             collection,
             expression,
         )
+        await resolve_request_macros(engine, expression, request_context, collection)
         part_sql, part_params = parse_filter(
             expression,
             request_context,

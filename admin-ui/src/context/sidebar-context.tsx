@@ -11,6 +11,7 @@ type SidebarSection =
   | 'migrations'
   | 'hooks'
   | 'logs'
+  | 'sql'
   | 'backups'
   | 'settings'
 

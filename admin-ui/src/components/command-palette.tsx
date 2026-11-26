@@ -9,14 +9,18 @@ import {
   Home,
   LayoutGrid,
   LogOut,
+  Moon,
   Plus,
   Search,
   Settings,
   ShieldCheck,
+  SquareTerminal,
+  Sun,
   Zap,
 } from 'lucide-react'
 import { useCommandPalette } from '@/context/command-palette-context'
 import { useAuth } from '@/context/auth-context'
+import { useTheme } from '@/context/theme-context'
 import { useCollections } from '@/hooks/use-collections'
 import { Dialog, DialogContent } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
@@ -39,6 +43,7 @@ export function CommandPalette() {
   const location = useLocation()
   const { open, closePalette } = useCommandPalette()
   const { logout } = useAuth()
+  const { resolvedTheme, setTheme } = useTheme()
   const { data: collections = [] } = useCollections()
 
   const [query, setQuery] = useState('')
@@ -112,6 +117,16 @@ export function CommandPalette() {
         run: go('/logs'),
       },
       {
+        id: 'go-sql',
+        label: 'Go to SQL Console',
+        hint: 'Navigation',
+        group: 'Navigation',
+        keywords: ['sql', 'query', 'database', 'postgres', 'console'],
+        icon: SquareTerminal,
+        prefetch: 'sql',
+        run: go('/sql'),
+      },
+      {
         id: 'go-backups',
         label: 'Go to Backups',
         hint: 'Settings',
@@ -158,6 +173,18 @@ export function CommandPalette() {
         },
       },
       {
+        id: 'toggle-theme',
+        label: resolvedTheme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme',
+        hint: 'Appearance',
+        group: 'Actions',
+        keywords: ['theme', 'dark', 'light', 'mode', 'appearance'],
+        icon: resolvedTheme === 'dark' ? Sun : Moon,
+        run: () => {
+          setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')
+          closePalette()
+        },
+      },
+      {
         id: 'logout',
         label: 'Log Out',
         hint: 'Session',
@@ -186,7 +213,7 @@ export function CommandPalette() {
     }))
 
     return [...baseItems, ...collectionItems]
-  }, [closePalette, location.pathname, logout, navigate, sortedCollections])
+  }, [closePalette, location.pathname, logout, navigate, resolvedTheme, setTheme, sortedCollections])
 
   const filteredItems = useMemo(() => {
     const q = query.trim().toLowerCase()

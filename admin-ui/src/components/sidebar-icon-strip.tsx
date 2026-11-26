@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import { prefetchRoute } from '@/lib/route-prefetch'
 import { navigateWithTransition } from '@/lib/navigation'
 import { useHealth } from '@/hooks/use-health'
+import { useTheme, type Theme } from '@/context/theme-context'
 import {
   Activity,
   ArchiveRestore,
@@ -14,7 +15,11 @@ import {
   Home,
   LayoutGrid,
   LogOut,
+  Monitor,
+  Moon,
   Settings,
+  SquareTerminal,
+  Sun,
   Users2,
   Zap,
 } from 'lucide-react'
@@ -24,6 +29,21 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+
+const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
+  { value: 'light', label: 'Light', icon: Sun },
+  { value: 'dark', label: 'Dark', icon: Moon },
+  { value: 'system', label: 'System', icon: Monitor },
+]
 
 export function SidebarIconStrip() {
   const navigate = useNavigate()
@@ -32,6 +52,8 @@ export function SidebarIconStrip() {
   const { logout } = useAuth()
   const { openPalette } = useCommandPalette()
   const { data: health } = useHealth()
+  const { theme, resolvedTheme, setTheme } = useTheme()
+  const ThemeIcon = resolvedTheme === 'dark' ? Moon : Sun
 
   const isSuperusersPage = location.pathname === '/collections/_superusers'
   const version = typeof health?.data?.version === 'string' ? health.data.version.trim() : ''
@@ -42,6 +64,7 @@ export function SidebarIconStrip() {
     if (section === 'migrations') return location.pathname === '/migrations'
     if (section === 'hooks') return location.pathname === '/hooks'
     if (section === 'logs') return location.pathname === '/logs'
+    if (section === 'sql') return location.pathname === '/sql'
     if (section === 'backups') return location.pathname === '/settings/backups'
     if (section === 'settings') return location.pathname === '/settings'
     return false
@@ -49,7 +72,7 @@ export function SidebarIconStrip() {
 
   const handleNav = (
     path: string,
-    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'backups' | 'settings',
+    section?: 'dashboard' | 'collections' | 'migrations' | 'hooks' | 'logs' | 'sql' | 'backups' | 'settings',
   ) => {
     if (section) setActiveSection(section)
     setSidebarOpen(false)
@@ -194,6 +217,21 @@ export function SidebarIconStrip() {
           <TooltipContent side="right" className="text-sm">Logs</TooltipContent>
         </Tooltip>
 
+        {/* SQL console */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              className={cn(btnClass, isActive('sql') && activeClass)}
+              onClick={() => handleNav('/sql', 'sql')}
+              onMouseEnter={() => prefetchRoute('sql')}
+              onFocus={() => prefetchRoute('sql')}
+            >
+              <SquareTerminal className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-sm">SQL Console</TooltipContent>
+        </Tooltip>
+
         {/* Backups */}
         <Tooltip>
           <TooltipTrigger asChild>
@@ -225,6 +263,32 @@ export function SidebarIconStrip() {
         </Tooltip>
 
         <div className="flex-1" />
+
+        {/* Theme */}
+        <DropdownMenu>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <DropdownMenuTrigger asChild>
+                <button className={btnClass} aria-label="Change theme">
+                  <ThemeIcon className="h-5 w-5" />
+                </button>
+              </DropdownMenuTrigger>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="text-sm">Theme</TooltipContent>
+          </Tooltip>
+          <DropdownMenuContent side="right" align="end" className="w-40">
+            <DropdownMenuLabel>Theme</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuRadioGroup value={theme} onValueChange={(value) => setTheme(value as Theme)}>
+              {THEME_OPTIONS.map(({ value, label, icon: Icon }) => (
+                <DropdownMenuRadioItem key={value} value={value} className="gap-2">
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         {/* Logout */}
         <Tooltip>

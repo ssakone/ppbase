@@ -130,6 +130,12 @@ admin-ui/src/
 └── styles/globals.css
 ```
 
+### Light / dark theme
+
+Theme is `light | dark | system` (`context/theme-context.tsx`, stored in `localStorage.ppbase_theme`, applied before first paint by the inline script in `index.html`; toggle in the sidebar and the command palette). Dark mode is the `.dark` class on `<html>`.
+
+Components use plain palette classes (`bg-white`, `text-slate-600`, `bg-emerald-50`, `border-red-200`...) — these are dark-aware: `tailwind.config.ts` routes the light shades through CSS variables (separate mappings for bg / text / border) that `.dark` redefines. So new code needs no `dark:` variants as long as it uses those classes or the shadcn tokens. Exceptions: inline hex colors (use CSS variables, see `--field-*` in `globals.css`) and things that must stay white on colored backgrounds (`bg-white/10` → use `bg-[rgb(255_255_255/0.1)]`).
+
 ### Serving
 
 `ppbase/app.py` mounts `/_/assets` → `ppbase/admin/dist/` (StaticFiles) and returns `index.html` for all `/_/*` routes (SPA catch-all). No changes needed to app.py for the React build.
@@ -151,6 +157,15 @@ Detailed specs live in `project_docs/` (~10K lines):
 - **SSE Realtime:** Server-Sent Events with PostgreSQL LISTEN/NOTIFY, subscription management (collection-wide `*` or single-record subscriptions), automatic event broadcasting on create/update/delete
 
 **Not yet implemented:** Hooks, S3 storage, image thumbnails.
+
+## SQL Console
+
+Admin page `/_/sql` backed by `POST /api/sql/execute` (`api/sql_console.py`, logic in `services/sql_console.py`).
+
+- Scripts are split on top-level `;` and each statement is classified (`read`, `modify`, `delete`, `schema`, `maintenance`, `other`). If any statement is mutating and the body lacks `confirm: true`, nothing runs and the response has `requiresConfirmation: true` — the UI then shows a confirmation dialog.
+- Unconfirmed scripts run in a `READ ONLY` transaction, so writes hidden in functions/`DO` blocks are rejected by PostgreSQL (SQLSTATE 25006) and turned into a confirmation request.
+- The whole script is one transaction (commit on success, rollback on error), with a 30s `statement_timeout`. Transaction control (`BEGIN`/`COMMIT`/…), `SET TRANSACTION` and `COPY` are rejected.
+- Runs on a dedicated connection via raw asyncpg, invalidated afterwards so session state never leaks into the pool. Confirmed scripts hold the shared write barrier.
 
 ## OAuth2 Configuration
 

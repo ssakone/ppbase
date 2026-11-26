@@ -24,6 +24,7 @@ from ppbase.services.auth_service import (
     create_verification_token,
     generate_token_key,
     get_collection_token_config,
+    normalize_auth_token_type,
     hash_password,
     verify_password,
     verify_purpose_token,
@@ -547,7 +548,7 @@ async def verify_record_auth_token(
     except _jwt.InvalidTokenError:
         return None
 
-    token_type = unverified.get("type")
+    token_type = normalize_auth_token_type(unverified.get("type"))
 
     # For _superusers, accept both admin and authRecord tokens
     if collection.name == "_superusers":
@@ -578,6 +579,8 @@ async def verify_record_auth_token(
     except _jwt.InvalidTokenError:
         return None
 
+    if payload.get("type") != "admin":
+        payload["type"] = token_type
     return payload
 
 

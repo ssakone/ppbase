@@ -36,6 +36,12 @@ _AUTH_COLUMN_MAP = {
 }
 
 
+def _is_superuser_auth(request_auth: dict[str, Any] | None) -> bool:
+    if not isinstance(request_auth, dict):
+        return False
+    return request_auth.get("type") == "admin" or request_auth.get("collectionName") == "_superusers"
+
+
 def build_record_response(
     row: dict[str, Any],
     collection_id: str,
@@ -110,8 +116,13 @@ def build_record_response(
             fname = field_def.get("name", "")
             if not fname:
                 continue
-            # Skip hidden fields unless specifically requested
-            if fname in hidden and (fields_filter is None or fname not in fields_filter):
+            # Skip hidden fields unless specifically requested; through the API (request
+            # context present) only superusers may request them, like PocketBase.
+            if fname in hidden and (
+                fields_filter is None
+                or fname not in fields_filter
+                or (apply_email_visibility and not _is_superuser_auth(request_auth))
+            ):
                 continue
             # Skip password-type fields always
             if field_def.get("type") == "password":

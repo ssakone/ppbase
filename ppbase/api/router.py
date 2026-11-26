@@ -50,6 +50,11 @@ from ppbase.api.backups import router as backups_router
 
 api_router.include_router(backups_router)
 
+# Raw SQL console (admin only, mutating scripts require confirmation).
+from ppbase.api.sql_console import router as sql_console_router
+
+api_router.include_router(sql_console_router, tags=["sql"])
+
 # Hooks management router -- import gracefully.
 try:
     from ppbase.api.hooks import router as hooks_router
