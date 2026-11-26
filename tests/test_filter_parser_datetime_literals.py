@@ -86,3 +86,69 @@ def test_relation_date_string_literals_are_bound_as_datetimes() -> None:
     assert 'EXISTS (SELECT 1 FROM "customers"' in sql
     assert '"customers"."joined_at" <= :_fp1' in sql
     assert params["_fp1"] == datetime(2026, 5, 17, 0, 0, 0, tzinfo=UTC)
+
+
+def test_datetime_literal_forms_are_parsed_strictly() -> None:
+    import pytest
+
+    from ppbase.services.filter_parser import parse_datetime_literal
+
+    expected = datetime(2026, 11, 1, 0, 0, 0, tzinfo=UTC)
+    for value in (
+        "2026-11-01",
+        "2026-11-01T00:00:00Z",
+        "2026-11-01T00:00:00z",
+        "2026-11-01T00:00Z",
+        "2026-11-01 00:00:00",
+        "2026-11-01 00:00:00.000Z",
+        "2026-11-01T00:00:00.000000000Z",
+        "2026-11-01T01:00:00+01:00",
+        "2026-11-01T01:00:00+0100",
+        "2026-10-31T19:00:00-05",
+    ):
+        assert parse_datetime_literal(value) == expected, value
+
+    assert parse_datetime_literal("2026-11-01 10:20:30.123Z") == datetime(
+        2026, 11, 1, 10, 20, 30, 123000, tzinfo=UTC
+    )
+
+    for value in (
+        "not-a-date",
+        "2026-13-01",
+        "2026-11-31",
+        "20261101",
+        "2026-W44",
+        "2026-11-01T00:00:00+25:00",
+        "2026-11-01 00:00:00 UTC",
+    ):
+        with pytest.raises(ValueError):
+            parse_datetime_literal(value)
+
+
+def test_invalid_datetime_literal_is_a_value_error() -> None:
+    import pytest
+
+    sales = _coll("boutique_sale", [_date("sold_at")])
+    index = _build_relation_index_from_collections([sales])
+
+    with pytest.raises(ValueError, match="Invalid datetime value"):
+        parse_filter(
+            'sold_at >= "tomorrow"',
+            relation_resolver=index,
+            current_table="boutique_sale",
+        )
+
+
+def test_empty_date_literal_matches_missing_dates() -> None:
+    sales = _coll("boutique_sale", [_date("sold_at")])
+    index = _build_relation_index_from_collections([sales])
+
+    sql, params = parse_filter(
+        'sold_at = "" || sold_at != ""',
+        relation_resolver=index,
+        current_table="boutique_sale",
+    )
+
+    assert '"boutique_sale"."sold_at" IS NULL' in sql
+    assert '"boutique_sale"."sold_at" IS NOT NULL' in sql
+    assert params == {}
