@@ -616,6 +616,22 @@ class _FilterTransformer(Transformer):
             return True
         return self._operand_field_type(node) in {"json", "geoPoint"}
 
+    def _is_datetime_comparison(
+        self,
+        left: tuple[str, Any],
+        right: tuple[str, Any],
+    ) -> bool:
+        """True when one side is ``null`` and the other is a date field."""
+        for null_side, other in ((left, right), (right, left)):
+            if (
+                isinstance(null_side, tuple)
+                and null_side
+                and null_side[0] == "null"
+                and self._operand_field_type(other) in _DATETIME_FIELD_TYPES
+            ):
+                return True
+        return False
+
     def _empty_equality_sql(
         self,
         sql_op: str,
@@ -638,6 +654,12 @@ class _FilterTransformer(Transformer):
         left_empty = _is_empty_operand(left)
         right_empty = _is_empty_operand(right)
         if not left_empty and not right_empty:
+            return None
+        # ``_literal_for_field_type`` rewrites an empty literal compared with a
+        # date/autodate field into ``null``. For those fields the plain
+        # ``IS NULL`` / ``IS NOT NULL`` form is the expected comparison, so the
+        # text-cast emptiness test is skipped here.
+        if self._is_datetime_comparison(left, right):
             return None
         if left_empty and right_empty:
             return "TRUE" if sql_op == "=" else "FALSE"
